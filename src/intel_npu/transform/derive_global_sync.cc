@@ -98,6 +98,72 @@ Stmt MakeSyncGrid() {
   return Evaluate(Call(DataType::Handle(), tl::sync_grid(), {}));
 }
 
+// A grid barrier every SHAVE must reach: one under a condition or loop bound
+// that depends on the launch coordinates (or on a value derived from them) is
+// reached by some SHAVEs and not others, and hangs the kernel.
+class UniformSyncVerifier : public StmtExprVisitor {
+public:
+  void Run(const Stmt &body) { VisitStmt(body); }
+
+private:
+  bool DependsOnLaunch(const PrimExpr &e) const {
+    bool found = false;
+    PostOrderVisit(e, [&](const ffi::ObjectRef &n) {
+      if (const auto *v = n.as<VarNode>())
+        if (launch_vars_.count(v))
+          found = true;
+    });
+    return found;
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tirx::attr::thread_extent) {
+      if (const auto *iv = op->node.as<IterVarNode>())
+        launch_vars_.insert(iv->var.get());
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  // `worker = tile * spt + shave`: a bound value derived from the launch coordinates.
+  void VisitStmt_(const BindNode *op) final {
+    if (DependsOnLaunch(op->value))
+      launch_vars_.insert(op->var.get());
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) final {
+    const bool dep = DependsOnLaunch(op->condition);
+    if (dep)
+      ++non_uniform_depth_;
+    StmtExprVisitor::VisitStmt_(op);
+    if (dep)
+      --non_uniform_depth_;
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    const bool dep = DependsOnLaunch(op->min) || DependsOnLaunch(op->extent);
+    if (dep)
+      ++non_uniform_depth_;
+    StmtExprVisitor::VisitStmt_(op);
+    if (dep)
+      --non_uniform_depth_;
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(tl::sync_grid()) && non_uniform_depth_ > 0) {
+      TVM_FFI_THROW(ValueError)
+          << "intel_npu: T.sync_grid() sits under a condition or loop bound that depends on the "
+             "tile or SHAVE index, so only some SHAVEs would reach it and the kernel would hang. "
+             "Every SHAVE of every tile must execute the same sequence of grid barriers: move the "
+             "barrier out of the worker-dependent region.";
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  std::unordered_set<const VarNode *> launch_vars_;
+  int non_uniform_depth_ = 0;
+};
+
 // Rewrites the first SeqStmt found under the launch wrappers: the phase sequence.
 class PhaseSequenceRewriter : public StmtMutator {
 public:
@@ -165,10 +231,22 @@ tvm::transform::Pass DeriveIntelNpuGlobalSync() {
                                              "tl.DeriveIntelNpuGlobalSync", {});
 }
 
+tvm::transform::Pass VerifyIntelNpuUniformSync() {
+  auto pass_func = [](PrimFunc func, const IRModule &mod,
+                      const tvm::transform::PassContext &ctx) -> PrimFunc {
+    UniformSyncVerifier verifier;
+    verifier.Run(func->body);
+    return func;
+  };
+  return tirx::transform::CreatePrimFuncPass(pass_func, 0,
+                                             "tl.VerifyIntelNpuUniformSync", {});
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.intel_npu.transform.DeriveIntelNpuGlobalSync",
-                        DeriveIntelNpuGlobalSync);
+  refl::GlobalDef()
+      .def("tl.intel_npu.transform.DeriveIntelNpuGlobalSync", DeriveIntelNpuGlobalSync)
+      .def("tl.intel_npu.transform.VerifyIntelNpuUniformSync", VerifyIntelNpuUniformSync);
 }
 
 } // namespace transform

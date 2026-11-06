@@ -166,6 +166,56 @@ def test_author_barrier_is_kept_not_duplicated():
     assert lowering.lower(main).source.count("ctx.sync_grid();") == 1
 
 
+@pytest.mark.parametrize("derive", [True, False])
+def test_sync_grid_under_worker_condition_is_refused(derive):
+    # Only SHAVE 0 would reach the barrier: a hang. Refused with or without derivation.
+    @T.prim_func
+    def main(X: T.Tensor((64, 64), T.float16), Y: T.Tensor((64, 64), T.float16)):
+        with T.Kernel(1, threads=2) as tile:
+            shave = T.get_thread_binding()
+            X_cmx = T.alloc_local((64, 64), T.float16)
+            if shave == 0:
+                T.copy(X, X_cmx)
+                T.sync_grid()
+                T.copy(X_cmx, Y)
+
+    with tvm.transform.PassContext(config={} if derive else NO_DERIVE):
+        with pytest.raises(ValueError, match="depends on the tile or SHAVE index"):
+            lowering.lower(main)
+
+
+def test_sync_grid_under_derived_worker_value_is_refused():
+    # The condition reads `worker`, a value computed from the launch coordinates.
+    @T.prim_func
+    def main(X: T.Tensor((64, 64), T.float16), Y: T.Tensor((64, 64), T.float16)):
+        with T.Kernel(2, threads=2) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * 2 + shave
+            X_cmx = T.alloc_local((64, 64), T.float16)
+            for w in T.serial(worker + 1):
+                T.copy(X, X_cmx)
+                T.sync_grid()
+                T.copy(X_cmx, Y)
+
+    with pytest.raises(ValueError, match="depends on the tile or SHAVE index"):
+        lowering.lower(main)
+
+
+def test_sync_grid_under_uniform_condition_is_allowed():
+    @T.prim_func
+    def main(X: T.Tensor((64, 64), T.float16), Y: T.Tensor((64, 64), T.float16), n: T.int32):
+        with T.Kernel(1, threads=2) as tile:
+            shave = T.get_thread_binding()
+            X_cmx = T.alloc_local((64, 64), T.float16)
+            for i in T.serial(2):
+                if shave == 0:
+                    T.copy(X, X_cmx)
+                    T.copy(X_cmx, Y)
+                T.sync_grid()
+
+    assert lowering.lower(main).source.count("ctx.sync_grid();") == 1
+
+
 def test_budget_refuses_oversized_kernel():
     func = make_gemm(2048, 64, 1024, BM=2048, BN=64, tiles=1, shaves=2)  # 4 MiB A tile per SHAVE
     with pytest.raises(ValueError, match=r"(?s)CMX budget exceeded.*A_cmx: 4194304 B per SHAVE"):

@@ -55,6 +55,8 @@ def IntelNpuPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     # Grid barriers between phases that communicate through DDR, unless written by hand.
     if _derive_global_sync_enabled():
         mod = tilelang.intel_npu.transform.DeriveIntelNpuGlobalSync()(mod)
+    # A barrier some SHAVEs would skip is a hang, derived or hand-written.
+    mod = tilelang.intel_npu.transform.VerifyIntelNpuUniformSync()(mod)
 
     # No PlanAndUpdateBufferAllocationLocation: it sinks CMX buffers into the
     # loops that use them, and a CMX allocation is made once per kernel.

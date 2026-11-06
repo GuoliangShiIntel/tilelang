@@ -27,3 +27,9 @@ def DeriveIntelNpuGlobalSync():
     DDR (RAW/WAR/WAW at buffer granularity) when the author did not write one.
     Runs after LowerIntelNpuTileOp and before LowerOpaqueBlock."""
     return _ffi_api.DeriveIntelNpuGlobalSync()  # type: ignore
+
+
+def VerifyIntelNpuUniformSync():
+    """Refuse a T.sync_grid() under a condition or loop bound that depends on
+    the tile/SHAVE index: some SHAVEs would never reach it and the kernel hangs."""
+    return _ffi_api.VerifyIntelNpuUniformSync()  # type: ignore
