@@ -92,9 +92,13 @@ def test_ksplit_refused_by_name():
 
 @needs_cxx
 def test_cmx_exhaustion_reported_in_status():
-    # 4 MiB of fp16 per SHAVE does not fit a 1.5 MiB tile.
-    func = make_gemm(2048, 64, 1024, BM=2048, BN=64, tiles=1, shaves=2)
-    lib = host_sim.build(_source(func), "gemm_too_big")
+    # The compile-time budget check (Phase 2) refuses this for the real target; lower it for a
+    # target that claims 16 MiB of CMX so the RUNTIME allocator is the one that reports the failure.
+    from tvm.target import Target
+
+    func = make_gemm(2048, 64, 1024, BM=2048, BN=64, tiles=1, shaves=2)  # 4 MiB of fp16 per SHAVE
+    big = Target({"kind": "intel_npu", "arch": "npu5", "cmx_bytes": 16 * 1024 * 1024})
+    lib = host_sim.build(tilelang.lower(func, target=big).kernel_source, "gemm_too_big")
     a = np.zeros((2048, 1024), np.float16)
     b = np.zeros((64, 1024), np.float16)
     c = np.zeros((2048, 64), np.float16)

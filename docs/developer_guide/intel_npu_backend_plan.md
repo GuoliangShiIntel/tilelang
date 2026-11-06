@@ -261,6 +261,19 @@ interop; a Python `nl.*`-compatible shim.
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-06: **Phase 2 closed (2a).** `T.sync_grid()` -> `ctx.sync_grid()` (npu::Sync::waitGlobal),
+  `T.sync_threads()` -> `ctx.sync_tile()` (waitLocal); `CheckIntelNpuBudgets` refuses a kernel whose
+  CMX allocations x shaves_per_tile + runtime reserve exceed the target's `cmx_bytes`, naming the
+  buffers (negative: the Phase 1 over-sized kernel; the verdict follows the target attribute). Two-phase
+  megakernel (`kernels.make_gemm_two_phase`: split-K partials on half the workers -> `sync_grid` ->
+  fp16 combine on all, one launch): host sim PASS and device **PASS** (rel 5.67e-4); without the
+  barrier 5/5 device launches FAIL, so the barrier is live. Harness: `lowering.py` binds arrays by the
+  device parameter order (`SplitHostDevice` reorders parameters). Device finding, fixed: a SHAVE's
+  direct DDR store needs `npu::sync::memoryFence()` or it can be lost at kernel end (the Phase 1
+  "unwritten status" one-off, ~1 in 25 launches); the runtime now fences after the status record and
+  before every barrier; 180 launches since, 0 lost. Details and the trace row in
+  `device/evidence/INDEX.md`. **Open for 2b:** `DeriveGlobalSync` (automatic `sync_grid` from
+  global-buffer dataflow) is not started; `.text` is still unmeasured (the runner can read the .elf).
 * 2026-11-06: **Phase 1 closed.** `LowerIntelNpuTileOp` (C++, before `FlattenBuffer`) lowers `copy`
   (DDR<->CMX, 1-D/2-D, byte widths and row strides from the 2-D buffers) to `intel_npu_dma_copy` and
   `gemm` (fp16, `transpose_B`, `clear_accum=True`) to `intel_npu_dpu_matmul`; every other tile op is
@@ -281,8 +294,8 @@ interop; a Python `nl.*`-compatible shim.
   compile-time budget check deferred to `CheckBudgets` (Phase 2); (c) `PlanAndUpdateBufferAllocationLocation`
   is not run (it sinks CMX buffers into loops; a CMX allocation is once per kernel); (d) scope `shared`
   and `local` are both SHAVE-private until Phase 3 places tile-shared buffers. One unexplained
-  one-off (first launch after the first build reported one SHAVE's status unwritten; not reproduced in
-  70+ launches) is recorded in `device/evidence/INDEX.md`.
+  one-off (first launch after the first build reported one SHAVE's status unwritten) was recorded in
+  `device/evidence/INDEX.md`; it recurred and was root-caused and fixed in Phase 2 (missing DL1 fence).
 * 2026-11-06: **Phase 0 closed.** `tilelang/intel_npu/` (target, manifest, pipeline, dialect with a
   1-D `T.Kernel`, source-only codegen, `source_only` execution spec), `src/intel_npu/` (target kind
   with PTL defaults, `LowerIntelNpuKernelLaunch`, `CodeGenTileLangIntelNpu` + `kernel_entry`

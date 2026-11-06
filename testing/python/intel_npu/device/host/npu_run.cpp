@@ -21,6 +21,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -109,6 +110,13 @@ int run(int argc, char **argv) {
     std::ofstream(dir + "/status.bin", std::ios::binary)
         .write(reinterpret_cast<const char *>(status), (std::streamsize)statusBytes);
   };
+  auto dumpOutputs = [&]() {
+    for (auto &p : ps)
+      if (p.mode == "out" || p.mode == "inout") {
+        std::ofstream f(dir + "/" + p.file, std::ios::binary);
+        f.write(static_cast<const char *>(p.dev), (std::streamsize)p.bytes);
+      }
+  };
   auto &k = device.createKernel(kernel, npu::Device::Tiles(tiles), npu::Device::ShavesPerTile(shaves));
   if (!profile.empty())
     k.setProfilingEnabled(true);
@@ -134,14 +142,29 @@ int run(int argc, char **argv) {
     std::string health;
     if (!device.isHealthy(&health)) {
       dumpStatus();
+      dumpOutputs();
       die("device unhealthy after run " + std::to_string(r) + ": " + health);
     }
-    for (std::uint32_t w = 0; w < workers; ++w)
-      if (status[w * 8] != kStatusOk) {
-        dumpStatus();
-        die("SHAVE " + std::to_string(w) + " status " + std::to_string(status[w * 8]) + " detail " +
-            std::to_string(status[w * 8 + 1]) + " (status.bin written)");
+    for (std::uint32_t w = 0; w < workers; ++w) {
+      volatile std::uint32_t *word = status + w * 8;
+      if (*word == 0xFFFFFFFFu) {
+        // Diagnostic for an intermittent unwritten record: is it late, or never written?
+        int waited_ms = 0;
+        while (*word == 0xFFFFFFFFu && waited_ms < 50) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          ++waited_ms;
+        }
+        if (*word != 0xFFFFFFFFu)
+          std::cout << "WARNING run " << r << ": SHAVE " << w << " status arrived " << waited_ms
+                    << " ms after stream.wait() returned" << std::endl;
       }
+      if (*word != kStatusOk) {
+        dumpStatus();
+        dumpOutputs();
+        die("SHAVE " + std::to_string(w) + " status " + std::to_string(*word) + " detail " +
+            std::to_string(status[w * 8 + 1]) + " (status.bin and outputs written)");
+      }
+    }
     if (r >= warmup) {
       times.push_back(ms);
       std::cout << "run " << r - warmup << " ms " << ms << std::endl;

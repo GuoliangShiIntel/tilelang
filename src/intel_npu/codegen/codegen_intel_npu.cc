@@ -125,7 +125,31 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
     os << "ctx.dpu_matmul(" << args(0, 6) << ")";
     return;
   }
+  if (op->op.same_as(tl::sync_grid())) {
+    // Every SHAVE of every tile: the megakernel phase boundary.
+    os << "ctx.sync_grid()";
+    return;
+  }
   CodeGenC::VisitExpr_(op, os);
+}
+
+void CodeGenTileLangIntelNpu::PrintStorageSync(const CallNode *op) {
+  const auto *scope = op->args[0].as<StringImmNode>();
+  ICHECK(scope != nullptr);
+  const std::string s = scope->value;
+  if (s == "shared" || s == "shared.dyn") {
+    PrintIndent();
+    stream << "ctx.sync_tile();\n";
+    return;
+  }
+  if (s == "global") {
+    PrintIndent();
+    stream << "ctx.sync_grid();\n";
+    return;
+  }
+  TVM_FFI_THROW(ValueError) << "intel_npu: storage sync scope '" << s
+                            << "' has no meaning on this target (shared = the tile's SHAVEs, "
+                               "global / T.sync_grid() = every SHAVE)";
 }
 
 void CodeGenTileLangIntelNpu::AddFunction(const PrimFunc &f) {

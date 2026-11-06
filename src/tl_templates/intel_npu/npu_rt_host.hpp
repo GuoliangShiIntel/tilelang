@@ -9,8 +9,11 @@
 #ifndef TL_TEMPLATES_INTEL_NPU_NPU_RT_HOST_HPP_
 #define TL_TEMPLATES_INTEL_NPU_NPU_RT_HOST_HPP_
 
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -29,6 +32,28 @@ struct Environment;
 void kernel_entry(int numParams, uint64_t *params, const npu::Environment &env);
 
 namespace npu {
+
+// Reusable rendezvous for a fixed party count (C++17; std::barrier is C++20).
+class Barrier {
+public:
+  explicit Barrier(unsigned parties) : parties_(parties) {}
+  void wait() {
+    std::unique_lock<std::mutex> lk(m_);
+    const unsigned gen = gen_;
+    if (++count_ == parties_) {
+      count_ = 0;
+      ++gen_;
+      cv_.notify_all();
+      return;
+    }
+    cv_.wait(lk, [&] { return gen != gen_; });
+  }
+
+private:
+  std::mutex m_;
+  std::condition_variable cv_;
+  unsigned parties_, count_{0}, gen_{0};
+};
 
 enum : std::uint32_t {
   kStatusOk = 1,
@@ -61,6 +86,8 @@ struct Environment {
   std::uint32_t tile, shave, tiles, spt;
   std::uint8_t *cmx;       // this tile's arena
   std::uint32_t cmxBytes;
+  Barrier *grid;           // all SHAVEs of all tiles
+  Barrier *tileBarrier;    // the SHAVEs of this tile
 };
 
 class Ctx {
@@ -125,6 +152,9 @@ public:
     }
   }
 
+  void sync_grid() { env_.grid->wait(); }
+  void sync_tile() { env_.tileBarrier->wait(); }
+
   void finish() {
     if (statusAddr_ == 0)
       return;
@@ -174,10 +204,14 @@ private:
 NPU_SIM_EXPORT int npu_sim_run(int numParams, uint64_t *params, uint32_t tiles, uint32_t spt,
                                uint32_t cmxBytes) {
   std::vector<std::vector<std::uint8_t>> arenas(tiles, std::vector<std::uint8_t>(cmxBytes));
+  npu::Barrier grid(tiles * spt);
+  std::deque<npu::Barrier> tileBarriers;
+  for (uint32_t t = 0; t < tiles; ++t)
+    tileBarriers.emplace_back(spt);
   std::vector<npu::Environment> envs;
   for (uint32_t t = 0; t < tiles; ++t)
     for (uint32_t s = 0; s < spt; ++s)
-      envs.push_back(npu::Environment{t, s, tiles, spt, arenas[t].data(), cmxBytes});
+      envs.push_back(npu::Environment{t, s, tiles, spt, arenas[t].data(), cmxBytes, &grid, &tileBarriers[t]});
   std::vector<std::thread> threads;
   for (auto &env : envs)
     threads.emplace_back([&] { kernel_entry(numParams, params, env); });

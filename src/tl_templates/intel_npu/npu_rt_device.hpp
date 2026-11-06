@@ -8,7 +8,10 @@
 //  * DMA/DPU descriptors must not lie in the DMA driver's trap-descriptor
 //    window of the tile's CMX (DmaDrv40xx::init: cmx.METADATA + 0x129C0);
 //  * DpuMatMul::init(M, N, K) builds a weight table of 16 bytes per (padded) N
-//    row at the address given to its constructor.
+//    row at the address given to its constructor;
+//  * a SHAVE's direct DDR store (DdrAccessor) sits in its data L1 until flushed:
+//    without npu::sync::memoryFence() the store can be lost when the SHAVE
+//    halts (seen as an unwritten status record in ~1 of 25 launches).
 #ifndef TL_TEMPLATES_INTEL_NPU_NPU_RT_DEVICE_HPP_
 #define TL_TEMPLATES_INTEL_NPU_NPU_RT_DEVICE_HPP_
 
@@ -18,6 +21,7 @@
 #include <hw/ddr/include/ddr_accessor_40xx.hpp>
 #include <lib/dma/include/dma_utils.hpp>
 #include <lib/dpu/include/dpu_matmul.hpp>
+#include <shave/sync/include/memory_fence.hpp>
 
 #include <cstdint>
 #include <new>
@@ -63,7 +67,8 @@ public:
 
   Ctx(const Environment &env, int numParams, std::uint64_t *params,
       int numTensorParams)
-      : env_(env), cmx_(env.getCmxAllocator()), dma_(env.getDmaDrv()) {
+      : env_(env), cmx_(env.getCmxAllocator()), dma_(env.getDmaDrv()),
+        sync_(env.getSync()) {
     const auto &info = env.getShaveInfo();
     shave_ = info.getShaveId();
     spt_ = info.getNumShavesPerTile();
@@ -133,6 +138,19 @@ public:
     mm_->run(out, const_cast<half *>(a), const_cast<half *>(bt));
   }
 
+  // Barriers. DMA is synchronous in Phase 1-2, so only SHAVE-side writes need
+  // publishing: CMX writes to the tile, direct DDR stores out of the data L1.
+  void sync_grid() {
+    flushCmxWrites();
+    sync::memoryFence();
+    sync_.waitGlobal();
+  }
+  void sync_tile() {
+    flushCmxWrites();
+    sync::memoryFence();
+    sync_.waitLocal();
+  }
+
   // Writes the per-SHAVE status record: {code, detail, cmx_free_at_entry, cmx_used}.
   void finish() {
     if (statusAddr_ == 0)
@@ -143,6 +161,7 @@ public:
     s1 = detail_;
     s2 = cmxFree0_;
     s3 = cmxFree0_ - cmx_.getAvailableSize();
+    sync::memoryFence();
   }
 
 private:
@@ -205,6 +224,7 @@ private:
   const Environment &env_;
   LinearAllocator &cmx_;
   DmaDrv &dma_;
+  Sync &sync_;
   std::int32_t shave_{0}, spt_{1}, tile_{0}, tiles_{1};
   std::uint64_t statusAddr_{0};
   std::uint32_t cmxFree0_{0};

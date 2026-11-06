@@ -14,3 +14,9 @@ def LowerIntelNpuTileOp():
     DMA, gemm (fp16, transpose_B, clear_accum) -> one DPU workload. Refuses
     every other tile op by name. Runs before FlattenBuffer."""
     return _ffi_api.LowerIntelNpuTileOp()  # type: ignore
+
+
+def CheckIntelNpuBudgets():
+    """Refuse a kernel whose CMX allocations (per SHAVE x shaves_per_tile +
+    runtime reserve) exceed the target's cmx_bytes, naming the buffers."""
+    return _ffi_api.CheckIntelNpuBudgets()  # type: ignore

@@ -53,3 +53,60 @@ def make_gemm_ksplit(M: int, N: int, K: int, BM: int = 64, BN: int = 64, BK: int
             T.copy(C_cmx, C[0, 0])
 
     return gemm_ksplit
+
+
+def make_gemm_two_phase(M: int, N: int, K: int, BM: int = 64, BN: int = 64, tiles: int = 2, shaves: int = 2,
+                        with_sync: bool = True):
+    """Megakernel shape: split-K partial products -> T.sync_grid() -> combine, one launch.
+
+    Phase A runs on the first half of the workers (the producers) and writes
+    partial products to DDR scratch P[half]; phase B deals output blocks over
+    ALL workers. The phases have different parallelism, as megakernel phases
+    do, and without the barrier the non-producer workers read partials that
+    have not been written yet, so `with_sync=False` is a negative control that
+    fails without depending on scheduling luck.
+    """
+    workers = tiles * shaves
+    producers = max(1, workers // 2)
+    nbm, nbn = M // BM, N // BN
+    nblk = nbm * nbn
+    KH = K // 2
+    assert M % BM == 0 and N % BN == 0 and K % 2 == 0
+
+    @T.prim_func
+    def gemm_two_phase(A: T.Tensor((M, K), T.float16), B: T.Tensor((N, K), T.float16),
+                       P: T.Tensor((2, M, N), T.float16), C: T.Tensor((M, N), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            A_cmx = T.alloc_local((BM, KH), T.float16)
+            B_cmx = T.alloc_local((BN, KH), T.float16)
+            P_cmx = T.alloc_local((BM, BN), T.float16)
+            Q_cmx = T.alloc_local((BM, BN), T.float16)
+            # Phase A: 2 * nblk items (block, k-half) over the producer workers only
+            for w in T.serial(T.ceildiv(2 * nblk, producers)):
+                item = w * producers + worker
+                if worker < producers and item < 2 * nblk:
+                    kh = item % 2
+                    blk = item // 2
+                    bm = blk // nbn
+                    bn = blk % nbn
+                    T.copy(A[bm * BM, kh * KH], A_cmx)
+                    T.copy(B[bn * BN, kh * KH], B_cmx)
+                    T.gemm(A_cmx, B_cmx, P_cmx, transpose_B=True, clear_accum=True)
+                    T.copy(P_cmx, P[kh, bm * BM, bn * BN])
+            if with_sync:
+                T.sync_grid()
+            # Phase B: output blocks over every worker
+            for w in T.serial(T.ceildiv(nblk, workers)):
+                blk = w * workers + worker
+                if blk < nblk:
+                    bm = blk // nbn
+                    bn = blk % nbn
+                    T.copy(P[0, bm * BM, bn * BN], P_cmx)
+                    T.copy(P[1, bm * BM, bn * BN], Q_cmx)
+                    for i, j in T.grid(BM, BN):
+                        P_cmx[i, j] = P_cmx[i, j] + Q_cmx[i, j]
+                    T.copy(P_cmx, C[bm * BM, bn * BN])
+
+    return gemm_two_phase

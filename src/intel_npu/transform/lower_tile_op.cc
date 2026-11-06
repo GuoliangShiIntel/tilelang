@@ -35,7 +35,8 @@ namespace {
 struct RegionInfo {
   Buffer buffer;
   ffi::Array<PrimExpr> indices;
-  std::vector<int64_t> extents;
+  std::vector<int64_t> extents; // leading unit extents dropped
+  std::vector<int64_t> full_extents;
 };
 
 bool IsDdr(const Buffer &buf) {
@@ -67,8 +68,13 @@ RegionInfo ParseRegion(const PrimExpr &e, const char *what) {
           << " has a non-constant extent " << call->args[i]
           << "; tile extents must be compile-time constants";
     }
-    info.extents.push_back(imm->value);
+    info.full_extents.push_back(imm->value);
   }
+  // A [1, ..., 1, R, C] region of a higher-rank tensor is a 2-D tile.
+  size_t lead = 0;
+  while (lead + 1 < info.full_extents.size() && info.full_extents[lead] == 1)
+    ++lead;
+  info.extents.assign(info.full_extents.begin() + lead, info.full_extents.end());
   return info;
 }
 
@@ -81,12 +87,12 @@ int64_t ConstDim(const PrimExpr &e, const Buffer &buf, const char *field) {
   return imm->value;
 }
 
-// Row stride in elements of the region's outer dimension (row-major 2-D), or the
-// region's own width for a 1-D region.
+// Row stride in elements of the region's second-innermost dimension (row-major),
+// or the region's own width for a 1-D region.
 int64_t RowStrideElems(const RegionInfo &r) {
   const Buffer &b = r.buffer;
   const size_t nd = b->shape.size();
-  if (nd == 1)
+  if (nd == 1 || r.extents.size() == 1)
     return r.extents.back();
   if (!b->strides.empty())
     return ConstDim(b->strides[nd - 2], b, "stride");

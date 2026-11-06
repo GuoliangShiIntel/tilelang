@@ -51,6 +51,7 @@ def IntelNpuPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     # loops that use them, and a CMX allocation is made once per kernel.
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
+    mod = tilelang.intel_npu.transform.CheckIntelNpuBudgets()(mod)
     mod = tirx.transform.NarrowDataType(32)(mod)
     mod = tilelang.transform.FlattenBuffer()(mod)
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
