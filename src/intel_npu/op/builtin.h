@@ -12,6 +12,10 @@
 namespace tvm {
 namespace tl {
 
+// Pass config: derive grid barriers between DDR-communicating phases (default
+// true). Off only for the negative controls that prove a barrier is live.
+static constexpr const char *kIntelNpuDeriveGlobalSync = "tl.intel_npu.derive_global_sync";
+
 /*!
  * \brief 2-D DMA between DDR and CMX.
  *

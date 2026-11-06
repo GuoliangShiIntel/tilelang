@@ -4,8 +4,11 @@ on the PTL/NPU5 against numpy, one launch.
 Usage (GENERIC_COMPUTE_ROOT and MV_TOOLS_PATH set):
     python testing/python/intel_npu/device/run_two_phase_device.py [--no-build] [--profile] [--nosync] [--runs N]
 
---nosync builds the kernel WITHOUT the barrier: the negative control, expected to FAIL the
-comparison on at least one of the --runs (default 5) launches; exit 0 means the control behaved.
+--nosync builds the kernel WITHOUT the barrier and with barrier derivation switched off
+(tl.intel_npu.derive_global_sync=False): the negative control, expected to FAIL the comparison on at
+least one of the --runs (default 5) launches; exit 0 means the control behaved.
+--auto builds the kernel without a hand-written barrier and lets DeriveIntelNpuGlobalSync insert it;
+its source must equal the hand-written kernel's and the golden must PASS.
 """
 
 import sys
@@ -22,6 +25,7 @@ sys.path.insert(0, str(HERE))
 import runner  # noqa: E402
 import lowering  # noqa: E402
 from kernels import make_gemm_two_phase  # noqa: E402
+from tilelang import tvm  # noqa: E402
 
 M, N, K = 256, 256, 512
 TILES, SHAVES = 2, 2
@@ -29,9 +33,17 @@ TILES, SHAVES = 2, 2
 
 def main(argv):
     nosync = "--nosync" in argv
+    auto = "--auto" in argv
     runs = int(argv[argv.index("--runs") + 1]) if "--runs" in argv else 5
-    kernel = "tl_gemm_two_phase" + ("_nosync" if nosync else "")
-    low = lowering.lower(make_gemm_two_phase(M, N, K, tiles=TILES, shaves=SHAVES, with_sync=not nosync))
+    kernel = "tl_gemm_two_phase" + ("_nosync" if nosync else "_auto" if auto else "")
+    config = {"tl.intel_npu.derive_global_sync": False} if nosync else {}
+    with tvm.transform.PassContext(config=config):
+        low = lowering.lower(make_gemm_two_phase(M, N, K, tiles=TILES, shaves=SHAVES, with_sync=not (nosync or auto)))
+    if auto:
+        hand = lowering.lower(make_gemm_two_phase(M, N, K, tiles=TILES, shaves=SHAVES, with_sync=True)).source
+        print("derived source identical to hand-written:", low.source == hand)
+        if low.source != hand:
+            return 1
     if "--no-build" in argv:
         _, sha = runner.write_kernel(low.source, kernel)
         db = runner.DeviceBuild(build_dir=HERE / "build", exe=HERE / "build" / "Release" / "npu_run.exe", kernel=kernel, source_sha256=sha)

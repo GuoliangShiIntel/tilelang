@@ -20,3 +20,10 @@ def CheckIntelNpuBudgets():
     """Refuse a kernel whose CMX allocations (per SHAVE x shaves_per_tile +
     runtime reserve) exceed the target's cmx_bytes, naming the buffers."""
     return _ffi_api.CheckIntelNpuBudgets()  # type: ignore
+
+
+def DeriveIntelNpuGlobalSync():
+    """Insert T.sync_grid() between top-level phases that communicate through
+    DDR (RAW/WAR/WAW at buffer granularity) when the author did not write one.
+    Runs after LowerIntelNpuTileOp and before LowerOpaqueBlock."""
+    return _ffi_api.DeriveIntelNpuGlobalSync()  # type: ignore

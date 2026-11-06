@@ -17,12 +17,15 @@ import pytest
 
 import tilelang
 import tilelang.intel_npu.language as T
+from tilelang import tvm
 from tvm.target import Target
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_sim  # noqa: E402
 import lowering  # noqa: E402
 from kernels import make_gemm, make_gemm_two_phase  # noqa: E402
+
+NO_DERIVE = {"tl.intel_npu.derive_global_sync": False}
 
 
 def _has_host_cxx() -> bool:
@@ -55,9 +58,11 @@ def test_sync_grid_and_sync_threads_lower():
     assert src.index("ctx.sync_tile();") < src.index("ctx.sync_grid();")
 
 
-def _run_two_phase(with_sync: bool, seed: int = 0):
-    low = lowering.lower(make_gemm_two_phase(M, N, K, tiles=TILES, shaves=SHAVES, with_sync=with_sync))
-    lib = host_sim.build(low.source, f"two_phase_{'sync' if with_sync else 'nosync'}")
+def _run_two_phase(with_sync: bool, seed: int = 0, derive: bool = True):
+    func = make_gemm_two_phase(M, N, K, tiles=TILES, shaves=SHAVES, with_sync=with_sync)
+    with tvm.transform.PassContext(config={} if derive else NO_DERIVE):
+        low = lowering.lower(func)
+    lib = host_sim.build(low.source, f"two_phase_{'sync' if with_sync else 'nosync'}_{'d' if derive else 'nd'}")
     rng = np.random.default_rng(seed)
     a = rng.standard_normal((M, K)).astype(np.float16)
     b = rng.standard_normal((N, K)).astype(np.float16)
@@ -76,9 +81,89 @@ def test_two_phase_matches_numpy():
 
 @needs_cxx
 def test_negative_without_sync_grid_races():
-    # Without the barrier at least one of several runs must read unfinished partials.
-    errs = [_run_two_phase(with_sync=False, seed=s) for s in range(5)]
+    # With derivation off and no hand-written barrier: at least one of several runs reads unfinished partials.
+    errs = [_run_two_phase(with_sync=False, seed=s, derive=False) for s in range(5)]
     assert max(errs) > 1e-2, f"the no-barrier kernel never failed: {errs}"
+
+
+@needs_cxx
+def test_derived_barrier_makes_unsynced_source_correct():
+    assert _run_two_phase(with_sync=False, derive=True) < 4e-3
+
+
+def test_derived_sync_identical_to_hand_written():
+    hand = lowering.lower(make_gemm_two_phase(M, N, K, tiles=TILES, shaves=SHAVES, with_sync=True)).source
+    auto = lowering.lower(make_gemm_two_phase(M, N, K, tiles=TILES, shaves=SHAVES, with_sync=False)).source
+    assert hand == auto
+    assert hand.count("ctx.sync_grid();") == 1
+    with tvm.transform.PassContext(config=NO_DERIVE):
+        off = lowering.lower(make_gemm_two_phase(M, N, K, tiles=TILES, shaves=SHAVES, with_sync=False)).source
+    assert "ctx.sync_grid()" not in off  # the kill switch is live
+
+
+def test_no_cross_phase_dependency_gets_no_barrier():
+    # Phase A writes P from A, B; phase B writes C from A, B: no DDR buffer flows between them.
+    @T.prim_func
+    def main(A: T.Tensor((64, 128), T.float16), B: T.Tensor((64, 128), T.float16),
+             P: T.Tensor((64, 64), T.float16), C: T.Tensor((64, 64), T.float16)):
+        with T.Kernel(1, threads=2) as tile:
+            shave = T.get_thread_binding()
+            A_cmx = T.alloc_local((64, 128), T.float16)
+            B_cmx = T.alloc_local((64, 128), T.float16)
+            O_cmx = T.alloc_local((64, 64), T.float16)
+            if shave == 0:
+                T.copy(A, A_cmx)
+                T.copy(B, B_cmx)
+                T.gemm(A_cmx, B_cmx, O_cmx, transpose_B=True, clear_accum=True)
+                T.copy(O_cmx, P)
+            if shave == 1:
+                T.copy(A, A_cmx)
+                T.copy(B, B_cmx)
+                T.gemm(A_cmx, B_cmx, O_cmx, transpose_B=True, clear_accum=True)
+                T.copy(O_cmx, C)
+
+    src = lowering.lower(main).source
+    assert "ctx.sync_grid()" not in src
+    assert src.count("ctx.dpu_matmul(") == 2
+
+
+def test_war_dependency_gets_barrier():
+    # Phase A reads X (DMA load); phase B overwrites X (DMA store): a WAR hazard across SHAVEs.
+    @T.prim_func
+    def main(X: T.Tensor((64, 64), T.float16), Y: T.Tensor((64, 64), T.float16)):
+        with T.Kernel(1, threads=2) as tile:
+            shave = T.get_thread_binding()
+            X_cmx = T.alloc_local((64, 64), T.float16)
+            Y_cmx = T.alloc_local((64, 64), T.float16)
+            if shave == 0:
+                T.copy(X, X_cmx)
+                T.copy(X_cmx, Y)
+            if shave == 1:
+                T.copy(Y, Y_cmx)
+                T.copy(Y_cmx, X)
+
+    src = lowering.lower(main).source
+    assert src.count("ctx.sync_grid();") == 1
+    # The barrier sits between the two phases.
+    first_store = src.index("ctx.dma_store(")
+    assert src.index("ctx.sync_grid();") > first_store
+
+
+def test_author_barrier_is_kept_not_duplicated():
+    @T.prim_func
+    def main(X: T.Tensor((64, 64), T.float16), Y: T.Tensor((64, 64), T.float16)):
+        with T.Kernel(1, threads=2) as tile:
+            shave = T.get_thread_binding()
+            X_cmx = T.alloc_local((64, 64), T.float16)
+            if shave == 0:
+                T.copy(X, X_cmx)
+                T.copy(X_cmx, Y)
+            T.sync_grid()
+            if shave == 1:
+                T.copy(Y, X_cmx)
+                T.copy(X_cmx, X)
+
+    assert lowering.lower(main).source.count("ctx.sync_grid();") == 1
 
 
 def test_budget_refuses_oversized_kernel():

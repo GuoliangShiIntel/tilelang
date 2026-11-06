@@ -152,11 +152,11 @@ resource is added.
 | 7 | `PlanDistribution` | per `copy` from DDR: source independent of the tile var => broadcast (one multicast fill, one issuing SHAVE), else split; refuse a per-tile unicast copy of a tile-invariant source | 3 |
 | 8 | `PlanDualPort` | split each DDR fill in half, one half per port, issued together | 3 |
 | 9 | `LowerPipelined` | `T.Pipelined(num_stages=2)` over a streamed loop -> ping/pong slots, SHAVE 0 = ping, SHAVE 1 = pong, pre-enqueued next fill gated on FREE, READY on completion | 3 |
-| 10 | `DeriveGlobalSync` | insert `sync_grid` from global-buffer RAW/WAR across phases when the author did not; reuse the access-set machinery of `thread_storage_sync.cc` at `global` scope | 2b |
+| 10 | `DeriveGlobalSync` | insert `sync_grid` from global-buffer RAW/WAR/WAW across top-level phases when the author did not; buffer granularity (done 2b; region granularity and loop-carried phases later) | 2b |
 | 11 | `InsertSync` | tile-level sync for shared CMX; map `sync_grid` to a software rendezvous, hardware barrier ids for the pipelined protocol | 2 |
 | 12 | `PlanCmx` | static CMX allocation per scope with live-range packing against `cmx_bytes`; refuse overflow naming the buffer | 1 (bump) / 3 (packing) |
 | 13 | shared legalisation: `DecoupleTypeCast`, `LegalizeSafeMemoryAccess`, `LowerOpaqueBlock`, `FlattenBuffer`, `NarrowDataType(32)`, `Simplify`, `RemoveNoOp` | shared | 1 |
-| 14 | `CheckBudgets` | `.text` estimate vs `text_limit_bytes`; CMX; barrier id count; emit the sidecar numbers | 2 |
+| 14 | `CheckBudgets` | CMX: allocations x shaves_per_tile + runtime reserve vs `cmx_bytes` (done 2a); `.text` is measured from the built `.elf` by the device runner vs `text_limit_bytes` (done 2b), not estimated | 2 |
 | 15 | `SplitHostDevice`, `AnnotateDeviceRegions`, `LowerDeviceKernelLaunch` | shared; host side is a stub in source-only mode | 0 |
 
 Every pass ships with a negative control (a fixture it must refuse or leave unchanged, shown to
@@ -261,6 +261,16 @@ interop; a Python `nl.*`-compatible shim.
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-06: **Phase 2b closed.** `DeriveIntelNpuGlobalSync` (C++, after tile-op lowering) inserts
+  `sync_grid` between top-level phases with a DDR RAW/WAR/WAW hazard at buffer granularity; an author's
+  barrier is kept and not duplicated; kill switch `tl.intel_npu.derive_global_sync=False` (used only by
+  the negative controls). Acceptance met: the two-phase kernel without a hand-written barrier lowers to
+  **byte-identical** source as with one (host sim and device, PASS rel 5.67e-4); a dependency-free
+  two-phase fixture gets no barrier; a WAR-only fixture gets one. Scope limits, recorded: buffer (not
+  region) granularity, so disjoint regions of one buffer still get a barrier; only the top-level phase
+  sequence is analysed, a serial loop over phases (Phase 5) is the author's or a later refinement.
+  `.text` is now measured from the SHAVE `.elf` by the runner and refused above `text_limit_bytes`:
+  GEMM 17920 B, two-phase 20096 B (7.7% of 262272; mostly the kernel wrapper and runtime).
 * 2026-11-06: **Phase 2 closed (2a).** `T.sync_grid()` -> `ctx.sync_grid()` (npu::Sync::waitGlobal),
   `T.sync_threads()` -> `ctx.sync_tile()` (waitLocal); `CheckIntelNpuBudgets` refuses a kernel whose
   CMX allocations x shaves_per_tile + runtime reserve exceed the target's `cmx_bytes`, naming the

@@ -15,11 +15,17 @@ import tilelang
 from tilelang.backend.pass_pipeline.pipeline_utils import should_force_let_inline
 
 DEFAULT_SHAVES_PER_TILE = 2
+DERIVE_GLOBAL_SYNC_KEY = "tl.intel_npu.derive_global_sync"
 
 
 def _shaves_per_tile(target: Target) -> int:
     value = target.attrs.get("shaves_per_tile")
     return int(value) if value is not None else DEFAULT_SHAVES_PER_TILE
+
+
+def _derive_global_sync_enabled() -> bool:
+    pass_ctx = tilelang.transform.get_pass_context()
+    return bool(pass_ctx.config.get(DERIVE_GLOBAL_SYNC_KEY, True)) if pass_ctx else True
 
 
 def IntelNpuPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
@@ -46,6 +52,9 @@ def IntelNpuPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     # Before FlattenBuffer: the DMA lowering reads 2-D shapes and strides.
     mod = tilelang.intel_npu.transform.LowerIntelNpuTileOp()(mod)
+    # Grid barriers between phases that communicate through DDR, unless written by hand.
+    if _derive_global_sync_enabled():
+        mod = tilelang.intel_npu.transform.DeriveIntelNpuGlobalSync()(mod)
 
     # No PlanAndUpdateBufferAllocationLocation: it sinks CMX buffers into the
     # loops that use them, and a CMX allocation is made once per kernel.

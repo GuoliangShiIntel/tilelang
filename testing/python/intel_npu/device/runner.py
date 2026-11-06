@@ -54,6 +54,44 @@ class DeviceBuild:
     exe: Path
     kernel: str
     source_sha256: str
+    text_bytes: int = 0  # executable section bytes of the SHAVE .elf (0 = not measured)
+
+
+def elf_section_sizes(elf: Path) -> dict[str, tuple[int, int]]:
+    """Section name -> (flags, size) of a little-endian ELF32/ELF64 (the SHAVE .elf is ELF32)."""
+    import struct
+
+    data = elf.read_bytes()
+    assert data[:4] == b"\x7fELF", f"{elf} is not an ELF"
+    is64 = data[4] == 2
+    if is64:
+        shoff, = struct.unpack_from("<Q", data, 0x28)
+        shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 0x3A)
+    else:
+        shoff, = struct.unpack_from("<I", data, 0x20)
+        shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 0x2E)
+    headers = []
+    for i in range(shnum):
+        off = shoff + i * shentsize
+        if is64:
+            name, typ, flags, _addr, _off, size = struct.unpack_from("<IIQQQQ", data, off)
+        else:
+            name, typ, flags, _addr, _off, size = struct.unpack_from("<IIIIII", data, off)
+        headers.append((name, typ, flags, size))
+    str_off = shoff + shstrndx * shentsize
+    strtab_off = struct.unpack_from("<Q" if is64 else "<I", data, str_off + (0x18 if is64 else 0x10))[0]
+    out = {}
+    for name, typ, flags, size in headers:
+        end = data.index(b"\0", strtab_off + name)
+        out[data[strtab_off + name:end].decode()] = (flags, size)
+    return out
+
+
+SHF_EXECINSTR = 0x4
+
+
+def text_bytes(elf: Path) -> int:
+    return sum(size for _, (flags, size) in elf_section_sizes(elf).items() if flags & SHF_EXECINSTR)
 
 
 def write_kernel(source: str, kernel: str) -> tuple[Path, str]:
@@ -63,7 +101,12 @@ def write_kernel(source: str, kernel: str) -> tuple[Path, str]:
     return path, hashlib.sha256(source.encode()).hexdigest()
 
 
-def build(source: str, kernel: str, build_dir: Path | None = None, log=print) -> DeviceBuild:
+def build(source: str, kernel: str, build_dir: Path | None = None, log=print, text_limit_bytes: int | None = None) -> DeviceBuild:
+    """`text_limit_bytes` defaults to the intel_npu target's attribute; the build is refused above it."""
+    if text_limit_bytes is None:
+        from tvm.target import Target
+
+        text_limit_bytes = int(Target({"kind": "intel_npu"}).attrs["text_limit_bytes"])
     gc_root = require_env("GENERIC_COMPUTE_ROOT")
     mv_tools = require_env("MV_TOOLS_PATH")
     build_dir = build_dir or (HERE / "build")
@@ -89,8 +132,11 @@ def build(source: str, kernel: str, build_dir: Path | None = None, log=print) ->
     elf = next(build_dir.rglob(f"*{kernel}*.elf"), None)
     if elf is None:
         raise RuntimeError(f"no .elf for kernel {kernel} under {build_dir}")
-    log(f"built {exe.name} and {elf.name}")
-    return DeviceBuild(build_dir=build_dir, exe=exe, kernel=kernel, source_sha256=sha)
+    text = text_bytes(elf)
+    log(f"built {exe.name} and {elf.name}; SHAVE .text {text} B of {text_limit_bytes} B ({100.0 * text / text_limit_bytes:.1f}%)")
+    if text > text_limit_bytes:
+        raise RuntimeError(f"kernel {kernel}: SHAVE .text {text} B exceeds text_limit_bytes {text_limit_bytes}")
+    return DeviceBuild(build_dir=build_dir, exe=exe, kernel=kernel, source_sha256=sha, text_bytes=text)
 
 
 @dataclass
