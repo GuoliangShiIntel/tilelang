@@ -149,7 +149,7 @@ resource is added.
 | 4 | shared normalisation: `LetInline`, `LegalizeNegativeIndex`, `InjectAssumes`, `Simplify`, `VerifyBufferInit` | shared | 0 |
 | 5 | `LayoutInference` + `NpuLayoutRules` | CMX buffers are row-major contiguous; DPU operands need no swizzle; refuse fragments | 1 |
 | 6 | `NpuLowerTileOp` | `copy`->DMA builtin (direction, rows, width, stride, port); `gemm`->DPU builtin; `fill` on a DPU output dropped | 1 |
-| 7 | `PlanDistribution` | per `copy` from DDR: source independent of the tile var => broadcast (one multicast fill, one issuing SHAVE), else split; refuse a per-tile unicast copy of a tile-invariant source | 3 |
+| 7 | `PlanDistribution` | per `copy` from DDR: source independent of the tile var => broadcast (one multicast fill, one issuing SHAVE), else split; refuse a per-tile unicast copy of a tile-invariant source. Amended 2026-11-06 (section 3.2): the split/duplicate choice and the tile shape are **cost-driven** (`TileGemm`, `PlanWorkloads`), the tile-variable rule is the legality floor, not the decision | 3 |
 | 8 | `PlanDualPort` | split each DDR fill in half, one half per port, issued together | 3 |
 | 9 | `LowerPipelined` | `T.Pipelined(num_stages=2)` over a streamed loop -> ping/pong slots, SHAVE 0 = ping, SHAVE 1 = pong, pre-enqueued next fill gated on FREE, READY on completion | 3 |
 | 10 | `DeriveGlobalSync` | insert `sync_grid` from global-buffer RAW/WAR/WAW across top-level phases when the author did not; buffer granularity (done 2b; region granularity and loop-carried phases later) | 2b |
@@ -182,6 +182,53 @@ they are cited here by file and section, not copied. What changes in this plan b
 | SHAVE and DDR | A SHAVE reaching DDR through its cache gets < 10% of DMA bandwidth (12 vs 256 outstanding) (`nce-subsystem.md` §7, §8) | Scalar `Ddr<T>` element access is for status words and the odd scalar, never a data path; a pass flagging scalar DDR access inside a loop is a Phase 4 item. Per-SHAVE SW-kernel inputs 32 B aligned (`multi-shave.md` §8.1) |
 | Scheduling | VPUX list-schedules with per-op cycle costs (VPUNN) over executor FIFOs, prefetch window 35 levels, loop ping-pong with two banks freed every second iteration, loop regions allocated first (`memory-scheduler.md` §8, §10; `workload-management.md` §3, §7) | Phase 3 keeps the author's explicit `T.Pipelined(num_stages=2)`; a cost-driven scheduler is a later item, and when it comes it is this model, not npu_dsl's six-coefficient fit |
 | Two SHAVEs, one DPU | SDPA runtime: SHAVE submits pre-built DPU descriptors; two SHAVEs split the L dimension and each runs the full head pipeline on its slice (`sdpa-extended.md` §6) | Confirms the Phase 3 ping/pong ownership (SHAVE 0 = PING chunks, SHAVE 1 = PONG chunks) is the production pattern |
+
+### 3.2 GEMM tiling, multi-cluster and workload split in VPUX; what is reusable (read 2026-11-06)
+
+`<user>` asked, before Phase 3b: how does VPUX tile a GEMM, and can its code be used here. Sources are
+under `applications.ai.vpu-accelerators.vpux-plugin/src/vpux_compiler/` (Apache 2.0); paths below are
+relative to it. Line numbers are as read on 2026-11-06.
+
+**How VPUX does it.**
+
+| Layer | Mechanism | Where |
+|---|---|---|
+| MatMul on the DPU | No standalone MatMul op. `NCE.MatMul` is a **grouped 1x1 convolution** over a 5-D `[G,N,H,W,C]` tensor: M on the spatial dims, N = output channels, K = input channels; legal only in GNHWC with groups >= cluster count, default multi-cluster strategy SplitOverGroup | `src/dialect/VPU/utils/nce_matmul_utils.cpp` (`inferNCEMatmulOutputType`, `isNCEMatMulSupported`); interfaces `tblgen/.../VPU/ops_interfaces.td:60-177` (`ClusteredOpInterface`), `:487-551` (`TilingBuilderOpInterface`: `getTilingStrategy`, `backInferTileInfo`, `adjustAttrs`) |
+| Tiling of one layer | Three modes, `TilingMode { ISOLATED, PIPELINING, PREFETCHING }` (`include/vpux/compiler/core/tiling.hpp:109-119`): ISOLATED = fewest tiles that fit CMX; PIPELINING = more tiles so this layer's DMA overlaps its own DPU; PREFETCHING = more still so the next layer's DMA overlaps this layer's DPU. Search: start at one tile, increase the divisor on the lowest-indexed dimension until the per-tile footprint fits CMX minus reserved minus a ~10% fragmentation margin, cost each candidate with VPUNN, keep the cheapest legal one | `src/dialect/VPU/transforms/passes/tiling_strategy_assignment.cpp`, `src/dialect/VPU/utils/cost_model/layer_vpunn_cost.cpp:436-500`, `src/dialect/VPU/utils/tiling_algorithm/tiling_general_algorithm.cpp` (`fillDividedTiles`), `passes/apply_tiling.cpp` |
+| Multi-cluster | `StrategyManager` evaluates SOH / SOK / Clustering / HKSwitch / SplitOverBatch / SplitOverGroup per layer: cost = VPUNN DPU cycles + weights DMA cost (theoretical DMA model), constrained by 4-D/5-D rank, channel % 16, SOK needs OC >= 16 x tiles, `doesLayerFitIntoCMX` | `include/.../VPU/utils/strategy_manager/strategy_manager.hpp:19-48`, `src/dialect/VPU/utils/strategy_manager/multi_cluster_strategy_utils.cpp` (MPE volume per cluster at `:443`), `passes/multi_cluster_strategy_assignment.cpp` |
+| DPU workload split | `DpuTiler` enumerates a split pool (over H, over W, H x W factor pairs; `generateSplitNumberPool(numDPU, maxSplits)`) for each MPE mode `CUBOID_16x16 / 8x16 / 4x16` (the 16/2, 8/4, 4/8 stencils of `dpu.md` §4.5), costs every candidate with VPUNN L1 and materialises `VPU.DPU.Workload {outOffsets, outSizes, padding, mpeMode, clusterId}` | `src/dialect/VPUIP/interfaces/dpu_tiler.cpp:149-284`, `passes/split_nce_ops_onto_workloads.cpp:40-71`, `include/.../VPU/utils/workload_split_utils.hpp:29-65` |
+| Scheduling | `FeasibleAllocation`: already recorded in section 3.1 (Scheduling row) | `knowledges/compiler/memory-scheduler.md` |
+
+All three decisions that Phase 3b needs (tile shape and depth, SEGMENTED vs DUPLICATED per operand,
+stencil per workload) are made by **one cost model, VPUNN**, not by rules. npu_dsl's `dpu_rate_probe`
+had measured the stencil/spatial choice moving DPU efficiency from 56% to 97% at one shape; VPUX computes
+that choice instead of guessing it.
+
+**What can be reused.**
+
+| Component | Verdict | Why |
+|---|---|---|
+| **VPUNN** (`thirdparty/vpucostmodel/`) | **Reusable as-is**: link or pip-install | Standalone CMake library, Apache 2.0, **no MLIR dependency**. Input is a plain struct `DPUWorkload { VPUDevice device; Operation op; VPUTensor inputs[1], outputs[1]; kernels[2]; strides[2]; padding[4]; ExecutionMode execution_order; act/weight sparsity; Swizzling; output_write_tiles; ISIStrategy isi_strategy; ... }` (`include/vpu/dpu_workload.h:32`); `Operation` is `{CONVOLUTION, DW_CONVOLUTION, ELTWISE, MAXPOOL, AVEPOOL, CM_CONVOLUTION}` (`include/vpu/dpu_types.h:106`), so a GEMM is costed exactly as VPUX does it, as a 1x1 CONVOLUTION. `VPUDevice` has `NPU_5_0` / `NPU_5_0_W`; model files `models/vpu_5_1*.vpunn` (0.8 MB), `models/dma_5_0.vpunn`. Layer-level API: `VPULayerCostModel` + `VPULayerStrategy { nDPUs, nSHVs, nTiles, tiling_strategy, prefetching }`. Optional Python binding (`ENABLE_PYTHON_BINDING`, `python/`, `pyproject.toml`) and CLI (`apps/cost_model_cli`) |
+| Tiling search, strategy choice, workload-split **algorithms** | **Portable, not linkable** (a few hundred lines of logic each) | The arithmetic depends only on shapes, CMX size and a cost; the MLIR coupling is the interface layer (`TilingBuilderOpInterface`, `ClusteredOpInterface`, `NDTypeInterface`, `mlir::Operation*`) |
+| The passes themselves, `FeasibleAllocation`, distributed tensor types | **Not reusable** | Bound to the VPU / VPUIP / async dialects and MLIR 17+, flatbuffers, OpenVINO |
+| "Graph compiler versus kernel compiler" | **Not an obstacle** | Inside one megakernel phase the objects are the same: a VPUX layer is our tile op; its tiling is our expansion of `T.gemm` into a workload loop; its multi-cluster strategy is our SEGMENTED/DUPLICATED choice; its memory scheduler is our CMX plan plus pipelined prefetch. The cross-layer machinery (vertical fusion, spilling) is not needed yet |
+
+**Consequence for Phase 3b** (replaces the rule-only item 7 of section 3):
+
+1. **Step 0, cost model.** Use VPUNN as an external dependency through its Python binding built from
+   `thirdparty/vpucostmodel` (no coupling into the `tvm_compiler` build; the same model serves offline
+   autotuning). `testing/python/intel_npu/gemm_cost.py` maps `(M, N, K, dtype, MPE mode, distribution,
+   tiles)` to a `DPUWorkload` by the same MatMul -> grouped 1x1 CONVOLUTION construction as
+   `layer_vpunn_cost.cpp`, and returns DPU cycles plus the theoretical DMA cost.
+2. **Calibrate before trusting.** Compare the prediction with the device at two or three shapes (the
+   Phase 1 GEMM, the npu_dsl stencil-sweep shapes) and record the ratio; VPUX also calibrates it.
+3. **Three cost-driven passes**, Python first, C++ once stable: `PlanWorkloads` (stencil and split pool
+   per `T.gemm`, VPUNN-ranked, legality from `dpu.md` §4.6), `PlanDistribution` (SEGMENTED vs
+   DUPLICATED per operand by DPU + DMA cost, with the tile-variable rule as the legality floor),
+   `TileGemm` (ISOLATED -> PIPELINING divisor search under the CMX fit of `CheckBudgets`).
+
+Decided by `<user>` 2026-11-06: (a) VPUNN through its Python binding, not linked into `tvm_compiler.dll`;
+(b) cost decisions live in Python-level passes, C++ is reserved for lowering and codegen.
 
 ## 4. Phases
 
@@ -224,6 +271,9 @@ fail** on a negative fixture and then pass on the real one.
 * Items 7, 8, 9; `PlanCmx` live-range packing; hardware barriers. Target schedule: A split across
   tiles and resident; B broadcast (multicast), ping-ponged, each chunk split across both DMA ports;
   DPU FIFO alternated by the two SHAVEs with no sync between them.
+* 3a (closed): `sync_grid` on hardware barriers; see section 8.
+* 3b: the pipelined flow above, with tile shape, distribution and stencil chosen by the VPUNN-backed
+  passes of section 3.2 (Step 0 cost model and calibration first).
 * Acceptance: device trace admissible (per-SHAVE event count below the profiler's saturation
   value; `NPU_PROFILE_FRC_MHZ=19.2` exported), a ported flow checker
   (`testing/python/intel_npu/device/check_flow_trace.py`) exits 0, DPU busy % and TOPS at the
@@ -286,6 +336,14 @@ interop; a Python `nl.*`-compatible shim.
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-06: **Pre-3b research filed (section 3.2).** `<user>` asked how VPUX tiles a GEMM and whether its
+  tiling / multi-cluster / scheduling code can be used. Findings: MatMul is a grouped 1x1 convolution;
+  tile count, SOH/SOK/Clustering and the DPU stencil per workload are all chosen by the VPUNN cost
+  model under a CMX-fit constraint; VPUNN itself (`thirdparty/vpucostmodel`) is MLIR-free, has an
+  `NPU_5_0` device and models, and is reusable directly; the algorithms are portable, the passes are
+  not. Section 3 item 7 amended from rule-based to cost-based; Phase 3b gains a Step 0 (cost model +
+  calibration). Two decisions taken by `<user>` the same day: VPUNN via its Python binding; cost
+  passes in Python.
 * 2026-11-06: **Phase 3a closed: `sync_grid` on hardware barriers.** `<user>` ruled: HAS is right, use
   hardware barriers as far as possible; which low ids are already taken is uncertain, so it is
   measured. (1) `device/probe_barriers.py` + `probes/barrier_probe.cpp` sweep every id of a job in its
