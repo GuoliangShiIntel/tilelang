@@ -25,7 +25,7 @@ TL_ROOT = Path(__file__).resolve().parents[3]
 INCLUDE_ROOT = TL_ROOT / "src"  # generated code includes <tl_templates/intel_npu/npu_rt.hpp>
 STATUS_BYTES_PER_SHAVE = 32
 STATUS_OK = 1
-STATUS_NAMES = {1: "OK", 2: "CMX_EXHAUSTED", 3: "BAD_PARAMS", 4: "UNSUPPORTED"}
+STATUS_NAMES = {1: "OK", 2: "CMX_EXHAUSTED", 3: "BAD_PARAMS", 4: "UNSUPPORTED", 5: "BARRIER_NOT_LIVE", 6: "BARRIER_TIMEOUT"}
 
 
 def find_clangxx() -> str:

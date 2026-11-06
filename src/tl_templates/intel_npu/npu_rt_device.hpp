@@ -21,6 +21,7 @@
 #include <hw/ddr/include/ddr_accessor_40xx.hpp>
 #include <lib/dma/include/dma_utils.hpp>
 #include <lib/dpu/include/dpu_matmul.hpp>
+#include <shave/hw/nce/include/hgl_barriers_40xx.hpp>
 #include <shave/sync/include/memory_fence.hpp>
 
 #include <cstdint>
@@ -28,12 +29,14 @@
 
 namespace npu {
 
-// Status word 0 per SHAVE, read by the host runner.
+// Status word 0 per SHAVE, read by the host runner; word 1 is the detail.
 enum : std::uint32_t {
   kStatusOk = 1,
   kStatusCmxExhausted = 2,
   kStatusBadParams = 3,
   kStatusUnsupported = 4,
+  kStatusBarrierNotLive = 5, // detail: barrier id whose config never went live
+  kStatusBarrierTimeout = 6, // detail: barrier id whose count never reached zero
 };
 
 template <class T> struct Ddr;
@@ -64,11 +67,14 @@ class Ctx {
 public:
   static constexpr std::uint32_t kAlign = 64;
   static constexpr std::uint32_t kMaxDpuN = 1024;
+  // sync_grid uses this many rotating hardware barrier ids starting at syncBarrierBase.
+  static constexpr std::uint32_t kSyncBarriers = 3;
+  static constexpr std::uint32_t kNoHwSync = 0xFFFFFFFFu;
 
   Ctx(const Environment &env, int numParams, std::uint64_t *params,
-      int numTensorParams)
+      int numTensorParams, std::uint32_t syncBarrierBase = kNoHwSync)
       : env_(env), cmx_(env.getCmxAllocator()), dma_(env.getDmaDrv()),
-        sync_(env.getSync()) {
+        sync_(env.getSync()), syncBase_(syncBarrierBase) {
     const auto &info = env.getShaveInfo();
     shave_ = info.getShaveId();
     spt_ = info.getNumShavesPerTile();
@@ -143,12 +149,68 @@ public:
   void sync_grid() {
     flushCmxWrites();
     sync::memoryFence();
-    sync_.waitGlobal();
+    if (syncBase_ == kNoHwSync) {
+      sync_.waitGlobal();
+    } else {
+      hw_sync_grid();
+    }
   }
   void sync_tile() {
     flushCmxWrites();
     sync::memoryFence();
     sync_.waitLocal();
+  }
+
+  // Hardware barrier primitives (NCE barrier registers; ids from the job's pool).
+  // Every wait is bounded: a barrier that never goes live or never drains
+  // reports kStatusBarrierNotLive / kStatusBarrierTimeout with the id and the
+  // kernel returns, instead of hanging the launch. The bound is far above any
+  // legitimate wait (a grid barrier completes in a few microseconds).
+  static constexpr std::uint32_t kBarrierSpinLimit = 50u * 1000u * 1000u;
+  // A pushed config goes live within microseconds; this bound is a few hundred ms.
+  static constexpr std::uint32_t kConfigSpinLimit = 2u * 1000u * 1000u;
+
+  bool barrier_config(std::uint32_t id, std::uint8_t producers, std::uint8_t consumers,
+                      bool waitLive) {
+    hw::nce::barriers::hgl::pushCounters(id, producers, consumers);
+    if (!waitLive)
+      return true;
+    return barrier_check_live(id, producers, consumers);
+  }
+  // True when the barrier's live counters equal the expected config.
+  bool barrier_check_live(std::uint32_t id, std::uint8_t producers, std::uint8_t consumers) {
+    std::uint8_t p = 0, c = 0;
+    for (std::uint32_t spins = 0; spins < kConfigSpinLimit; ++spins) {
+      hw::nce::barriers::hgl::getCounters(id, &p, &c);
+      if (p == producers && c == consumers)
+        return true;
+    }
+    fail(kStatusBarrierNotLive, id);
+    return false;
+  }
+  static void barrier_produce(std::uint32_t id) { hw::nce::barriers::hgl::produceBarrier(id); }
+  static void barrier_consume(std::uint32_t id) { hw::nce::barriers::hgl::consumeBarrier(id); }
+  // Wait until every producer has arrived (producer count reaches zero). A barrier
+  // whose config is not live reads (0, 0) and would pass: callers arm with waitLive.
+  bool barrier_wait_produced(std::uint32_t id) {
+    std::uint8_t p = 1, c = 0;
+    for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
+      hw::nce::barriers::hgl::getCounters(id, &p, &c);
+      if (p == 0)
+        return true;
+    }
+    fail(kStatusBarrierTimeout, id);
+    return false;
+  }
+  bool barrier_wait_consumed(std::uint32_t id) {
+    std::uint8_t p = 0, c = 1;
+    for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
+      hw::nce::barriers::hgl::getCounters(id, &p, &c);
+      if (c == 0)
+        return true;
+    }
+    fail(kStatusBarrierTimeout, id);
+    return false;
   }
 
   // Writes the per-SHAVE status record: {code, detail, cmx_free_at_entry, cmx_used}.
@@ -172,6 +234,41 @@ private:
   static constexpr std::uint32_t kTrapLo = 0x12000, kTrapHi = 0x14000;
 
   std::uint32_t worker() const { return tile_ * spt_ + shave_; }
+
+  // Grid rendezvous on hardware barriers syncBase_ + (k mod 3): every SHAVE
+  // produces, waits for the last producer, consumes; worker 0 re-arms the id
+  // once every SHAVE has consumed it. No SHAVE can reach an id again before
+  // worker 0 has produced on the next two, which it does only after re-arming,
+  // so the re-armed config is live by then. The ids are armed once per launch
+  // behind one software rendezvous.
+  void hw_sync_grid() {
+    if (!ok_)
+      return; // a failed SHAVE stops at its status; the others time out and report too
+    const std::uint8_t n = static_cast<std::uint8_t>(tiles_ * spt_);
+    if (!syncArmed_) {
+      if (worker() == 0)
+        for (std::uint32_t i = 0; i < kSyncBarriers; ++i)
+          barrier_config(syncBase_ + i, n, n, false);
+      sync_.waitGlobal();
+      syncArmed_ = true;
+      // Every SHAVE checks liveness itself: a dead barrier reads (0, 0), which a
+      // producer wait would take for "all arrived".
+      for (std::uint32_t i = 0; i < kSyncBarriers; ++i)
+        if (!barrier_check_live(syncBase_ + i, n, n))
+          return;
+    }
+    const std::uint32_t id = syncBase_ + syncK_;
+    syncK_ = (syncK_ + 1 == kSyncBarriers) ? 0 : syncK_ + 1;
+    barrier_produce(id);
+    if (!barrier_wait_produced(id))
+      return;
+    barrier_consume(id);
+    if (worker() == 0) {
+      if (!barrier_wait_consumed(id))
+        return;
+      barrier_config(id, n, n, false);
+    }
+  }
 
   void fail(std::uint32_t code, std::uint32_t detail) {
     if (ok_) {
@@ -230,6 +327,9 @@ private:
   std::uint32_t cmxFree0_{0};
   bool ok_{true};
   std::uint32_t code_{kStatusOk}, detail_{0};
+  std::uint32_t syncBase_{kNoHwSync};
+  std::uint32_t syncK_{0};
+  bool syncArmed_{false};
 
   DmaDescriptor *desc_{nullptr};
   DpuMatMul::DescriptorsBuffer *dpuDesc_{nullptr};

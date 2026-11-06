@@ -110,3 +110,28 @@ def make_gemm_two_phase(M: int, N: int, K: int, BM: int = 64, BN: int = 64, tile
                     T.copy(P_cmx, C[bm * BM, bn * BN])
 
     return gemm_two_phase
+
+
+def make_sync_chain(rounds: int, tiles: int = 3, shaves: int = 2):
+    """A chain of `rounds` grid barriers with a token passed around the workers through DDR.
+
+    Round r: worker w writes T[r+1, w] = T[r, (w+1) % W] + 1, then everyone syncs. After the
+    chain, T[rounds, w] == rounds for every w, and a single missed or racing barrier breaks
+    the value. Measures sync_grid cost (rounds barriers per launch) and checks correctness.
+
+    Each worker's token sits in its own 16-byte slot: the SHAVE data L1 is write-back with
+    16-byte lines, so two SHAVEs storing scalars into one line clobber each other's bytes.
+    """
+    W = tiles * shaves
+    LINE = 4  # int32 per 16-byte DL1 line
+
+    @T.prim_func
+    def sync_chain(Tok: T.Tensor((rounds + 1, W * LINE), T.int32)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            for r in T.serial(rounds):
+                Tok[r + 1, worker * LINE] = Tok[r, ((worker + 1) % W) * LINE] + 1
+                T.sync_grid()
+
+    return sync_chain

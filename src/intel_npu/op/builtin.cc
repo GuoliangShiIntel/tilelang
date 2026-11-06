@@ -15,6 +15,7 @@ namespace tl {
 using namespace tirx;
 
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuDeriveGlobalSync, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuHwSyncGrid, Bool);
 
 TIR_DEFINE_TL_BUILTIN(intel_npu_dma_copy)
     .set_num_inputs(7)

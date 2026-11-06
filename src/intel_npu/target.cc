@@ -31,10 +31,12 @@ TVM_REGISTER_TARGET_KIND("intel_npu", kDLExtDev)
     .add_attr_option<int64_t>("cmx_bytes", refl::DefaultValue(1473536))
     // DMA engines per tile a fill may be split across.
     .add_attr_option<int64_t>("dma_ports", refl::DefaultValue(2))
-    // Hardware barrier ids a kernel may allocate: [first, first + count). PTL
-    // has 16 per tile (48); ids 0-7 are taken or faulting on this driver.
+    // Hardware barriers: the job gets barriers_per_tile x (tiles in the job)
+    // ids starting at 0; ids below barrier_pool_first are taken or never go
+    // live on this driver (device probe 2026-11-06: 0-3, 5, 6 config-not-live;
+    // 7 is the toolkit mutex). An id at or above the job's range hangs the run.
     .add_attr_option<int64_t>("barrier_pool_first", refl::DefaultValue(8))
-    .add_attr_option<int64_t>("barrier_pool_count", refl::DefaultValue(40))
+    .add_attr_option<int64_t>("barriers_per_tile", refl::DefaultValue(16))
     // DPU workload legality (NPU5): Z extents multiples of 16, at most this
     // many output points per workload.
     .add_attr_option<int64_t>("dpu_z_align", refl::DefaultValue(16))

@@ -5,6 +5,8 @@
 
 #include "codegen_intel_npu.h"
 
+#include <tvm/ir/transform.h>
+#include <tvm/target/target.h>
 #include <tvm/tirx/op.h>
 
 #include <sstream>
@@ -172,6 +174,46 @@ void CodeGenTileLangIntelNpu::AddFunction(const PrimFunc &f) {
       static_cast<std::string>(global_symbol.value());
   bool no_alias = f->HasNonzeroAttr(tirx::attr::kNoAlias);
 
+  // sync_grid on hardware barriers: the top kSyncBarriers ids of the JOB's pool,
+  // [barrier_pool_first, barriers_per_tile x launch tiles). An id beyond the
+  // job's allocation is a context violation that hangs the run, so the pool
+  // follows the kernel's own tile count, not the platform's.
+  sync_barrier_base_ = -1;
+  const bool hw_sync = tvm::transform::PassContext::Current()
+                           ->GetConfig<Bool>(tl::kIntelNpuHwSyncGrid, Bool(true))
+                           .value();
+  if (hw_sync) {
+    if (auto target = f->GetAttr<Target>(tvm::attr::kTarget)) {
+      const int64_t first =
+          target.value()->GetAttr<Integer>("barrier_pool_first").value_or(Integer(-1)).IntValue();
+      const int64_t per_tile =
+          target.value()->GetAttr<Integer>("barriers_per_tile").value_or(Integer(0)).IntValue();
+      int64_t launch_tiles = 0;
+      tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &n) {
+        if (const auto *attr = n.as<AttrStmtNode>()) {
+          if (attr->attr_key == tirx::attr::thread_extent) {
+            if (const auto *iv = attr->node.as<IterVarNode>()) {
+              if (iv->thread_tag == "blockIdx.x") {
+                if (const auto *imm = attr->value.as<IntImmNode>())
+                  launch_tiles = imm->value;
+              }
+            }
+          }
+        }
+      });
+      const int64_t pool_end = per_tile * launch_tiles;
+      if (first >= 0 && pool_end - first >= 3) {
+        sync_barrier_base_ = pool_end - 3;
+      } else {
+        TVM_FFI_THROW(ValueError)
+            << "intel_npu: the hardware-barrier pool [" << first << ", " << pool_end
+            << ") of a " << launch_tiles
+            << "-tile launch has no room for the 3 sync_grid barriers; set "
+               "tl.intel_npu.hw_sync_grid=False or launch more tiles";
+      }
+    }
+  }
+
   for (const auto &param : f->params) {
     if (param->dtype.is_handle()) {
       alloc_storage_scope_[param.get()] = GetPtrStorageScope(param);
@@ -239,8 +281,16 @@ void CodeGenTileLangIntelNpu::EmitKernelEntry(
   // and an optional params[n] is the per-SHAVE status area the host reads.
   stream << "void kernel_entry(int numParams, uint64_t* params, const "
             "npu::Environment& env) {\n";
-  stream << "  npu::Ctx ctx(env, numParams, params, " << params.size()
-         << ");\n";
+  if (sync_barrier_base_ >= 0) {
+    // Named here so a launch that never returns can be matched to the ids it touches.
+    stream << "  // hardware barrier ids used by this kernel: sync_grid " << sync_barrier_base_ << ".."
+           << sync_barrier_base_ + 2 << "\n";
+  }
+  stream << "  npu::Ctx ctx(env, numParams, params, " << params.size();
+  if (sync_barrier_base_ >= 0) {
+    stream << ", /*sync_barrier_base=*/" << sync_barrier_base_;
+  }
+  stream << ");\n";
   stream << "  if (!ctx.ok()) { ctx.finish(); return; }\n";
   stream << "  " << kernel_name << "(ctx";
   for (size_t i = 0; i < params.size(); ++i) {

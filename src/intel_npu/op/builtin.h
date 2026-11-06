@@ -15,6 +15,9 @@ namespace tl {
 // Pass config: derive grid barriers between DDR-communicating phases (default
 // true). Off only for the negative controls that prove a barrier is live.
 static constexpr const char *kIntelNpuDeriveGlobalSync = "tl.intel_npu.derive_global_sync";
+// Pass config: implement sync_grid on hardware barriers (default true); false
+// selects the toolkit's software rendezvous, for A/B measurement only.
+static constexpr const char *kIntelNpuHwSyncGrid = "tl.intel_npu.hw_sync_grid";
 
 /*!
  * \brief 2-D DMA between DDR and CMX.

@@ -1,0 +1,732 @@
+{
+ "date": "2026-11-06",
+ "tiles": 3,
+ "shaves": 2,
+ "kernel_sha256": "7f2f41dfcb5ae20c6fb01bc0026e10c0efaea990f4164ce58963162134c20c9b",
+ "results": {
+  "0": {
+   "verdict": "config-not-live",
+   "codes": [
+    2,
+    2,
+    2,
+    2,
+    2,
+    2
+   ],
+   "live_prod": 0,
+   "live_cons": 0,
+   "spins": 0,
+   "seconds": 0.61
+  },
+  "1": {
+   "verdict": "config-not-live",
+   "codes": [
+    2,
+    2,
+    2,
+    2,
+    2,
+    2
+   ],
+   "live_prod": 0,
+   "live_cons": 0,
+   "spins": 0,
+   "seconds": 0.57
+  },
+  "2": {
+   "verdict": "config-not-live",
+   "codes": [
+    2,
+    2,
+    2,
+    2,
+    2,
+    2
+   ],
+   "live_prod": 0,
+   "live_cons": 0,
+   "spins": 0,
+   "seconds": 0.55
+  },
+  "3": {
+   "verdict": "config-not-live",
+   "codes": [
+    2,
+    2,
+    2,
+    2,
+    2,
+    2
+   ],
+   "live_prod": 0,
+   "live_cons": 0,
+   "spins": 0,
+   "seconds": 0.56
+  },
+  "4": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "5": {
+   "verdict": "config-not-live",
+   "codes": [
+    2,
+    2,
+    2,
+    2,
+    2,
+    2
+   ],
+   "live_prod": 6,
+   "live_cons": 4,
+   "spins": 0,
+   "seconds": 0.6
+  },
+  "6": {
+   "verdict": "config-not-live",
+   "codes": [
+    2,
+    2,
+    2,
+    2,
+    2,
+    2
+   ],
+   "live_prod": 10,
+   "live_cons": 1,
+   "spins": 0,
+   "seconds": 0.56
+  },
+  "7": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "8": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 3,
+   "seconds": 0.23
+  },
+  "9": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.25
+  },
+  "10": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 5,
+   "seconds": 0.25
+  },
+  "11": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "12": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "13": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.22
+  },
+  "14": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "15": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "16": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 1,
+   "seconds": 0.23
+  },
+  "17": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.23
+  },
+  "18": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 3,
+   "seconds": 0.22
+  },
+  "19": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 3,
+   "seconds": 0.25
+  },
+  "20": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.26
+  },
+  "21": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.23
+  },
+  "22": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "23": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "24": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 3,
+   "seconds": 0.25
+  },
+  "25": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 3,
+   "seconds": 0.23
+  },
+  "26": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.23
+  },
+  "27": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.23
+  },
+  "28": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 2,
+   "seconds": 0.24
+  },
+  "29": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.23
+  },
+  "30": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "31": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.23
+  },
+  "32": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.25
+  },
+  "33": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.25
+  },
+  "34": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.23
+  },
+  "35": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "36": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.25
+  },
+  "37": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "38": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "39": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.23
+  },
+  "40": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.23
+  },
+  "41": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "42": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 3,
+   "seconds": 0.23
+  },
+  "43": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "44": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.23
+  },
+  "45": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.26
+  },
+  "46": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 1,
+   "seconds": 0.24
+  },
+  "47": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 6,
+   "live_cons": 6,
+   "spins": 0,
+   "seconds": 0.22
+  }
+ },
+ "usable_pool": {
+  "first": 7,
+  "count": 41
+ }
+}

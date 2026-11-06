@@ -57,7 +57,7 @@ def test_explicit_target_dict_with_attrs():
     assert int(target.attrs["num_tiles"]) == 1
     # The usable CMX workspace (1439 KiB), not the physical 1536 KiB.
     assert int(target.attrs["cmx_bytes"]) == 1473536
-    assert int(target.attrs["barrier_pool_first"]) == 8 and int(target.attrs["barrier_pool_count"]) == 40
+    assert int(target.attrs["barrier_pool_first"]) == 8 and int(target.attrs["barriers_per_tile"]) == 16
     assert int(target.attrs["dpu_max_output_points"]) == 8192
 
 
@@ -71,7 +71,8 @@ def test_lower_scalar_kernel_emits_kernel_entry():
     src = artifact.kernel_source
     assert "#include <tl_templates/intel_npu/npu_rt.hpp>" in src
     assert "void kernel_entry(int numParams, uint64_t* params, const npu::Environment& env)" in src
-    assert "npu::Ctx ctx(env, numParams, params, 1);" in src
+    # 2-tile launch: the job's barrier pool is [8, 16 x 2 = 32); sync_grid takes the top three -> base 29.
+    assert "npu::Ctx ctx(env, numParams, params, 1, /*sync_barrier_base=*/29);" in src
     assert "ctx.tile_id()" in src
     assert "ctx.shave_id()" in src
     assert "npu::Ddr<half>(params[0])" in src

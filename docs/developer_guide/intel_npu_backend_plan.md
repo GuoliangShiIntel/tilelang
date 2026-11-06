@@ -273,15 +273,40 @@ interop; a Python `nl.*`-compatible shim.
 
 1. For a persistent grid, is the SHAVE count per launch fixed at `num_tiles * shaves_per_tile`, or
    may a kernel request fewer SHAVEs on a tile?
-2. Which hardware barrier ids are free for a kernel's own use on this driver (plan assumes 12..19)?
-3. Is a `sync_grid` across tiles implementable with one hardware barrier, or only as a software
-   rendezvous through DDR/CMX flags?
+2. ~~Which hardware barrier ids are free for a kernel's own use on this driver (plan assumes 12..19)?~~
+   **Measured 2026-11-06** (`device/evidence/barrier_probe*.json`): a job owns `16 x tiles` ids from 0;
+   0-3, 5, 6 never go live and 7 is the toolkit mutex, so the pool is `[8, 16 x tiles)`. Re-probe after
+   any firmware or toolkit change (`python device/probe_barriers.py`).
+3. ~~Is a `sync_grid` across tiles implementable with one hardware barrier, or only as a software
+   rendezvous through DDR/CMX flags?~~ **Done 2026-11-06**: three rotating hardware barriers per
+   launch, 5.7 us faster per barrier than the toolkit's software rendezvous (Phase 3a log entry).
 
 ## 8. Log
 
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-06: **Phase 3a closed: `sync_grid` on hardware barriers.** `<user>` ruled: HAS is right, use
+  hardware barriers as far as possible; which low ids are already taken is uncertain, so it is
+  measured. (1) `device/probe_barriers.py` + `probes/barrier_probe.cpp` sweep every id of a job in its
+  own process: 3-tile job ids 0-47: **0-3, 5, 6 never go live; 4 and 7-47 OK** (7 is the toolkit mutex,
+  excluded); 2-tile job: 28-31 OK, **32 and 33 hang the launch** (context violation: the job owns
+  `barriers_per_tile x tiles` ids). So the pool is **per job**, `[barrier_pool_first=8, 16 x launch tiles)`,
+  and codegen derives it from the kernel's own `T.Kernel(tiles)`; `barrier_pool_count` is gone. (2)
+  `Ctx::hw_sync_grid`: 3 rotating ids at the top of the job's pool, armed once per launch, worker 0
+  re-arms after every SHAVE consumed. Chain of 200 grid barriers (`kernels.make_sync_chain`, token
+  passed through DDR; wrong without every barrier): hw 0.469 ms vs sw 1.604 ms per launch, **5.7 us
+  less per barrier**, both correct; no-barrier negative FAILs. Kill switch
+  `tl.intel_npu.hw_sync_grid=False` keeps the software rendezvous for A/B. (3) **A hang is turned
+  into a report**: every barrier wait is bounded (`kBarrierSpinLimit`), every SHAVE verifies the armed
+  config is live itself (a dead barrier reads (0, 0), which a producer wait would take for "all
+  arrived"), and failures surface as status `BARRIER_NOT_LIVE(id)` / `BARRIER_TIMEOUT(id)`; the
+  generated source names the ids it uses. Negative control `run_dead_barrier_device.py` (sync on ids
+  0-2): all four SHAVEs report `BARRIER_NOT_LIVE id 0` in 0.4 s. An id outside the job's allocation
+  still hangs before any code runs; only the compile-time pool rule prevents that, and the runner's
+  wall-clock timeout catches it. Finding, recorded in `kernels.py`: SHAVE scalar DDR stores go through
+  a write-back DL1 with 16-byte lines, so two SHAVEs writing scalars into one line clobber each other;
+  per-SHAVE scalars need their own 16-byte slot.
 * 2026-11-06: **Phase 2b closed.** `DeriveIntelNpuGlobalSync` (C++, after tile-op lowering) inserts
   `sync_grid` between top-level phases with a DDR RAW/WAR/WAW hazard at buffer granularity; an author's
   barrier is kept and not duplicated; kill switch `tl.intel_npu.derive_global_sync=False` (used only by

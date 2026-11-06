@@ -1,0 +1,72 @@
+{
+ "date": "2026-11-06",
+ "tiles": 2,
+ "shaves": 2,
+ "kernel_sha256": "7f2f41dfcb5ae20c6fb01bc0026e10c0efaea990f4164ce58963162134c20c9b",
+ "results": {
+  "28": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 4,
+   "live_cons": 4,
+   "spins": 0,
+   "seconds": 0.27
+  },
+  "29": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 4,
+   "live_cons": 4,
+   "spins": 0,
+   "seconds": 0.26
+  },
+  "30": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 4,
+   "live_cons": 4,
+   "spins": 0,
+   "seconds": 0.24
+  },
+  "31": {
+   "verdict": "OK",
+   "codes": [
+    1,
+    1,
+    1,
+    1
+   ],
+   "live_prod": 4,
+   "live_cons": 4,
+   "spins": 0,
+   "seconds": 0.25
+  },
+  "32": {
+   "verdict": "hang",
+   "seconds": 20.24
+  },
+  "33": {
+   "verdict": "hang",
+   "seconds": 20.25
+  }
+ },
+ "usable_pool": {
+  "first": 28,
+  "count": 4
+ }
+}

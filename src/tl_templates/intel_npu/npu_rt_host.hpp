@@ -95,7 +95,10 @@ public:
   static constexpr std::uint32_t kAlign = 64;
   static constexpr std::uint32_t kMaxDpuN = 1024;
 
-  Ctx(const Environment &env, int numParams, std::uint64_t *params, int numTensorParams)
+  static constexpr std::uint32_t kNoHwSync = 0xFFFFFFFFu;
+
+  Ctx(const Environment &env, int numParams, std::uint64_t *params, int numTensorParams,
+      std::uint32_t /*syncBarrierBase*/ = kNoHwSync)
       : env_(env) {
     statusAddr_ = numParams > numTensorParams ? params[numTensorParams] : 0;
     if (numParams < numTensorParams) {

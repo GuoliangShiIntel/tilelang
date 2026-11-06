@@ -46,6 +46,8 @@ private:
                        const std::vector<EntryParam> &params);
 
   int kernel_count_{0};
+  // Base of the three rotating hardware barrier ids sync_grid uses; -1 = software rendezvous.
+  int64_t sync_barrier_base_{-1};
 };
 
 } // namespace codegen
