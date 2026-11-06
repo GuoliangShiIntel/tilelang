@@ -130,3 +130,9 @@ maint/host_checks/logs/*
 
 # uv Lockfile
 uv.lock
+
+# intel_npu device runner outputs
+testing/python/intel_npu/device/build/
+testing/python/intel_npu/device/generated/
+testing/python/intel_npu/device/run_*/
+
