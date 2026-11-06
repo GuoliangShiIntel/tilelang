@@ -90,18 +90,33 @@ def test_ksplit_refused_by_name():
         _source(make_gemm_ksplit(64, 64, 256))
 
 
+def test_dpu_output_points_limit_refused():
+    # 128 x 128 = 16384 output points: over the NPU5 DPU's 8192 per workload.
+    with pytest.raises(ValueError, match="16384 points exceeds the DPU's 8192"):
+        _source(make_gemm(128, 128, 256, BM=128, BN=128, tiles=1, shaves=1))
+    # 64 x 128 = 8192 is the limit and is accepted.
+    assert "ctx.dpu_matmul(" in _source(make_gemm(64, 128, 256, BM=64, BN=128, tiles=1, shaves=1))
+
+
+def test_dpu_z_alignment_refused():
+    with pytest.raises(ValueError, match="must be multiples of 16"):
+        _source(make_gemm(64, 72, 256, BM=64, BN=72, tiles=1, shaves=1))  # N = 72
+    with pytest.raises(ValueError, match="must be multiples of 16"):
+        _source(make_gemm(64, 64, 200, BM=64, BN=64, tiles=1, shaves=1))  # K = 200
+
+
 @needs_cxx
 def test_cmx_exhaustion_reported_in_status():
     # The compile-time budget check (Phase 2) refuses this for the real target; lower it for a
-    # target that claims 16 MiB of CMX so the RUNTIME allocator is the one that reports the failure.
+    # target that claims 64 MiB of CMX so the RUNTIME allocator is the one that reports the failure.
     from tvm.target import Target
 
-    func = make_gemm(2048, 64, 1024, BM=2048, BN=64, tiles=1, shaves=2)  # 4 MiB of fp16 per SHAVE
-    big = Target({"kind": "intel_npu", "arch": "npu5", "cmx_bytes": 16 * 1024 * 1024})
+    func = make_gemm(64, 64, 32768, BM=64, BN=64, tiles=1, shaves=2)  # A tile 64 x 32768 fp16 = 4 MiB per SHAVE
+    big = Target({"kind": "intel_npu", "arch": "npu5", "cmx_bytes": 64 * 1024 * 1024})
     lib = host_sim.build(tilelang.lower(func, target=big).kernel_source, "gemm_too_big")
-    a = np.zeros((2048, 1024), np.float16)
-    b = np.zeros((64, 1024), np.float16)
-    c = np.zeros((2048, 64), np.float16)
+    a = np.zeros((64, 32768), np.float16)
+    b = np.zeros((64, 32768), np.float16)
+    c = np.zeros((64, 64), np.float16)
     status = host_sim.run(lib, [a, b, c], tiles=1, shaves=2)
     with pytest.raises(RuntimeError, match="CMX_EXHAUSTED"):
         host_sim.check_status(status)

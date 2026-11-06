@@ -162,6 +162,27 @@ resource is added.
 Every pass ships with a negative control (a fixture it must refuse or leave unchanged, shown to
 fail when the check is removed). A pass is not done when it is only observed passing.
 
+### 3.1 Design inputs from the production compiler (VPUX), read 2026-11-06
+
+npu_dsl was a PoC; the production NPU compiler is VPUX (`applications.ai.vpu-accelerators.vpux-plugin`),
+and its local knowledge base (`knowledges/`: `hw/npu5/{nce-subsystem,dma-controller,dpu,shave}.md`,
+`compiler/{workload-management,memory-scheduler,multi-shave,sdpa-extended,platform-resources}.md`) is
+the reference this backend is designed against from Phase 3 on. The HAS-derived files are Intel-internal:
+they are cited here by file and section, not copied. What changes in this plan because of them:
+
+| Topic | VPUX / HAS fact (citation) | Consequence for `intel_npu` |
+|---|---|---|
+| Synchronisation | DPU, DMA and SHAVE communicate through **hardware barriers only**; IPC/software sync is a measured performance loss (`nce-subsystem.md` §5, §8). VPUX models every op as a task with *wait* and *update* barrier sets: virtual barriers -> legalisation -> physical assignment by graph colouring -> **barrier simulation** that proves deadlock-freedom (`workload-management.md` §5, §11) | Phase 3 adopts the task/barrier model: every DMA and DPU op in a pipelined region carries wait/update barrier sets; `AssignBarriers` colours them onto the tile's physical pool; a compile-time `BarrierSimulation` pass refuses a schedule that can deadlock. `sync_grid` phase boundaries stay on the toolkit's software rendezvous until a hardware version is measured faster |
+| Barrier resources | 16 barriers per tile in the job, 48 on PTL, ids 48-127 fault; each barrier has a 32-deep FIFO that **auto-reloads** producer/consumer counts when both reach zero (`nce-subsystem.md` §4.2, §5). Ids 0-7 are taken or faulting on this driver (npu_dsl measurement, `platform_configs/ptl.json`), so the usable pool is 8-47 | Target attributes `barrier_pool_first=8`, `barrier_pool_count=40` (the 0-7 exclusion is measured, not from the HAS; section 7 question 2 stays open). Auto-reload replaces the prior art's manual re-arm for pipelined rounds |
+| Distribution | VPUX names: `SEGMENTED` (disjoint slice per tile), `DUPLICATED` (full copy on every tile, one DMA), `OVERLAPPED`, `MULTICASTED`; a distributed DMA consumes **all DMA ports** (`workload-management.md` §8, §10). Multicast is one DDR read at unicast throughput (`dma-controller.md` §3). A DUPLICATED operand sits at the **same CMX offset on every tile** | `PlanDistribution` emits these modes by name; a DUPLICATED fill is one multicast DMA (same offset everywhere: our allocator's identical per-tile sequence guarantees it), split in two halves over the two ports |
+| Remote CMX | DPU and SHAVE can **write** a remote tile's CMX (ITI) but never read it; remote reads fault (`nce-subsystem.md` §2.1, §9) | Scope `shared` means "the two SHAVEs of one tile"; cross-tile data moves only by DMA multicast. The dialect never offers a cross-tile read |
+| CMX | 1536 KiB physical per tile on PTL; the compiler-usable workspace is **1439 KiB** after the runtime's reserved regions (`platform-resources.md` §3). Our kernels observe exactly 1473536 B free at entry. Accesses 32 B aligned; VPUX allocates at 64 B; a tiling heuristic keeps ~10% slack for fragmentation (`FRAGMENTATION_AVOID_RATIO`) | `cmx_bytes` default becomes the **workspace** 1473536, not the physical size; `CheckBudgets` compares against it; allocations stay 64 B aligned |
+| DPU workload legality | Output and input Z (N, K) multiples of 16; any workload dimension <= 8192; max output points per operation 8192 on VPU5 (`dpu.md` §4.6, §13). Stencils 16/2, 8/4, 4/8 with reduced activation reuse vs VPU4 (§4.5); IC-split secondary accumulator exists but is only enabled for a grouped 1x1 pattern (§4.7) | `LowerIntelNpuTileOp` refuses N % 16, K % 16 and M*N > `dpu_max_output_points` (target attribute 8192) with the reason; stencil selection (`setSpatial`/`setStencil` in the prior art) is a Phase 3 performance item driven by M, N |
+| DPU FIFO | One workload FIFO per tile, 256 entries (`nce-subsystem.md` §4.2) | Two SHAVEs enqueue on one DPU without a sync between them, as the flow assumes |
+| SHAVE and DDR | A SHAVE reaching DDR through its cache gets < 10% of DMA bandwidth (12 vs 256 outstanding) (`nce-subsystem.md` §7, §8) | Scalar `Ddr<T>` element access is for status words and the odd scalar, never a data path; a pass flagging scalar DDR access inside a loop is a Phase 4 item. Per-SHAVE SW-kernel inputs 32 B aligned (`multi-shave.md` §8.1) |
+| Scheduling | VPUX list-schedules with per-op cycle costs (VPUNN) over executor FIFOs, prefetch window 35 levels, loop ping-pong with two banks freed every second iteration, loop regions allocated first (`memory-scheduler.md` §8, §10; `workload-management.md` §3, §7) | Phase 3 keeps the author's explicit `T.Pipelined(num_stages=2)`; a cost-driven scheduler is a later item, and when it comes it is this model, not npu_dsl's six-coefficient fit |
+| Two SHAVEs, one DPU | SDPA runtime: SHAVE submits pre-built DPU descriptors; two SHAVEs split the L dimension and each runs the full head pipeline on its slice (`sdpa-extended.md` §6) | Confirms the Phase 3 ping/pong ownership (SHAVE 0 = PING chunks, SHAVE 1 = PONG chunks) is the production pattern |
+
 ## 4. Phases
 
 Each phase has an executable acceptance. A phase closes only when its acceptance **has been seen to

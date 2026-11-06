@@ -16,6 +16,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/target/target.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -106,6 +107,9 @@ PrimExpr AddressOf(const RegionInfo &r) {
 
 class IntelNpuTileOpLowerer : public StmtExprMutator {
 public:
+  IntelNpuTileOpLowerer(int64_t dpu_z_align, int64_t dpu_max_output_points)
+      : dpu_z_align_(dpu_z_align), dpu_max_output_points_(dpu_max_output_points) {}
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const auto *call = op->value.as<CallNode>();
     if (call == nullptr) {
@@ -228,10 +232,25 @@ private:
     check(a, M, K, "A");
     check(b, N, K, "B");
     check(c, M, N, "C");
+    // DPU workload legality (NPU5 HAS via the VPUX knowledge base, dpu.md 4.6/13).
+    if (N % dpu_z_align_ != 0 || K % dpu_z_align_ != 0) {
+      TVM_FFI_THROW(ValueError)
+          << "intel_npu: gemm N=" << N << ", K=" << K << " must be multiples of " << dpu_z_align_
+          << ": the DPU's output and input channel extents are " << dpu_z_align_ << "-aligned";
+    }
+    if (M * N > dpu_max_output_points_) {
+      TVM_FFI_THROW(ValueError)
+          << "intel_npu: gemm output tile " << M << "x" << N << " = " << M * N
+          << " points exceeds the DPU's " << dpu_max_output_points_
+          << " output points per workload; split the output tile";
+    }
     auto i32 = [](int64_t v) { return IntImm(DataType::Int(32), v); };
     return Evaluate(Call(DataType::Handle(), intel_npu_dpu_matmul(),
                          {AddressOf(c), AddressOf(a), AddressOf(b), i32(M), i32(N), i32(K)}));
   }
+
+  int64_t dpu_z_align_;
+  int64_t dpu_max_output_points_;
 };
 
 } // namespace
@@ -241,7 +260,13 @@ namespace transform {
 tvm::transform::Pass LowerIntelNpuTileOp() {
   auto pass_func = [](PrimFunc func, const IRModule &mod,
                       const tvm::transform::PassContext &ctx) -> PrimFunc {
-    IntelNpuTileOpLowerer lowerer;
+    int64_t z_align = 16, max_points = 8192;
+    if (auto target = func->GetAttr<Target>(tvm::attr::kTarget)) {
+      z_align = target.value()->GetAttr<Integer>("dpu_z_align").value_or(Integer(16)).IntValue();
+      max_points =
+          target.value()->GetAttr<Integer>("dpu_max_output_points").value_or(Integer(8192)).IntValue();
+    }
+    IntelNpuTileOpLowerer lowerer(z_align, max_points);
     func.CopyOnWrite()->body = lowerer(func->body);
     return func;
   };

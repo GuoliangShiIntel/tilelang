@@ -78,17 +78,17 @@ def main(argv):
 
 def cmx_negative():
     # 2048 x 1024 fp16 A tile = 4 MiB per SHAVE: cannot fit a 1.5 MiB tile. The compile-time budget
-    # check refuses it for the real target, so lower for a target claiming 16 MiB and let the DEVICE
+    # check refuses it for the real target, so lower for a target claiming 64 MiB and let the DEVICE
     # allocator report the failure through the status record.
     from tvm.target import Target
 
-    func = make_gemm(2048, 64, 1024, BM=2048, BN=64, tiles=1, shaves=2)
-    big = Target({"kind": "intel_npu", "arch": "npu5", "cmx_bytes": 16 * 1024 * 1024})
+    func = make_gemm(64, 64, 32768, BM=64, BN=64, tiles=1, shaves=2)  # A tile 64 x 32768 fp16 = 4 MiB per SHAVE
+    big = Target({"kind": "intel_npu", "arch": "npu5", "cmx_bytes": 64 * 1024 * 1024})
     source = tilelang.lower(func, target=big).kernel_source
     db = runner.build(source, KERNEL + "_toobig")
-    a = np.zeros((2048, 1024), np.float16)
-    b = np.zeros((64, 1024), np.float16)
-    c = np.zeros((2048, 64), np.float16)
+    a = np.zeros((64, 32768), np.float16)
+    b = np.zeros((64, 32768), np.float16)
+    c = np.zeros((64, 64), np.float16)
     try:
         runner.run(db, [("in", a), ("in", b), ("out", c)], 1, 2, HERE / "run_gemm_toobig", repeat=1, warmup=0)
     except RuntimeError as e:

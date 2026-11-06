@@ -55,7 +55,10 @@ def test_explicit_target_dict_with_attrs():
     target = Target({"kind": "intel_npu", "arch": "npu5", "num_tiles": 1})
     assert target.kind.name == "intel_npu"
     assert int(target.attrs["num_tiles"]) == 1
-    assert int(target.attrs["cmx_bytes"]) == 1572864  # default from the target kind
+    # The usable CMX workspace (1439 KiB), not the physical 1536 KiB.
+    assert int(target.attrs["cmx_bytes"]) == 1473536
+    assert int(target.attrs["barrier_pool_first"]) == 8 and int(target.attrs["barrier_pool_count"]) == 40
+    assert int(target.attrs["dpu_max_output_points"]) == 8192
 
 
 @pytest.mark.parametrize("other", ["cuda", "c", "ascend", "intel_npu_x", ""])

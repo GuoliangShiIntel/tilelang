@@ -217,7 +217,7 @@ def test_sync_grid_under_uniform_condition_is_allowed():
 
 
 def test_budget_refuses_oversized_kernel():
-    func = make_gemm(2048, 64, 1024, BM=2048, BN=64, tiles=1, shaves=2)  # 4 MiB A tile per SHAVE
+    func = make_gemm(64, 64, 32768, BM=64, BN=64, tiles=1, shaves=2)  # A tile 64 x 32768 fp16 = 4 MiB per SHAVE
     with pytest.raises(ValueError, match=r"(?s)CMX budget exceeded.*A_cmx: 4194304 B per SHAVE"):
         tilelang.lower(func, target="intel_npu")
 
