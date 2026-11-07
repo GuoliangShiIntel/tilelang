@@ -105,14 +105,28 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const AllocBufferNode *op) {
         << "intel_npu: buffer " << op->buffer->name << " has scope '" << scope
         << "'; on-chip buffers are scope shared (tile) or local (SHAVE)";
   }
-  // Phase 1: every on-chip buffer is a SHAVE-private CMX slice; tile-shared
-  // placement for scope "shared" arrives with the multi-tile flow (Phase 3).
+  // scope local: a SHAVE-private slice of one allocation of shaves_per_tile
+  // slots; scope shared: one tile-wide allocation at the same address on every
+  // SHAVE (and the same offset on every tile, which a multicast fill needs).
+  const bool shared = scope != "local";
   PrintIndent();
   PrintType(op->buffer->dtype, stream);
-  stream << "* " << vid << " = ctx.alloc<";
+  stream << "* " << vid << " = ctx." << (shared ? "alloc_shared<" : "alloc<");
   PrintType(op->buffer->dtype, stream);
   stream << ">(" << count << ");  // " << scope << "\n";
   RegisterHandleType(op->buffer->data.get(), op->buffer->dtype);
+}
+
+void CodeGenTileLangIntelNpu::VisitStmt_(const BindNode *op) {
+  if (const auto *call = op->value.as<CallNode>()) {
+    if (call->op.same_as(tl::intel_npu_ring_begin())) {
+      PrintIndent();
+      stream << "npu::Ctx::Ring " << AllocVarID(op->var.get()) << " = " << PrintExpr(op->value)
+             << ";\n";
+      return;
+    }
+  }
+  CodeGenC::VisitStmt_(op);
 }
 
 void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
@@ -136,6 +150,35 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
   }
   if (op->op.same_as(tl::intel_npu_dpu_matmul())) {
     os << "ctx.dpu_matmul(" << args(0, 8) << ")";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_ring_begin())) {
+    os << "ctx.ring_begin(" << args(0, 6) << ")";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_ring_uses())) {
+    os << "ctx.ring_uses(" << args(0, 1) << ")";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_ring_slot())) {
+    // fp16 is the only DPU operand type lowered today.
+    os << "ctx.ring_slot<half>(" << args(0, 1) << ")";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_ring_fill())) {
+    os << "ctx.ring_fill(" << args(0, 4) << ")";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_ring_dpu_submit())) {
+    os << "ctx.ring_dpu_submit(" << args(0, 10) << ")";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_ring_dpu_wait())) {
+    os << "ctx.ring_dpu_wait(" << args(0, 2) << ")";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_ring_end())) {
+    os << "ctx.ring_end(" << args(0, 1) << ")";
     return;
   }
   if (op->op.same_as(tl::sync_grid())) {

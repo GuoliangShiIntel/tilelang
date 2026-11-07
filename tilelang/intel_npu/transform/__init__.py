@@ -3,6 +3,8 @@ Python passes alongside this file)."""
 
 from .. import _ffi_api
 from .plan_workloads import PlanIntelNpuWorkloads  # noqa: F401
+from .lower_pipelined import PlanIntelNpuDistribution, LowerIntelNpuPipelined  # noqa: F401
+from .assign_barriers import AssignIntelNpuBarriers  # noqa: F401
 
 
 def LowerIntelNpuKernelLaunch():

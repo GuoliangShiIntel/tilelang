@@ -80,6 +80,52 @@ def make_gemm_repeat(BM: int, BN: int, K: int, repeat: int, tiles: int = 1, shav
     return gemm_repeat
 
 
+def make_ring_flow(M: int, N: int, K: int, BM: int = 32, BN: int = 256, tiles: int = 3, shaves: int = 2,
+                   num_stages: int = 2):
+    """THE FLOW (docs/examples/pingpong_multitile/README.md 1-3) as the author writes it:
+    Y[M, N] = X[M, K] . W[N, K]^T. W's fill depends on the tile -> SEGMENTED, resident in shared CMX;
+    X's fill inside the pipelined loop does not -> DUPLICATED (one multicast per chunk), streamed
+    through `num_stages` slots dealt round-robin to the tile's SHAVEs. The compiler derives the rest."""
+    assert N == BN * tiles and M % BM == 0
+
+    @T.prim_func
+    def ring_flow(X: T.Tensor((M, K), T.float16), W: T.Tensor((N, K), T.float16), Y: T.Tensor((M, N), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            W_cmx = T.alloc_shared((BN, K), T.float16)
+            X_cmx = T.alloc_shared((BM, K), T.float16)
+            Y_cmx = T.alloc_local((BM, BN), T.float16)
+            T.copy(W[tile * BN, 0], W_cmx)
+            for c in T.Pipelined(M // BM, num_stages=num_stages):
+                T.copy(X[c * BM, 0], X_cmx)
+                T.gemm(X_cmx, W_cmx, Y_cmx, transpose_B=True, clear_accum=True)
+                T.copy(Y_cmx, Y[c * BM, tile * BN])
+
+    return ring_flow
+
+
+def make_ring_flow_swapped(M: int, N: int, K: int, BM: int = 256, BN: int = 32, tiles: int = 3, shaves: int = 2,
+                          num_stages: int = 2):
+    """The flow with the roles swapped (activation-stationary, README section 1 "roles, not names"):
+    the tile keeps its block of rows of Xa resident and streams the weight rows Wb. The gemm's
+    SECOND operand is the streamed one. Different names, loops and operand order: a source the
+    passes were not written for."""
+    assert M == BM * tiles and N % BN == 0
+
+    @T.prim_func
+    def ring_flow_swapped(Xa: T.Tensor((M, K), T.float16), Wb: T.Tensor((N, K), T.float16), Out: T.Tensor((M, N), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as t:
+            rows_cmx = T.alloc_shared((BM, K), T.float16)
+            wstream = T.alloc_shared((BN, K), T.float16)
+            acc = T.alloc_local((BM, BN), T.float16)
+            T.copy(Xa[t * BM, 0], rows_cmx)
+            for j in T.Pipelined(N // BN, num_stages=num_stages):
+                T.copy(Wb[j * BN, 0], wstream)
+                T.gemm(rows_cmx, wstream, acc, transpose_B=True, clear_accum=True)
+                T.copy(acc, Out[t * BM, j * BN])
+
+    return ring_flow_swapped
+
+
 def make_gemm_two_phase(M: int, N: int, K: int, BM: int = 64, BN: int = 64, tiles: int = 2, shaves: int = 2,
                         with_sync: bool = True):
     """Megakernel shape: split-K partial products -> T.sync_grid() -> combine, one launch.

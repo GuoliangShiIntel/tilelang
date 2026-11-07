@@ -197,17 +197,23 @@ public:
     return r.freeBase + shave_ * 2 + (use & 1u);
   }
   std::uint8_t *ring_slot(const Ring &r) const { return r.slotBase + shave_ * r.slotBytes; }
+  template <class T> T *ring_slot(const Ring &r) const {
+    return reinterpret_cast<T *>(ring_slot(r));
+  }
   std::uint32_t ring_uses(const Ring &r) const { return r.myUses; }
   std::uint32_t ring_chunk(std::uint32_t use) const { return use * spt_ + shave_; }
 
-  // Allocates the slots and the order words (shared) and the issuer's fill
-  // descriptors; arms the first use's barriers on tile 0; one grid rendezvous so
-  // every config is live before any gate. `readyBase`/`freeBase` come from the
-  // compiler's barrier assignment (2 x slots ids each).
-  Ring ring_begin(std::uint32_t slotBytes, std::uint32_t slots, std::uint32_t total,
+  // `slotBase` is the compiler's shared buffer of slots x slotBytes (same address
+  // on every SHAVE of the tile, same offset on every tile). Allocates the order
+  // words (shared) and the issuer's fill descriptors; arms the first use's
+  // barriers on tile 0; one grid rendezvous so every config is live before any
+  // gate. `readyBase`/`freeBase` come from the compiler's barrier assignment
+  // (2 x slots ids each).
+  Ring ring_begin(void *slotBase, std::uint32_t slotBytes, std::uint32_t slots, std::uint32_t total,
                   std::uint32_t readyBase, std::uint32_t freeBase) {
     Ring r{};
-    r.slotBytes = alignUp(slotBytes, kAlign);
+    r.slotBase = static_cast<std::uint8_t *>(slotBase);
+    r.slotBytes = slotBytes;
     r.slots = slots;
     r.total = total;
     r.readyBase = readyBase;
@@ -222,7 +228,6 @@ public:
       fail(kStatusRingRefused, kRingOneTile);
       return r;
     }
-    r.slotBase = alloc_shared<std::uint8_t>(r.slotBytes * slots);
     r.order = alloc_shared<std::uint32_t>(16); // 64 B: one line, two words used
     r.fill = alloc_hw<DmaDescriptor>(2);
     if (!ok_)
@@ -277,6 +282,10 @@ public:
     DmaDrv::setConsumerBarriers(r.fill + 1, 0, 0);
     dma_.start(r.fill, 0);
     dma_.start(r.fill + 1, 1);
+  }
+  template <class T>
+  void ring_fill(Ring &r, std::uint32_t use, Ddr<T> src, std::uint32_t bytes) {
+    ring_fill(r, use, src.addr, bytes);
   }
 
   // Every SHAVE: submit the DPU workload of my `use`, gated on READY[use] (in

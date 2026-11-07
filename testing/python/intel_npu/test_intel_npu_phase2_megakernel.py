@@ -1,4 +1,4 @@
-"""Phase 2 of the Intel NPU backend: megakernel primitives in the host sim.
+﻿"""Phase 2 of the Intel NPU backend: megakernel primitives in the host sim.
 
   * T.sync_grid() lowers to ctx.sync_grid(); T.sync_threads() to ctx.sync_tile();
   * a two-phase kernel (split-K partials -> sync_grid -> combine) matches numpy;
@@ -218,7 +218,7 @@ def test_sync_grid_under_uniform_condition_is_allowed():
 
 def test_budget_refuses_oversized_kernel():
     func = make_gemm(64, 64, 32768, BM=64, BN=64, tiles=1, shaves=2)  # A tile 64 x 32768 fp16 = 4 MiB per SHAVE
-    with pytest.raises(ValueError, match=r"(?s)CMX budget exceeded.*A_cmx: 4194304 B per SHAVE"):
+    with pytest.raises(ValueError, match=r"(?s)CMX budget exceeded.*A_cmx: 4194304 B"):
         tilelang.lower(func, target="intel_npu")
 
 

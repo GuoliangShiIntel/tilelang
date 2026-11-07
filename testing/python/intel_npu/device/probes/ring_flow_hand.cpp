@@ -17,7 +17,8 @@ static inline void ring_flow(npu::Ctx &ctx, npu::Ddr<half> X, npu::Ddr<half> W, 
   const int32_t tile = ctx.tile_id();
   const int32_t shave = ctx.shave_id();
   half *W_cmx = ctx.alloc_shared<half>(BN * K);
-  half *Y_cmx = ctx.alloc<half>(2 * BM * BN);   // double-buffered by use parity (submit-ahead)
+  half *X_cmx = ctx.alloc_shared<half>(2 * BM * K);  // the ring's two slots
+  half *Y_cmx = ctx.alloc<half>(2 * BM * BN);        // double-buffered by use parity (submit-ahead)
   // Resident SEGMENTED operand: the tile's SHAVEs each load half the rows, then meet.
   {
     const std::uint32_t rows = BN / 2;
@@ -25,8 +26,8 @@ static inline void ring_flow(npu::Ctx &ctx, npu::Ddr<half> X, npu::Ddr<half> W, 
   }
   ctx.sync_tile();
   const std::uint32_t nchunks = M / BM;
-  npu::Ctx::Ring ring = ctx.ring_begin(BM * K * sizeof(half), 2, nchunks, kReadyBase, kFreeBase);
-  const half *X_slot = reinterpret_cast<const half *>(ctx.ring_slot(ring));
+  npu::Ctx::Ring ring = ctx.ring_begin(X_cmx, BM * K * sizeof(half), 2, nchunks, kReadyBase, kFreeBase);
+  const half *X_slot = ctx.ring_slot<half>(ring);
   ctx.ring_fill(ring, 0, (&(X[(ctx.ring_chunk(0) * BM) * K])).addr, BM * K * sizeof(half));
   ctx.ring_dpu_submit(ring, 0, Y_cmx, X_slot, W_cmx, BM, BN, K, 4, 0);  // VPUNN: CUBOID_4x16 x=4 for 32x256x1024
   for (std::uint32_t u = 0; u < ctx.ring_uses(ring); ++u) {

@@ -52,6 +52,9 @@ def IntelNpuPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
 
     # Before FlattenBuffer: the DMA lowering reads 2-D shapes and strides.
     mod = tilelang.intel_npu.transform.LowerIntelNpuTileOp()(mod)
+    # Phase 3b: SEGMENTED/DUPLICATED per fill, then the streamed ring (plan 3.2 order).
+    mod = tilelang.intel_npu.transform.PlanIntelNpuDistribution()(mod)
+    mod = tilelang.intel_npu.transform.LowerIntelNpuPipelined()(mod)
     # Grid barriers between phases that communicate through DDR, unless written by hand.
     if _derive_global_sync_enabled():
         mod = tilelang.intel_npu.transform.DeriveIntelNpuGlobalSync()(mod)
@@ -59,6 +62,8 @@ def IntelNpuPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.intel_npu.transform.VerifyIntelNpuUniformSync()(mod)
     # Each DPU workload's cuboid and spatial split, by the VPUNN cost model (plan 3.2).
     mod = tilelang.intel_npu.transform.PlanIntelNpuWorkloads()(mod)
+    # Hardware barrier ids for every ring from the job's pool.
+    mod = tilelang.intel_npu.transform.AssignIntelNpuBarriers()(mod)
 
     # No PlanAndUpdateBufferAllocationLocation: it sinks CMX buffers into the
     # loops that use them, and a CMX allocation is made once per kernel.

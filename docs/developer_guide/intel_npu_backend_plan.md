@@ -157,9 +157,10 @@ resource is added.
 | 5 | `LayoutInference` + `NpuLayoutRules` | CMX buffers are row-major contiguous; DPU operands need no swizzle; refuse fragments | 1 |
 | 6 | `NpuLowerTileOp` | `copy`->DMA builtin (direction, rows, width, stride, port); `gemm`->DPU builtin; `fill` on a DPU output dropped | 1 |
 | 6b | `PlanIntelNpuWorkloads` (Python) | per DPU workload, the MPE cuboid and spatial split ranked by VPUNN (section 3.2); explicit knobs kept; modes auto / require / off; what was chosen or skipped is written into the generated source | 3b (done) |
-| 7 | `PlanDistribution` | per `copy` from DDR: source independent of the tile var => broadcast (one multicast fill, one issuing SHAVE), else split; refuse a per-tile unicast copy of a tile-invariant source. Amended 2026-11-06 (section 3.2): the split/duplicate choice and the tile shape are **cost-driven** (`TileGemm`, `PlanWorkloads`), the tile-variable rule is the legality floor, not the decision | 3 |
-| 8 | `PlanDualPort` | split each DDR fill in half, one half per port, issued together | 3 |
-| 9 | `LowerPipelined` | `T.Pipelined(num_stages=2)` over a streamed loop -> ping/pong slots, SHAVE 0 = ping, SHAVE 1 = pong, pre-enqueued next fill gated on FREE, READY on completion | 3 |
+| 7 | `PlanIntelNpuDistribution` (Python, done 3b) | per DDR->CMX copy: into a shared buffer outside a pipelined loop = resident (SEGMENTED when the source names the tile), rows split over the tile's SHAVEs on both ports + tile sync; into a shared buffer inside a pipelined loop = the streamed DUPLICATED operand, refused if its source depends on the tile (a tile split on the streamed loop); into a local buffer = per SHAVE, noted when the source is tile-invariant. The tile-variable rule is the legality floor; the cost model's role is advisory (section 3.2) | 3 |
+| 8 | `PlanDualPort` | folded into the ring: every multicast fill is two contiguous halves, one per port, issued together (`Ctx::ring_fill`) | 3 (done) |
+| 9 | `LowerIntelNpuPipelined` (Python, done 3b) | `T.Pipelined(num_stages=S)` over one streamed fill + gemm + stores -> the ring program: S == SHAVEs per tile (slot = SHAVE), chunk c -> SHAVE c % S, streamed buffer x S slots, output x 2 by use parity (submit-ahead), per use `wait(u); submit(u+1); fill(u+1) [issuer]; store(u)`; issuer = tile 0's SHAVE s; barrier ids placeholders | 3 |
+| 9b | `AssignIntelNpuBarriers` (Python, done 3b) | READY/FREE x slots x 2 parities per ring from the job's pool `[barrier_pool_first, barriers_per_tile x tiles)` below sync_grid's 3; refuses by name with the shortfall | 3 |
 | 10 | `DeriveGlobalSync` | insert `sync_grid` from global-buffer RAW/WAR/WAW across top-level phases when the author did not; buffer granularity (done 2b; region granularity and loop-carried phases later) | 2b |
 | 11 | `InsertSync` | tile-level sync for shared CMX; map `sync_grid` to a software rendezvous, hardware barrier ids for the pipelined protocol | 2 |
 | 12 | `PlanCmx` | static CMX allocation per scope with live-range packing against `cmx_bytes`; refuse overflow naming the buffer | 1 (bump) / 3 (packing) |
@@ -308,8 +309,11 @@ fail** on a negative fixture and then pass on the real one.
   tiles and resident; B broadcast (multicast), ping-ponged, each chunk split across both DMA ports;
   DPU FIFO alternated by the two SHAVEs with no sync between them.
 * 3a (closed): `sync_grid` on hardware barriers; see section 8.
-* 3b: the pipelined flow above, with tile shape, distribution and stencil chosen by the VPUNN-backed
-  passes of section 3.2 (Step 0 cost model and calibration first).
+* 3b (steps A and B closed, C open): the pipelined flow above, with tile shape, distribution and stencil chosen by
+  the VPUNN-backed passes of section 3.2 (Step 0 cost model and calibration first). Open: the trace checker and a
+  kernel-only timing stamp for the TOPS claim (C); a host-simulation ring so the suite runs the flow without
+  hardware; `DeriveGlobalSync` does not yet see `ring_fill` as a DDR read; rounds for a resident operand larger
+  than CMX.
 * Acceptance: device trace admissible (per-SHAVE event count below the profiler's saturation
   value; `NPU_PROFILE_FRC_MHZ=19.2` exported), a ported flow checker
   (`testing/python/intel_npu/device/check_flow_trace.py`) exits 0, DPU busy % and TOPS at the
@@ -372,6 +376,23 @@ interop; a Python `nl.*`-compatible shim.
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-06: **Phase 3b step B: the compiler emits the flow from the author's loops.** Three Python
+  passes after `LowerIntelNpuTileOp` (section 3 items 7, 9, 9b): `PlanIntelNpuDistribution`,
+  `LowerIntelNpuPipelined`, `AssignIntelNpuBarriers`; `PlanIntelNpuWorkloads` now also plans
+  `ring_dpu_submit`. The source (`kernels.make_ring_flow`) is the README's: `alloc_shared` for the
+  resident and streamed operands (the dialect's `alloc_shared` is scope `shared`, not the GPU
+  `shared.dyn`, which the late kernel-launch pass takes for dynamic shared memory), one
+  `T.Pipelined(num_stages=2)` loop with fill, gemm, store. Codegen prints `alloc_shared`, the ring
+  builtins and `npu::Ctx::Ring` for the `Bind`; `CheckBudgets` counts shared buffers once. Every
+  derivation is written into the generated source as `// intel_npu:` notes. **Device: the compiled
+  flow PASSes** (rel 2.86e-4; 0.970 ms host wall incl. submit vs the hand kernel's 0.944; 6 SHAVEs OK;
+  perturbed W FAILs), and the **generality clause holds**: `make_ring_flow_swapped` (roles swapped,
+  streamed operand second, other names and loops) lowers and PASSes with zero compiler edits
+  (rel 2.78e-4). Negatives, each seen to fire: depth != SHAVEs, tile-dependent streamed fill,
+  one-tile launch, 3 rings on 2 tiles (short by 3 ids). Suite 55 passed (50 + 5 skips without VPUNN).
+  Two rules relaxed on evidence: a tile-invariant copy into a local buffer is legal and noted, not
+  refused (fixtures and probes do it legitimately); the ring borrows the compiler's shared slot
+  buffer so `CheckBudgets` sees the slots.
 * 2026-11-06: **Phase 3b step A: the ping-pong ring runs on the device from the runtime.** `npu::Ctx`
   gained `alloc_shared` (one tile-shared allocation, same offset on every tile), `dpu_prepare` /
   async DPU with barrier setters, and `Ring`: `ring_begin` (slots = SHAVEs, order words, first-use

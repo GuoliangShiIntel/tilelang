@@ -40,7 +40,8 @@ bool IsCmxScope(const std::string &scope) {
 
 class CmxUsage : public StmtVisitor {
 public:
-  int64_t per_slot_bytes = 0;
+  int64_t per_slot_bytes = 0; // scope local: x shaves_per_tile
+  int64_t shared_bytes = 0;   // scope shared: once per tile
   std::vector<std::pair<std::string, int64_t>> buffers;
 
 private:
@@ -57,8 +58,12 @@ private:
         count *= imm->value;
       }
       const int64_t bytes = AlignUp(count * b->dtype.bytes());
-      per_slot_bytes += bytes;
-      buffers.emplace_back(b->name, bytes);
+      if (b.scope() == "local") {
+        per_slot_bytes += bytes;
+      } else {
+        shared_bytes += bytes;
+      }
+      buffers.emplace_back(b->name + (b.scope() == "local" ? "" : " (shared)"), bytes);
     }
     StmtVisitor::VisitStmt_(op);
   }
@@ -84,16 +89,16 @@ tvm::transform::Pass CheckIntelNpuBudgets() {
     }
     CmxUsage usage;
     usage(func->body);
-    const int64_t total = usage.per_slot_bytes * spt + kRuntimeReserveBytes;
+    const int64_t total = usage.per_slot_bytes * spt + usage.shared_bytes + kRuntimeReserveBytes;
     if (total > cmx_bytes) {
       std::ostringstream names;
       for (const auto &[name, bytes] : usage.buffers) {
-        names << "\n    " << name << ": " << bytes << " B per SHAVE";
+        names << "\n    " << name << ": " << bytes << " B";
       }
       TVM_FFI_THROW(ValueError)
           << "intel_npu: CMX budget exceeded: " << usage.per_slot_bytes << " B per SHAVE x "
-          << spt << " SHAVEs + " << kRuntimeReserveBytes << " B runtime = " << total
-          << " B > cmx_bytes " << cmx_bytes << ". Buffers:" << names.str();
+          << spt << " SHAVEs + " << usage.shared_bytes << " B shared + " << kRuntimeReserveBytes
+          << " B runtime = " << total << " B > cmx_bytes " << cmx_bytes << ". Buffers:" << names.str();
     }
     return func;
   };

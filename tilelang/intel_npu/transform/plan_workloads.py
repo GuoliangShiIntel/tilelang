@@ -33,6 +33,9 @@ from .. import vpunn
 PLAN_WORKLOADS_KEY = "tl.intel_npu.plan_workloads"
 NOTES_ATTR = "intel_npu.notes"
 DPU_MATMUL_OP = "tl.intel_npu_dpu_matmul"
+RING_SUBMIT_OP = "tl.intel_npu_ring_dpu_submit"
+# (op name, index of M in the args): N, K, spatial_x, mpe follow M.
+DPU_OPS = {DPU_MATMUL_OP: 3, RING_SUBMIT_OP: 5}
 # Runtime encoding of the MPE cuboid (npu_rt_device.hpp dpu_matmul).
 MPE_CODE = {"CUBOID_4x16": 0, "CUBOID_8x16": 1, "CUBOID_16x16": 2}
 
@@ -80,11 +83,20 @@ def PlanIntelNpuWorkloads():
     def _pass(func: tirx.PrimFunc, mod, ctx):
         if mode == "off":
             return func
-        op = tvm.ir.Op.get(DPU_MATMUL_OP)
+        ops = {name: tvm.ir.Op.get(name) for name in DPU_OPS}
+
+        def dpu_call(stmt):
+            """(op, index of M) when stmt is a DPU workload call, else None."""
+            if isinstance(stmt, tirx.Evaluate) and isinstance(stmt.value, tirx.Call):
+                for name, op in ops.items():
+                    if stmt.value.op.same_as(op):
+                        return op, DPU_OPS[name]
+            return None
+
         calls = []
 
         def find(stmt):
-            if isinstance(stmt, tirx.Evaluate) and isinstance(stmt.value, tirx.Call) and stmt.value.op.same_as(op):
+            if dpu_call(stmt):
                 calls.append(stmt)
             return None
 
@@ -101,12 +113,14 @@ def PlanIntelNpuWorkloads():
         planned = []
 
         def rewrite(stmt):
-            if not (isinstance(stmt, tirx.Evaluate) and isinstance(stmt.value, tirx.Call) and stmt.value.op.same_as(op)):
+            hit = dpu_call(stmt)
+            if hit is None:
                 return None
+            op, m = hit
             args = list(stmt.value.args)
-            M, N, K = (int(args[i].value) for i in (3, 4, 5))
-            if int(args[6].value) != 0 or int(args[7].value) != -1:
-                planned.append(f"{M}x{N}x{K}: kept author/config knobs x={int(args[6].value)} mpe={int(args[7].value)}")
+            M, N, K = (int(args[i].value) for i in (m, m + 1, m + 2))
+            if int(args[m + 3].value) != 0 or int(args[m + 4].value) != -1:
+                planned.append(f"{M}x{N}x{K}: kept author/config knobs x={int(args[m + 3].value)} mpe={int(args[m + 4].value)}")
                 return None
             try:
                 mpe, x, cycles = plan_gemm(M, N, K)
@@ -115,8 +129,8 @@ def PlanIntelNpuWorkloads():
                 # Outside the model's domain (e.g. a huge K): the runtime default stays, visibly.
                 planned.append(f"{M}x{N}x{K}: left at the runtime default, VPUNN: {str(e).splitlines()[-1]}")
                 return None
-            args[6] = tirx.IntImm("int32", x)
-            args[7] = tirx.IntImm("int32", MPE_CODE[mpe])
+            args[m + 3] = tirx.IntImm("int32", x)
+            args[m + 4] = tirx.IntImm("int32", MPE_CODE[mpe])
             planned.append(f"{M}x{N}x{K} -> {mpe} x={x} ({cycles} cyc; runtime default {default_cycles})")
             return tirx.Evaluate(tirx.Call(stmt.value.dtype, op, args))
 

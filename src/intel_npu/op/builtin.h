@@ -53,6 +53,28 @@ TVM_DLL const Op &intel_npu_dma_copy();
  */
 TVM_DLL const Op &intel_npu_dpu_matmul();
 
+/*!
+ * \brief The streamed ping-pong ring (plan Phase 3b; README sections 1-3). A
+ * T.Pipelined loop over a DUPLICATED fill becomes:
+ *
+ *   ring = intel_npu_ring_begin(slot_base_ptr, slot_bytes, slots, total_chunks, ready_base, free_base)
+ *   intel_npu_ring_uses(ring) -> int32         chunks of this SHAVE's slot
+ *   intel_npu_ring_slot(ring) -> ptr           this SHAVE's slot
+ *   intel_npu_ring_fill(ring, use, src_ptr, bytes)       issuer: multicast fill of chunk `use`
+ *   intel_npu_ring_dpu_submit(ring, use, out, a, bt, M, N, K, spatial_x, mpe)
+ *   intel_npu_ring_dpu_wait(ring, use)
+ *   intel_npu_ring_end(ring)
+ *
+ * Barrier ids are placeholders (-1) until AssignIntelNpuBarriers fills them.
+ */
+TVM_DLL const Op &intel_npu_ring_begin();
+TVM_DLL const Op &intel_npu_ring_uses();
+TVM_DLL const Op &intel_npu_ring_slot();
+TVM_DLL const Op &intel_npu_ring_fill();
+TVM_DLL const Op &intel_npu_ring_dpu_submit();
+TVM_DLL const Op &intel_npu_ring_dpu_wait();
+TVM_DLL const Op &intel_npu_ring_end();
+
 } // namespace tl
 } // namespace tvm
 
