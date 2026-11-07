@@ -481,7 +481,7 @@ device-verified and measured here.
 | Block | Needed | This backend | Milestone |
 |---|---|---|---|
 | Projections, prefill | int4 group-128: SHAVE dequant -> fp16 DPU; fp16 (`baProj`) | **have** (log 2026-11-07 M2): W4A16 flow in both role assignments, device PASS; 0.82x npu_dsl's tuned probe at its shape, dequant row op 0.26 cyc/value | M2 |
-| Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | **have** int4 (log 2026-11-07 M2 step 2): `T.gemm_i4` merged-FC DPU path, device PASS, 20-29 GB/s of weights (DMA bound ~126); int8 not yet | M2 |
+| Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | **have** (log 2026-11-07 M2): `T.gemm_i4` / `T.gemm_i8` merged-FC DPU path, device PASS, 30 / 41 GB/s of weights (DMA bound ~126) | M2 |
 | Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | `T.vectorized` loops lower to half32/float16 SHAVE vector ops with VAU exp/log/tanh (**have**, log 2026-11-07); the ops themselves not yet written | M1 |
 | Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**; 960x1024x64 vectorised 1.765 ms TURBO (log 2026-11-07); GQA, gate, decode, KV cache open | M1 |
 | Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | none | M4 |
@@ -499,6 +499,16 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-07: **M2 closed: int8 g128 GEMV (`T.gemm_i8`, the lm_head's format), and the GEMV's variance explained.**
+  `dpu_matmul_qg(bits)` shares the merged-FC body: int8 rows K bytes apart, PPE 1/256. Device int8 N 6144 K 2048:
+  PASS, **0.308 ms = 41 GB/s** of weights. The 0.22-0.32 ms spread of the int4 GEMV was a **launch-set step**: the
+  per-run kernel-only list (now printed by the runner) reads 0.333 x4 then 0.213 x6 -- a clock or power state that
+  settles after ~7 launches; with warmup 10 the int4 GEMV is **0.208 ms (0.207-0.209) = 30 GB/s**. Rule for the
+  runners: warmup 10, and a quoted number carries its per-run list. The decode GEMV's remaining distance to the
+  ~126 GB/s DMA bound is the per-SHAVE serialisation (acquire -> 4 workloads -> release -> store) and six
+  concurrent issuers; the lever is a tile-shared chunk filled by one issuer and consumed by both SHAVEs (a ring
+  variant), left for the model's profile to justify. M2 coverage: prefill W4A16 both roles, decode int4 and int8;
+  75 passed.
 * 2026-11-07: **M2 step 2: the decode GEMV through the DPU's int4-weight mode.** New dialect op `T.gemm_i4(a, wq, s,
   out, group, row0, rows)` -> runtime `dpu_matmul_i4g`: one mixed-mode DPU workload (fp16 activations x packed int4
   weights read in place, `wmode = I4`) over the M x ng pseudo-rows against N x ng channels whose weight-table

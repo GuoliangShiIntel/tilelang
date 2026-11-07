@@ -162,6 +162,7 @@ class DeviceResult:
     status: np.ndarray  # [workers, 16] uint32
     stdout: str
     turbo: bool = True        # NPU_TURBO=YES was set for the run (the measurement condition of every quoted number)
+    kernel_times_ms: list[float] | None = None   # per timed run, kernel-only
 
 
 def turbo_requested() -> bool:
@@ -208,9 +209,11 @@ def run(db: DeviceBuild, arrays: list[tuple[str, np.ndarray]], tiles: int, shave
     workers = tiles * shaves
     status = np.fromfile(run_dir / "status.bin", dtype=np.uint32)[: workers * STATUS_WORDS].reshape(workers, STATUS_WORDS)
     times = [float(ln.split()[3]) for ln in r.stdout.splitlines() if ln.startswith("run ")]
+    kernel_times = [float(ln.split()[5]) for ln in r.stdout.splitlines() if ln.startswith("run ") and "kernel_ms" in ln]
     median = float(r.stdout.split("median_ms")[1].split()[0])
     median_kernel = float(r.stdout.split("median_kernel_ms")[1].split()[0])
-    return DeviceResult(median_ms=median, median_kernel_ms=median_kernel, times_ms=times, status=status, stdout=r.stdout, turbo=turbo)
+    return DeviceResult(median_ms=median, median_kernel_ms=median_kernel, times_ms=times, status=status, stdout=r.stdout, turbo=turbo,
+                        kernel_times_ms=kernel_times)
 
 
 def check_status(status: np.ndarray) -> None:

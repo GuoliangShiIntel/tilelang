@@ -290,6 +290,15 @@ public:
   // Scratch (part [M x ng, C] fp16, sT [ng, N] fp16) is allocated on first use at that call's size.
   void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
                       std::uint32_t N, std::uint32_t K, std::uint32_t G) {
+    dpu_matmul_qg(out, a, q, s, M, N, K, G, 4);
+  }
+  // int8 weights (one signed byte per value, rows K bytes apart), the DPU's native mixed mode; PPE 1/256.
+  void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q, const half *s, std::uint32_t M,
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G) {
+    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), s, M, N, K, G, 8);
+  }
+  void dpu_matmul_qg(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
+                     std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t bits) {
     if (!ok_)
       return;
     const std::uint32_t ng = K / G, C = N * ng;
@@ -311,23 +320,26 @@ public:
       fail(kStatusUnsupported, M * ng * C);
       return;
     }
+    const float partScale = bits == 8 ? kI8PartScale : kI4PartScale;
     const std::uint64_t key = (static_cast<std::uint64_t>(M) << 40) | (static_cast<std::uint64_t>(N) << 20) |
-                              (static_cast<std::uint64_t>(K) << 8) | (G >> 4);
+                              (static_cast<std::uint64_t>(K) << 8) | ((G >> 4) << 1) | (bits == 8);
     if (key != i4Key_) {
       // weight table rows {byte offset of (row n, group g) in q, 0, PPE multiplier, 0}, channel g * N + n
       union { float f; std::uint32_t u; } sc;
-      sc.f = kI4PartScale;
+      sc.f = partScale;
+      const std::uint32_t rowB = K * bits / 8, grpB = G * bits / 8;
       for (std::uint32_t g = 0; g < ng; ++g)
         for (std::uint32_t n = 0; n < N; ++n) {
           std::uint32_t *w = i4Wt_ + 4 * (g * N + n);
-          w[0] = n * (K / 2) + g * (G / 2);
+          w[0] = n * rowB + g * grpB;
           w[1] = 0;
           w[2] = sc.u;
           w[3] = 0;
         }
-      i4Mm_->initMixedDescOnly(M * ng, C, G);
-      i4Desc_->invariant.tensor_mode.tensor_mode_bf.wmode =
-          static_cast<std::uint32_t>(npu40xx::VpuInputTensorDType::I4);   // initMixed's default is I8
+      i4Mm_->initMixedDescOnly(M * ng, C, G);   // sets the int8 weight mode
+      if (bits == 4)
+        i4Desc_->invariant.tensor_mode.tensor_mode_bf.wmode =
+            static_cast<std::uint32_t>(npu40xx::VpuInputTensorDType::I4);
       i4Key_ = key;
     }
     i4Mm_->setConsumerBarriers(0, 0);
@@ -348,7 +360,7 @@ public:
     dpuCount_ += 1;
     dpuIduTicks_ += static_cast<volatile const DpuMatMul::DescriptorsBuffer *>(i4Desc_)->hwpStats.idu_workload_duration;
     dpuOduTicks_ += static_cast<volatile const DpuMatMul::DescriptorsBuffer *>(i4Desc_)->hwpStats.odu_workload_duration;
-    q_reduce(out, i4Part_, i4ST_, M, N, ng, 1.0f / kI4PartScale);
+    q_reduce(out, i4Part_, i4ST_, M, N, ng, 1.0f / partScale);
     const std::uint32_t t3 = perf_ticks();
     ringTicks_[kTickSubmit] += (t1 - t0) + (t3 - t2);   // SHAVE side: start + transpose, reduce
     ringTicks_[kTickDpuWait] += t2 - t1;                // DPU time not hidden behind the transpose
@@ -1104,6 +1116,7 @@ private:
   DpuMatMul::DescriptorsBuffer *dpuDesc_{nullptr};
   // Mixed-mode (fp16 x int4 weights) set for dpu_matmul_i4g, allocated on first use.
   static constexpr float kI4PartScale = 1.0f / 16.0f;  // PPE multiplier keeping the group partials in fp16 range
+  static constexpr float kI8PartScale = 1.0f / 256.0f; // |q| <= 128
   alignas(DpuMatMul) unsigned char i4Store_[sizeof(DpuMatMul)];
   DpuMatMul *i4Mm_{nullptr};
   DpuMatMul::DescriptorsBuffer *i4Desc_{nullptr};

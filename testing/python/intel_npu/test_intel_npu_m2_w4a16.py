@@ -84,16 +84,23 @@ def test_gemv_streams_split_weight_chunks_the_dpu_reads_in_place():
 
 
 @needs_cxx
-def test_gemv_serial_form_matches_numpy_in_host_sim():
+@pytest.mark.parametrize("bits", [4, 8])
+def test_gemv_serial_form_matches_numpy_in_host_sim(bits):
     N, K, BN = 768, 1024, 64
-    low = _lower(make_w4a16_gemv(N, K, BN=BN, G=G, tiles=TILES, pipelined=False))
-    lib = host_sim.build(low.source, "tl_gemv_serial_sim")
+    low = _lower(make_w4a16_gemv(N, K, BN=BN, G=G, tiles=TILES, pipelined=False, bits=bits))
+    lib = host_sim.build(low.source, f"tl_gemv_serial_sim_b{bits}")
     rng = np.random.default_rng(0)
     x = (rng.standard_normal((1, K)) * 0.5).astype(np.float16)
-    w_int = rng.integers(-8, 8, size=(N, K)).astype(np.int8)
-    scales = rng.uniform(0.01, 0.05, size=(N, K // G)).astype(np.float16)
+    if bits == 8:
+        w_int = rng.integers(-128, 128, size=(N, K)).astype(np.int8)
+        scales = rng.uniform(0.001, 0.004, size=(N, K // G)).astype(np.float16)
+        wq = w_int.copy()
+    else:
+        w_int = rng.integers(-8, 8, size=(N, K)).astype(np.int8)
+        scales = rng.uniform(0.01, 0.05, size=(N, K // G)).astype(np.float16)
+        wq = pack_int4(w_int)
     y = np.zeros((1, N), np.float16)
-    host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, {"X": x, "Wq": pack_int4(w_int), "S": scales, "Y": y}), TILES, 2))
+    host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, {"X": x, "Wq": wq, "S": scales, "Y": y}), TILES, 2))
     ref = x.astype(np.float32) @ (w_int.astype(np.float32) * np.repeat(scales.astype(np.float32), G, axis=1)).T
     assert np.abs(y.astype(np.float32) - ref).max() / np.abs(ref).max() < 4e-3   # group partials rounded to fp16
 

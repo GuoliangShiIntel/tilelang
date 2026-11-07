@@ -40,10 +40,11 @@ def main(argv):
     split = "n" if "--split-n" in argv else "m"
     stages = arg(argv, "--stages", 2)
     gemv = "--gemv" in argv
+    bits = arg(argv, "--bits", 4)
     if gemv:
         M = arg(argv, "--m", 1)
-        kernel = f"tl_w4a16_gemv_m{M}_n{N}_k{K}_bn{BN}" + (f"_s{stages}" if stages != 2 else "")
-        low = lowering.lower(make_w4a16_gemv(N, K, BN=BN, G=G, tiles=TILES, shaves=SHAVES, num_stages=stages, M=M))
+        kernel = f"tl_w4a16_gemv_m{M}_n{N}_k{K}_bn{BN}_b{bits}" + (f"_s{stages}" if stages != 2 else "")
+        low = lowering.lower(make_w4a16_gemv(N, K, BN=BN, G=G, tiles=TILES, shaves=SHAVES, num_stages=stages, M=M, bits=bits))
     else:
         kernel = f"tl_w4a16_m{M}_n{N}_k{K}_bn{BN}_split{split}" + (f"_s{stages}" if stages != 2 else "")
         low = lowering.lower(make_w4a16_flow(M, N, K, BN=BN, G=G, tiles=TILES, shaves=SHAVES, split=split, num_stages=stages))
@@ -59,20 +60,25 @@ def main(argv):
         print(f"build {time.time() - t0:.0f} s")
     rng = np.random.default_rng(0)
     x = (rng.standard_normal((M, K)) * 0.5).astype(np.float16)
-    w_int = rng.integers(-8, 8, size=(N, K)).astype(np.int8)
-    scales = rng.uniform(0.01, 0.05, size=(N, K // G)).astype(np.float16)
-    wq = pack_int4(w_int)
+    if bits == 8:
+        w_int = rng.integers(-128, 128, size=(N, K)).astype(np.int8)
+        scales = rng.uniform(0.001, 0.004, size=(N, K // G)).astype(np.float16)
+        wq = w_int.copy()
+    else:
+        w_int = rng.integers(-8, 8, size=(N, K)).astype(np.int8)
+        scales = rng.uniform(0.01, 0.05, size=(N, K // G)).astype(np.float16)
+        wq = pack_int4(w_int)
     wq_dev = wq.copy()
     negative = "--negative" in argv
     if negative:
-        wq_dev[3, :64] ^= np.uint8(0x77)   # one whole group of row 3 (a single nibble can meet a near-zero activation)
+        wq_dev[3, :64] ^= (np.int8(0x77) if bits == 8 else np.uint8(0x77))   # one whole group of row 3 (a single nibble can meet a near-zero activation)
     y = np.zeros((M, N), np.float16)
     profile = None
     if "--profile" in argv:
         (HERE / "evidence").mkdir(exist_ok=True)
         profile = HERE / "evidence" / f"{kernel}_trace.json"
     arrays = lowering.order_arrays(low, {"X": ("in", x), "Wq": ("in", wq_dev), "S": ("in", scales), "Y": ("out", y)})
-    res = runner.run(db, arrays, TILES, SHAVES, HERE / "run_w4a16", profile_json=profile, repeat=10, warmup=3, timeout_s=120)
+    res = runner.run(db, arrays, TILES, SHAVES, HERE / "run_w4a16", profile_json=profile, repeat=10, warmup=10, timeout_s=120)   # a launch set steps 0.33 -> 0.21 ms after ~7 launches (a clock state?)
     print(f"status per SHAVE (code, detail): {res.status[:, :2].tolist()}")
     runner.check_status(res.status)
     w = (w_int.astype(np.float32) * np.repeat(scales.astype(np.float32), G, axis=1)).astype(np.float16).astype(np.float32)
@@ -87,9 +93,11 @@ def main(argv):
     idu_us = [float(res.status[t * SHAVES:(t + 1) * SHAVES, 5].astype(np.int64).sum()) / PERF_CLK_MHZ for t in range(TILES)]
     print(f"device: kernel-only {res.median_kernel_ms:.3f} ms (host wall {res.median_ms:.3f} ms) [{kind}]; "
           f"max |y - ref| = {err:.4f} (rel {rel:.2e}) -> {verdict}; kernel sha256 {db.source_sha256[:12]}")
+    if res.kernel_times_ms:
+        print("  kernel-only per run ms: " + " ".join(f"{t:.3f}" for t in res.kernel_times_ms))
     print(f"ops {ops / 1e9:.2f} GFLOP; {tops:.2f} TOPS kernel-only = {100 * tops / peak:.1f}% of {peak:.2f} (dense fp16 peak); "
           f"DPU IDU busy per tile {[f'{100 * u / (res.median_kernel_ms * 1e3):.0f}%' for u in idu_us]}; "
-          f"weights {N * K / 2 / 1e6:.1f} MB read once -> {N * K / 2 / (res.median_kernel_ms * 1e-3) / 1e9:.1f} GB/s")
+          f"weights {wq.nbytes / 1e6:.1f} MB read once -> {wq.nbytes / (res.median_kernel_ms * 1e-3) / 1e9:.1f} GB/s")
     names = ["live_wait", "order_wait", "submit", "slot_wait", "free_wait", "fill_issue"]
     phases = res.status[:, 10:16].astype(np.int64) / PERF_CLK_MHZ
     for w_ in (0, 1, 2):

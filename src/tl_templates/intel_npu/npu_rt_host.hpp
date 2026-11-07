@@ -261,6 +261,14 @@ public:
   // scaled by 1/16 and rounded to fp16 by the DPU's ODU, the SHAVE sums partial x scale in fp32, x16, fp16.
   void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
                       std::uint32_t N, std::uint32_t K, std::uint32_t G) {
+    dpu_matmul_qg(out, a, q, s, M, N, K, G, 4);
+  }
+  void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q, const half *s, std::uint32_t M,
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G) {
+    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), s, M, N, K, G, 8);
+  }
+  void dpu_matmul_qg(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
+                     std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t bits) {
     if (!ok_)
       return;
     const std::uint32_t ng = K / G;
@@ -268,20 +276,27 @@ public:
       fail(kStatusUnsupported, N * ng);
       return;
     }
+    const float partScale = bits == 8 ? 1.0f / 256.0f : 1.0f / 16.0f;
     for (std::uint32_t m = 0; m < M; ++m)
       for (std::uint32_t n = 0; n < N; ++n) {
         float acc = 0.f;
         for (std::uint32_t g = 0; g < ng; ++g) {
           float part = 0.f;
           for (std::uint32_t k = g * G; k < (g + 1) * G; ++k) {
-            const unsigned byte = q[static_cast<std::size_t>(n) * (K / 2) + k / 2];
-            const int nib = (k & 1) ? (byte >> 4) : (byte & 0xF);
-            part += static_cast<float>(a[static_cast<std::size_t>(m) * K + k]) * static_cast<float>((nib ^ 8) - 8);
+            int w;
+            if (bits == 8) {
+              w = static_cast<signed char>(q[static_cast<std::size_t>(n) * K + k]);
+            } else {
+              const unsigned byte = q[static_cast<std::size_t>(n) * (K / 2) + k / 2];
+              const int nib = (k & 1) ? (byte >> 4) : (byte & 0xF);
+              w = (nib ^ 8) - 8;
+            }
+            part += static_cast<float>(a[static_cast<std::size_t>(m) * K + k]) * static_cast<float>(w);
           }
-          const half p16 = static_cast<half>(part * (1.0f / 16.0f));
+          const half p16 = static_cast<half>(part * partScale);
           acc += static_cast<float>(p16) * static_cast<float>(s[static_cast<std::size_t>(n) * ng + g]);
         }
-        out[static_cast<std::size_t>(m) * N + n] = static_cast<half>(acc * 16.0f);
+        out[static_cast<std::size_t>(m) * N + n] = static_cast<half>(acc / partScale);
       }
   }
 
