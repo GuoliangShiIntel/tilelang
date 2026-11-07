@@ -7,9 +7,12 @@
 
 #include <tvm/ir/transform.h>
 #include <tvm/target/target.h>
+#include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 
 #include <sstream>
+
+#include "arith/pattern_match.h"
 
 #include "intel_npu/op/builtin.h"
 #include "support/check.h"
@@ -171,6 +174,19 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const AllocBufferNode *op) {
   // slots; scope shared: one tile-wide allocation at the same address on every
   // SHAVE (and the same offset on every tile, which a multicast fill needs).
   const bool shared = scope != "local";
+  const DataType dt = op->buffer->dtype;
+  const bool one_vector = !shared && dt.lanes() == 1 && dt.is_float() &&
+                          ((dt.bits() == 16 && (count == 8 || count == 16 || count == 32)) ||
+                           (dt.bits() == 32 && (count == 4 || count == 8 || count == 16)));
+  if (one_vector) {
+    // a vector register, not CMX (see register_lanes_)
+    register_lanes_[op->buffer->data.get()] = static_cast<int>(count);
+    PrintIndent();
+    PrintType(dt.with_lanes(static_cast<int>(count)), stream);
+    stream << " " << vid << " = {};  // local, one vector: a register\n";
+    RegisterHandleType(op->buffer->data.get(), dt);
+    return;
+  }
   PrintIndent();
   PrintType(op->buffer->dtype, stream);
   // Distinct allocations never alias; without __restrict moviCompile keeps every
@@ -180,6 +196,54 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const AllocBufferNode *op) {
   PrintType(op->buffer->dtype, stream);
   stream << ">(" << count << ");  // " << scope << "\n";
   RegisterHandleType(op->buffer->data.get(), op->buffer->dtype);
+}
+
+void CodeGenTileLangIntelNpu::VisitExpr_(const BufferLoadNode *op, std::ostream &os) {
+  const VarNode *v = op->buffer->data.get();
+  if (!IsRegisterBuffer(v)) {
+    CodeGenC::VisitExpr_(op, os);
+    return;
+  }
+  ICHECK_EQ(op->indices.size(), 1);
+  const int lanes = register_lanes_.at(v);
+  const PrimExpr index = op->indices[0];
+  if (op->dtype.lanes() == 1) {
+    os << GetVarID(v) << "[" << PrintExpr(index) << "]";
+    return;
+  }
+  arith::PVar<PrimExpr> base;
+  if (op->dtype.lanes() == lanes && arith::ramp(base, 1, lanes).Match(index) && is_zero(base.Eval())) {
+    os << GetVarID(v);
+    return;
+  }
+  TVM_FFI_THROW(ValueError) << "intel_npu: the one-vector buffer " << op->buffer->name
+                            << " is read as a partial or shifted vector (" << index
+                            << "); read the whole vector or single lanes";
+}
+
+void CodeGenTileLangIntelNpu::VisitStmt_(const BufferStoreNode *op) {
+  const VarNode *v = op->buffer->data.get();
+  if (!IsRegisterBuffer(v)) {
+    CodeGenC::VisitStmt_(op);
+    return;
+  }
+  ICHECK_EQ(op->indices.size(), 1);
+  const int lanes = register_lanes_.at(v);
+  const PrimExpr index = op->indices[0];
+  const std::string value = PrintExpr(op->value);
+  PrintIndent();
+  if (op->value.dtype().lanes() == 1) {
+    stream << GetVarID(v) << "[" << PrintExpr(index) << "] = " << value << ";\n";
+    return;
+  }
+  arith::PVar<PrimExpr> base;
+  if (op->value.dtype().lanes() == lanes && arith::ramp(base, 1, lanes).Match(index) && is_zero(base.Eval())) {
+    stream << GetVarID(v) << " = " << value << ";\n";
+    return;
+  }
+  TVM_FFI_THROW(ValueError) << "intel_npu: the one-vector buffer " << op->buffer->name
+                            << " is written as a partial or shifted vector (" << index
+                            << "); write the whole vector or single lanes";
 }
 
 void CodeGenTileLangIntelNpu::VisitStmt_(const BindNode *op) {
@@ -196,6 +260,15 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const BindNode *op) {
 
 void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
                                          std::ostream &os) {
+  if (op->op.same_as(builtin::address_of())) {
+    if (const auto *load = op->args[0].as<BufferLoadNode>()) {
+      if (IsRegisterBuffer(load->buffer->data.get())) {
+        TVM_FFI_THROW(ValueError) << "intel_npu: the one-vector buffer " << load->buffer->name
+                                  << " is a register; it has no address (a DMA or extern call cannot use it): "
+                                     "give it more than one vector's worth of elements";
+      }
+    }
+  }
   auto args = [&](size_t first, size_t last) {
     std::string s;
     for (size_t i = first; i < last; ++i) {
@@ -354,6 +427,24 @@ void CodeGenTileLangIntelNpu::AddFunction(const PrimFunc &f) {
       alloc_storage_scope_[param.get()] = GetPtrStorageScope(param);
     }
   }
+  // The merged-FC scratch (npu_rt_device.hpp dpu_matmul_qg): part [M x ng, N x ng] and sT [ng, N] halves of the
+  // largest quantised GEMV, reserved up front in kernel_entry so a kernel with two GEMV shapes pays no re-size.
+  qg_part_elems_ = qg_st_elems_ = 0;
+  tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &n) {
+    const auto *call = n.as<CallNode>();
+    if (call == nullptr || !(call->op.same_as(tl::intel_npu_dpu_matmul_i4g()) ||
+                             call->op.same_as(tl::intel_npu_dpu_matmul_i8g())))
+      return;
+    const auto *M = call->args[4].as<IntImmNode>();
+    const auto *N = call->args[5].as<IntImmNode>();
+    const auto *K = call->args[6].as<IntImmNode>();
+    const auto *G = call->args[7].as<IntImmNode>();
+    if (M && N && K && G && G->value > 0) {
+      const int64_t ng = K->value / G->value;
+      qg_part_elems_ = std::max(qg_part_elems_, M->value * ng * N->value * ng);
+      qg_st_elems_ = std::max(qg_st_elems_, ng * N->value);
+    }
+  });
 
   std::vector<EntryParam> entry_params;
 
@@ -427,6 +518,11 @@ void CodeGenTileLangIntelNpu::EmitKernelEntry(
   }
   stream << ");\n";
   stream << "  if (!ctx.ok()) { ctx.finish(); return; }\n";
+  if (qg_part_elems_ > 0) {
+    stream << "  ctx.reserve_qg(" << qg_part_elems_ << ", " << qg_st_elems_
+           << ");  // merged-FC scratch of the largest gemm_i4/i8 shape\n";
+    stream << "  if (!ctx.ok()) { ctx.finish(); return; }\n";
+  }
   stream << "  " << kernel_name << "(ctx";
   for (size_t i = 0; i < params.size(); ++i) {
     stream << ", ";

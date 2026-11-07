@@ -484,7 +484,7 @@ device-verified and measured here.
 | Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | **have** (log 2026-11-07 M2): `T.gemm_i4` / `T.gemm_i8` merged-FC DPU path, device PASS, 30 / 41 GB/s of weights (DMA bound ~126) | M2 |
 | Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | `T.vectorized` loops lower to half32/float16 SHAVE vector ops with VAU exp/log/tanh (**have**, log 2026-11-07); the ops themselves not yet written | M1 |
 | Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**; 960x1024x64 vectorised 1.765 ms TURBO (log 2026-11-07); GQA, gate, decode, KV cache open | M1 |
-| Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | none | M4 |
+| Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | **decode have** (log 2026-11-08 M4): one launch at Qwen3.6's shape, device PASS with both states checked, **0.750 ms** TURBO; the chunked prefill scan open | M4 |
 | MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | **have** (log 2026-11-08 M3): one launch at Qwen3.6's shape, device PASS (routing == oracle), **0.560 ms** TURBO = 28 GB/s of the 15.8 MB it reads; expert phase ~0.43 ms at 34 GB/s (DMA-latency bound, see the log's cost split) | M3 |
 | Head | final norm + lm_head (int8 g128) + greedy argmax | none | M2 / M5 |
 | Compiler | layer table + device-side layer loop with two layer kinds; long-prompt chunk loop; CMX reuse across phases; barrier id reuse; `.text` per kernel | phases + derived `sync_grid`, budgets as sums (**have**); PlanCmx and id reuse open | M5 |
@@ -496,6 +496,31 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 
 ## 8. Log
 
+* 2026-11-08: **M4 decode closed: the Gated DeltaNet mixer layer in one launch** (`kernels.make_gdn_decode`,
+  `device/run_gdn_device.py`, `test_intel_npu_m4_gdn.py`). Qwen3.6's shape (H 2048, 16 k-heads / 32 v-heads of 128,
+  conv k 4, int4 g128 in_proj [12352, 2048] and out_proj [2048, 4096]): in_proj GEMV (rows padded to the tile
+  multiple, chunk blocks, local ring) -> `T.sync_grid()` -> causal conv + SiLU per channel block with the conv state
+  carried in place -> `T.sync_grid()` -> 6 consecutive v-heads per worker (whole k-heads; one DMA each for the worker's
+  q, k, v, z rows), per head the fp32 S [128, 128] in from DDR, l2-norm q / k, gates, the two-pass delta rule, S out,
+  gated RMSNorm -> `T.sync_grid()` -> out_proj GEMV + residual. Device: PASS rel 8.7e-4 against the numpy oracle,
+  conv state and SSM state checked (7.7e-4 / 5.4e-4), negative (one head's SSM perturbed) FAIL as required; **0.750 ms**
+  kernel-only (0.745-0.754 over 10, TURBO, UNPROFILED). `npu_run` re-uploads every input before each launch, so the
+  one-step oracle is the golden (the 20-step iteration disagreed, the one-step agreed: verified before adopting).
+  **Compiler/runtime capability added, generic:** (1) **one-vector SHAVE-local buffers are vector register variables**
+  in codegen (half8/16/32, float4/8/16; whole-vector or single-lane access, no address): moviCompile kept every CMX
+  lane accumulator in CMX and reloaded it after each store, `__restrict` on local pointers notwithstanding, so the
+  scan spent 60% of its cycles in NOPs; flash's softmax accumulators became registers too (1.130 -> 1.042 ms);
+  (2) the merged-FC scratch is sized by the largest `gemm_i4/i8` of the kernel, reserved in `kernel_entry`
+  (`ctx.reserve_qg`) and counted by `CheckIntelNpuBudgets` (the budget gate refused the first GDN form by 34 KiB:
+  the out_proj ring took one slot per SHAVE); (3) `T.macro` carries the per-head body. **Cost split** (skip arms):
+  1.095 -> 0.918 (conv state time-major: the channel-major loop auto-vectorised into per-lane gathers, 1671 cycles
+  per 16 channels) -> 0.882 (norms on lanes) -> 0.750 (register accumulators, column-block-outer scan); the scan phase
+  is still ~0.25 ms (42 us per head; the pass loops run at ~440 cycles per row pair with 61% NOPs: no software
+  pipelining across rows), the GEMV + conv phases ~0.5 ms. Levers left: 4-row unroll / fp16 lanes for the S update /
+  a DPU matvec for S^T k and S^T q; the GEMV rings' DMA as in M3. Two device hangs on the way, both root-caused: a
+  DDR read past a scratch buffer (the last worker's whole-block row loads; scratch now padded, `gdn_sizes`) hangs the
+  device, and the CMX budget must include the merged-FC scratch. Prefill GDN (chunked scan on the DPU, npu_dsl's
+  `gated_delta_net_prefill` is the precedent) is open. 79 passed.
 * 2026-11-08: **M3 closed: the MoE decode layer in one launch** (`kernels.make_moe_decode`, `device/run_moe_device.py`,
   `test_intel_npu_m3_moe.py`). Qwen3.6's shape (H 2048, 256 experts of inter 512, top-8 softmax renormalised + a
   shared expert gated by sigmoid(router row E), int4 g128): router fp16 GEMM (x padded to 16 rows, 288 padded router
@@ -522,7 +547,12 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   `--skip-dpu` arm (0.545 ms) shows the phase is DMA/ring bound, not DPU bound. Levers left for M5: larger chunks
   (CMX reuse across phases would allow 256-row chunks at two slots), the per-fill SHAVE cost (3 us), the router's
   fp16 ring and the scalar top-k (~0.12 ms together). Flash re-measured after the runtime changes: 1.130 ms (1.112
-  before, within the launch-set spread); 77 passed.
+  before, within the launch-set spread); 77 passed. **Filed for later (`<user>`, 2026-11-08: "GDN first"):** (a) move
+  the M2 decode GEMV (`make_w4a16_gemv`) onto chunk blocks and re-measure (its row-major scales still cost a SHAVE
+  transpose per workload); (b) unify `dpu_matmul` / `dpu_matmul_qg` / `ring_dpu_submit` into one gated, optionally
+  asynchronous `dpu_run` with double-buffered merged-FC scratch (M5); (c) the maintainability rules: cost model as the
+  acceptance gate (>25% deviation = runtime/model defect), automatic predicted-vs-measured phase split in the runner,
+  one-command re-measure of every pinned kernel after a runtime change.
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.

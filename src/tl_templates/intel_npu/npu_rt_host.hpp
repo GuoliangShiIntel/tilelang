@@ -277,6 +277,7 @@ public:
                   sStride);
   }
   // sStride 0: s row-major [N, K/G]; > 0: s group-major [K/G, sStride] (the device reads it in place).
+  void reserve_qg(std::uint32_t, std::uint32_t) {}   // the device's merged-FC scratch; nothing to reserve here
   void dpu_matmul_qg(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t bits, std::uint32_t sStride) {
     if (!ok_)

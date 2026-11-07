@@ -617,6 +617,352 @@ def moe_reference(x: "np.ndarray", router: "np.ndarray", gu_int, gu_scales, d_in
     return out, order, w
 
 
+def make_gdn_decode(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV: int = 128, G: int = 128,
+                    tiles: int = 3, shaves: int = 2, num_stages: int = 4, num_stages2: int = 2, BN1: int = 128, R1: int = 64,
+                    BN2: int = 64, R2: int = 32, CB: int = 512, eps: float = 1e-6, pipelined: bool = True,
+                    probe_skip: str | None = None):
+    """M4 decode: one token through a Gated DeltaNet mixer layer in ONE launch (Qwen3.6's shape by default: hidden H,
+    KH k-heads and VH v-heads of DK = DV = 128, conv kernel 4, int4 g128 projections).
+
+      mixed | z | b | a = x . Win^T            (in_proj GEMV, rows [q | k | v | z | b | a | pad])
+      conv  = silu(conv1d_k4(mixed; state))    (per channel, the state carried in place)
+      q, k  = l2norm(conv_q) / sqrt(DK), l2norm(conv_k); v = conv_v;  beta = sigmoid(b);  g = -exp(A_log) softplus(a + dt_bias)
+      S     = S e^g + k (v - e^g S^T k) beta^T;  o = S^T q           (per v-head, S [DK, DV] fp32 carried in place)
+      out   = res + rmsnorm(o) * g_norm * silu(z) . Wout^T          (gated RMSNorm per head, out_proj GEMV)
+
+    Phases: A. in_proj GEMV, rows split over the tiles (chunk blocks, local rings) -> Y in DDR, T.sync_grid();
+    B1. causal conv + SiLU over CONV channels in blocks of CB dealt over the workers, conv state updated, -> CV;
+    T.sync_grid(); B2. each worker takes HPW consecutive v-heads (whole k-heads): one DMA each for its q, k, v, z
+    rows, then per head S in (64 KiB), the two-pass delta rule in fp32 on vector lanes, S out, gated norm -> O;
+    T.sync_grid(); C. out_proj GEMV + residual, rows split over the tiles -> Out (padded to NOUT_pad); its ring has
+    `num_stages2` slots (one per SHAVE by default: both rings at two slots exceed the CMX budget by 34 KiB).
+    Scratch (DDR): Y [1, YLEN], CV [1, CVLEN], O [1, workers x HPW x DV] (padded so the last worker's whole-block
+    row loads stay in bounds; a DDR read past a buffer hangs the device). Packing: `pack_gdn`; sizes: `gdn_sizes`.
+    `probe_skip`: MEASUREMENT ARM ONLY (output wrong by design): 'conv' leaves out the conv SHAVE loop, 'scan' the
+    per-head delta rule and gated norm, 'gemv' both GEMVs' DPU workloads (the rings still stream)."""
+    assert DK == DV and VH % KH == 0 and H % G == 0 and CB % 16 == 0
+    REP = VH // KH
+    QK, VC = KH * DK, VH * DV
+    CONV = 2 * QK + VC
+    ZOFF, BOFF, AOFF = CONV, CONV + VC, CONV + VC + VH
+    NIN = CONV + VC + 2 * VH
+    NIN_pad = -(-NIN // (BN1 * tiles)) * BN1 * tiles
+    NOUT_pad = -(-H // (BN2 * tiles)) * BN2 * tiles
+    C1, C2 = NIN_pad // (BN1 * tiles), NOUT_pad // (BN2 * tiles)
+    HG1, KG2 = H // G, VC // G
+    assert R1 * HG1 <= 1024 and R2 * KG2 <= 1024 and BN1 % R1 == 0 and BN2 % R2 == 0
+    assert (HG1 * BN1 * 2) % (H // 2) == 0 and (KG2 * BN2 * 2) % (VC // 2) == 0
+    SR1, SR2 = HG1 * BN1 * 2 // (H // 2), KG2 * BN2 * 2 // (VC // 2)
+    BR1, BR2 = BN1 + SR1, BN2 + SR2
+    workers = tiles * shaves
+    HPW = -(-VH // workers)
+    HPW += (-HPW) % REP                       # whole k-heads per worker
+    KHW = HPW // REP
+    assert CONV % CB == 0
+    NB = CONV // CB
+    OPAD = workers * HPW * DV
+    YLEN = max(NIN_pad, ZOFF + OPAD)          # the last worker's z rows reach past VH heads (skipped, but in bounds)
+    CVLEN = max(CONV, 2 * QK + OPAD)
+    FL = 16                                   # fp32 lanes
+    assert DV % FL == 0
+    qscale = 1.0 / (DK ** 0.5)
+    skip_conv, skip_scan, skip_gemv = (probe_skip == "conv"), (probe_skip == "scan"), (probe_skip == "gemv")
+
+    @T.macro
+    def gdn_head(S_cmx, q_cmx, k_cmx, v_cmx, z_cmx, ba_cmx, al_cmx, db_cmx, gn_cmx, qn, kn, knv, qnv, egv, betav, kv, delta,
+                 o, kr, kr2, dr, sn, sn2, st, ls, ls2, eh, on_cmx, j, h):
+        """One v-head's step: l2-normalised q / k of its k-head, the gates, the two-pass delta rule on S (fp32
+        lanes), the gated RMSNorm into on_cmx[j]. j: the head's index within the worker's block, h: its index."""
+        for v in T.vectorized(FL):
+            ls[v] = T.float32(0)
+            ls2[v] = T.float32(0)
+        for d0 in T.serial(DK // FL):
+            for v in T.vectorized(FL):
+                ls[v] = ls[v] + (T.cast(q_cmx[0, (j // REP) * DK + d0 * FL + v], T.float32)
+                                 * T.cast(q_cmx[0, (j // REP) * DK + d0 * FL + v], T.float32))
+                ls2[v] = ls2[v] + (T.cast(k_cmx[0, (j // REP) * DK + d0 * FL + v], T.float32)
+                                   * T.cast(k_cmx[0, (j // REP) * DK + d0 * FL + v], T.float32))
+        st[0] = T.float32(0)
+        st[1] = T.float32(0)
+        for v in T.serial(FL):
+            st[0] = st[0] + ls[v]
+            st[1] = st[1] + ls2[v]
+        st[0] = T.float32(qscale) / T.sqrt(st[0] + T.float32(1e-6))
+        st[1] = T.float32(1) / T.sqrt(st[1] + T.float32(1e-6))
+        for d0 in T.serial(DK // FL):
+            for v in T.vectorized(FL):
+                qn[d0 * FL + v] = T.cast(q_cmx[0, (j // REP) * DK + d0 * FL + v], T.float32) * st[0]
+                kn[d0 * FL + v] = T.cast(k_cmx[0, (j // REP) * DK + d0 * FL + v], T.float32) * st[1]
+        # the per-row scalars as vector rows, built once per head: a scalar splat costs ~16 lane copies on this
+        # SHAVE, a vector load one LSU op, and the scan's inner loops use each row's k and q 8 times
+        for d in T.serial(DK):
+            for v in T.vectorized(FL):
+                knv[d, v] = kn[d]
+                qnv[d, v] = qn[d]
+        # gates: beta = sigmoid(b); g = -exp(A_log) softplus(a + dt_bias); e^g
+        st[2] = T.float32(1) / (T.float32(1) + T.exp(T.float32(0) - T.cast(ba_cmx[0, j], T.float32)))
+        st[3] = T.cast(ba_cmx[1, j], T.float32) + db_cmx[0, h]
+        st[3] = T.if_then_else(st[3] > T.float32(20), st[3], T.log(T.float32(1) + T.exp(st[3])))
+        st[3] = T.exp(T.float32(0) - T.exp(al_cmx[0, h]) * st[3])
+        for v in T.vectorized(FL):
+            egv[v] = st[3]
+            betav[v] = st[2]
+        # pass 1: kv = S^T k (the decay e^g applied once below). Column block outer, rows inner, the block's
+        # accumulators in one-vector register buffers (kr, kr2: two rows per iteration = two independent chains);
+        # the row-outer form with CMX accumulators spent 503 cycles per row pair on their loads and stores.
+        for v0 in T.unroll(DV // FL):
+            for v in T.vectorized(FL):
+                kv[v0 * FL + v] = T.float32(0)
+                o[v0 * FL + v] = T.float32(0)
+        for v0 in T.serial(DV // FL):
+            for v in T.vectorized(FL):
+                kr[v] = T.float32(0)
+                kr2[v] = T.float32(0)
+            for d0 in T.serial(DK // 2):
+                for v in T.vectorized(FL):
+                    kr[v] = kr[v] + S_cmx[2 * d0, v0 * FL + v] * knv[2 * d0, v]
+                    kr2[v] = kr2[v] + S_cmx[2 * d0 + 1, v0 * FL + v] * knv[2 * d0 + 1, v]
+            for v in T.vectorized(FL):
+                kv[v0 * FL + v] = kr[v] + kr2[v]
+        for v0 in T.unroll(DV // FL):
+            for v in T.vectorized(FL):
+                delta[v0 * FL + v] = (T.cast(v_cmx[0, j * DV + v0 * FL + v], T.float32) - egv[v] * kv[v0 * FL + v]) * betav[v]
+        # pass 2: S = S e^g + k delta^T; o = S^T q (same loop order: delta[block] and o[block] stay in registers). The
+        # new row goes through a lane temporary: re-reading S right after its store made moviCompile scalarise the
+        # body (422 lane copies and 147 scalar ops per iteration).
+        for v0 in T.serial(DV // FL):
+            for v in T.vectorized(FL):
+                dr[v] = delta[v0 * FL + v]
+                kr[v] = T.float32(0)
+                kr2[v] = T.float32(0)
+            for d0 in T.serial(DK // 2):
+                for v in T.vectorized(FL):
+                    sn[v] = S_cmx[2 * d0, v0 * FL + v] * egv[v] + knv[2 * d0, v] * dr[v]
+                    sn2[v] = S_cmx[2 * d0 + 1, v0 * FL + v] * egv[v] + knv[2 * d0 + 1, v] * dr[v]
+                    S_cmx[2 * d0, v0 * FL + v] = sn[v]
+                    S_cmx[2 * d0 + 1, v0 * FL + v] = sn2[v]
+                    kr[v] = kr[v] + sn[v] * qnv[2 * d0, v]
+                    kr2[v] = kr2[v] + sn2[v] * qnv[2 * d0 + 1, v]
+            for v in T.vectorized(FL):
+                o[v0 * FL + v] = kr[v] + kr2[v]
+        # gated RMSNorm: o * rsqrt(mean(o^2) + eps) * g_norm * silu(z), on lanes (the exp of -z on half16, VAU.EXP)
+        for v in T.vectorized(FL):
+            ls[v] = T.float32(0)
+        for v0 in T.unroll(DV // FL):
+            for v in T.vectorized(FL):
+                ls[v] = ls[v] + o[v0 * FL + v] * o[v0 * FL + v]
+        st[0] = T.float32(0)
+        for v in T.serial(FL):
+            st[0] = st[0] + ls[v]
+        st[0] = T.float32(1) / T.sqrt(st[0] / T.float32(DV) + T.float32(eps))
+        for v0 in T.unroll(DV // FL):
+            for v in T.vectorized(FL):
+                eh[v] = T.exp(T.float16(0) - z_cmx[0, j * DV + v0 * FL + v])
+                on_cmx[0, j * DV + v0 * FL + v] = T.cast(
+                    o[v0 * FL + v] * st[0] * T.cast(gn_cmx[0, v0 * FL + v], T.float32)
+                    * T.cast(z_cmx[0, j * DV + v0 * FL + v], T.float32) / (T.float32(1) + T.cast(eh[v], T.float32)), T.float16)
+
+    @T.prim_func
+    def gdn(X: T.Tensor((1, H), T.float16), Res: T.Tensor((1, H), T.float16),
+            WinP: T.Tensor(((NIN_pad // BN1) * BR1, H // 2), T.uint8), ConvW: T.Tensor((4, CONV), T.float16),
+            ALog: T.Tensor((1, VH), T.float32), DtBias: T.Tensor((1, VH), T.float32), GNorm: T.Tensor((1, DV), T.float16),
+            ConvState: T.Tensor((3, CONV), T.float16), Ssm: T.Tensor((VH, DK, DV), T.float32),
+            WoutP: T.Tensor(((NOUT_pad // BN2) * BR2, VC // 2), T.uint8),
+            Y: T.Tensor((1, YLEN), T.float16), CV: T.Tensor((1, CVLEN), T.float16), O: T.Tensor((1, OPAD), T.float16),
+            Out: T.Tensor((1, NOUT_pad), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            x_cmx = T.alloc_shared((1, H), T.float16)
+            w1_cmx = T.alloc_shared((BR1, H // 2), T.uint8)
+            y1_cmx = T.alloc_local((1, BN1), T.float16)
+            cs_cmx = T.alloc_local((3, CB), T.float16)
+            cw_cmx = T.alloc_local((4, CB), T.float16)
+            cx_cmx = T.alloc_local((1, CB), T.float16)
+            cv_cmx = T.alloc_local((1, CB), T.float16)
+            q_cmx = T.alloc_local((1, KHW * DK), T.float16)
+            k_cmx = T.alloc_local((1, KHW * DK), T.float16)
+            v_cmx = T.alloc_local((1, HPW * DV), T.float16)
+            z_cmx = T.alloc_local((1, HPW * DV), T.float16)
+            ba_cmx = T.alloc_local((2, HPW), T.float16)
+            gn_cmx = T.alloc_shared((1, DV), T.float16)
+            al_cmx = T.alloc_shared((1, VH), T.float32)
+            db_cmx = T.alloc_shared((1, VH), T.float32)
+            S_cmx = T.alloc_local((DK, DV), T.float32)
+            qn = T.alloc_local((DK,), T.float32)
+            kn = T.alloc_local((DK,), T.float32)
+            knv = T.alloc_local((DK, FL), T.float32)
+            qnv = T.alloc_local((DK, FL), T.float32)
+            egv = T.alloc_local((FL,), T.float32)
+            betav = T.alloc_local((FL,), T.float32)
+            sn = T.alloc_local((FL,), T.float32)
+            sn2 = T.alloc_local((FL,), T.float32)
+            kv = T.alloc_local((DV,), T.float32)
+            delta = T.alloc_local((DV,), T.float32)
+            o = T.alloc_local((DV,), T.float32)
+            kr = T.alloc_local((FL,), T.float32)
+            kr2 = T.alloc_local((FL,), T.float32)
+            dr = T.alloc_local((FL,), T.float32)
+            acc = T.alloc_local((FL,), T.float32)
+            ls = T.alloc_local((FL,), T.float32)
+            ls2 = T.alloc_local((FL,), T.float32)
+            eh = T.alloc_local((FL,), T.float16)
+            st = T.alloc_local((4,), T.float32)
+            on_cmx = T.alloc_local((1, HPW * DV), T.float16)
+            o_cmx = T.alloc_shared((1, VC), T.float16)
+            res_cmx = T.alloc_shared((1, NOUT_pad), T.float16)
+            w2_cmx = T.alloc_shared((BR2, VC // 2), T.uint8)
+            y2_cmx = T.alloc_local((1, BN2), T.float16)
+            # --- A. in_proj GEMV: rows [q | k | v | z | b | a | pad] split over the tiles --------------------------
+            T.copy(X[0, 0], x_cmx)
+            for n in (T.Pipelined(C1, num_stages=num_stages) if pipelined else T.serial(C1)):
+                T.copy(WinP[(tile * C1 + n) * BR1, 0], w1_cmx)
+                if skip_gemv:
+                    y1_cmx[0, 0] = T.cast(w1_cmx[0, 0], T.float16)
+                else:
+                    for sub in T.serial(BN1 // R1):
+                        T.gemm_i4(x_cmx, w1_cmx, None, y1_cmx, group=G, row0=sub * R1, rows=R1, scales_row=BN1)
+                T.copy(y1_cmx, Y[0, (tile * C1 + n) * BN1])
+            T.sync_grid()
+            # --- B1. causal conv1d (k = 4) + SiLU over the CONV channels, blocks of CB dealt over the workers -------
+            for it in T.serial(T.ceildiv(NB, workers)):
+                blk = it * workers + worker
+                if blk < NB:
+                    T.copy(ConvState[0, blk * CB], cs_cmx)
+                    T.copy(ConvW[0, blk * CB], cw_cmx)
+                    T.copy(Y[0, blk * CB], cx_cmx)
+                    if not skip_conv:
+                        # time-major state and weights: unit-stride lanes (the channel-major form auto-vectorised
+                        # into per-lane gathers at ~100 cycles per channel); fp32 accumulate, half16 exp for the SiLU
+                        for c0 in T.serial(CB // FL):
+                            for v in T.vectorized(FL):
+                                acc[v] = (T.cast(cs_cmx[0, c0 * FL + v], T.float32) * T.cast(cw_cmx[0, c0 * FL + v], T.float32)
+                                          + T.cast(cs_cmx[1, c0 * FL + v], T.float32) * T.cast(cw_cmx[1, c0 * FL + v], T.float32)
+                                          + T.cast(cs_cmx[2, c0 * FL + v], T.float32) * T.cast(cw_cmx[2, c0 * FL + v], T.float32)
+                                          + T.cast(cx_cmx[0, c0 * FL + v], T.float32) * T.cast(cw_cmx[3, c0 * FL + v], T.float32))
+                                eh[v] = T.exp(T.cast(T.float32(0) - acc[v], T.float16))
+                                cv_cmx[0, c0 * FL + v] = T.cast(acc[v] / (T.float32(1) + T.cast(eh[v], T.float32)), T.float16)
+                                cs_cmx[0, c0 * FL + v] = cs_cmx[1, c0 * FL + v]
+                                cs_cmx[1, c0 * FL + v] = cs_cmx[2, c0 * FL + v]
+                                cs_cmx[2, c0 * FL + v] = cx_cmx[0, c0 * FL + v]
+                    T.copy(cv_cmx, CV[0, blk * CB])
+                    T.copy(cs_cmx, ConvState[0, blk * CB])
+            T.sync_grid()
+            # --- B2. the delta rule per v-head: worker w takes heads [w * HPW, w * HPW + HPW) ------------------------
+            T.copy(GNorm[0, 0], gn_cmx)
+            T.copy(ALog[0, 0], al_cmx)
+            T.copy(DtBias[0, 0], db_cmx)
+            T.copy(CV[0, worker * KHW * DK], q_cmx)
+            T.copy(CV[0, QK + worker * KHW * DK], k_cmx)
+            T.copy(CV[0, 2 * QK + worker * HPW * DV], v_cmx)
+            T.copy(Y[0, ZOFF + worker * HPW * DV], z_cmx)
+            T.copy(Y[0, BOFF + worker * HPW], ba_cmx[0:1, 0:HPW])
+            T.copy(Y[0, AOFF + worker * HPW], ba_cmx[1:2, 0:HPW])
+            for j in T.serial(HPW):
+                if worker * HPW + j < VH:
+                    T.copy(Ssm[worker * HPW + j, 0, 0], S_cmx)
+                    if skip_scan:
+                        on_cmx[0, j * DV] = T.cast(S_cmx[0, 0], T.float16)
+                    else:
+                        gdn_head(S_cmx, q_cmx, k_cmx, v_cmx, z_cmx, ba_cmx, al_cmx, db_cmx, gn_cmx, qn, kn, knv, qnv, egv, betav,
+                                 kv, delta, o, kr, kr2, dr, sn, sn2, st, ls, ls2, eh, on_cmx, j, worker * HPW + j)
+                    T.copy(S_cmx, Ssm[worker * HPW + j, 0, 0])
+            T.copy(on_cmx, O[0, worker * HPW * DV])
+            T.sync_grid()
+            # --- C. out_proj GEMV + residual, rows split over the tiles -------------------------------------------
+            for c in T.serial(NOUT_pad - H):
+                if shave == 0:
+                    res_cmx[0, H + c] = T.float16(0)
+            T.copy(O[0, 0], o_cmx)
+            T.copy(Res[0:1, 0:H], res_cmx[0:1, 0:H])
+            for n in (T.Pipelined(C2, num_stages=num_stages2) if pipelined else T.serial(C2)):
+                T.copy(WoutP[(tile * C2 + n) * BR2, 0], w2_cmx)
+                for sub in T.serial(BN2 // R2):
+                    T.gemm_i4(o_cmx, w2_cmx, None, y2_cmx, group=G, row0=sub * R2, rows=R2, scales_row=BN2)
+                for c in T.serial(BN2):
+                    y2_cmx[0, c] = T.cast(T.cast(y2_cmx[0, c], T.float32)
+                                          + T.cast(res_cmx[0, (tile * C2 + n) * BN2 + c], T.float32), T.float16)
+                T.copy(y2_cmx, Out[0, (tile * C2 + n) * BN2])
+
+    return gdn
+
+
+def gdn_sizes(H: int, KH: int, VH: int, DK: int, tiles: int = 3, shaves: int = 2, BN1: int = 128, BN2: int = 64, **_):
+    """make_gdn_decode's scratch and output sizes: dict(YLEN, CVLEN, OPAD, NOUT_pad)."""
+    DV = DK
+    QK, VC = KH * DK, VH * DV
+    CONV = 2 * QK + VC
+    NIN = CONV + VC + 2 * VH
+    NIN_pad = -(-NIN // (BN1 * tiles)) * BN1 * tiles
+    NOUT_pad = -(-H // (BN2 * tiles)) * BN2 * tiles
+    workers = tiles * shaves
+    HPW = -(-VH // workers)
+    HPW += (-HPW) % (VH // KH)
+    OPAD = workers * HPW * DV
+    return dict(YLEN=max(NIN_pad, CONV + OPAD), CVLEN=max(CONV, 2 * QK + OPAD), OPAD=OPAD, NOUT_pad=NOUT_pad)
+
+
+def pack_gdn(win_int, win_scales, wout_int, wout_scales, tiles: int = 3, BN1: int = 128, BN2: int = 64):
+    """make_gdn_decode's weights from the in_proj rows (int4 values [NIN, H] in [-8, 7] with scales [NIN, H/G], rows
+    [q | k | v | z | b | a]) and the out_proj ([H, VC] with [H, VC/G]): zero-padded to the tile multiple, then chunk
+    blocks of BN1 / BN2 rows (`pack_chunk_blocks`)."""
+    import numpy as np
+
+    def padded(w, s, BN):
+        n_pad = -(-w.shape[0] // (BN * tiles)) * BN * tiles
+        wp = np.zeros((n_pad, w.shape[1]), np.int8)
+        sp = np.zeros((n_pad, s.shape[1]), np.float16)
+        wp[: w.shape[0]] = w
+        sp[: s.shape[0]] = s
+        return pack_chunk_blocks(wp, sp, BN)
+
+    return dict(WinP=padded(win_int, win_scales, BN1), WoutP=padded(wout_int, wout_scales, BN2))
+
+
+def gdn_reference(x, res, win_int, win_scales, wout_int, wout_scales, conv_w, a_log, dt_bias, g_norm, conv_state, ssm,
+                  KH: int, VH: int, DK: int, G: int, eps: float = 1e-6, details: bool = False):
+    """numpy oracle of make_gdn_decode (fp32; conv_state [3, CONV] and conv_w [4, CONV] time-major; returns out [H],
+    the new conv_state [3, CONV] and ssm [VH, DK, DV]; `details` adds a dict of the intermediates y, conv, on)."""
+    import numpy as np
+    DV = DK
+    QK, VC = KH * DK, VH * DV
+    CONV = 2 * QK + VC
+    xf = x.astype(np.float32).reshape(-1)
+    win = win_int.astype(np.float32) * np.repeat(win_scales.astype(np.float32), G, axis=1)
+    y = win @ xf
+    mixed, z = y[:CONV], y[CONV:CONV + VC]
+    b, a = y[CONV + VC:CONV + VC + VH], y[CONV + VC + VH:CONV + VC + 2 * VH]
+    cs = conv_state.astype(np.float32)                                     # [3, CONV] time-major, oldest first
+    seq = np.concatenate([cs, mixed[None, :]], axis=0)                      # [4, CONV]
+    conv = (seq * conv_w.astype(np.float32)).sum(axis=0)
+    conv = conv / (1 + np.exp(-conv))
+    new_cs = seq[1:].astype(np.float16)
+    q = conv[:QK].reshape(KH, DK)
+    k = conv[QK:2 * QK].reshape(KH, DK)
+    v = conv[2 * QK:].reshape(VH, DV)
+    q = q / np.sqrt((q * q).sum(-1, keepdims=True) + 1e-6) / np.sqrt(DK)
+    k = k / np.sqrt((k * k).sum(-1, keepdims=True) + 1e-6)
+    rep = VH // KH
+    q, k = np.repeat(q, rep, axis=0), np.repeat(k, rep, axis=0)
+    beta = 1 / (1 + np.exp(-b))
+    g = -np.exp(a_log.astype(np.float32).reshape(-1)) * np.logaddexp(0, a + dt_bias.astype(np.float32).reshape(-1))
+    S = ssm.astype(np.float32).copy()
+    o = np.zeros((VH, DV), np.float32)
+    for h in range(VH):
+        S[h] *= np.exp(g[h])
+        kvh = S[h].T @ k[h]
+        d = (v[h] - kvh) * beta[h]
+        S[h] += np.outer(k[h], d)
+        o[h] = S[h].T @ q[h]
+    zf = z.reshape(VH, DV)
+    on = o / np.sqrt((o * o).mean(-1, keepdims=True) + eps) * g_norm.astype(np.float32).reshape(-1) * (zf / (1 + np.exp(-zf)))
+    wout = wout_int.astype(np.float32) * np.repeat(wout_scales.astype(np.float32), G, axis=1)
+    out = res.astype(np.float32).reshape(-1) + wout @ on.reshape(-1)
+    if details:
+        return out, new_cs, S, dict(y=y, conv=conv, on=on.reshape(-1), g=g, beta=beta)
+    return out, new_cs, S
+
+
 def pack_int4(w_int: "np.ndarray") -> "np.ndarray":
     """[N, K] signed int4 values in [-8, 7] -> [N, K/2] bytes, low nibble first (the reference packer)."""
     import numpy as np

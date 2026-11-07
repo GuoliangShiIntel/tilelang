@@ -116,14 +116,16 @@ def test_ring_is_hoisted_over_an_enclosing_loop_its_fills_do_not_read():
 
 def test_vectorized_loops_lower_to_shave_vector_ops():
     # T.vectorized(32) over fp16 -> half32 (VAU.EXP through tl_npu_hexp), T.vectorized(16) over fp32 -> float16;
-    # broadcasts splat, fp16 -> fp32 lane casts are __builtin_convertvector; no per-kernel emitter involved.
+    # broadcasts splat, fp16 -> fp32 lane casts are __builtin_convertvector; no per-kernel emitter involved. The
+    # one-vector lane accumulators (mx, ls) are vector register variables, not CMX buffers.
     src = _lower(make_flash_attention_phase(NUMQ, NUMKV, D=D, BQ=BQ, BKV=BKV, tiles=TILES, vectorized=True)).source
-    assert re.search(r"\*\(half32\*\)\(mx \+ 0\) = max\(\*\(half32\*\)\(mx \+ 0\), \*\(half32\*\)\(s_cmx \+ ", src)
+    assert "half32 mx = {};  // local, one vector: a register" in src
+    assert re.search(r"mx = max\(mx, \*\(half32\*\)\(s_cmx \+ ", src)
     assert "= tl_npu_hexp(((*(half32*)(s_cmx + " in src and "((half32)(" in src
-    assert "__builtin_convertvector(*(half16*)(s_cmx + " in src and ", float16)" in src
+    assert "ls = (ls + __builtin_convertvector(*(half16*)(s_cmx + " in src and ", float16)" in src
     assert re.search(r"\*\(float16\*\)\(o_acc \+ .*\) = \(\(\*\(float16\*\)\(o_acc \+ .*\) \* \(\(float16\)\(corr\[", src)
     scalar = _lower(make_flash_attention_phase(NUMQ, NUMKV, D=D, BQ=BQ, BKV=BKV, tiles=TILES)).source
-    assert "half32" not in scalar and "float16" not in scalar
+    assert "*(half32*)" not in scalar and "*(float16*)" not in scalar   # no vector accesses (the unused lane buffers are still declared)
 
 
 @needs_cxx

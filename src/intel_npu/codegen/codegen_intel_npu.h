@@ -33,6 +33,8 @@ public:
   void VisitStmt_(const ForNode *op) final;
   void VisitStmt_(const AllocBufferNode *op) final;
   void VisitStmt_(const BindNode *op) final;
+  void VisitStmt_(const BufferStoreNode *op) final;
+  void VisitExpr_(const BufferLoadNode *op, std::ostream &os) final;
   void VisitExpr_(const CallNode *op, std::ostream &os) final;
   void VisitExpr_(const BroadcastNode *op, std::ostream &os) final;
   void VisitExpr_(const CastNode *op, std::ostream &os) final;
@@ -52,6 +54,12 @@ private:
   int kernel_count_{0};
   // Base of the three rotating hardware barrier ids sync_grid uses; -1 = software rendezvous.
   int64_t sync_barrier_base_{-1};
+  int64_t qg_part_elems_{0}, qg_st_elems_{0};   // merged-FC scratch of the largest gemm_i4/i8 shape
+  // SHAVE-local buffers of exactly one vector (half8/16/32, float4/8/16) are C++ vector variables, so a lane
+  // accumulator lives in a register: moviCompile keeps a CMX buffer in CMX and reloads it after every store
+  // (the GDN scan spent 60% of its cycles in NOPs around such round trips, M4).
+  std::unordered_map<const VarNode *, int> register_lanes_;
+  bool IsRegisterBuffer(const VarNode *v) const { return register_lanes_.count(v) != 0; }
 };
 
 } // namespace codegen

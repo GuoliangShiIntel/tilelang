@@ -310,6 +310,29 @@ public:
     dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), reinterpret_cast<const half *>(s), M, N, K, G, 8,
                   sStride);
   }
+  // The merged-FC scratch (part [M x ng, C] fp16, sT [ng, N] fp16, one descriptor set and weight table) for the
+  // largest quantised GEMV shape of the kernel: codegen emits the call from the kernel's gemm_i4/i8 ops, so the
+  // CMX budget is exact and the first workload pays no allocation; a larger later shape re-sizes (the old buffers
+  // are left behind, which is the case the up-front reservation avoids).
+  void reserve_qg(std::uint32_t partElems, std::uint32_t stElems) {
+    if (!ok_)
+      return;
+    if (partElems > i4PartElems_) {
+      i4PartElems_ = partElems;
+      i4Part_ = alloc<half>(i4PartElems_);
+    }
+    if (stElems > i4STElems_) {
+      i4STElems_ = stElems;
+      i4ST_ = alloc<half>(i4STElems_);
+    }
+    if (i4Desc_ == nullptr && ok_) {
+      i4Desc_ = alloc_hw<DpuMatMul::DescriptorsBuffer>(1);
+      i4Wt_ = alloc<std::uint32_t>(4 * kMaxDpuN);
+      if (!ok_)
+        return;
+      i4Mm_ = new (i4Store_) DpuMatMul(env_.getDpuDrv(), i4Desc_, i4Wt_);
+    }
+  }
   void dpu_matmul_qg(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t bits, std::uint32_t sStride) {
     if (!ok_)
@@ -319,20 +342,10 @@ public:
       fail(kStatusUnsupported, C);
       return;
     }
-    if (i4Part_ == nullptr) {
-      i4PartElems_ = M * ng * C;
-      i4STElems_ = ng * N;
-      i4Part_ = alloc<half>(i4PartElems_);
-      i4ST_ = alloc<half>(i4STElems_);
-      i4Desc_ = alloc_hw<DpuMatMul::DescriptorsBuffer>(1);
-      i4Wt_ = alloc<std::uint32_t>(4 * kMaxDpuN);
-      if (!ok_)
-        return;
-      i4Mm_ = new (i4Store_) DpuMatMul(env_.getDpuDrv(), i4Desc_, i4Wt_);
-    } else if (M * ng * C > i4PartElems_ || ng * N > i4STElems_) {
-      fail(kStatusUnsupported, M * ng * C);
+    if (i4Part_ == nullptr || M * ng * C > i4PartElems_ || ng * N > i4STElems_)
+      reserve_qg(M * ng * C, ng * N);
+    if (!ok_)
       return;
-    }
     const float partScale = bits == 8 ? kI8PartScale : kI4PartScale;
     const std::uint64_t key = (static_cast<std::uint64_t>(M) << 40) | (static_cast<std::uint64_t>(N) << 20) |
                               (static_cast<std::uint64_t>(K) << 8) | ((G >> 4) << 1) | (bits == 8);
