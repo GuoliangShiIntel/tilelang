@@ -389,6 +389,18 @@ interop; a Python `nl.*`-compatible shim.
    implied by the 22.73 TOPS basis (2048 MAC/cycle x 1.85 GHz x 3 tiles). Is 2048 MAC/cycle the fp16 x fp16
    rate on NPU5, or the int8 (or fp16 x int8 mixed) rate, with fp16 x fp16 at half? The answer sets the
    honest peak basis for every TOPS percentage in this plan.
+   **Narrowed 2026-11-06 by a same-day A/B against npu_dsl** (`<user>`: "we must not be slower than
+   npu_dsl"). `device/run_dpu_rate_compare.py` reimplements npu_dsl's `dpu_rate_probe` method (one SHAVE,
+   start/wait, median `idu_workload_duration`) and the npu_dsl probe **binary itself** (built Nov 2,
+   `kernels_poc/dpu_rate_probe/build/Release/test_dpu_rate_probe.exe`) was run unchanged on the same
+   shapes: both give **64 ticks = 46.9%** of 2048 x 2.0454 GHz for fp16 64x64x1600 with 8_8 x=8, **30.7%**
+   at x=4, **36.0%** for 32x192 4_16, where npu_dsl's table (Oct, `evidence/e7_21/stencil_table_validated.txt`)
+   recorded **100.1% / 77.7%** for the same arms. Operand data (zeros vs random) and the ODU nthw make no
+   difference. So the backend is not slower than npu_dsl; **the box's DPU is ~2.1x slower per workload today
+   than when that table was taken**, which also explains the VPUNN ratio of ~1.6 and every TOPS percentage
+   here. Question for `<user>`: what changed on the box since early October (NPU driver/firmware, Windows
+   power plan, DVFS cap, thermal)? Until it is answered, percentages are quoted against the measured
+   same-day probe, not against the October table.
 
 ## 8. Log
 

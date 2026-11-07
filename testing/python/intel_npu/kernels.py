@@ -126,6 +126,77 @@ def make_ring_flow_swapped(M: int, N: int, K: int, BM: int = 256, BN: int = 32, 
     return ring_flow_swapped
 
 
+def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32, BKV: int = 128, tiles: int = 3,
+                               shaves: int = 2, num_stages: int = 2):
+    """One attention phase of a megakernel, written in the flow's form (plan 3b, README 1-3):
+    the tile's Q block is resident (SEGMENTED), K and V^T stream through the ring (DUPLICATED),
+    chunk c -> SHAVE c % 2 keeps its own online-softmax partials (m, l, O) over its chunks, and
+    the two partials are merged per tile at the end (flash-decoding's split-KV combine). Used
+    first as a probe of what the passes refuse (plan section 8), then as the Phase 4 target."""
+    assert numQ == BQ * tiles and numKv % BKV == 0
+    NKV = numKv // BKV
+    scale = 1.0 / (D ** 0.5)
+
+    @T.prim_func
+    def flash(Q: T.Tensor((numQ, D), T.float16), K: T.Tensor((numKv, D), T.float16),
+              Vt: T.Tensor((D, numKv), T.float16), O: T.Tensor((numQ, D), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            q_cmx = T.alloc_shared((BQ, D), T.float16)
+            k_cmx = T.alloc_shared((BKV, D), T.float16)
+            v_cmx = T.alloc_shared((D, BKV), T.float16)
+            s_cmx = T.alloc_local((BQ, BKV), T.float16)
+            pv_cmx = T.alloc_local((BQ, D), T.float16)
+            o_acc = T.alloc_local((BQ, D), T.float16)
+            m_i = T.alloc_local((BQ,), T.float16)
+            l_i = T.alloc_local((BQ,), T.float16)
+            m_new = T.alloc_local((BQ,), T.float16)
+            corr = T.alloc_local((BQ,), T.float16)
+            part = T.alloc_shared((shaves, BQ, D + 2), T.float16)  # per-SHAVE (O, m, l) for the merge
+            T.copy(Q[tile * BQ, 0], q_cmx)
+            # T.fill is a Phase 4 tile op (refused today); the scalar loops lower
+            for i, d in T.grid(BQ, D):
+                o_acc[i, d] = T.float16(0)
+            for i in T.serial(BQ):
+                m_i[i] = T.float16(-65504.0)
+                l_i[i] = T.float16(0)
+            for kv in T.Pipelined(NKV, num_stages=num_stages):
+                T.copy(K[kv * BKV, 0], k_cmx)
+                T.copy(Vt[0, kv * BKV], v_cmx)
+                T.gemm(q_cmx, k_cmx, s_cmx, transpose_B=True, clear_accum=True)
+                # online softmax on the SHAVE: m_new = max(m_i, rowmax(S)); P = exp(S*scale - m_new); l = l*corr + rowsum(P)
+                for i in T.serial(BQ):
+                    m_new[i] = m_i[i]
+                    for j in T.serial(BKV):
+                        m_new[i] = T.max(m_new[i], s_cmx[i, j] * scale)
+                    corr[i] = T.exp(m_i[i] - m_new[i])
+                    l_i[i] = l_i[i] * corr[i]
+                    for j in T.serial(BKV):
+                        s_cmx[i, j] = T.exp(s_cmx[i, j] * scale - m_new[i])
+                        l_i[i] = l_i[i] + s_cmx[i, j]
+                    m_i[i] = m_new[i]
+                T.gemm(s_cmx, v_cmx, pv_cmx, transpose_B=True, clear_accum=True)
+                for i, d in T.grid(BQ, D):
+                    o_acc[i, d] = o_acc[i, d] * corr[i] + pv_cmx[i, d]
+            # merge the two SHAVEs' partials in the tile, SHAVE 0 writes the block
+            for i, d in T.grid(BQ, D):
+                part[shave, i, d] = o_acc[i, d]
+            for i in T.serial(BQ):
+                part[shave, i, D] = m_i[i]
+                part[shave, i, D + 1] = l_i[i]
+            T.sync_threads()
+            if shave == 0:
+                for i in T.serial(BQ):
+                    m_new[i] = T.max(part[0, i, D], part[1, i, D])
+                    corr[i] = T.exp(part[0, i, D] - m_new[i])
+                    l_i[i] = T.exp(part[1, i, D] - m_new[i])
+                    for d in T.serial(D):
+                        o_acc[i, d] = (part[0, i, d] * corr[i] + part[1, i, d] * l_i[i]) / (part[0, i, D + 1] * corr[i] + part[1, i, D + 1] * l_i[i])
+                T.copy(o_acc, O[tile * BQ, 0])
+
+    return flash
+
+
 def make_gemm_two_phase(M: int, N: int, K: int, BM: int = 64, BN: int = 64, tiles: int = 2, shaves: int = 2,
                         with_sync: bool = True):
     """Megakernel shape: split-K partial products -> T.sync_grid() -> combine, one launch.
