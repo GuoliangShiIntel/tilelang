@@ -37,6 +37,8 @@ enum : std::uint32_t {
   kStatusUnsupported = 4,
   kStatusBarrierNotLive = 5, // detail: barrier id whose config never went live
   kStatusBarrierTimeout = 6, // detail: barrier id whose count never reached zero
+  kStatusRingRefused = 7,    // detail: reason code (ring_* below)
+  kStatusOrderTimeout = 8,   // detail: the DPU submission-order word waited for
 };
 
 template <class T> struct Ddr;
@@ -110,6 +112,18 @@ public:
     }
     return reinterpret_cast<T *>(base + bytes * shave_);
   }
+  // Tile-shared CMX: one allocation, the same address on every SHAVE of the tile
+  // (identical allocation sequences) and the same offset on every tile, which is
+  // what a multicast fill needs.
+  template <class T> T *alloc_shared(std::uint32_t count) {
+    const std::uint32_t bytes = alignUp(count * sizeof(T), kAlign);
+    auto *base = cmx_.alloc<kAlign>(bytes);
+    if (base == nullptr) {
+      fail(kStatusCmxExhausted, bytes);
+      return nullptr;
+    }
+    return reinterpret_cast<T *>(base);
+  }
 
   void dma_load(void *dst, Ddr<void> src, std::uint32_t width, std::uint32_t rows,
                 std::uint32_t dstStride, std::uint32_t srcStride) {
@@ -133,45 +147,188 @@ public:
   void dpu_matmul(half *out, const half *a, const half *bt, std::uint32_t M,
                   std::uint32_t N, std::uint32_t K, std::uint32_t spatialX = 0,
                   std::int32_t mpe = -1) {
-    if (!ok_)
+    if (!dpu_prepare(M, N, K, spatialX, mpe))
       return;
-    if (N > kMaxDpuN) {
-      fail(kStatusUnsupported, N);
-      return;
-    }
-    if (spatialX != 0 && M % spatialX != 0) {
-      fail(kStatusBadParams, spatialX);
-      return;
-    }
-    if (mpe < -1 || mpe > 2) {
-      fail(kStatusBadParams, static_cast<std::uint32_t>(mpe));
-      return;
-    }
-    const std::uint64_t key = (static_cast<std::uint64_t>(M) << 40) |
-                              (static_cast<std::uint64_t>(N) << 20) | K;
-    const std::uint32_t shapeKey = (spatialX << 8) | static_cast<std::uint32_t>(mpe + 1);
-    if (key != mmKey_ || shapeKey != mmShapeKey_) {
-      mm_->init(M, N, K);
-      if (spatialX != 0)
-        mm_->setSpatial(M, spatialX);
-      if (mpe >= 0) {
-        // No static tables: a function-local static array misreads on the SHAVE.
-        const std::uint32_t nthwNtk = mpe == 0 ? 1u : (mpe == 1 ? 0u : 3u);
-        const std::uint32_t oduNthw = mpe == 0 ? 1u : (mpe == 1 ? 2u : 3u);
-        mm_->setStencil(nthwNtk, oduNthw);
-      }
-      mmKey_ = key;
-      mmShapeKey_ = shapeKey;
-    }
+    // No barriers on a synchronous workload (a ring use may have set them).
+    mm_->setConsumerBarriers(0, 0);
+    mm_->setProducerBarriers(0, 0);
     mm_->run(out, const_cast<half *>(a), const_cast<half *>(bt));
-    // DPU hardware profile of the workload just completed. The duration fields
-    // sit before the odu_workload_id watermark wait() spins on, so they are
-    // committed; the timestamps after it may still be in flight and are not read.
-    // Durations count 19.2 MHz perf-clock ticks on this box (npu_dsl SS690.2).
-    volatile const DpuMatMul::DescriptorsBuffer *d = dpuDesc_;
-    dpuCount_ += 1;
-    dpuIduTicks_ += d->hwpStats.idu_workload_duration;
-    dpuOduTicks_ += d->hwpStats.odu_workload_duration;
+    dpu_account();
+  }
+
+  // ---- Streamed ping-pong ring (plan Phase 3b; the flow of
+  // docs/examples/pingpong_multitile/README.md sections 1-3 and 6c) ----
+  //
+  // One operand streams through `slots` CMX slots shared by the tile's SHAVEs;
+  // chunk c lives in slot c % slots and is the work of SHAVE c % spt (slots ==
+  // spt). Tile 0's SHAVE s fills slot s for every tile with ONE multicast DMA,
+  // split in two halves on ports 0 and 1. Per (slot, use parity) two hardware
+  // barriers: READY (the two halves produce, every tile's DPU workload consumes)
+  // and FREE (every tile's DPU workload produces, the issuer consumes before it
+  // refills). The next fill is kicked when FREE lifts (one outstanding DMA job
+  // per SHAVE per link agent on NPU5: a held job would block the other slot's
+  // fill). Barrier ids alternate by use parity so a config is never more than
+  // one deep in the barrier FIFO and "consumer count != 0" means "this use's
+  // config is live". The tile's two SHAVEs submit to the one DPU FIFO in chunk
+  // order through two CMX order words (the FIFO runs in submission order and
+  // every fill waits for the slowest tile).
+  struct Ring {
+    std::uint8_t *slotBase;   // shared: slots x slotBytes, same offset on every tile
+    std::uint32_t slotBytes;
+    std::uint32_t slots;
+    std::uint32_t total;      // chunks streamed in this ring
+    std::uint32_t myUses;     // chunks of this SHAVE's slot
+    std::uint32_t readyBase;  // READY id = readyBase + slot * 2 + parity
+    std::uint32_t freeBase;   // FREE id  = freeBase  + slot * 2 + parity
+    volatile std::uint32_t *order; // shared: one word per SHAVE, uses submitted
+    DmaDescriptor *fill;      // issuer's two half descriptors
+    bool armed;
+  };
+  enum : std::uint32_t {
+    kRingSlotsNeShaves = 1,
+    kRingOneTile = 2,
+    kRingBarrierPool = 3,
+  };
+
+  std::uint32_t ring_ready(const Ring &r, std::uint32_t use) const {
+    return r.readyBase + shave_ * 2 + (use & 1u);
+  }
+  std::uint32_t ring_free(const Ring &r, std::uint32_t use) const {
+    return r.freeBase + shave_ * 2 + (use & 1u);
+  }
+  std::uint8_t *ring_slot(const Ring &r) const { return r.slotBase + shave_ * r.slotBytes; }
+  std::uint32_t ring_uses(const Ring &r) const { return r.myUses; }
+  std::uint32_t ring_chunk(std::uint32_t use) const { return use * spt_ + shave_; }
+
+  // Allocates the slots and the order words (shared) and the issuer's fill
+  // descriptors; arms the first use's barriers on tile 0; one grid rendezvous so
+  // every config is live before any gate. `readyBase`/`freeBase` come from the
+  // compiler's barrier assignment (2 x slots ids each).
+  Ring ring_begin(std::uint32_t slotBytes, std::uint32_t slots, std::uint32_t total,
+                  std::uint32_t readyBase, std::uint32_t freeBase) {
+    Ring r{};
+    r.slotBytes = alignUp(slotBytes, kAlign);
+    r.slots = slots;
+    r.total = total;
+    r.readyBase = readyBase;
+    r.freeBase = freeBase;
+    if (!ok_)
+      return r;
+    if (static_cast<std::int32_t>(slots) != spt_) {
+      fail(kStatusRingRefused, kRingSlotsNeShaves);
+      return r;
+    }
+    if (tiles_ < 2) {
+      fail(kStatusRingRefused, kRingOneTile);
+      return r;
+    }
+    r.slotBase = alloc_shared<std::uint8_t>(r.slotBytes * slots);
+    r.order = alloc_shared<std::uint32_t>(16); // 64 B: one line, two words used
+    r.fill = alloc_hw<DmaDescriptor>(2);
+    if (!ok_)
+      return r;
+    r.myUses = total > static_cast<std::uint32_t>(shave_)
+                   ? (total - shave_ + spt_ - 1) / spt_
+                   : 0;
+    if (shave_ == 0) {
+      for (std::int32_t s = 0; s < spt_; ++s)
+        r.order[s] = 0;
+      flushCmxWrites();
+    }
+    if (tile_ == 0 && r.myUses > 0) {
+      const std::uint8_t nt = static_cast<std::uint8_t>(tiles_);
+      barrier_config(ring_ready(r, 0), 2, nt, false);
+      barrier_config(ring_free(r, 0), nt, 1, false);
+      if (!barrier_check_live(ring_ready(r, 0), 2, nt) || !barrier_check_live(ring_free(r, 0), nt, 1))
+        return r;
+    }
+    sync_grid();
+    r.armed = ok_;
+    return r;
+  }
+
+  // Issuer (tile 0, SHAVE s): fill my slot with chunk `use * spt + s` from `src`
+  // (contiguous bytes), two halves on ports 0 and 1, both producing READY[use].
+  // For use > 0 it first waits until every tile's DPU has produced FREE[use-1].
+  void ring_fill(Ring &r, std::uint32_t use, std::uint64_t src, std::uint32_t bytes) {
+    if (!ok_ || tile_ != 0 || use >= r.myUses)
+      return;
+    if (use > 0) {
+      const std::uint32_t freeId = ring_free(r, use - 1);
+      if (!barrier_wait_produced(freeId))
+        return;
+      barrier_consume(freeId);
+      // The previous halves have completed (READY lifted); the chains still need the wait.
+      dma_.wait(r.fill);
+      dma_.wait(r.fill + 1);
+    }
+    const std::uint32_t mask = (1u << tiles_) - 1u;
+    const std::uint32_t half0 = bytes / 2;
+    std::uint8_t *dst = ring_slot(r);
+    const std::uint32_t ready = ring_ready(r, use);
+    DmaDrv::initDesc(r.fill);
+    DmaDrv::initDesc(r.fill + 1);
+    configDmaCopy(r.fill, reinterpret_cast<std::uint32_t>(convertToCmxMulticastAddr(dst, mask)), src, half0);
+    configDmaCopy(r.fill + 1, reinterpret_cast<std::uint32_t>(convertToCmxMulticastAddr(dst + half0, mask)),
+                  src + half0, bytes - half0);
+    DmaDrv::setProducerBarrier(r.fill, ready);
+    DmaDrv::setProducerBarrier(r.fill + 1, ready);
+    DmaDrv::setConsumerBarriers(r.fill, 0, 0);
+    DmaDrv::setConsumerBarriers(r.fill + 1, 0, 0);
+    dma_.start(r.fill, 0);
+    dma_.start(r.fill + 1, 1);
+  }
+
+  // Every SHAVE: submit the DPU workload of my `use`, gated on READY[use] (in
+  // hardware, so it may be queued before the chunk has landed) and producing
+  // FREE[use], in chunk order after the other SHAVE's previous chunk; then the
+  // issuer pushes the next use's configs. The caller submits use u+1 right after
+  // use u completes (submit-ahead, README 6c fact 3), before its FREE wait, fill
+  // kick and store, so the DPU FIFO never drains while a SHAVE does its own work;
+  // that needs the output buffer double-buffered by use parity.
+  void ring_dpu_submit(Ring &r, std::uint32_t use, half *out, const half *a, const half *bt,
+                       std::uint32_t M, std::uint32_t N, std::uint32_t K,
+                       std::uint32_t spatialX = 0, std::int32_t mpe = -1) {
+    if (!ok_ || !r.armed || use >= r.myUses)
+      return;
+    const std::uint32_t ready = ring_ready(r, use), freeId = ring_free(r, use);
+    if (!barrier_wait_live(ready) || !barrier_wait_live(freeId))
+      return;
+    // Submission order P0(u), P1(u), P0(u+1), ...: SHAVE 0 needs SHAVE 1 at `use`
+    // submissions, SHAVE 1 needs SHAVE 0 at `use + 1`.
+    const std::uint32_t prev = (shave_ + spt_ - 1) % spt_;
+    if (!order_wait(r.order + prev, shave_ == 0 ? use : use + 1))
+      return;
+    if (!dpu_prepare(M, N, K, spatialX, mpe))
+      return;
+    mm_->setConsumerBarrier(ready);
+    mm_->setProducerBarrier(freeId);
+    mm_->start(out, const_cast<half *>(a), const_cast<half *>(bt));
+    r.order[shave_] = use + 1;
+    flushCmxWrites();
+    if (tile_ == 0 && use + 1 < r.myUses) {
+      const std::uint8_t nt = static_cast<std::uint8_t>(tiles_);
+      barrier_config(ring_ready(r, use + 1), 2, nt, false);
+      barrier_config(ring_free(r, use + 1), nt, 1, false);
+    }
+  }
+  void ring_dpu_wait(Ring &r, std::uint32_t use) {
+    if (!ok_ || !r.armed || use >= r.myUses)
+      return;
+    mm_->wait();
+    dpu_account();
+  }
+
+  // Issuer: the last fills must be retired on their chains before the kernel ends.
+  void ring_end(Ring &r) {
+    if (!ok_ || tile_ != 0 || r.myUses == 0)
+      return;
+    dma_.wait(r.fill);
+    dma_.wait(r.fill + 1);
+    // Clear the barriers' consumer side of the last FREE so the id is quiescent.
+    const std::uint32_t freeId = ring_free(r, r.myUses - 1);
+    if (barrier_wait_produced(freeId))
+      barrier_consume(freeId);
   }
 
   // Barriers. DMA is synchronous in Phase 1-2, so only SHAVE-side writes need
@@ -207,12 +364,16 @@ public:
       return true;
     return barrier_check_live(id, producers, consumers);
   }
-  // True when the barrier's live counters equal the expected config.
-  bool barrier_check_live(std::uint32_t id, std::uint8_t producers, std::uint8_t consumers) {
+  // True once the barrier's config is live. Only the consumer side is checked: a
+  // dead barrier reads (0, 0), while a fast peer may already have PRODUCED on a
+  // live one before a slow peer looks (seen under profiling skew: an exact
+  // (p, c) check spun out and reported NOT_LIVE on a healthy barrier). Nobody
+  // consumes before every producer has arrived, so c stays at its armed value.
+  bool barrier_check_live(std::uint32_t id, std::uint8_t /*producers*/, std::uint8_t consumers) {
     std::uint8_t p = 0, c = 0;
     for (std::uint32_t spins = 0; spins < kConfigSpinLimit; ++spins) {
       hw::nce::barriers::hgl::getCounters(id, &p, &c);
-      if (p == producers && c == consumers)
+      if (c == consumers)
         return true;
     }
     fail(kStatusBarrierNotLive, id);
@@ -240,6 +401,19 @@ public:
         return true;
     }
     fail(kStatusBarrierTimeout, id);
+    return false;
+  }
+  // A config is live once its consumer count is non-zero (a dead barrier reads
+  // (0, 0)); the exact counts are not checked because producers may already have
+  // arrived.
+  bool barrier_wait_live(std::uint32_t id) {
+    std::uint8_t p = 0, c = 0;
+    for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
+      hw::nce::barriers::hgl::getCounters(id, &p, &c);
+      if (c != 0)
+        return true;
+    }
+    fail(kStatusBarrierNotLive, id);
     return false;
   }
 
@@ -312,6 +486,62 @@ private:
       code_ = code;
       detail_ = detail;
     }
+  }
+
+  bool order_wait(volatile std::uint32_t *word, std::uint32_t need) {
+    for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
+      if (*word >= need)
+        return true;
+    }
+    fail(kStatusOrderTimeout, need);
+    return false;
+  }
+
+  // Programs the one DPU descriptor for this workload shape (cached by shape).
+  bool dpu_prepare(std::uint32_t M, std::uint32_t N, std::uint32_t K, std::uint32_t spatialX,
+                   std::int32_t mpe) {
+    if (!ok_)
+      return false;
+    if (N > kMaxDpuN) {
+      fail(kStatusUnsupported, N);
+      return false;
+    }
+    if (spatialX != 0 && M % spatialX != 0) {
+      fail(kStatusBadParams, spatialX);
+      return false;
+    }
+    if (mpe < -1 || mpe > 2) {
+      fail(kStatusBadParams, static_cast<std::uint32_t>(mpe));
+      return false;
+    }
+    const std::uint64_t key = (static_cast<std::uint64_t>(M) << 40) |
+                              (static_cast<std::uint64_t>(N) << 20) | K;
+    const std::uint32_t shapeKey = (spatialX << 8) | static_cast<std::uint32_t>(mpe + 1);
+    if (key != mmKey_ || shapeKey != mmShapeKey_) {
+      mm_->init(M, N, K);
+      if (spatialX != 0)
+        mm_->setSpatial(M, spatialX);
+      if (mpe >= 0) {
+        // No static tables: a function-local static array misreads on the SHAVE.
+        const std::uint32_t nthwNtk = mpe == 0 ? 1u : (mpe == 1 ? 0u : 3u);
+        const std::uint32_t oduNthw = mpe == 0 ? 1u : (mpe == 1 ? 2u : 3u);
+        mm_->setStencil(nthwNtk, oduNthw);
+      }
+      mmKey_ = key;
+      mmShapeKey_ = shapeKey;
+    }
+    return true;
+  }
+
+  // DPU hardware profile of the workload just completed. The duration fields
+  // sit before the odu_workload_id watermark wait() spins on, so they are
+  // committed; the timestamps after it may still be in flight and are not read.
+  // Durations count 19.2 MHz perf-clock ticks on this box (npu_dsl SS690.2).
+  void dpu_account() {
+    volatile const DpuMatMul::DescriptorsBuffer *d = dpuDesc_;
+    dpuCount_ += 1;
+    dpuIduTicks_ += d->hwpStats.idu_workload_duration;
+    dpuOduTicks_ += d->hwpStats.odu_workload_duration;
   }
 
   // Hardware descriptors avoid the trap window; every SHAVE of the tile makes

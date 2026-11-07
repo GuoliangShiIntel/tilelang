@@ -238,6 +238,34 @@ that choice instead of guessing it.
 Decided by `<user>` 2026-11-06: (a) VPUNN through its Python binding, not linked into `tvm_compiler.dll`;
 (b) cost decisions live in Python-level passes, C++ is reserved for lowering and codegen.
 
+**3b pass order and barrier budget (agreed with `<user>` 2026-11-06).** Only decisions that change a
+workload's (M, N, K) run before `PlanWorkloads`; it runs last and reads the final shape. In a DSL where the
+author writes the loop order, which operand is split and which is broadcast is *derived* from the source
+(a fill whose DDR address depends on the tile variable is SEGMENTED, otherwise DUPLICATED; README section 3
+"nothing is named"), so `PlanDistribution` derives and refuses, and the cost model's role there is advisory
+(the notes say what the swapped roles would cost). The shape search (`TileGemm`: BM, BN, stages, tiles) is a
+VPUNN-pruned search over the kernel factory's parameters **before lowering**, where TileLang's autotuner
+sits, not an IR rewrite. Every candidate's DPU cost is `plan_gemm(M, N, K)` (the cost at the best stencil),
+so the passes cannot disagree.
+
+```
+[Python, pre-lower]  TileGemm: VPUNN-pruned search over (BM, BN, stages, tiles)        <- changes shapes
+[IR] LowerTileOp -> PlanDistribution (derive SEGMENTED/DUPLICATED, refuse unicast of an invariant source)
+     -> LowerPipelined (slots, ports, READY/FREE) -> DeriveGlobalSync -> VerifyUniformSync
+     -> PlanWorkloads (final shape -> cuboid, x)                                           <- last cost pass
+     -> AssignBarriers -> BarrierSimulation -> CheckBudgets -> ... -> codegen
+```
+
+Barriers: the job owns `[8, 16 x tiles)`; `sync_grid` takes 3 rotating ids however many syncs are derived;
+one ping-pong ring takes READY/FREE x 2 slots x 2 parities = **8**. So 3 tiles: 40 - 3 = 37, up to 4 rings;
+2 tiles: 21, 2 rings; **1 tile: 5 < 8, the hardware ring is refused by name** (no multicast on one tile
+anyway). `AssignBarriers` becomes the one owner of the pool (the 3 sync ids move from codegen's
+`pool_end - 3` into it), hands ids to codegen as IR annotations, and refuses when the pool runs out, saying
+by how much. The two users never share an id; id reuse across phases separated by a `sync_grid` (VPUX's
+graph colouring) is deferred until a kernel needs it. Build order: **A** runtime `Ring` + a hand-written
+kernel verified on the device, **B** the passes emit the same program from the DSL, **C** `check_flow_trace`
++ TOPS.
+
 ## 4. Phases
 
 Each phase has an executable acceptance. A phase closes only when its acceptance **has been seen to
@@ -344,6 +372,28 @@ interop; a Python `nl.*`-compatible shim.
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-06: **Phase 3b step A: the ping-pong ring runs on the device from the runtime.** `npu::Ctx`
+  gained `alloc_shared` (one tile-shared allocation, same offset on every tile), `dpu_prepare` /
+  async DPU with barrier setters, and `Ring`: `ring_begin` (slots = SHAVEs, order words, first-use
+  configs on tile 0, one grid rendezvous), `ring_fill` (issuer = tile 0's SHAVE s for slot s: wait
+  FREE[use-1], retire the previous halves, kick two multicast halves on ports 0 and 1 producing
+  READY[use]), `ring_dpu_submit` (live checks, submission order through the order words, DPU gated on
+  READY and producing FREE, next use's configs pushed by the issuer), `ring_dpu_wait`, `ring_end`.
+  Barrier ids alternate by use parity (README 6c fact 4); the next fill is kicked at FREE, not
+  pre-queued (6e, one outstanding job per SHAVE per link agent); submit-ahead with a parity
+  double-buffered output (6c fact 3). Hand kernel `device/probes/ring_flow_hand.cpp` in the shape the
+  compiler will emit: 3 tiles, W split by tile and resident (each SHAVE loads half the rows, then
+  `sync_tile`), X streamed. **Golden PASS on the device** (rel 2.9e-4 at 2048x768x2048; perturbed W
+  FAILs; profiled run PASS with a trace). Two findings: (1) **a latent Phase 3a race**: `hw_sync_grid`
+  checked liveness with exact (p, c) counts, and under profiling skew a fast SHAVE produced before a
+  slow one looked, which then reported NOT_LIVE on a healthy barrier (all six SHAVEs failed on id 45);
+  liveness is now the consumer count alone, since nobody consumes before every producer arrived.
+  (2) **The window rule is real** (README Round 774): at BM=32, BN=256, K=1024 (5.2 us DPU per
+  workload) the FREE -> fill -> READY chain does not fit one workload and the DPU sits at ~70% of the
+  kernel; at K=2048 (10.9 us) it is ~94%: 0.944 ms host wall incl. submit for 6.44 GFLOP, DPU IDU
+  696 us per tile. Submit-ahead alone was worth 5%. Choosing K per chunk so that D >= chain is
+  TileGemm's job (section 3.2), with VPUNN's DPU and DMA costs. Timing caveat: host wall includes
+  ~0.2 ms of submit; a kernel-only stamp is step C's work before any TOPS claim.
 * 2026-11-06: **`PlanIntelNpuWorkloads` landed (section 3 item 6b), the first cost-driven pass.** A Python
   `prim_func_pass` after the sync passes: for every `intel_npu_dpu_matmul` call still at the runtime
   defaults it ranks (cuboid, spatial x | M, x <= 64) with `vpunn.GemmCost.best_stencil` and writes the
