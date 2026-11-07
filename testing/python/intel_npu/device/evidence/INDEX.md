@@ -16,6 +16,7 @@ the `.cpp`) and the `gc_dsl_barrier` commit it was built against.
 | 2026-11-06 | 3a | `tl_dead_barrier_sync` (hand-written) | sync_grid armed on dead ids 0-2 | 2 x 2 | negative control: every SHAVE reports `BARRIER_NOT_LIVE id 0` in 0.4 s, no hang | n/a | - | - | `daf6c05` |
 | 2026-11-06 | 3a | `tl_gemm_two_phase` (`c954a8d995f2`, hw sync ids 29-31) | as Phase 2 | 2 x 2 | PASS rel 5.67e-4 | 0.454 ms | - | - | `daf6c05` |
 | 2026-11-06 | 3b-0 | `tl_dpucal_<shape>_x<X>_m<mpe+1>_r<R>_k` (80 kernels; e.g. `..._64x64x512_x8_m2_r401_k` `8d7776157209`) | VPUNN calibration: DPU repeat probe, 4 tile shapes x 10 (spatial, MPE) configs | 1 x 2 | all 80 golden PASS | DPU IDU time per workload from the HWP counters (19.2 MHz ticks): default 1.564 us vs best 1.001 us at 64x64x512; VPUNN pick within 0.0-2.8% of best on every shape; IDU / VPUNN@1950 median 1.58 | `vpunn_calibration.json` (not a timeline trace) | - | `daf6c05` |
+| 2026-11-06 | 3b | `tl_gemm_f16` (`0039c507d6e3`, workloads planned by VPUNN: CUBOID_8x16 x=16) and `tl_gemm_two_phase` | Phase 1 GEMM and Phase 2 two-phase with `PlanIntelNpuWorkloads` on by default | 2 x 2 | PASS rel 3.24e-4; PASS rel 5.67e-4 | 0.225 ms / 0.452 ms (incl. submit; launch-dominated at this shape, the DPU gain is in the 3b-0 row) | - | - | `daf6c05` |
 
 Negative controls, Phase 2: `run_two_phase_device.py --nosync` (same kernel without the barrier and
 with `tl.intel_npu.derive_global_sync=False`, since Phase 2b the derivation would otherwise insert it):

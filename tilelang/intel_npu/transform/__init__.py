@@ -1,6 +1,8 @@
-"""Intel NPU-specific transformation frontends (native passes in src/intel_npu/transform)."""
+"""Intel NPU-specific transformation frontends (native passes in src/intel_npu/transform,
+Python passes alongside this file)."""
 
 from .. import _ffi_api
+from .plan_workloads import PlanIntelNpuWorkloads  # noqa: F401
 
 
 def LowerIntelNpuKernelLaunch():

@@ -57,6 +57,8 @@ def IntelNpuPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.intel_npu.transform.DeriveIntelNpuGlobalSync()(mod)
     # A barrier some SHAVEs would skip is a hang, derived or hand-written.
     mod = tilelang.intel_npu.transform.VerifyIntelNpuUniformSync()(mod)
+    # Each DPU workload's cuboid and spatial split, by the VPUNN cost model (plan 3.2).
+    mod = tilelang.intel_npu.transform.PlanIntelNpuWorkloads()(mod)
 
     # No PlanAndUpdateBufferAllocationLocation: it sinks CMX buffers into the
     # loops that use them, and a CMX allocation is made once per kernel.

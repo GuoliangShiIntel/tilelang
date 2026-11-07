@@ -12,7 +12,11 @@ Acceptance with negative controls:
   * the pass configs `tl.intel_npu.dpu_spatial_x` / `dpu_mpe` reach the emitted
     `ctx.dpu_matmul(...)` call, and an invalid value is refused by name;
   * the device calibration (evidence/vpunn_calibration.json) is consistent:
-    every row's golden PASSed and VPUNN's pick is within 5% of the measured best.
+    every row's golden PASSed and VPUNN's pick is within 5% of the measured best;
+  * PlanIntelNpuWorkloads sets every DPU call's knobs and records what it chose
+    in the source; it works unchanged on a kernel it was not written for; it
+    keeps explicit knobs; "off" leaves defaults; without VPUNN "auto" leaves the
+    defaults and says so, "require" refuses by name.
 """
 
 import json
@@ -27,6 +31,7 @@ import tvm
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from kernels import make_gemm_repeat  # noqa: E402
 from tilelang.intel_npu import vpunn  # noqa: E402
+from tilelang.intel_npu.transform import plan_workloads  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 
@@ -74,7 +79,7 @@ def test_default_spatial_mirrors_runtime():
 
 def _dpu_call(cfg):
     func = make_gemm_repeat(64, 64, 512, repeat=2, tiles=1, shaves=2)
-    with tvm.transform.PassContext(config=cfg):
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", **cfg}):
         src = tilelang.lower(func, target="intel_npu").kernel_source
     return [ln for ln in src.splitlines() if "ctx.dpu_matmul(" in ln][0]
 
@@ -100,3 +105,62 @@ def test_calibration_evidence_is_consistent():
     assert all(r["golden"] for r in data["rows"]), [r for r in data["rows"] if not r["golden"]]
     for s in data["summary"]:
         assert s["regret_pct"] < 5.0, s
+
+
+# -- PlanIntelNpuWorkloads ---------------------------------------------------------------
+
+def _lower(func, cfg=None):
+    with tvm.transform.PassContext(config=cfg or {}):
+        return tilelang.lower(func, target="intel_npu").kernel_source
+
+
+def _dpu_calls(src):
+    return [ln.strip() for ln in src.splitlines() if "ctx.dpu_matmul(" in ln]
+
+
+@needs_vpunn
+def test_plan_workloads_sets_every_dpu_call_and_says_so():
+    from kernels import make_gemm
+    src = _lower(make_gemm(256, 256, 512, BM=64, BN=64, tiles=2, shaves=2))
+    assert "// intel_npu: DPU workloads planned by VPUNN" in src
+    calls = _dpu_calls(src)
+    assert calls and all(not c.endswith(", 0, -1);") for c in calls), calls
+    mpe, x, _ = plan_workloads.plan_gemm(64, 64, 512)
+    assert calls[0].endswith(f", 64, 64, 512, {x}, {plan_workloads.MPE_CODE[mpe]});"), calls[0]
+
+
+@needs_vpunn
+def test_plan_workloads_is_generic_over_kernels():
+    # Generality clause: a kernel the pass was not written for (two gemm phases, K/2), zero compiler edits.
+    from kernels import make_gemm_two_phase
+    src = _lower(make_gemm_two_phase(256, 256, 512, BM=64, BN=64, tiles=2, shaves=2))
+    calls = _dpu_calls(src)
+    assert calls and all(not c.endswith(", 0, -1);") for c in calls), calls
+    assert "64x64x256 ->" in src
+
+
+@needs_vpunn
+def test_plan_workloads_keeps_explicit_knobs_and_off_mode():
+    from kernels import make_gemm
+    f = make_gemm(256, 256, 512, BM=64, BN=64, tiles=2, shaves=2)
+    kept = _lower(f, {"tl.intel_npu.dpu_spatial_x": 4, "tl.intel_npu.dpu_mpe": 2})
+    assert _dpu_calls(kept)[0].endswith(", 4, 2);") and "kept author/config knobs" in kept
+    off = _lower(f, {"tl.intel_npu.plan_workloads": "off"})
+    assert _dpu_calls(off)[0].endswith(", 0, -1);") and "intel_npu: DPU workloads" not in off
+
+
+def test_plan_workloads_without_vpunn(monkeypatch):
+    from kernels import make_gemm
+
+    def unavailable():
+        raise vpunn.VpunnUnavailable("VPUNN not configured (test)")
+
+    monkeypatch.setattr(plan_workloads, "_cost_model", unavailable)
+    f = make_gemm(256, 256, 512, BM=64, BN=64, tiles=2, shaves=2)
+    src = _lower(f)  # auto: runtime defaults, and the source says why
+    assert _dpu_calls(src)[0].endswith(", 0, -1);")
+    assert "// intel_npu: DPU workloads NOT planned (1 left at the runtime default): VPUNN not configured (test)" in src
+    with pytest.raises(Exception, match="plan_workloads=require but VPUNN not configured"):
+        _lower(f, {"tl.intel_npu.plan_workloads": "require"})
+    with pytest.raises(Exception, match="is not auto, require or off"):
+        _lower(f, {"tl.intel_npu.plan_workloads": "bogus"})

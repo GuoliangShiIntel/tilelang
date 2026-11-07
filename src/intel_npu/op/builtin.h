@@ -23,6 +23,13 @@ static constexpr const char *kIntelNpuHwSyncGrid = "tl.intel_npu.hw_sync_grid";
 // mpe -1 = the runtime's own stencil, else 0 CUBOID_4x16, 1 CUBOID_8x16, 2 CUBOID_16x16.
 static constexpr const char *kIntelNpuDpuSpatialX = "tl.intel_npu.dpu_spatial_x";
 static constexpr const char *kIntelNpuDpuMpe = "tl.intel_npu.dpu_mpe";
+// Pass config: PlanIntelNpuWorkloads mode, "auto" (VPUNN when available), "off", "require".
+static constexpr const char *kIntelNpuPlanWorkloads = "tl.intel_npu.plan_workloads";
+// AttrStmt key: free-text notes a pass leaves for the reader of the generated source
+// (what was planned, or what was skipped and why); a StringImm value, printed as a comment.
+// An AttrStmt rather than a PrimFunc attribute because SplitHostDevice keeps only a fixed
+// attribute set on the device function.
+static constexpr const char *kIntelNpuNotesAttr = "intel_npu.notes";
 
 /*!
  * \brief 2-D DMA between DDR and CMX.

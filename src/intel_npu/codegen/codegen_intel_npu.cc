@@ -74,6 +74,17 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const AttrStmtNode *op) {
     PrintStmt(op->body);
     return;
   }
+  if (op->attr_key == tl::kIntelNpuNotesAttr) {
+    const auto *notes = op->value.as<StringImmNode>();
+    ICHECK(notes != nullptr) << "intel_npu.notes must carry a StringImm";
+    std::istringstream lines(notes->value);
+    for (std::string line; std::getline(lines, line);) {
+      PrintIndent();
+      stream << "// intel_npu: " << line << "\n";
+    }
+    PrintStmt(op->body);
+    return;
+  }
   CodeGenC::VisitStmt_(op);
 }
 

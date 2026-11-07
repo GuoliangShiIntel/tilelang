@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import tvm
 
 import tilelang
 import tilelang.intel_npu.language as T
@@ -37,7 +38,9 @@ needs_cxx = pytest.mark.skipif(not _has_host_cxx(), reason="host sim needs clang
 
 
 def _source(func) -> str:
-    return tilelang.lower(func, target="intel_npu").kernel_source
+    # The raw lowering: workload planning (Phase 3b, test_intel_npu_phase3b_cost.py) is off here.
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off"}):
+        return tilelang.lower(func, target="intel_npu").kernel_source
 
 
 def test_gemm_source_has_dma_and_dpu_calls():

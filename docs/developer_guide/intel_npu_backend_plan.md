@@ -156,6 +156,7 @@ resource is added.
 | 4 | shared normalisation: `LetInline`, `LegalizeNegativeIndex`, `InjectAssumes`, `Simplify`, `VerifyBufferInit` | shared | 0 |
 | 5 | `LayoutInference` + `NpuLayoutRules` | CMX buffers are row-major contiguous; DPU operands need no swizzle; refuse fragments | 1 |
 | 6 | `NpuLowerTileOp` | `copy`->DMA builtin (direction, rows, width, stride, port); `gemm`->DPU builtin; `fill` on a DPU output dropped | 1 |
+| 6b | `PlanIntelNpuWorkloads` (Python) | per DPU workload, the MPE cuboid and spatial split ranked by VPUNN (section 3.2); explicit knobs kept; modes auto / require / off; what was chosen or skipped is written into the generated source | 3b (done) |
 | 7 | `PlanDistribution` | per `copy` from DDR: source independent of the tile var => broadcast (one multicast fill, one issuing SHAVE), else split; refuse a per-tile unicast copy of a tile-invariant source. Amended 2026-11-06 (section 3.2): the split/duplicate choice and the tile shape are **cost-driven** (`TileGemm`, `PlanWorkloads`), the tile-variable rule is the legality floor, not the decision | 3 |
 | 8 | `PlanDualPort` | split each DDR fill in half, one half per port, issued together | 3 |
 | 9 | `LowerPipelined` | `T.Pipelined(num_stages=2)` over a streamed loop -> ping/pong slots, SHAVE 0 = ping, SHAVE 1 = pong, pre-enqueued next fill gated on FREE, READY on completion | 3 |
@@ -343,6 +344,18 @@ interop; a Python `nl.*`-compatible shim.
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-06: **`PlanIntelNpuWorkloads` landed (section 3 item 6b), the first cost-driven pass.** A Python
+  `prim_func_pass` after the sync passes: for every `intel_npu_dpu_matmul` call still at the runtime
+  defaults it ranks (cuboid, spatial x | M, x <= 64) with `vpunn.GemmCost.best_stencil` and writes the
+  cheapest pair into the call; explicit kernel-wide knobs are kept. Modes `tl.intel_npu.plan_workloads`
+  = auto (default; without VPUNN the defaults stay and the generated source carries
+  `// intel_npu: DPU workloads NOT planned ...`), require (refuses by name), off. The notes travel as an
+  `intel_npu.notes` AttrStmt inside the outermost `thread_extent` because SplitHostDevice keeps only a
+  fixed set of PrimFunc attributes. A shape VPUNN cannot cost (K=32768 in the CMX negative) is left at
+  the default and noted, so the budget check still fires. Generality: the two-phase kernel (64x64x256)
+  is planned with zero edits. Device: Phase 1 GEMM golden PASS (rel 3.24e-4, kernel `0039c507d6e3`,
+  `64x64x512 -> CUBOID_8x16 x=16`), two-phase PASS (rel 5.67e-4). Suite: 49 passed with VPUNN;
+  44 passed, 5 skipped by name without it.
 * 2026-11-06: **Phase 3b Step 0 done: VPUNN wired and calibrated on the device.** (1) VPUNN v1.10.2
   built as a pybind module from a standalone clone (section 0); `tilelang/intel_npu/vpunn.py` costs a
   GEMM tile as VPUX does (1x1 CONVOLUTION, ZXY, `W x H = M`, `N` output channels), plus a 1-D DMA cost.
