@@ -94,6 +94,21 @@ def test_serial_phase_has_no_ring():
     assert "ring_begin" not in src and "ctx.dpu_matmul(" in src
 
 
+def test_ring_is_hoisted_over_an_enclosing_loop_its_fills_do_not_read():
+    # 10 Q blocks: the K/V fills read only kv, so one ring streams 10 x 8 chunks with one begin/end per kernel;
+    # inside the Q-block loop each SHAVE's uses are qb * 4 + u and the fill source wraps modulo the 8 kv chunks.
+    src = _lower(make_flash_attention_phase(960, NUMKV, D=D, BQ=BQ, BKV=BKV, tiles=TILES)).source
+    assert src.count("ctx.ring_begin(") == 2 and src.count("ctx.ring_end(") == 2
+    assert "ctx.ring_begin((&(k_cmx[0])), 16384, 2, 80, 8, 12, 0);" in src
+    assert "ring hoisted over qb (10 iterations: one begin/end)" in src
+    assert re.search(r"for \(int32_t qb = 0; qb < 10; \+\+qb\) \{", src)
+    assert "ctx.ring_dpu_submit(ring, ((qb * 4) + u)," in src
+    assert re.search(r"ctx\.ring_fill\(ring, \(\(\(qb \* 4\) \+ u\) \+ 1\), \(&\(K\[\(\(\(\(\(u \* 2\) \+ shave\) \+ 2\) & 7\) \* 8192\)\]\)\)", src)
+    # negative: a fill that reads the outer variable keeps one ring per iteration
+    outer_dep = _lower(make_flash_attention_phase(960, NUMKV, D=D, BQ=BQ, BKV=BKV, tiles=TILES, kv_offset_by_qb=True)).source
+    assert "ring hoisted" not in outer_dep and "ctx.ring_begin((&(k_cmx[0])), 16384, 2, 8, 8, 12, 0);" in outer_dep
+
+
 def test_vectorized_loops_lower_to_shave_vector_ops():
     # T.vectorized(32) over fp16 -> half32 (VAU.EXP through tl_npu_hexp), T.vectorized(16) over fp32 -> float16;
     # broadcasts splat, fp16 -> fp32 lane casts are __builtin_convertvector; no per-kernel emitter involved.

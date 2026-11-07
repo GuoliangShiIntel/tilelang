@@ -830,6 +830,13 @@ private:
                 std::uint32_t dstStride, std::uint32_t srcStride) {
     if (!ok_ || width == 0 || rows == 0)
       return;
+    // The toolkit's start re-kicks a port's chain as soon as its fences ran, before the
+    // previous job completed: a ring fill in flight on the port lost its READY (hoisted
+    // ring, Q fill after the first K fill). One job per port per SHAVE, here too.
+    port_retire(0);
+    port_retire(1);
+    if (!ok_)
+      return;
     DmaDrv::initDesc(desc_);
     configDmaCopy2D(desc_, reinterpret_cast<std::uint32_t>(dst), src, width, rows,
                     dstStride, srcStride);
@@ -839,6 +846,10 @@ private:
   void dma_store(std::uint64_t dst, const void *src, std::uint32_t width, std::uint32_t rows,
                  std::uint32_t dstStride, std::uint32_t srcStride) {
     if (!ok_ || width == 0 || rows == 0)
+      return;
+    port_retire(0);
+    port_retire(1);
+    if (!ok_)
       return;
     flushCmxWrites();
     DmaDrv::initDesc(desc_ + 1);

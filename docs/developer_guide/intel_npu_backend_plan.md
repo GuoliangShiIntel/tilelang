@@ -499,6 +499,19 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-07: **M1 step 3c (end): ring hoisting; the split is now SHAVE math 57%, per-Q-block overhead 26%,
+  ring protocol 17%.** `LowerIntelNpuPipelined` hoists a `T.Pipelined` loop out of an enclosing serial loop
+  when no stream's fill reads the outer variable and the inner chunk count is a multiple of the SHAVEs: one
+  ring over outer x inner chunks, the use loop in the inner loop's place with global use `outer * per + u`, the
+  fill source wrapped modulo the inner extent; a fill that reads the outer variable keeps one ring per iteration
+  (test with the negative). Found on the device: the toolkit's `DmaDrv::start` re-kicks a port's chain once its
+  fences ran, before the previous job completed, so a synchronous `dma_load` issued while a ring fill was in
+  flight on the port lost that fill's READY (status 9 at use 0); `dma_load/store` now retire the ports first.
+  **960x1024x64 TURBO: 1.112 ms** (3c started at 1.765), floor 0.478. Remaining: SHAVE math ~0.63 ms (the row loop
+  364 static cycles for 128 scores, 57% NOP: one row's dependency chain at a time; unroll-by-2 or two rows in
+  flight is the lever), per-Q-block ~30 us (Q fill with two tile syncs, merge on one SHAVE, output store),
+  protocol ~0.18 ms. Stopping the single-kernel work here (`<user>`: model first); the levers are recorded, the
+  counters stay in the status record for every later kernel.
 * 2026-11-07: **M1 step 3c (continued): where the flash phase's time goes, and four generic fixes.** Instrument
   first: the ring path now accumulates six per-SHAVE phase counters (live-wait, order-wait, submit, dpu-wait,
   free-wait, fill-issue; NCE_TIME ticks) into the status record's extra words, and `run_flash_device.py --floor`

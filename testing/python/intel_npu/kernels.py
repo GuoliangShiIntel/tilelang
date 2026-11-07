@@ -155,7 +155,7 @@ def make_ring_flow_swapped(M: int, N: int, K: int, BM: int = 256, BN: int = 32, 
 
 def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32, BKV: int = 128, tiles: int = 3,
                                shaves: int = 2, num_stages: int = 2, pipelined: bool = True, vectorized: bool = False,
-                               probe_skip_shave: bool = False):
+                               probe_skip_shave: bool = False, kv_offset_by_qb: bool = False):
     """One attention phase of a megakernel, written in the flow's form (plan 3b, README 1-3):
     the tile's Q block is resident (SEGMENTED), K and V^T stream through the ring (DUPLICATED),
     chunk c -> SHAVE c % 2 keeps its own online-softmax partials (m, l, O) over its chunks, and
@@ -164,7 +164,9 @@ def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32,
     `vectorized`: the same math with T.vectorized inner loops (half32 / float16 lanes on the
     SHAVE: VAU.EXP for the fp16 exp, lane accumulators for the row max / sum).
     `probe_skip_shave`: MEASUREMENT ARM ONLY -- no SHAVE math between the gemms (the output is
-    wrong by design); what remains is the DPU + ring + fill floor the softmax is added to."""
+    wrong by design); what remains is the DPU + ring + fill floor the softmax is added to.
+    `kv_offset_by_qb`: TEST ARM -- the K/V fills read (kv + qb) % NKV, so they depend on the Q-block
+    loop and the ring cannot be hoisted over it (the negative of the hoisting rule; output wrong)."""
     assert numQ % (BQ * tiles) == 0 and numKv % BKV == 0
     NKV, QB = numKv // BKV, numQ // (BQ * tiles)
     scale = 1.0 / (D ** 0.5)
@@ -205,8 +207,12 @@ def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32,
                     m_i[i] = T.float32(-1e30)
                     l_i[i] = T.float32(0)
                 for kv in (T.Pipelined(NKV, num_stages=num_stages) if pipelined else T.serial(NKV)):
-                    T.copy(K[kv * BKV, 0], k_cmx)
-                    T.copy(Vt[0, kv * BKV], v_cmx)
+                    if kv_offset_by_qb:
+                        T.copy(K[((kv + qb) % NKV) * BKV, 0], k_cmx)
+                        T.copy(Vt[0, ((kv + qb) % NKV) * BKV], v_cmx)
+                    else:
+                        T.copy(K[kv * BKV, 0], k_cmx)
+                        T.copy(Vt[0, kv * BKV], v_cmx)
                     T.gemm(q_cmx, k_cmx, s_cmx, transpose_B=True, clear_accum=True)
                     # online softmax on the SHAVE: m_new = max(m_i, rowmax(S)); P = exp(S*scale - m_new); l = l*corr + rowsum(P)
                     if probe_skip_shave:

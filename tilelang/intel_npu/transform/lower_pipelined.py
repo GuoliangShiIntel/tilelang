@@ -252,10 +252,12 @@ class _Stream:
 class _Pipeline:
     """A T.Pipelined loop classified into streams, gemms, stores and other (SHAVE) statements."""
 
-    def __init__(self, loop: tirx.For, launch: _Launch):
+    def __init__(self, loop: tirx.For, launch: _Launch, outer: tirx.For | None = None):
         self.loop = loop
+        self.outer = outer   # the enclosing serial loop the ring is hoisted over, if any
         self.c = loop.loop_var
         self.total = _const(loop.extent)
+        self.total_chunks = self.total * (_const(outer.extent) if outer is not None else 1)
         self.stages = int(loop.annotations["num_stages"])
         if _const(loop.min) != 0:
             raise ValueError("intel_npu: a pipelined loop must start at 0")
@@ -307,8 +309,12 @@ def LowerIntelNpuPipelined():
         def chunk(use):
             return use * spt + tx
 
+        def inner_chunk(p, use):
+            # the pipelined loop's own index of global chunk `use * spt + tx` (hoisted: modulo the inner extent)
+            return tirx.floormod(chunk(use), _i32(p.total)) if p.outer is not None else chunk(use)
+
         def fill(st, use):
-            src = substitute(st.src, {st.pipe_c: chunk(use)})
+            src = substitute(st.src, {st.pipe_c: inner_chunk(st.pipe, use)})
             return tirx.Evaluate(tirx.Call("handle", _op(RING_FILL),
                                            [st.ring, use, src, _i32(st.width), _i32(st.rows), _i32(st.src_stride)]))
 
@@ -329,11 +335,20 @@ def LowerIntelNpuPipelined():
             port = -1 if len(p.streams) == 1 else p.streams.index(st) % 2
             return tirx.Bind(st.ring, tirx.Call("handle", _op(RING_BEGIN),
                                                 [_address_of(st.slots, [_i32(0)] * len(st.slots.shape)),
-                                                 _i32(st.slot_bytes), _i32(p.stages), _i32(p.total), _i32(-1), _i32(-1),
-                                                 _i32(port)]))
+                                                 _i32(st.slot_bytes), _i32(p.stages), _i32(p.total_chunks), _i32(-1),
+                                                 _i32(-1), _i32(port)]))
 
         def end(st):
             return tirx.Evaluate(tirx.Call("handle", _op(RING_END), [st.ring]))
+
+        def use_loop(p, u, body):
+            """This SHAVE's uses: all of them, or (hoisted) those of one outer iteration, as a loop over `u`
+            with the body written against the global use `g`."""
+            if p.outer is None:
+                uses = tirx.floordiv(_i32(p.total) - tx + _i32(spt - 1), _i32(spt))
+                return tirx.For(u, _i32(0), uses, tirx.ForKind.SERIAL, body(u))
+            per = p.total // spt
+            return tirx.For(u, _i32(0), _i32(per), tirx.ForKind.SERIAL, body(p.outer.loop_var * per + u))
 
         def lower_simple(p: _Pipeline):
             # One stream, its gemm, stores: submit u+1 right after u completes, output double-buffered by parity.
@@ -357,17 +372,17 @@ def LowerIntelNpuPipelined():
                 sidx = list(_load_of(sa[1]).indices)
                 sidx[0] = sidx[0] + parity * M
                 sa[1] = _address_of(outs, sidx)
-                return substitute(tirx.Evaluate(tirx.Call(s.value.dtype, s.value.op, sa)), {p.c: chunk(use)})
+                return substitute(tirx.Evaluate(tirx.Call(s.value.dtype, s.value.op, sa)), {p.c: inner_chunk(p, use)})
 
-            uses = tirx.floordiv(_i32(p.total) - tx + _i32(spt - 1), _i32(spt))
-            loop_body = tirx.SeqStmt([wait(st, u), submit(st, u + 1, out_addr(tirx.floormod(u + 1, 2))), fill(st, u + p.depth)]
-                                     + [store(s, u, tirx.floormod(u, 2)) for s in p.stores])
-            notes.append(f"ring over {p.c.name} ({p.total} chunks of {st.slot_bytes} B into {st.slot_buf.name}"
+            def loop_body(g):
+                return tirx.SeqStmt([wait(st, g), submit(st, g + 1, out_addr(tirx.floormod(g + 1, 2))), fill(st, g + p.depth)]
+                                    + [store(s, g, tirx.floormod(g, 2)) for s in p.stores])
+
+            notes.append(f"ring over {p.c.name} ({p.total_chunks} chunks of {st.slot_bytes} B into {st.slot_buf.name}"
                          f"[{p.stages} slots], SHAVE s owns {p.depth} slot(s), fills {p.depth} use(s) ahead, output "
                          f"{out_buf.name} x2 by use parity, submit-ahead; issuer tile 0, two halves on ports 0/1)")
-            return tirx.SeqStmt([begin(st, p)] + [fill(st, _i32(k)) for k in range(p.depth)]
-                                + [submit(st, _i32(0), out_addr(_i32(0))),
-                                   tirx.For(u, _i32(0), uses, tirx.ForKind.SERIAL, loop_body), end(st)])
+            prologue = [begin(st, p)] + [fill(st, _i32(k)) for k in range(p.depth)] + [submit(st, _i32(0), out_addr(_i32(0)))]
+            return prologue, use_loop(p, u, loop_body), [end(st)]
 
         def lower_general(p: _Pipeline):
             # Several streams and SHAVE statements between the gemms: the body runs in the author's order
@@ -376,36 +391,77 @@ def LowerIntelNpuPipelined():
             # reader, so its FREE is the refill's gate). No submit-ahead: the SHAVE code between the
             # gemms depends on the gemm's output.
             u = tirx.Var("u", "int32")
-            uses = tirx.floordiv(_i32(p.total) - tx + _i32(spt - 1), _i32(spt))
-            seq = []
-            for s in p.stmts:
-                if _is_call(s, DMA_COPY) and _const(s.value.args[6]) == 1:
-                    continue  # fills are issued by the ring, after the previous use's last reader
-                hit = [st for st in p.streams if st.gemm is not None and st.gemm.same_as(s)]
-                if hit:
-                    st = hit[0]
-                    out_addr = st.gemm.value.args[0]
-                    seq += [submit(st, u, out_addr), wait(st, u), fill(st, u + p.depth)]
-                else:
-                    seq.append(substitute(s, {p.c: chunk(u)}))
+
+            def loop_body(g):
+                seq = []
+                for s in p.stmts:
+                    if _is_call(s, DMA_COPY) and _const(s.value.args[6]) == 1:
+                        continue  # fills are issued by the ring, after the previous use's last reader
+                    hit = [st for st in p.streams if st.gemm is not None and st.gemm.same_as(s)]
+                    if hit:
+                        st = hit[0]
+                        seq += [submit(st, g, st.gemm.value.args[0]), wait(st, g), fill(st, g + p.depth)]
+                    else:
+                        seq.append(substitute(s, {p.c: inner_chunk(p, g)}))
+                return tirx.SeqStmt(seq)
+
             prologue = [begin(st, p) for st in p.streams] + [fill(st, _i32(k)) for k in range(p.depth) for st in p.streams]
-            notes.append(f"ring over {p.c.name} ({p.total} chunks; streams " +
+            notes.append(f"ring over {p.c.name} ({p.total_chunks} chunks; streams " +
                          ", ".join(f"{st.slot_buf.name}[{p.stages} slots, {st.slot_bytes} B]" for st in p.streams) +
                          f"; SHAVE s owns {p.depth} slot(s), fills {p.depth} use(s) ahead; {len(p.gemms)} gemms with SHAVE "
                          f"statements between, no submit-ahead)")
-            return tirx.SeqStmt(prologue + [tirx.For(u, _i32(0), uses, tirx.ForKind.SERIAL, tirx.SeqStmt(seq))]
-                                + [end(st) for st in p.streams])
+            return prologue, use_loop(p, u, loop_body), [end(st) for st in p.streams]
 
-        def lower(stmt):
-            if not (isinstance(stmt, tirx.For) and int(stmt.annotations.get("num_stages", 0)) > 0):
-                return None
-            p = _Pipeline(stmt, launch)
+        def is_pipelined(s):
+            return isinstance(s, tirx.For) and int(s.annotations.get("num_stages", 0)) > 0
+
+        def lower_pipe(stmt, outer):
+            p = _Pipeline(stmt, launch, outer)
             for st in p.streams:
                 st.pipe_c = p.c
+                st.pipe = p
                 remap.append((st.slot_buf, st.slots))
             return lower_simple(p) if p.simple else lower_general(p)
 
-        body = ir_transform(func.body, None, lower, ["tirx.For"])
+        def hoistable(outer):
+            """The one pipelined loop directly inside a serial loop whose variable no stream's fill reads."""
+            if not isinstance(outer, tirx.For) or outer.kind != tirx.ForKind.SERIAL or is_pipelined(outer):
+                return None
+            stmts = list(outer.body.seq) if isinstance(outer.body, tirx.SeqStmt) else [outer.body]
+            pipes = [s for s in stmts if is_pipelined(s)]
+            if len(pipes) != 1:
+                return None
+            inner = pipes[0]
+            fills = [s for s in (list(inner.body.seq) if isinstance(inner.body, tirx.SeqStmt) else [inner.body])
+                     if _is_call(s, DMA_COPY) and _const(s.value.args[6]) == 1]
+            if not fills or any(_uses(f.value.args[1], outer.loop_var) for f in fills):
+                return None
+            if _const(inner.extent) % spt != 0:
+                return None  # uses would straddle outer iterations unevenly; one ring per iteration instead
+            return inner
+
+        def pre(stmt):
+            inner = hoistable(stmt)
+            if inner is None:
+                return None
+            # One ring over (outer x inner): begin and the first fills before the outer loop, the use loop in
+            # the inner loop's place, the ends after. The fills' sources do not depend on the outer variable.
+            prologue, loop, ends = lower_pipe(inner, stmt)
+            stmts = list(stmt.body.seq) if isinstance(stmt.body, tirx.SeqStmt) else [stmt.body]
+            replaced = [loop if s.same_as(inner) else s for s in stmts]
+            new_body = replaced[0] if len(replaced) == 1 else tirx.SeqStmt(replaced)
+            outer = tirx.For(stmt.loop_var, stmt.min, stmt.extent, stmt.kind, new_body, stmt.thread_binding,
+                             stmt.annotations)
+            notes.append(f"ring hoisted over {stmt.loop_var.name} ({_const(stmt.extent)} iterations: one begin/end)")
+            return tirx.SeqStmt(prologue + [outer] + ends)
+
+        def lower(stmt):
+            if not is_pipelined(stmt):
+                return None
+            prologue, loop, ends = lower_pipe(stmt, None)
+            return tirx.SeqStmt(prologue + [loop] + ends)
+
+        body = ir_transform(func.body, pre, lower, ["tirx.For"])
         if not remap:
             return func
 
