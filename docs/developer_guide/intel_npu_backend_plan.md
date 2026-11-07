@@ -421,8 +421,12 @@ interop; a Python `nl.*`-compatible shim.
    **Knowledge base (2026-11-07):** `hw/npu5/dma-controller.md#1,#3`: one DMA engine with two compute
    resource groups (the two "ports"), AXI DDR read 64 B/clk per group, 128 B/clk both, at the CMX clock
    (4/7 of the DPU clock); the 6D cap is `min(64, SRC_WIDTH)` B/clk per job, so a 2-D fill narrower than 64 B
-   per row runs at the row width. The 34 / 67 GB/s above were measured **without turbo**; re-measure under
-   `NPU_TURBO=YES` before using them in TileGemm's DMA model. The ~4 us per job remains a question.
+   per row runs at the row width. The 34 / 67 GB/s above were measured **without turbo**. **Under turbo
+   (2026-11-07, same probe, 64 KiB .. 1 MiB):** one port 4.37 / 6.98 / 5.76 / 9.51 / 16.98 us, two ports 3.49 /
+   4.85 / 4.35 / 6.68 / 10.84 us; from the 512 KiB -> 1 MiB increments **~70 GB/s one port, ~126 GB/s two ports,
+   ~2-2.5 us fixed per job**, which is the knowledge base's 64 B/clk per group at a CMX clock near 1.1-1.2 GHz
+   (4/7 of the 2.0454 GHz DPU clock). TileGemm's DMA model under turbo: `t_fill = 2.5 us + bytes / 126 GB/s`
+   for a two-port fill. The fixed ~2 us per job remains the only open part.
 5. **fp16 x fp16 DPU rate.** The best measured fp16 workload reaches 2743 MAC/ns per tile (calibration,
    64x64x2048, CUBOID_8x16) and the flow's 32x256x2048 workload 1540 MAC/ns, against the 3790 MAC/ns
    implied by the 22.73 TOPS basis (2048 MAC/cycle x 1.85 GHz x 3 tiles). Is 2048 MAC/cycle the fp16 x fp16

@@ -32,11 +32,11 @@ PERF_CLK_MHZ = 19.2
 def main(argv):
     numKv = int(argv[argv.index("--kv") + 1]) if "--kv" in argv else 1024
     numQ = int(argv[argv.index("--q") + 1]) if "--q" in argv else BQ * TILES   # a multiple of BQ x TILES
-    kernel = f"tl_flash_phase_q{numQ}_kv{numKv}_d{D}" + ("_vec" if "--vec" in argv else "")
+    kernel = f"tl_flash_phase_q{numQ}_kv{numKv}_d{D}" + ("_vec" if "--vec" in argv else "") + ("_floor" if "--floor" in argv else "")
     cfg = {"tl.intel_npu.plan_workloads": "off"} if "--no-vpunn" in argv else {}
     with tvm.transform.PassContext(config=cfg):
         low = lowering.lower(make_flash_attention_phase(numQ, numKv, D=D, BQ=BQ, BKV=BKV, tiles=TILES, shaves=SHAVES,
-                                                        vectorized="--vec" in argv))
+                                                        vectorized="--vec" in argv, probe_skip_shave="--floor" in argv))
     for ln in low.source.splitlines():
         if "// intel_npu:" in ln:
             print(ln.strip()[:220])
@@ -84,6 +84,9 @@ def main(argv):
     if negative:
         print("negative control (perturbed K): " + ("behaved (FAIL reported)" if verdict == "FAIL" else "BROKEN: PASS reported"))
         return 0 if verdict == "FAIL" else 1
+    if "--floor" in argv:
+        print("floor arm (no SHAVE math, output wrong by design): the time above is the DPU + ring + fill floor")
+        return 0
     return 0 if verdict == "PASS" else 1
 
 

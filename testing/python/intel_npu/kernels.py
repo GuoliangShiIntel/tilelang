@@ -154,14 +154,17 @@ def make_ring_flow_swapped(M: int, N: int, K: int, BM: int = 256, BN: int = 32, 
 
 
 def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32, BKV: int = 128, tiles: int = 3,
-                               shaves: int = 2, num_stages: int = 2, pipelined: bool = True, vectorized: bool = False):
+                               shaves: int = 2, num_stages: int = 2, pipelined: bool = True, vectorized: bool = False,
+                               probe_skip_shave: bool = False):
     """One attention phase of a megakernel, written in the flow's form (plan 3b, README 1-3):
     the tile's Q block is resident (SEGMENTED), K and V^T stream through the ring (DUPLICATED),
     chunk c -> SHAVE c % 2 keeps its own online-softmax partials (m, l, O) over its chunks, and
     the two partials are merged per tile at the end (flash-decoding's split-KV combine). Used
     first as a probe of what the passes refuse (plan section 8), then as the Phase 4 target.
     `vectorized`: the same math with T.vectorized inner loops (half32 / float16 lanes on the
-    SHAVE: VAU.EXP for the fp16 exp, lane accumulators for the row max / sum)."""
+    SHAVE: VAU.EXP for the fp16 exp, lane accumulators for the row max / sum).
+    `probe_skip_shave`: MEASUREMENT ARM ONLY -- no SHAVE math between the gemms (the output is
+    wrong by design); what remains is the DPU + ring + fill floor the softmax is added to."""
     assert numQ % (BQ * tiles) == 0 and numKv % BKV == 0
     NKV, QB = numKv // BKV, numQ // (BQ * tiles)
     scale = 1.0 / (D ** 0.5)
@@ -201,29 +204,29 @@ def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32,
                     T.copy(Vt[0, kv * BKV], v_cmx)
                     T.gemm(q_cmx, k_cmx, s_cmx, transpose_B=True, clear_accum=True)
                     # online softmax on the SHAVE: m_new = max(m_i, rowmax(S)); P = exp(S*scale - m_new); l = l*corr + rowsum(P)
-                    if vectorized:
+                    if probe_skip_shave:
+                        pass
+                    elif vectorized:
                         for i in T.serial(BQ):
                             for v in T.vectorized(HL):
                                 mx[v] = s_cmx[i, v]
                             for j0 in T.serial(1, BKV // HL):
                                 for v in T.vectorized(HL):
                                     mx[v] = T.max(mx[v], s_cmx[i, j0 * HL + v])
-                            m_new[i] = m_i[i]
-                            for v in T.serial(HL):
-                                m_new[i] = T.max(m_new[i], T.cast(mx[v], T.float32) * scale)
+                            # whole-vector lane reductions (runtime library ops on the CMU: log2(lanes) rotate-and-combine);
+                            # scale once (max is monotone, scale > 0)
+                            m_new[i] = T.max(m_i[i], T.cast(T.call_extern(T.float16, "tl_npu_vmax", mx[0:HL]), T.float32) * scale)
                             corr[i] = T.exp(m_i[i] - m_new[i])
                             # P in fp16 on the VAU: exp(s * scale - m_new), |arg| <= ~11 so fp16 holds it
                             for j0 in T.serial(BKV // HL):
                                 for v in T.vectorized(HL):
                                     s_cmx[i, j0 * HL + v] = T.exp(s_cmx[i, j0 * HL + v] * T.float16(scale) - T.cast(m_new[i], T.float16))
                             for v in T.vectorized(FL):
-                                ls[v] = T.float32(0)
-                            for j0 in T.serial(BKV // FL):
+                                ls[v] = T.cast(s_cmx[i, v], T.float32)
+                            for j0 in T.serial(1, BKV // FL):
                                 for v in T.vectorized(FL):
                                     ls[v] = ls[v] + T.cast(s_cmx[i, j0 * FL + v], T.float32)
-                            l_i[i] = l_i[i] * corr[i]
-                            for v in T.serial(FL):
-                                l_i[i] = l_i[i] + ls[v]
+                            l_i[i] = l_i[i] * corr[i] + T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL])
                             m_i[i] = m_new[i]
                     else:
                         for i in T.serial(BQ):
@@ -238,7 +241,9 @@ def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32,
                                 l_i[i] = l_i[i] + p
                             m_i[i] = m_new[i]
                     T.gemm(s_cmx, v_cmx, pv_cmx, transpose_B=True, clear_accum=True)
-                    if vectorized:
+                    if probe_skip_shave:
+                        pass
+                    elif vectorized:
                         for i in T.serial(BQ):
                             for d0 in T.serial(D // FL):
                                 for v in T.vectorized(FL):

@@ -69,7 +69,7 @@ FACTS: dict[str, Fact] = {
     # --- DMA ---------------------------------------------------------------------------------
     "dma_ports": Fact(2, "compiler/platform-resources.md#6 (MAX_DMA_PORTS NPU5010 = 2); hw/npu5/dma-controller.md#1 (2 CTRGs)"),
     "dma_ddr_read_bytes_per_clk_per_group": Fact(64, "hw/npu5/dma-controller.md#1 and #3 (AXI read 64 B/clk per group, 128 B/clk both)",
-                                                 measured="~34 GB/s per port, ~67 GB/s two ports streaming, +4.2-4.5 us fixed per job, measured WITHOUT turbo (run_dma_rate_probe 2026-11-06); to be re-measured under turbo"),
+                                                 measured="TURBO (run_dma_rate_probe 2026-11-07, 512->1024 KiB increments): ~70 GB/s one port, ~126 GB/s two ports streaming, ~2-2.5 us fixed per job; = 64 B/clk at a CMX clock of ~1.1-1.2 GHz (4/7 of 2.0454). NO TURBO (2026-11-06): 34 / 67 GB/s, 4.2-4.5 us"),
     "dma_min_src_width_full_rate_bytes": Fact(64, "hw/npu5/dma-controller.md#3 (6D cap: min(64, SRC_WIDTH) B/clk per job)",
                                               note="a 2-D fill whose row is narrower than 64 B runs at the row width per clock"),
     "dma_link_agent_fifo_entries": Fact(8, "hw/npu5/dma-controller.md#4 (each LA holds a FIFO of 8 entries, a linked list completes before the next entry starts)",

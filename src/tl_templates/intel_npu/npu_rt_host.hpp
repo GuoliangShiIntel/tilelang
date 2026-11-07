@@ -37,9 +37,11 @@ template <class T> static inline T max(T a, T b) { return a > b ? a : b; }
 template <class T> static inline T min(T a, T b) { return a < b ? a : b; }
 
 // The SHAVE compiler's ext_vector typedefs (the codegen prints half16, float8, ...).
+typedef half half4 __attribute__((ext_vector_type(4)));
 typedef half half8 __attribute__((ext_vector_type(8)));
 typedef half half16 __attribute__((ext_vector_type(16)));
 typedef half half32 __attribute__((ext_vector_type(32)));
+typedef float float2 __attribute__((ext_vector_type(2)));
 typedef float float4 __attribute__((ext_vector_type(4)));
 typedef float float8 __attribute__((ext_vector_type(8)));
 typedef float float16 __attribute__((ext_vector_type(16)));
@@ -47,6 +49,28 @@ typedef int int4 __attribute__((ext_vector_type(4)));
 typedef int int8 __attribute__((ext_vector_type(8)));
 typedef int int16 __attribute__((ext_vector_type(16)));
 #include "npu_rt_vecmath.hpp"
+
+// Whole-vector reductions behind T.call_extern("tl_npu_vmax" / "tl_npu_vsum", buf[0:N]).
+#define TL_NPU_HOST_REDUCE(V, S, N)                                             \
+  static inline S tl_npu_vmax(V v) {                                            \
+    S r = v[0];                                                                 \
+    for (int i = 1; i < N; ++i)                                                 \
+      r = v[i] > r ? (S)v[i] : r;                                               \
+    return r;                                                                   \
+  }                                                                             \
+  static inline S tl_npu_vsum(V v) {                                            \
+    S r = v[0];                                                                 \
+    for (int i = 1; i < N; ++i)                                                 \
+      r = r + (S)v[i];                                                          \
+    return r;                                                                   \
+  }
+TL_NPU_HOST_REDUCE(half32, half, 32)
+TL_NPU_HOST_REDUCE(half16, half, 16)
+TL_NPU_HOST_REDUCE(half8, half, 8)
+TL_NPU_HOST_REDUCE(float16, float, 16)
+TL_NPU_HOST_REDUCE(float8, float, 8)
+TL_NPU_HOST_REDUCE(float4, float, 4)
+#undef TL_NPU_HOST_REDUCE
 
 #if defined(_WIN32)
 #define NPU_SIM_EXPORT extern "C" __declspec(dllexport)

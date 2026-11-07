@@ -36,9 +36,9 @@ def _src(func):
 
 def test_flow_lowers_to_one_ring():
     src = _src(make_ring_flow(2048, 768, 2048, BM=32, BN=256, tiles=3))
-    assert "half* W_cmx = ctx.alloc_shared<half>(524288);" in src          # resident, one per tile
-    assert "half* X_cmx = ctx.alloc_shared<half>(131072);" in src          # 2 slots x 32 x 2048
-    assert "half* Y_cmx = ctx.alloc<half>(16384);" in src                  # 2 x 32 x 256, per SHAVE
+    assert "half* __restrict W_cmx = ctx.alloc_shared<half>(524288);" in src          # resident, one per tile
+    assert "half* __restrict X_cmx = ctx.alloc_shared<half>(131072);" in src          # 2 slots x 32 x 2048
+    assert "half* __restrict Y_cmx = ctx.alloc<half>(16384);" in src                  # 2 x 32 x 256, per SHAVE
     # resident fill split over the SHAVEs (128 of 256 rows each), then the tile sync
     assert re.search(r"ctx\.dma_load\(\(&\(W_cmx\[\(tx \* 262144\)\]\)\).*, 4096, 128, 4096, 4096\);\n\s*ctx\.sync_tile\(\);", src)
     assert "npu::Ctx::Ring ring = ctx.ring_begin((&(X_cmx[0])), 131072, 2, 64, 8, 12);" in src

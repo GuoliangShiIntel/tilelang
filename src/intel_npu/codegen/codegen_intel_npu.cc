@@ -164,7 +164,10 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const AllocBufferNode *op) {
   const bool shared = scope != "local";
   PrintIndent();
   PrintType(op->buffer->dtype, stream);
-  stream << "* " << vid << " = ctx." << (shared ? "alloc_shared<" : "alloc<");
+  // Distinct allocations never alias; without __restrict moviCompile keeps every
+  // vector accumulator in CMX and re-issues each load after the previous store
+  // (NOP 8 per load in the flash softmax row loop, M1 step 3c).
+  stream << "* __restrict " << vid << " = ctx." << (shared ? "alloc_shared<" : "alloc<");
   PrintType(op->buffer->dtype, stream);
   stream << ">(" << count << ");  // " << scope << "\n";
   RegisterHandleType(op->buffer->data.get(), op->buffer->dtype);

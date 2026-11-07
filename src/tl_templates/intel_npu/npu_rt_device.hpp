@@ -70,6 +70,40 @@ TL_NPU_VAU_F16(tanh, __builtin_shave_vau_tanh_r_half32)
 #define TL_NPU_VEC_HAS_VAU_TANH 1
 #include "npu_rt_vecmath.hpp"
 
+// Whole-vector reductions (the DSL's T.call_extern("tl_npu_vmax" / "tl_npu_vsum", buf[0:N])):
+// log2(N) rotate-and-combine steps on the CMU/VAU instead of N lane extracts
+// (moviCompile lowers a half-vector extract to one CMU.CP.16 per lane).
+static inline half tl_npu_vmax(half32 v) {
+  v = __builtin_shave_cmu_max_f16_rr_half32(v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 32));
+  v = __builtin_shave_cmu_max_f16_rr_half32(v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 16));
+  v = __builtin_shave_cmu_max_f16_rr_half32(v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 8));
+  v = __builtin_shave_cmu_max_f16_rr_half32(v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 4));
+  v = __builtin_shave_cmu_max_f16_rr_half32(v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 2));
+  return v[0];
+}
+static inline float tl_npu_vmax(float16 v) {
+  v = __builtin_shave_cmu_max_f32_rr_float16(v, __builtin_shave_cmu_alignvec_rri_float16(v, v, 32));
+  v = __builtin_shave_cmu_max_f32_rr_float16(v, __builtin_shave_cmu_alignvec_rri_float16(v, v, 16));
+  v = __builtin_shave_cmu_max_f32_rr_float16(v, __builtin_shave_cmu_alignvec_rri_float16(v, v, 8));
+  v = __builtin_shave_cmu_max_f32_rr_float16(v, __builtin_shave_cmu_alignvec_rri_float16(v, v, 4));
+  return v[0];
+}
+static inline float tl_npu_vsum(float16 v) {
+  v = v + __builtin_shave_cmu_alignvec_rri_float16(v, v, 32);
+  v = v + __builtin_shave_cmu_alignvec_rri_float16(v, v, 16);
+  v = v + __builtin_shave_cmu_alignvec_rri_float16(v, v, 8);
+  v = v + __builtin_shave_cmu_alignvec_rri_float16(v, v, 4);
+  return v[0];
+}
+static inline half tl_npu_vsum(half32 v) {
+  v = v + __builtin_shave_cmu_alignvec_rri_half32(v, v, 32);
+  v = v + __builtin_shave_cmu_alignvec_rri_half32(v, v, 16);
+  v = v + __builtin_shave_cmu_alignvec_rri_half32(v, v, 8);
+  v = v + __builtin_shave_cmu_alignvec_rri_half32(v, v, 4);
+  v = v + __builtin_shave_cmu_alignvec_rri_half32(v, v, 2);
+  return v[0];
+}
+
 namespace npu {
 
 // Status word 0 per SHAVE, read by the host runner; word 1 is the detail.
