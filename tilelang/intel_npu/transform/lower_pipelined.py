@@ -22,6 +22,10 @@ double-buffered by use parity (submit-ahead), and the per-use program is
 
     wait(u); submit(u+1); fill(u+1) [issuer: tile 0, SHAVE s]; store(u)
 
+A pipelined loop directly inside a serial loop is hoisted: one ring over all the iterations (several
+pipelined loops in one outer loop each get their own), and a fill issued ahead reads the chunk's own
+iteration (its source may read the outer variable, e.g. an expert id), unless the source index reads
+a buffer the iteration writes, in which case the loop gets one ring per iteration.
 Barrier ids are left as -1 for AssignIntelNpuBarriers.
 """
 
@@ -351,7 +355,12 @@ def LowerIntelNpuPipelined():
             return tirx.floormod(chunk(use), _i32(p.total)) if p.outer is not None else chunk(use)
 
         def fill(st, use):
-            src = substitute(st.src, {st.pipe_c: inner_chunk(st.pipe, use)})
+            # the source of global chunk `use * spt + tx`: the pipelined index is that chunk modulo the inner extent
+            # and (hoisted) the outer index is its quotient, so a fill issued ahead reads the next iteration's rows
+            sub = {st.pipe_c: inner_chunk(st.pipe, use)}
+            if st.pipe.outer is not None:
+                sub[st.pipe.outer.loop_var] = tirx.floordiv(chunk(use), _i32(st.pipe.total))
+            src = substitute(st.src, sub)
             return tirx.Evaluate(tirx.Call("handle", _op(RING_FILL),
                                            [st.ring, use, src, _i32(st.width), _i32(st.rows), _i32(st.src_stride)]))
 
@@ -377,15 +386,42 @@ def LowerIntelNpuPipelined():
             return (tx + spt * tirx.floormod(use, _i32(p.depth))) * _i32(int(st.slot_buf.shape[0]))
 
         def begin(st, p):
-            # one stream: each fill split in two halves over both ports; several streams: stream i whole on
-            # port i % 2, so the streams' fills run concurrently (one job in flight per port per SHAVE).
-            # A stream whose source reads the tile is split: every tile fills its own slot (no multicast).
-            port = -1 if len(p.streams) == 1 else p.streams.index(st) % 2
+            # A stream whose source reads the tile is split: every tile fills its own slot (no multicast). A split
+            # stream the SHAVE reads is LOCAL: the SHAVE that fills the slot is its only reader, so the fill's DMA
+            # watermark is READY and program order is FREE -- no hardware barriers, no coupling between tiles.
             multicast = 0 if _uses(st.src, launch.tile_var) else 1
+            local = 1 if (multicast == 0 and st.gemm is None) else 0
+            st.local = local
             return tirx.Bind(st.ring, tirx.Call("handle", _op(RING_BEGIN),
                                                 [_address_of(st.slots, [_i32(0)] * len(st.slots.shape)),
                                                  _i32(st.slot_bytes), _i32(p.stages), _i32(p.total_chunks), _i32(-1),
-                                                 _i32(-1), _i32(port), _i32(multicast)]))
+                                                 _i32(-1), _i32(st.port), _i32(multicast), _i32(local)]))
+
+        def assign_ports(pipes):
+            """DMA ports for the streams of the rings live together. The runtime takes one job in flight per port
+            per SHAVE (a second start on a port waits for the first), so a ring whose SHAVE owns two or more
+            slots alternates its fills between the ports by use (port 2 = use & 1, 3 = the opposite phase,
+            dealt alternately to such streams), which is what lets its fills overlap. Of the depth-1 streams,
+            one alone is split in two halves (port -1, the halves' fixed costs overlap across the ports);
+            several are dealt whole to the port with the smaller load so far, largest first, where a port's
+            load is the serial sum of its jobs' costs, `fixed + bytes / rate` (plan 7.4: ~2.5 us + bytes /
+            70 GB/s per port under turbo; 72 scale fills of 8 KiB cost as much as 72 x 175 KiB)."""
+            streams = [st for p in pipes for st in p.streams]
+            deep = [st for st in streams if st.pipe.depth >= 2]
+            for i, st in enumerate(deep):
+                st.port = 2 + i % 2
+            shallow = [st for st in streams if st.pipe.depth < 2]
+            if len(shallow) == 1 and not deep:
+                shallow[0].port = -1
+                return
+            fixed_bytes = 175 * 1024   # 2.5 us at 70 GB/s
+            load = [0, 0]
+            for st in deep:
+                for port in (0, 1):
+                    load[port] += st.pipe.total_chunks * (st.slot_bytes + fixed_bytes) // 2
+            for st in sorted(shallow, key=lambda s: -(s.slot_bytes)):
+                st.port = 0 if load[0] <= load[1] else 1
+                load[st.port] += st.pipe.total_chunks * (st.slot_bytes + fixed_bytes)
 
         def end(st):
             return tirx.Evaluate(tirx.Call("handle", _op(RING_END), [st.ring]))
@@ -475,50 +511,98 @@ def LowerIntelNpuPipelined():
         def is_pipelined(s):
             return isinstance(s, tirx.For) and int(s.annotations.get("num_stages", 0)) > 0
 
-        def lower_pipe(stmt, outer):
+        _pipes = []
+
+        def make_pipe(stmt, outer):
             p = _Pipeline(stmt, launch, outer)
+            _pipes.append(p)
             for st in p.streams:
                 st.pipe_c = p.c
                 st.pipe = p
                 remap.append((st.slot_buf, st.slots))
+            return p
+
+        def lower_pipe(p):
             return lower_simple(p) if p.simple else lower_general(p)
 
+        def _written_in(stmt):
+            """Buffers a statement writes: BufferStores and the destinations of DDR -> CMX copies."""
+            found = []
+
+            def visit(node):
+                if isinstance(node, tirx.BufferStore):
+                    found.append(node.buffer)
+                elif isinstance(node, tirx.Call) and node.op.same_as(_op(DMA_COPY)) and _const(node.args[6]) == 1:
+                    found.append(_load_of(node.args[0]).buffer)
+
+            post_order_visit(stmt, visit)
+            return found
+
+        def _index_reads(src):
+            """Buffers read inside the index of a fill's DDR source (an expert id, a token's row)."""
+            found = []
+
+            def visit(node):
+                if isinstance(node, tirx.BufferLoad):
+                    found.append(node.buffer)
+
+            for i in _load_of(src).indices:
+                post_order_visit(i, visit)
+            return found
+
         def hoistable(outer):
-            """The one pipelined loop directly inside a serial loop whose variable no stream's fill reads."""
+            """The pipelined loops directly inside a serial loop whose rings can run over all its iterations: a
+            fill issued ahead then reads the next iteration's chunk, which is sound when nothing the outer body
+            writes feeds the fill's source index (an index read from a buffer the iteration computes is not)."""
             if not isinstance(outer, tirx.For) or outer.kind != tirx.ForKind.SERIAL or is_pipelined(outer):
-                return None
+                return []
             stmts = list(outer.body.seq) if isinstance(outer.body, tirx.SeqStmt) else [outer.body]
-            pipes = [s for s in stmts if is_pipelined(s)]
-            if len(pipes) != 1:
-                return None
-            inner = pipes[0]
-            fills = [s for s in (list(inner.body.seq) if isinstance(inner.body, tirx.SeqStmt) else [inner.body])
-                     if _is_call(s, DMA_COPY) and _const(s.value.args[6]) == 1]
-            if not fills or any(_uses(f.value.args[1], outer.loop_var) for f in fills):
-                return None
-            if _const(inner.extent) % spt != 0:
-                return None  # uses would straddle outer iterations unevenly; one ring per iteration instead
-            return inner
+            written = _written_in(outer.body)
+            hoisted = []
+            for inner in (s for s in stmts if is_pipelined(s)):
+                fills = [s for s in (list(inner.body.seq) if isinstance(inner.body, tirx.SeqStmt) else [inner.body])
+                         if _is_call(s, DMA_COPY) and _const(s.value.args[6]) == 1]
+                if not fills or _const(inner.extent) % spt != 0:
+                    continue  # uses would straddle outer iterations unevenly; one ring per iteration instead
+                if any(any(w.same_as(b) for w in written) for f in fills for b in _index_reads(f.value.args[1])):
+                    notes.append(f"ring over {inner.loop_var.name} not hoisted over {outer.loop_var.name}: a fill's "
+                                 f"source index reads a buffer the iteration writes")
+                    continue
+                hoisted.append(inner)
+            return hoisted
 
         def pre(stmt):
-            inner = hoistable(stmt)
-            if inner is None:
+            inners = hoistable(stmt)
+            if not inners:
                 return None
-            # One ring over (outer x inner): begin and the first fills before the outer loop, the use loop in
-            # the inner loop's place, the ends after. The fills' sources do not depend on the outer variable.
-            prologue, loop, ends = lower_pipe(inner, stmt)
+            # One ring per hoisted loop over (outer x inner): begin and the first fills before the outer loop,
+            # the use loop in the inner loop's place, the ends after. A fill's source may read the outer
+            # variable: the fill ahead substitutes the chunk's own iteration (see `fill`).
+            prologue, ends, loops = [], [], {}
+            pipes = [make_pipe(inner, stmt) for inner in inners]
+            assign_ports(pipes)
+            for inner, p in zip(inners, pipes):
+                pro, loop, end = lower_pipe(p)
+                prologue += pro
+                ends += end
+                loops[inner] = loop
+                reads_outer = any(_uses(st.src, stmt.loop_var) for st in p.streams)
+                notes.append(f"ring over {inner.loop_var.name} hoisted over {stmt.loop_var.name} "
+                             f"({_const(stmt.extent)} iterations: one begin/end"
+                             + (", fills read the iteration" if reads_outer else "") + ")")
             stmts = list(stmt.body.seq) if isinstance(stmt.body, tirx.SeqStmt) else [stmt.body]
-            replaced = [loop if s.same_as(inner) else s for s in stmts]
+            replaced = [next((l for k, l in loops.items() if s.same_as(k)), s) for s in stmts]
             new_body = replaced[0] if len(replaced) == 1 else tirx.SeqStmt(replaced)
             outer = tirx.For(stmt.loop_var, stmt.min, stmt.extent, stmt.kind, new_body, stmt.thread_binding,
                              stmt.annotations)
-            notes.append(f"ring hoisted over {stmt.loop_var.name} ({_const(stmt.extent)} iterations: one begin/end)")
             return tirx.SeqStmt(prologue + [outer] + ends)
 
         def lower(stmt):
             if not is_pipelined(stmt):
                 return None
-            prologue, loop, ends = lower_pipe(stmt, None)
+            p = make_pipe(stmt, None)
+            assign_ports([p])
+            prologue, loop, ends = lower_pipe(p)
             return tirx.SeqStmt(prologue + [loop] + ends)
 
         body = ir_transform(func.body, pre, lower, ["tirx.For"])

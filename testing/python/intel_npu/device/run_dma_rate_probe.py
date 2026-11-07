@@ -20,10 +20,11 @@ import runner  # noqa: E402
 KERNEL = "tl_dma_rate_probe"
 TILES, SHAVES = 3, 2
 BYTES, REPS = 128 * 1024, 16
-LABELS = ["unicast 1-D, 1 port, 1 issuer", "multicast 1-D, 1 port, 1 issuer",
+LABELS = ["unicast 1-D, 1 port, 1 issuer", "unicast 1-D, 6 issuers each its OWN region, port = shave & 1 (x6 bytes)",
           "multicast, every SHAVE of every tile issues 1/6 as 2 halves (6 issuers x 2 ports)",
           "multicast, SHAVE 0 of every tile issues 1/3 as 2 halves (3 issuers x 2 ports)",
           "multicast 1-D two halves ports 0+1, 1 issuer (the ring fill today)", "unicast 1-D two halves ports 0+1, 1 issuer"]
+MULT = [1, 6, 1, 1, 1, 1]   # bytes moved per rep relative to one job
 
 
 def main(argv):
@@ -37,14 +38,14 @@ def main(argv):
         db = runner.DeviceBuild(build_dir=HERE / "build", exe=HERE / "build" / "Release" / "npu_run.exe", kernel=kernel, source_sha256=sha)
     else:
         db = runner.build(source, kernel)
-    x = np.random.default_rng(0).standard_normal((nbytes // 2,)).astype(np.float16)
+    x = np.random.default_rng(0).standard_normal((TILES * SHAVES * nbytes // 2,)).astype(np.float16)   # six regions
     res = runner.run(db, [("in", x)], TILES, SHAVES, HERE / "run_dma_rate", repeat=5, warmup=2, timeout_s=120)
     runner.check_status(res.status)
     ticks = res.status[0, 10:16].astype(np.int64)
     print(f"kernel sha256 {db.source_sha256[:12]}; {REPS} x {nbytes} B per configuration, tile 0 SHAVE 0, NCE_TIME 19.2 MHz")
-    for label, t in zip(LABELS, ticks):
+    for label, t, m in zip(LABELS, ticks, MULT):
         us = t / 19.2
-        print(f"  {label:82s}: {us / REPS:7.2f} us per {kib} KiB, {REPS * nbytes / (us * 1e-6) / 1e9:6.2f} GB/s")
+        print(f"  {label:82s}: {us / REPS:7.2f} us per {kib} KiB, {m * REPS * nbytes / (us * 1e-6) / 1e9:6.2f} GB/s")
     return 0
 
 

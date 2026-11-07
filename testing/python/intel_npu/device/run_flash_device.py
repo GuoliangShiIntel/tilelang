@@ -83,7 +83,7 @@ def main(argv):
           f"{[f'{u:.0f}' for u in idu_us]} us of {res.median_kernel_ms * 1e3:.0f} us -> {[f'{100 * u / (res.median_kernel_ms * 1e3):.0f}%' for u in idu_us]}; "
           f"{flops / 1e9:.3f} GFLOP, {flops / (res.median_kernel_ms * 1e-3) / 1e12:.2f} TFLOP/s kernel-only (the SHAVE softmax is the rest)")
     # ring phase counters (status extra words, 19.2 MHz ticks), per SHAVE in us
-    names = ["live_wait", "order_wait", "submit", "dpu_wait", "free_wait", "fill_issue"]
+    names = ["live/acquire_wait", "order_wait", "submit", "dpu_wait", "free_wait", "fill_issue"]
     phases = res.status[:, 10:16].astype(np.int64) / PERF_CLK_MHZ
     for w in range(TILES * SHAVES):
         print(f"  tile {w // SHAVES} SHAVE {w % SHAVES} ring phases us: " + ", ".join(f"{n} {phases[w, i]:.0f}" for i, n in enumerate(names))

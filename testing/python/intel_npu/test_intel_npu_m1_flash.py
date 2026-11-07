@@ -55,8 +55,8 @@ def _reference(q, k, vt):
 
 def test_pipelined_phase_lowers_to_two_rings_over_one_loop():
     src = _lower(make_flash_attention_phase(NUMQ, NUMKV, D=D, BQ=BQ, BKV=BKV, tiles=TILES)).source
-    assert "npu::Ctx::Ring ring = ctx.ring_begin((&(k_cmx[0])), 16384, 2, 8, 8, 12, 0, 1);" in src       # stream 0 on port 0
-    assert "npu::Ctx::Ring ring_1 = ctx.ring_begin((&(v_cmx[0])), 16384, 2, 8, 16, 20, 1, 1);" in src   # stream 1 on port 1
+    assert "npu::Ctx::Ring ring = ctx.ring_begin((&(k_cmx[0])), 16384, 2, 8, 8, 12, 0, 1, 0);" in src       # stream 0 on port 0
+    assert "npu::Ctx::Ring ring_1 = ctx.ring_begin((&(v_cmx[0])), 16384, 2, 8, 16, 20, 1, 1, 0);" in src   # stream 1 on port 1
     # K chunk: 128 rows of 128 B, contiguous; Vt chunk: 64 rows of 256 B, 2048 B apart (2-D fill)
     assert "ctx.ring_fill(ring, 0, (&(K[(shave * 8192)])), 128, 128, 128);" in src
     assert "ctx.ring_fill(ring_1, 0, (&(Vt[(shave * 128)])), 256, 64, 2048);" in src
@@ -78,8 +78,10 @@ def test_ring_depth_two_per_shave_fills_two_uses_ahead():
     # the body refills use u+2 after use u's gemm, and each ring takes 4 x 4 = 16 ids.
     src = _lower(make_flash_attention_phase(NUMQ, NUMKV, D=D, BQ=BQ, BKV=BKV, tiles=TILES, num_stages=4)).source
     assert "half* __restrict k_cmx = ctx.alloc_shared<half>(32768);" in src        # 4 slots x 128 x 64
-    assert "ctx.ring_begin((&(k_cmx[0])), 16384, 4, 8, 8, 16, 0, 1);" in src
-    assert "ctx.ring_begin((&(v_cmx[0])), 16384, 4, 8, 24, 32, 1, 1);" in src
+    # two slots per SHAVE: the fills alternate ports by use (2 = use & 1, 3 = the opposite phase) so a ring keeps
+    # one fill in flight per port under the runtime's one-job-per-port rule
+    assert "ctx.ring_begin((&(k_cmx[0])), 16384, 4, 8, 8, 16, 2, 1, 0);" in src
+    assert "ctx.ring_begin((&(v_cmx[0])), 16384, 4, 8, 24, 32, 3, 1, 0);" in src
     assert "ctx.ring_fill(ring, 0, (&(K[(shave * 8192)])), 128, 128, 128);" in src
     assert "ctx.ring_fill(ring, 1, (&(K[((shave * 8192) + 16384)])), 128, 128, 128);" in src
     assert "ctx.ring_fill(ring, (u + 2)," in src and "ctx.ring_fill(ring_1, (u + 2)," in src
@@ -99,14 +101,17 @@ def test_ring_is_hoisted_over_an_enclosing_loop_its_fills_do_not_read():
     # inside the Q-block loop each SHAVE's uses are qb * 4 + u and the fill source wraps modulo the 8 kv chunks.
     src = _lower(make_flash_attention_phase(960, NUMKV, D=D, BQ=BQ, BKV=BKV, tiles=TILES)).source
     assert src.count("ctx.ring_begin(") == 2 and src.count("ctx.ring_end(") == 2
-    assert "ctx.ring_begin((&(k_cmx[0])), 16384, 2, 80, 8, 12, 0, 1);" in src
-    assert "ring hoisted over qb (10 iterations: one begin/end)" in src
+    assert "ctx.ring_begin((&(k_cmx[0])), 16384, 2, 80, 8, 12, 0, 1, 0);" in src
+    assert "ring over kv hoisted over qb (10 iterations: one begin/end)" in src
     assert re.search(r"for \(int32_t qb = 0; qb < 10; \+\+qb\) \{", src)
     assert "ctx.ring_dpu_submit(ring, ((qb * 4) + u)," in src
     assert re.search(r"ctx\.ring_fill\(ring, \(\(\(qb \* 4\) \+ u\) \+ 1\), \(&\(K\[\(\(\(\(\(u \* 2\) \+ shave\) \+ 2\) & 7\) \* 8192\)\]\)\)", src)
-    # negative: a fill that reads the outer variable keeps one ring per iteration
+    # a fill that reads the outer variable is hoisted too (M3): the fill ahead reads the chunk's own iteration,
+    # qb = chunk / 8, so the last fills of one Q block already stream the next block's first K/V chunks
     outer_dep = _lower(make_flash_attention_phase(960, NUMKV, D=D, BQ=BQ, BKV=BKV, tiles=TILES, kv_offset_by_qb=True)).source
-    assert "ring hoisted" not in outer_dep and "ctx.ring_begin((&(k_cmx[0])), 16384, 2, 8, 8, 12, 0, 1);" in outer_dep
+    assert "ring over kv hoisted over qb (10 iterations: one begin/end, fills read the iteration)" in outer_dep
+    assert "ctx.ring_begin((&(k_cmx[0])), 16384, 2, 80, 8, 12, 0, 1, 0);" in outer_dep
+    assert "ctx.ring_fill(ring, (((qb * 4) + u) + 1), (&(K[((((((((u * 2) + shave) + 2) >> 3) + qb) + ((((u * 2) + shave) + 2) & 7)) & 7) * 8192)])), 128, 128, 128);" in outer_dep
 
 
 def test_vectorized_loops_lower_to_shave_vector_ops():

@@ -44,7 +44,8 @@ def _live_ranges(body: tirx.Stmt, begin_op, end_op):
     def visit(node):
         if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call) and node.value.op.same_as(begin_op):
             seq[0] += 1
-            rings.append((node, seq[0]))
+            if int(node.value.args[8].value) == 0:   # a local ring (split, SHAVE-read) uses no ids
+                rings.append((node, seq[0]))
         elif isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call) and node.value.op.same_as(end_op):
             seq[0] += 1
             ends.append((node.value.args[0], seq[0]))
@@ -91,7 +92,14 @@ def AssignIntelNpuBarriers():
     def _pass(func: tirx.PrimFunc, mod, ctx):
         op = tvm.ir.Op.get(RING_BEGIN)
         ranges = _live_ranges(func.body, op, tvm.ir.Op.get(RING_END))
-        if not ranges:
+        any_ring = [False]
+
+        def seen(node):
+            if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call) and node.value.op.same_as(op):
+                any_ring[0] = True
+
+        post_order_visit(func.body, seen)
+        if not any_ring[0]:
             return func
         rings = [b for b, _, _ in ranges]
         target = func.attrs["target"]
@@ -112,6 +120,13 @@ def AssignIntelNpuBarriers():
 
         def rewrite(stmt):
             if isinstance(stmt, tirx.Bind) and isinstance(stmt.value, tirx.Call) and stmt.value.op.same_as(op):
+                if int(stmt.value.args[8].value) == 1:
+                    args = list(stmt.value.args)
+                    args[4] = args[5] = tirx.IntImm("int32", 0)
+                    n = names.get(stmt.var.name, 0)
+                    names[stmt.var.name] = n + 1
+                    notes.append(f"{stmt.var.name if n == 0 else f'{stmt.var.name}_{n}'}: local (no ids)")
+                    return tirx.Bind(stmt.var, tirx.Call(stmt.value.dtype, op, args))
                 for r in rings:
                     if r.same_as(stmt):
                         slots = int(stmt.value.args[2].value)

@@ -43,8 +43,10 @@ def main(argv):
     bits = arg(argv, "--bits", 4)
     if gemv:
         M = arg(argv, "--m", 1)
-        kernel = f"tl_w4a16_gemv_m{M}_n{N}_k{K}_bn{BN}_b{bits}" + (f"_s{stages}" if stages != 2 else "")
-        low = lowering.lower(make_w4a16_gemv(N, K, BN=BN, G=G, tiles=TILES, shaves=SHAVES, num_stages=stages, M=M, bits=bits))
+        rows = arg(argv, "--rows", 64)
+        kernel = f"tl_w4a16_gemv_m{M}_n{N}_k{K}_bn{BN}_b{bits}" + (f"_s{stages}" if stages != 2 else "") + (f"_r{rows}" if rows != 64 else "")
+        low = lowering.lower(make_w4a16_gemv(N, K, BN=BN, G=G, tiles=TILES, shaves=SHAVES, num_stages=stages, M=M, bits=bits,
+                                             rows_per_workload=rows))
     else:
         kernel = f"tl_w4a16_m{M}_n{N}_k{K}_bn{BN}_split{split}" + (f"_s{stages}" if stages != 2 else "")
         low = lowering.lower(make_w4a16_flow(M, N, K, BN=BN, G=G, tiles=TILES, shaves=SHAVES, split=split, num_stages=stages))
@@ -98,7 +100,7 @@ def main(argv):
     print(f"ops {ops / 1e9:.2f} GFLOP; {tops:.2f} TOPS kernel-only = {100 * tops / peak:.1f}% of {peak:.2f} (dense fp16 peak); "
           f"DPU IDU busy per tile {[f'{100 * u / (res.median_kernel_ms * 1e3):.0f}%' for u in idu_us]}; "
           f"weights {wq.nbytes / 1e6:.1f} MB read once -> {wq.nbytes / (res.median_kernel_ms * 1e-3) / 1e9:.1f} GB/s")
-    names = ["live_wait", "order_wait", "submit", "slot_wait", "free_wait", "fill_issue"]
+    names = ["acquire_wait", "order_wait", "submit", "dpu_wait", "free_wait", "fill_issue"]
     phases = res.status[:, 10:16].astype(np.int64) / PERF_CLK_MHZ
     for w_ in (0, 1, 2):
         print(f"  tile {w_ // SHAVES} SHAVE {w_ % SHAVES} ring phases us: " + ", ".join(f"{n} {phases[w_, i]:.0f}" for i, n in enumerate(names)))

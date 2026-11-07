@@ -49,8 +49,8 @@ def test_pipelined_m_split_streams_weights_through_multicast_rings_the_shave_rea
     src = _lower(make_w4a16_flow(96, 2048, 2048, BN=64, G=G, tiles=TILES, split="m")).source
     assert "wq_cmx: DUPLICATED (streamed, one multicast per chunk)" in src
     assert "x_cmx: SEGMENTED resident" in src
-    assert "ctx.ring_begin((&(wq_cmx[0])), 65536, 2, 32, 8, 12, 0, 1);" in src     # port 0, multicast
-    assert "ctx.ring_begin((&(s_cmx[0])), 2048, 2, 32, 16, 20, 1, 1);" in src     # port 1, multicast
+    assert "ctx.ring_begin((&(wq_cmx[0])), 65536, 2, 32, 8, 12, 0, 1, 0);" in src     # port 0, multicast
+    assert "ctx.ring_begin((&(s_cmx[0])), 2048, 2, 32, 16, 20, 1, 1, 0);" in src     # port 1, multicast
     assert "2 slot(s) read by the SHAVE" in src
     # acquire both slots before the dequant, release each after it and refill; the gemm reads the private fp16 buffer
     assert re.search(r"ctx\.ring_slot_acquire\(ring, u\);\s*ctx\.ring_slot_acquire\(ring_1, u\);", src)
@@ -65,7 +65,7 @@ def test_pipelined_n_split_streams_each_tiles_own_weights():
     src = _lower(make_w4a16_flow(96, 1536, 2048, BN=64, G=G, tiles=TILES, split="n")).source
     assert "wq_cmx: SEGMENTED (streamed, each tile fills its own slot)" in src
     assert "x_cmx: tile-invariant resident" in src
-    assert "ctx.ring_begin((&(wq_cmx[0])), 65536, 2, 8, 8, 12, 0, 0);" in src      # multicast off
+    assert "ctx.ring_begin((&(wq_cmx[0])), 65536, 2, 8, 0, 0, 0, 0, 1);" in src      # multicast off
     assert "ctx.ring_fill(ring, 0, (&(Wq[((bx * 524288) + (tx * 65536))])), 1024, 64, 1024);" in src
 
 
@@ -75,10 +75,10 @@ def test_gemv_streams_split_weight_chunks_the_dpu_reads_in_place():
     src = _lower(make_w4a16_gemv(6144, 2048, BN=256, G=G, tiles=TILES)).source
     assert "x_cmx: tile-invariant resident, 1 row(s) filled by SHAVE 0, tile sync after" in src
     assert "wq_cmx: SEGMENTED (streamed, each tile fills its own slot)" in src
-    assert "ctx.ring_begin((&(wq_cmx[0])), 262144, 2, 8, 8, 12, 0, 0);" in src
+    assert "ctx.ring_begin((&(wq_cmx[0])), 262144, 2, 8, 0, 0, 0, 0, 1);" in src
     assert "0 gemm(s), 2 slot(s) read by the SHAVE" in src
     assert re.search(r"for \(int32_t sub = 0; sub < 4; \+\+sub\) \{\s*ctx\.dpu_matmul_i4g\(\(&\(y_cmx\[\(sub \* 64\)\]\)\), \(&\(x_cmx\[0\]\)\), "
-                     r"\(&\(wq_cmx\[\(\(tx \* 262144\) \+ \(sub \* 65536\)\)\]\)\), \(&\(s_cmx\[\(\(tx \* 4096\) \+ \(sub \* 1024\)\)\]\)\), 1, 64, 2048, 128\);", src)
+                     r"\(&\(wq_cmx\[\(\(tx \* 262144\) \+ \(sub \* 65536\)\)\]\)\), \(&\(s_cmx\[\(\(tx \* 4096\) \+ \(sub \* 1024\)\)\]\)\), 1, 64, 2048, 128, 0\);", src)   # row-major scales (stride 0)
     with pytest.raises(AssertionError):
         make_w4a16_gemv(6144, 2048, BN=256, G=G, tiles=TILES, rows_per_workload=128)   # 128 x 16 groups > 1024 channels
 

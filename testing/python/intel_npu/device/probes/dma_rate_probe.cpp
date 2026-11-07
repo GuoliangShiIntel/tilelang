@@ -1,6 +1,9 @@
 // DMA rate probe: 128 KiB DDR -> CMX repeatedly in several configurations, timed with NCE_TIME
 // (19.2 MHz) on tile 0 SHAVE 0 and reported in status words 10..15 (ticks for kReps transfers):
-//   10: unicast 1-D, one port, one issuer          11: multicast (all tiles) 1-D, one port, one issuer
+//   10: unicast 1-D, one port, one issuer          11: unicast 1-D, every SHAVE of every tile streams its OWN
+//                                                      kBytes region (6 distinct DDR sources) on port (shave & 1)
+//                                                      -- the split weight stream of a decode GEMV / MoE; the
+//                                                      rate is the aggregate over the six
 //   12: multicast, every SHAVE of every tile issues its 1/(2*tiles) piece as two halves on ports 0/1
 //   13: multicast, SHAVE 0 of every tile issues its 1/tiles piece as two halves on ports 0/1
 //   14: multicast 1-D, two halves on ports 0 and 1, one issuer (the ring's fill today)
@@ -82,8 +85,22 @@ void kernel_entry(int numParams, uint64_t *params, const npu::Environment &env) 
     ctx.sync_grid();
     if (lead) r[slot] = ticks() - t0;
   };
+  // every SHAVE streams its own kBytes region (src + index * kBytes), unicast, one whole job on port shave & 1
+  auto runOwn = [&](std::uint32_t slot) {
+    const std::uint32_t index = tile * spt + shave;
+    ctx.sync_grid();
+    const std::uint32_t t0 = ticks();
+    for (std::uint32_t i = 0; i < kReps; ++i) {
+      npu::DmaDrv::initDesc(d);
+      npu::configDmaCopy(d, reinterpret_cast<std::uint32_t>(dst), src + static_cast<std::uint64_t>(index) * kBytes, kBytes);
+      dma.start(d, shave & 1);
+      dma.wait(d);
+    }
+    ctx.sync_grid();
+    if (lead) r[slot] = ticks() - t0;
+  };
   run1(0, false);
-  run1(1, true);
+  runOwn(1);
   runN(2, true);
   runN(3, false);
   run2(4, true);

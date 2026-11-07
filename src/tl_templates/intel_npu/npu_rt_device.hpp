@@ -288,17 +288,30 @@ public:
   // needed products, which at decode's M = 1 is free: the workload is bound by reading the weights.
   // VPUX's merged FC; ported from npu_dsl's fused_rt.hpp matmul_qg / q_reduce (plan section 0 amendment).
   // Scratch (part [M x ng, C] fp16, sT [ng, N] fp16) is allocated on first use at that call's size.
+  // `sStride` 0: s is row-major [N, ng] and the SHAVE transposes it while the DPU runs; > 0: s is group-major
+  // [ng, sStride] (the packer's layout) and is read in place -- the transpose cost ~70 ns per row when ng % 8
+  // != 0 (scalar path), 210 us per SHAVE in the MoE's down GEMVs (M3).
   void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G) {
-    dpu_matmul_qg(out, a, q, s, M, N, K, G, 4);
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride = 0) {
+    dpu_matmul_qg(out, a, q, s, M, N, K, G, 4, sStride);
   }
   // int8 weights (one signed byte per value, rows K bytes apart), the DPU's native mixed mode; PPE 1/256.
   void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q, const half *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G) {
-    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), s, M, N, K, G, 8);
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride = 0) {
+    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), s, M, N, K, G, 8, sStride);
+  }
+  // The scales packed after the weight rows of the chunk (gemm_i4's scales_row): addressed as bytes.
+  void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const std::uint8_t *s, std::uint32_t M,
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride) {
+    dpu_matmul_qg(out, a, q, reinterpret_cast<const half *>(s), M, N, K, G, 4, sStride);
+  }
+  void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q, const std::int8_t *s, std::uint32_t M,
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride) {
+    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), reinterpret_cast<const half *>(s), M, N, K, G, 8,
+                  sStride);
   }
   void dpu_matmul_qg(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
-                     std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t bits) {
+                     std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t bits, std::uint32_t sStride) {
     if (!ok_)
       return;
     const std::uint32_t ng = K / G, C = N * ng;
@@ -348,19 +361,26 @@ public:
     i4Mm_->startMixed(i4Part_, const_cast<half *>(a), reinterpret_cast<std::int8_t *>(const_cast<std::uint8_t *>(q)));
     // s [N, ng] -> sT [ng, N] while the DPU runs: 8x8 vector transposes (npu_dsl's transpose_h) when the
     // shape allows, a scalar loop otherwise (1024 strided scalar copies cost ~9 us at N=64, ng=16).
-    if (N % 8 == 0 && ng % 8 == 0)
-      transpose_h(i4ST_, s, N, ng);
-    else
-      for (std::uint32_t n = 0; n < N; ++n)
-        for (std::uint32_t g = 0; g < ng; ++g)
-          i4ST_[g * N + n] = s[n * ng + g];
+    // Group-major s (sStride > 0) needs none of it.
+    const half *sT = s;
+    std::uint32_t sRow = sStride;
+    if (sStride == 0) {
+      if (N % 8 == 0 && ng % 8 == 0)
+        transpose_h(i4ST_, s, N, ng);
+      else
+        for (std::uint32_t n = 0; n < N; ++n)
+          for (std::uint32_t g = 0; g < ng; ++g)
+            i4ST_[g * N + n] = s[n * ng + g];
+      sT = i4ST_;
+      sRow = N;
+    }
     const std::uint32_t t1 = perf_ticks();
     i4Mm_->wait();
     const std::uint32_t t2 = perf_ticks();
     dpuCount_ += 1;
     dpuIduTicks_ += static_cast<volatile const DpuMatMul::DescriptorsBuffer *>(i4Desc_)->hwpStats.idu_workload_duration;
     dpuOduTicks_ += static_cast<volatile const DpuMatMul::DescriptorsBuffer *>(i4Desc_)->hwpStats.odu_workload_duration;
-    q_reduce(out, i4Part_, i4ST_, M, N, ng, 1.0f / partScale);
+    q_reduce(out, i4Part_, sT, sRow, M, N, ng, 1.0f / partScale);
     const std::uint32_t t3 = perf_ticks();
     ringTicks_[kTickSubmit] += (t1 - t0) + (t3 - t2);   // SHAVE side: start + transpose, reduce
     ringTicks_[kTickDpuWait] += t2 - t1;                // DPU time not hidden behind the transpose
@@ -395,10 +415,11 @@ public:
       }
   }
 
-  // out[m, n] = inv x sum_g sT[g, n] x part[(m, g), g * N + n]: four 16-column blocks at a time (independent
-  // accumulators; the sum order per output is fixed, so the result is deterministic). N % 16 == 0.
-  static void q_reduce(half *__restrict out, const half *__restrict part, const half *__restrict sT, std::uint32_t M,
-                       std::uint32_t N, std::uint32_t ng, float inv) {
+  // out[m, n] = inv x sum_g sT[g, n] x part[(m, g), g * N + n] (sT rows `sRow` apart): four 16-column blocks
+  // at a time (independent accumulators; the sum order per output is fixed, so the result is deterministic).
+  // N % 16 == 0.
+  static void q_reduce(half *__restrict out, const half *__restrict part, const half *__restrict sT, std::uint32_t sRow,
+                       std::uint32_t M, std::uint32_t N, std::uint32_t ng, float inv) {
     const std::uint32_t C = N * ng;
     for (std::uint32_t m = 0; m < M; ++m) {
       std::uint32_t n0 = 0;
@@ -406,7 +427,7 @@ public:
         float16 a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
         for (std::uint32_t g = 0; g < ng; ++g) {
           const half *p = part + (m * ng + g) * C + g * N + n0;
-          const half *w = sT + g * N + n0;
+          const half *w = sT + g * sRow + n0;
           a0 += __builtin_convertvector(*reinterpret_cast<const half16 *>(p), float16) *
                 __builtin_convertvector(*reinterpret_cast<const half16 *>(w), float16);
           a1 += __builtin_convertvector(*reinterpret_cast<const half16 *>(p + 16), float16) *
@@ -426,7 +447,7 @@ public:
         float16 acc = 0.f;
         for (std::uint32_t g = 0; g < ng; ++g)
           acc += __builtin_convertvector(*reinterpret_cast<const half16 *>(part + (m * ng + g) * C + g * N + n0), float16) *
-                 __builtin_convertvector(*reinterpret_cast<const half16 *>(sT + g * N + n0), float16);
+                 __builtin_convertvector(*reinterpret_cast<const half16 *>(sT + g * sRow + n0), float16);
         *reinterpret_cast<half16 *>(out + m * N + n0) = __builtin_convertvector(acc * inv, half16);
       }
     }
@@ -455,8 +476,13 @@ public:
     std::uint32_t slotBytes;
     std::uint32_t slots;
     std::uint32_t depth;      // slots / spt: this SHAVE's slots, fills in flight ahead
-    std::int32_t port;        // -1: each fill in two halves on ports 0 and 1; 0/1: whole fill on that port
+    std::int32_t port;        // -1: each fill in two halves on ports 0 and 1; 0/1: whole fill on that port;
+                              // 2/3: whole fill on port (use & 1) / (use + 1) & 1, so a ring of depth 2 has one
+                              // fill in flight per port (the toolkit's chain takes one job per port per SHAVE: a
+                              // second start on a port waits for the first; M3's num_stages=4 arm spent 280 us there)
     bool multicast;           // true: tile 0 fills every tile's slot; false: each tile fills its own (split stream)
+    bool local;               // split stream read by the SHAVE that fills it: no barriers (the fill's DMA
+                              // watermark is READY; program order is FREE), no cross-tile coupling
     std::uint32_t total;      // chunks streamed in this ring
     std::uint32_t myUses;     // chunks of this SHAVE
     std::uint32_t readyBase;  // READY id = readyBase + slot * 2 + parity
@@ -490,6 +516,9 @@ public:
     return reinterpret_cast<T *>(ring_slot(r, use));
   }
   DmaDescriptor *ring_fill_desc(const Ring &r, std::uint32_t use) const { return r.fill + 2 * (use % r.depth); }
+  std::uint32_t ring_fill_port(const Ring &r, std::uint32_t use) const {
+    return r.port >= 2 ? ((use + static_cast<std::uint32_t>(r.port)) & 1u) : static_cast<std::uint32_t>(r.port);
+  }
   std::uint32_t ring_uses(const Ring &r) const { return r.myUses; }
   std::uint32_t ring_chunk(std::uint32_t use) const { return use * spt_ + shave_; }
 
@@ -500,7 +529,8 @@ public:
   // every config is live before any gate. `readyBase`/`freeBase` come from the
   // compiler's barrier assignment (2 x slots ids each).
   Ring ring_begin(void *slotBase, std::uint32_t slotBytes, std::uint32_t slots, std::uint32_t total,
-                  std::uint32_t readyBase, std::uint32_t freeBase, std::int32_t port = -1, bool multicast = true) {
+                  std::uint32_t readyBase, std::uint32_t freeBase, std::int32_t port = -1, bool multicast = true,
+                  bool local = false) {
     Ring r{};
     r.slotBase = static_cast<std::uint8_t *>(slotBase);
     r.slotBytes = slotBytes;
@@ -508,8 +538,9 @@ public:
     r.total = total;
     r.readyBase = readyBase;
     r.freeBase = freeBase;
-    r.port = port < 0 ? -1 : (port & 1);
-    r.multicast = multicast;
+    r.port = port < 0 ? -1 : (port >= 2 ? 2 + (port & 1) : (port & 1));
+    r.multicast = multicast && !local;
+    r.local = local;
     if (!ok_)
       return r;
     if (slots == 0 || static_cast<std::int32_t>(slots) % spt_ != 0) {
@@ -532,6 +563,10 @@ public:
       for (std::int32_t s = 0; s < spt_; ++s)
         r.order[s] = 0;
       flushCmxWrites();
+    }
+    if (local) {
+      r.armed = ok_;   // no ids to configure, no rendezvous
+      return r;
     }
     if (tile_ == 0) {
       for (std::uint32_t u = 0; u < 2 * r.depth && u < r.myUses; ++u)
@@ -587,20 +622,24 @@ public:
     DmaDescriptor *d = ring_fill_desc(r, use);
     std::uint32_t t0 = perf_ticks();
     if (use >= r.depth) {
-      const std::uint32_t freeId = ring_free(r, use - r.depth);
-      if (!barrier_wait_produced(freeId))
-        return;
-      barrier_consume(freeId);
+      if (!r.local) {
+        const std::uint32_t freeId = ring_free(r, use - r.depth);
+        if (!barrier_wait_produced(freeId))
+          return;
+        barrier_consume(freeId);
+      }
       // The previous halves have completed (READY lifted); the chains still need the wait.
       if (!dma_wait(d, 1) || (r.port < 0 && !dma_wait(d + 1, 2)))
         return;
     }
     std::uint32_t t1 = perf_ticks();
     ringTicks_[kTickFreeWait] += t1 - t0;
-    ring_arm(r, use);
-    // A split stream's issuer on another tile produces on ids tile 0 arms: wait for the config.
-    if (!r.multicast && tile_ != 0 && !barrier_wait_live(ring_ready(r, use)))
-      return;
+    if (!r.local) {
+      ring_arm(r, use);
+      // A split stream's issuer on another tile produces on ids tile 0 arms: wait for the config.
+      if (!r.multicast && tile_ != 0 && !barrier_wait_live(ring_ready(r, use)))
+        return;
+    }
     // One descriptor of this SHAVE in flight per port: a second start while another
     // ring's fill is still running on the port left one half unproduced (flash phase,
     // two rings; READY stuck at p=1). Before initDesc below: it clears the watermark
@@ -609,7 +648,7 @@ public:
       port_retire(0);
       port_retire(1);
     } else {
-      port_retire(r.port);
+      port_retire(ring_fill_port(r, use));
     }
     if (!ok_)
       return;
@@ -619,15 +658,17 @@ public:
     auto cmx = [&](std::uint8_t *p) {
       return reinterpret_cast<std::uint32_t>(r.multicast ? convertToCmxMulticastAddr(p, mask) : p);
     };
-    const std::uint32_t ready = ring_ready(r, use);
+    const std::uint32_t ready = r.local ? 0 : ring_ready(r, use);
     DmaDrv::initDesc(d);
     if (r.port >= 0) {
       // whole fill, one descriptor on this ring's port (several streams share the two ports)
-      configDmaCopy2D(d, cmx(dst0), src, width, rows, width, srcStride);
-      DmaDrv::setProducerBarrier(d, ready);
+      const std::uint32_t port = ring_fill_port(r, use);
+      config_copy(d, cmx(dst0), src, width, rows, width, srcStride);
+      if (!r.local)
+        DmaDrv::setProducerBarrier(d, ready);
       DmaDrv::setConsumerBarriers(d, 0, 0);
-      dma_.start(d, r.port);
-      lastOnPort_[r.port] = d;
+      dma_.start(d, port);
+      lastOnPort_[port] = d;
       ringTicks_[kTickFillIssue] += perf_ticks() - t1;
       return;
     }
@@ -638,12 +679,14 @@ public:
       configDmaCopy(d + 1, cmx(dst0 + half0), src + half0, width - half0);
     } else {
       const std::uint32_t rows0 = rows / 2;
-      configDmaCopy2D(d, cmx(dst0), src, width, rows0, width, srcStride);
-      configDmaCopy2D(d + 1, cmx(dst0 + rows0 * width), src + static_cast<std::uint64_t>(rows0) * srcStride, width,
-                      rows - rows0, width, srcStride);
+      config_copy(d, cmx(dst0), src, width, rows0, width, srcStride);
+      config_copy(d + 1, cmx(dst0 + rows0 * width), src + static_cast<std::uint64_t>(rows0) * srcStride, width,
+                  rows - rows0, width, srcStride);
     }
-    DmaDrv::setProducerBarrier(d, ready);
-    DmaDrv::setProducerBarrier(d + 1, ready);
+    if (!r.local) {
+      DmaDrv::setProducerBarrier(d, ready);
+      DmaDrv::setProducerBarrier(d + 1, ready);
+    }
     DmaDrv::setConsumerBarriers(d, 0, 0);
     DmaDrv::setConsumerBarriers(d + 1, 0, 0);
     dma_.start(d, 0);
@@ -700,16 +743,25 @@ public:
   void ring_slot_acquire(Ring &r, std::uint32_t use) {
     if (!ok_ || !r.armed || use >= r.myUses)
       return;
-    ring_arm(r, use);
-    const std::uint32_t ready = ring_ready(r, use);
     const std::uint32_t t0 = perf_ticks();
-    if (!barrier_wait_live(ready) || !barrier_wait_produced(ready))
-      return;
-    barrier_consume(ready);
-    ringTicks_[kTickDpuWait] += perf_ticks() - t0;
+    if (r.local) {
+      // my own fill: its DMA watermark is the READY
+      DmaDescriptor *d = ring_fill_desc(r, use);
+      if (!dma_wait(d, 7) || (r.port < 0 && !dma_wait(d + 1, 8)))
+        return;
+    } else {
+      ring_arm(r, use);
+      const std::uint32_t ready = ring_ready(r, use);
+      if (!barrier_wait_live(ready) || !barrier_wait_produced(ready))
+        return;
+      barrier_consume(ready);
+    }
+    // the acquire wait (the fill landing) is counted with the submit path's barrier-live wait (counter 0), apart
+    // from the DPU wait (counter 3), so a SHAVE-read ring's DMA and DPU waits are told apart in the status words
+    ringTicks_[kTickLive] += perf_ticks() - t0;
   }
   void ring_slot_release(Ring &r, std::uint32_t use) {
-    if (!ok_ || !r.armed || use >= r.myUses)
+    if (!ok_ || !r.armed || use >= r.myUses || r.local)
       return;
     barrier_produce(ring_free(r, use));
   }
@@ -754,6 +806,8 @@ public:
         if (lastOnPort_[p] == d || lastOnPort_[p] == d + 1)
           lastOnPort_[p] = nullptr;
     }
+    if (r.local)
+      return;
     const std::uint32_t first = r.myUses > r.depth ? r.myUses - r.depth : 0;
     for (std::uint32_t u = first; u < r.myUses; ++u) {
       const std::uint32_t freeId = ring_free(r, u);
@@ -1062,8 +1116,7 @@ private:
     if (!ok_)
       return;
     DmaDrv::initDesc(desc_);
-    configDmaCopy2D(desc_, reinterpret_cast<std::uint32_t>(dst), src, width, rows,
-                    dstStride, srcStride);
+    config_copy(desc_, reinterpret_cast<std::uint32_t>(dst), src, width, rows, dstStride, srcStride);
     dma_.run(desc_);
   }
 
@@ -1077,9 +1130,23 @@ private:
       return;
     flushCmxWrites();
     DmaDrv::initDesc(desc_ + 1);
-    configDmaCopy2D(desc_ + 1, dst, reinterpret_cast<std::uint32_t>(src), width, rows,
-                    dstStride, srcStride);
+    config_copy(desc_ + 1, dst, reinterpret_cast<std::uint32_t>(src), width, rows, dstStride, srcStride);
     dma_.run(desc_ + 1);
+  }
+
+  // The fewest dimensions that describe the copy: rows that are contiguous on both sides are ONE 1-D
+  // transfer (a 2-D descriptor of 512 rows x 256 B ran at a third of the rate of 1024-B rows: the
+  // engine's per-row cost; M3), one strided side keeps the other side as a single run.
+  static void config_copy(DmaDescriptor *d, std::uint64_t dst, std::uint64_t src, std::uint32_t width,
+                          std::uint32_t rows, std::uint32_t dstStride, std::uint32_t srcStride) {
+    if (rows == 1 || (dstStride == width && srcStride == width))
+      configDmaCopy(d, dst, src, width * rows);
+    else if (dstStride == width)
+      configDmaCopySrcStrided2D(d, dst, src, width, rows, srcStride);
+    else if (srcStride == width)
+      configDmaCopyDstStrided2D(d, dst, src, width, rows, dstStride);
+    else
+      configDmaCopy2D(d, dst, src, width, rows, dstStride, srcStride);
   }
 
   const Environment &env_;

@@ -218,15 +218,15 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
     return;
   }
   if (op->op.same_as(tl::intel_npu_dpu_matmul_i4g())) {
-    os << "ctx.dpu_matmul_i4g(" << args(0, 8) << ")";
+    os << "ctx.dpu_matmul_i4g(" << args(0, 9) << ")";
     return;
   }
   if (op->op.same_as(tl::intel_npu_dpu_matmul_i8g())) {
-    os << "ctx.dpu_matmul_i8g(" << args(0, 8) << ")";
+    os << "ctx.dpu_matmul_i8g(" << args(0, 9) << ")";
     return;
   }
   if (op->op.same_as(tl::intel_npu_ring_begin())) {
-    os << "ctx.ring_begin(" << args(0, 8) << ")";
+    os << "ctx.ring_begin(" << args(0, 9) << ")";
     return;
   }
   if (op->op.same_as(tl::intel_npu_ring_uses())) {

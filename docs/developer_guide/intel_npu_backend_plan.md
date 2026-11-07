@@ -485,7 +485,7 @@ device-verified and measured here.
 | Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | `T.vectorized` loops lower to half32/float16 SHAVE vector ops with VAU exp/log/tanh (**have**, log 2026-11-07); the ops themselves not yet written | M1 |
 | Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**; 960x1024x64 vectorised 1.765 ms TURBO (log 2026-11-07); GQA, gate, decode, KV cache open | M1 |
 | Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | none | M4 |
-| MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | none | M3 |
+| MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | **have** (log 2026-11-08 M3): one launch at Qwen3.6's shape, device PASS (routing == oracle), **0.560 ms** TURBO = 28 GB/s of the 15.8 MB it reads; expert phase ~0.43 ms at 34 GB/s (DMA-latency bound, see the log's cost split) | M3 |
 | Head | final norm + lm_head (int8 g128) + greedy argmax | none | M2 / M5 |
 | Compiler | layer table + device-side layer loop with two layer kinds; long-prompt chunk loop; CMX reuse across phases; barrier id reuse; `.text` per kernel | phases + derived `sync_grid`, budgets as sums (**have**); PlanCmx and id reuse open | M5 |
 | e2e | pack, export, fp32 reference on the quantised weights, golden, `longseq` | none here; npu_dsl's `qwen36_e2e` reference / pack / golden are reusable model-side code | M6 |
@@ -496,6 +496,33 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 
 ## 8. Log
 
+* 2026-11-08: **M3 closed: the MoE decode layer in one launch** (`kernels.make_moe_decode`, `device/run_moe_device.py`,
+  `test_intel_npu_m3_moe.py`). Qwen3.6's shape (H 2048, 256 experts of inter 512, top-8 softmax renormalised + a
+  shared expert gated by sigmoid(router row E), int4 g128): router fp16 GEMM (x padded to 16 rows, 288 padded router
+  rows split over the tiles) -> `T.sync_grid()` -> top-k on SHAVE 0 of every tile (redundant, so no second grid
+  barrier) -> 9 items dealt 3 per tile, each a gate/up GEMV and a down GEMV through rings whose **fill source reads
+  `ids[tile * 3 + j]`** (an indirect, tile-split stream the DPU reads in place) with SwiGLU between -> partials meet
+  in DDR -> `T.sync_grid()` -> tile 0 combines into the residual. Device: PASS rel 8.7e-4 against a numpy oracle,
+  routing identical, negative (a routed expert's group perturbed) FAIL as required; **0.560 ms** kernel-only
+  (0.555-0.562 over 10, TURBO, UNPROFILED) = 28.2 GB/s of the 15.78 MB read. **Compiler capability added, all
+  generic:** (1) a ring hoisted over an outer loop may have fills that read the outer variable (the fill ahead
+  substitutes `chunk / inner_extent`), several pipelined loops in one outer loop each get a ring, and a fill whose
+  source index reads a buffer the iteration writes is not hoisted (test); (2) `T.gemm_i4(..., scales_row=N)`: the
+  chunk block carries its group-major scales after the weight rows (one DMA per chunk; row-major and group-major
+  `s` buffers still accepted, runtime `sStride`); (3) DMA ports assigned over all live rings by a per-port serial
+  job-cost model, and rings of depth >= 2 alternate ports by use (runtime port modes 2/3) because the toolkit's chain
+  takes one job per port per SHAVE; (4) **local rings**: a split stream read by the SHAVE that fills it needs no
+  hardware barriers (DMA watermark = READY, program order = FREE), so the barrier pool is untouched by decode GEMVs.
+  **Cost split (per SHAVE, from the status counters):** 0.950 ms at first -> 0.823 (no per-workload scale transpose:
+  the 256x4 scalar transpose of the down GEMV cost 18 us per workload) -> 0.751 (weights not all on port 0) -> 0.729
+  (one job per chunk) -> 0.607 (two slots per SHAVE, ports alternating) -> 0.551 (local rings) -> 0.560 final. What
+  remains: acquire wait ~130 us, DPU wait ~100 (36 workloads x 2.7 us), fill issue ~85, submit ~37; the intercept
+  (router + routing + combine + prologue, from a top-2 run at 0.284 ms) is ~0.12 ms; the expert phase moves 13.9 MiB
+  at ~34 GB/s where the DMA probe's six-issuer unicast pattern reaches 75 GB/s at 128 KiB jobs (94 at 256 KiB). The
+  `--skip-dpu` arm (0.545 ms) shows the phase is DMA/ring bound, not DPU bound. Levers left for M5: larger chunks
+  (CMX reuse across phases would allow 256-row chunks at two slots), the per-fill SHAVE cost (3 us), the router's
+  fp16 ring and the scalar top-k (~0.12 ms together). Flash re-measured after the runtime changes: 1.130 ms (1.112
+  before, within the launch-set spread); 77 passed.
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
@@ -508,7 +535,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   ~126 GB/s DMA bound is the per-SHAVE serialisation (acquire -> 4 workloads -> release -> store) and six
   concurrent issuers; the lever is a tile-shared chunk filled by one issuer and consumed by both SHAVEs (a ring
   variant), left for the model's profile to justify. M2 coverage: prefill W4A16 both roles, decode int4 and int8;
-  75 passed.
+  74 passed.
 * 2026-11-07: **M2 step 2: the decode GEMV through the DPU's int4-weight mode.** New dialect op `T.gemm_i4(a, wq, s,
   out, group, row0, rows)` -> runtime `dpu_matmul_i4g`: one mixed-mode DPU workload (fp16 activations x packed int4
   weights read in place, `wmode = I4`) over the M x ng pseudo-rows against N x ng channels whose weight-table
