@@ -483,7 +483,7 @@ device-verified and measured here.
 | Projections, prefill | int4 group-128: SHAVE dequant -> fp16 DPU; fp16 (`baProj`) | **have** (log 2026-11-07 M2): W4A16 flow in both role assignments, device PASS; 0.82x npu_dsl's tuned probe at its shape, dequant row op 0.26 cyc/value | M2 |
 | Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | **have** (log 2026-11-07 M2): `T.gemm_i4` / `T.gemm_i8` merged-FC DPU path, device PASS, 30 / 41 GB/s of weights (DMA bound ~126) | M2 |
 | Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | `T.vectorized` loops lower to half32/float16 SHAVE vector ops with VAU exp/log/tanh (**have**, log 2026-11-07); the ops themselves not yet written | M1 |
-| Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**; 960x1024x64 vectorised 1.765 ms TURBO (log 2026-11-07); GQA, gate, decode, KV cache open | M1 |
+| Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash prefill phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**, 960x1024x64 vectorised 1.042 ms TURBO; **decode layer have** (log 2026-11-08): qkv GEMV, zero-centred q/k norm, RoPE, cache append, flash-decoding over 1536 positions with GQA 8:1 and the output gate, o_proj, in one launch, device PASS, **0.563 ms** TURBO; prefill GQA / gate / causal mask open | M1 |
 | Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | **decode have** (log 2026-11-08 M4): one launch at Qwen3.6's shape, device PASS with both states checked, **0.750 ms** TURBO; the chunked prefill scan open | M4 |
 | MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | **have** (log 2026-11-08 M3): one launch at Qwen3.6's shape, device PASS (routing == oracle), **0.560 ms** TURBO = 28 GB/s of the 15.8 MB it reads; expert phase ~0.43 ms at 34 GB/s (DMA-latency bound, see the log's cost split) | M3 |
 | Head | final norm + lm_head (int8 g128) + greedy argmax | none | M2 / M5 |
@@ -496,6 +496,20 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 
 ## 8. Log
 
+* 2026-11-08: **Attention decode layer closed** (`kernels.make_attn_decode`, `device/run_attn_device.py`,
+  `test_intel_npu_m1_attn_decode.py`): Qwen3.6's shape (16 q-heads over 2 kv-heads of 256, RoPE 64, output gate,
+  zero-centred norms, int4 g128 qkv [9216, 2048] / o_proj [2048, 4096], a 1536-position cache). qkv GEMV -> the 18
+  head items dealt over the workers (norm, RoPE from host cos/sin, K row and V^T column appended at pos) -> flash-
+  decoding with every tile streaming its third of the positions through K / Vt rings hoisted over the kv groups, GQA
+  rows M = 8, positions past pos masked on the straddling chunk (the cache past pos holds zeros) -> tile merge ->
+  head merge over the tiles + gate -> o_proj + residual. Device: PASS (rel 6.3e-3 of the attention contribution),
+  cache entries within 2e-3, negative FAIL as required; **0.563 ms** (0.556-0.566, TURBO, UNPROFILED) for 14.2 MB of
+  weights + 3.15 MB of cache. Two generic fixes found by it: a one-vector buffer indexed by a loop variable stays in
+  CMX (a register's variable-lane extract feeding a splat is unselectable: `LANESPLAT`), and the planner's SHAVE
+  split of a resident fill offsets the second-to-last index (a 3-D cache source). Open: a chunk count that follows
+  pos (today every chunk of the window streams and the mask does the rest: the long-context lever for M5), decode
+  attention cost split. **With this the decode path has every block but the head**: embedding row, final norm,
+  lm_head int8 GEMV + argmax, and then the layer loop (M5).
 * 2026-11-08: **M4 decode closed: the Gated DeltaNet mixer layer in one launch** (`kernels.make_gdn_decode`,
   `device/run_gdn_device.py`, `test_intel_npu_m4_gdn.py`). Qwen3.6's shape (H 2048, 16 k-heads / 32 v-heads of 128,
   conv k 4, int4 g128 in_proj [12352, 2048] and out_proj [2048, 4096]): in_proj GEMV (rows padded to the tile

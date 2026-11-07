@@ -216,8 +216,9 @@ def PlanIntelNpuDistribution():
             per = rows // spt
             dst_idx = list(dst.indices)
             src_idx = list(src.indices)
-            dst_idx[0] = dst_idx[0] + tx * per
-            src_idx[0] = src_idx[0] + tx * per
+            # the rows of a 2-D region are its second-to-last index (a [g, row, col] cache source, not only [row, col])
+            dst_idx[-2 if len(dst_idx) >= 2 else -1] = dst_idx[-2 if len(dst_idx) >= 2 else -1] + tx * per
+            src_idx[-2 if len(src_idx) >= 2 else -1] = src_idx[-2 if len(src_idx) >= 2 else -1] + tx * per
             new_args = [_address_of(dst.buffer, dst_idx), _address_of(src.buffer, src_idx), args[2], _i32(per),
                         args[4], args[5], args[6]]
             fill = tirx.Evaluate(tirx.Call(stmt.value.dtype, stmt.value.op, new_args))

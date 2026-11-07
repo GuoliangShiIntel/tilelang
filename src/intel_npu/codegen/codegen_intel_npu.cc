@@ -88,7 +88,21 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const ForNode *op) {
 }
 
 void CodeGenTileLangIntelNpu::VisitExpr_(const BroadcastNode *op, std::ostream &os) {
-  // A scalar cast to an ext_vector type splats.
+  // A scalar cast to an ext_vector type splats. A lane of a register buffer is splatted by a shuffle instead:
+  // moviCompile's backend cannot select v16f32 LANESPLAT of an extracted lane (M1 decode's norm factor), a
+  // shuffle of the register with a constant index list it can.
+  if (const auto *load = op->value.as<BufferLoadNode>()) {
+    const auto *imm = load->indices[0].as<IntImmNode>();
+    if (IsRegisterBuffer(load->buffer->data.get()) && load->dtype.lanes() == 1 && imm != nullptr &&
+        op->dtype.element_of() == load->buffer->dtype) {
+      const std::string vid = GetVarID(load->buffer->data.get());
+      os << "__builtin_shufflevector(" << vid << ", " << vid;
+      for (int i = 0; i < op->dtype.lanes(); ++i)
+        os << ", " << imm->value;
+      os << ")";
+      return;
+    }
+  }
   os << "((";
   PrintType(op->dtype, os);
   os << ")(" << PrintExpr(op->value) << "))";
@@ -176,6 +190,7 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const AllocBufferNode *op) {
   const bool shared = scope != "local";
   const DataType dt = op->buffer->dtype;
   const bool one_vector = !shared && dt.lanes() == 1 && dt.is_float() &&
+                          variable_lane_.count(op->buffer->data.get()) == 0 &&
                           ((dt.bits() == 16 && (count == 8 || count == 16 || count == 32)) ||
                            (dt.bits() == 32 && (count == 4 || count == 8 || count == 16)));
   if (one_vector) {
@@ -430,6 +445,26 @@ void CodeGenTileLangIntelNpu::AddFunction(const PrimFunc &f) {
   // The merged-FC scratch (npu_rt_device.hpp dpu_matmul_qg): part [M x ng, N x ng] and sT [ng, N] halves of the
   // largest quantised GEMV, reserved up front in kernel_entry so a kernel with two GEMV shapes pays no re-size.
   qg_part_elems_ = qg_st_elems_ = 0;
+  // Buffers accessed at a variable lane (indexed by a loop variable) are arrays, not registers: a splat of a
+  // variable-lane extract is unselectable on the SHAVE (the flash-decoding o_acc update by corr[i], M1 decode).
+  variable_lane_.clear();
+  register_lanes_.clear();
+  tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &n) {
+    const BufferNode *buf = nullptr;
+    PrimExpr index;
+    int lanes = 1;
+    if (const auto *ld = n.as<BufferLoadNode>()) {
+      buf = ld->buffer.get();
+      index = ld->indices[0];
+      lanes = ld->dtype.lanes();
+    } else if (const auto *st = n.as<BufferStoreNode>()) {
+      buf = st->buffer.get();
+      index = st->indices[0];
+      lanes = st->value.dtype().lanes();
+    }
+    if (buf != nullptr && lanes == 1 && !index.as<IntImmNode>())
+      variable_lane_.insert(buf->data.get());
+  });
   tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &n) {
     const auto *call = n.as<CallNode>();
     if (call == nullptr || !(call->op.same_as(tl::intel_npu_dpu_matmul_i4g()) ||

@@ -963,6 +963,321 @@ def gdn_reference(x, res, win_int, win_scales, wout_int, wout_scales, conv_w, a_
     return out, new_cs, S
 
 
+def make_attn_decode(H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, ROT: int = 64, SMAX: int = 1536, G: int = 128,
+                     tiles: int = 3, shaves: int = 2, BN1: int = 128, R1: int = 64, BN2: int = 64, R2: int = 32, BKV: int = 128,
+                     num_stages: int = 4, num_stages2: int = 2, kv_stages: int = 2, eps: float = 1e-6, pipelined: bool = True):
+    """M1/M5 decode: one token through a full-attention layer in ONE launch (Qwen3.6's shape by default: NH q-heads
+    over NKV kv-heads (GQA), head dim D, RoPE on the first ROT dims, an output gate per head, zero-centred q / k norms,
+    int4 g128 projections, a KV cache of SMAX positions).
+
+      q | gate | k | v = x . Wqkv^T         (rows [per q-head: q(D) gate(D)] x NH, then k (NKV x D), v (NKV x D))
+      q, k = rope(rmsnorm_zc(.))           (x rsqrt(mean x^2 + eps) (1 + w); rotate-half on the first ROT dims)
+      Kc[g, pos] = k_g;  Vt[g, :, pos] = v_g
+      o_h = softmax(q_h . Kc[g]^T / sqrt(D)) . V_g     over positions <= pos (g = h / (NH / NKV))
+      out = res + (o * sigmoid(gate)) . Wo^T
+
+    Phases: A. qkv GEMV (rows split over the tiles, chunk blocks) -> Y; T.sync_grid(); B. the NH + NKV head items
+    dealt over the workers: q heads normed and roped into QN, k heads normed, roped and appended to the K cache, v
+    heads appended to the transposed V cache; T.sync_grid(); C. flash-decoding: every tile streams its third of the
+    positions through K / Vt rings for each kv group (fills read the group: the rings are hoisted over the groups),
+    online softmax per SHAVE on the group's GQ = NH / NKV rows, positions past pos masked, the tile's two partials
+    merged into Part; T.sync_grid(); D. the three tiles' partials merged per head, the gate applied -> O;
+    T.sync_grid(); E. o_proj GEMV + residual -> Out. Positions past pos must hold zeros in the cache (the host
+    zero-initialises it; the mask then only has to zero their probabilities). Packing: `pack_attn`; sizes: `attn_sizes`."""
+    assert NH % NKV == 0 and D % 32 == 0 and ROT % 2 == 0 and SMAX % (tiles * BKV) == 0 and BKV % 32 == 0
+    GQ = NH // NKV
+    NQKV = NH * 2 * D + 2 * NKV * D
+    KOFF, VOFF = NH * 2 * D, NH * 2 * D + NKV * D
+    assert NQKV % (BN1 * tiles) == 0
+    C1 = NQKV // (BN1 * tiles)
+    NOUT_pad = -(-H // (BN2 * tiles)) * BN2 * tiles
+    C2 = NOUT_pad // (BN2 * tiles)
+    KO = NH * D                                 # o_proj K
+    HG1, KG2 = H // G, KO // G
+    assert R1 * HG1 <= 1024 and R2 * KG2 <= 1024 and BN1 % R1 == 0 and BN2 % R2 == 0
+    assert (HG1 * BN1 * 2) % (H // 2) == 0 and (KG2 * BN2 * 2) % (KO // 2) == 0
+    BR1, BR2 = BN1 + HG1 * BN1 * 2 // (H // 2), BN2 + KG2 * BN2 * 2 // (KO // 2)
+    workers = tiles * shaves
+    NIT = NH + NKV
+    CPT = SMAX // (tiles * BKV)                 # key chunks per tile per group
+    HL, FL = 32, 16
+    PW = D + FL                                 # partial row: O then m, l
+    scale = 1.0 / (D ** 0.5)
+    HR = ROT // 2
+
+    @T.prim_func
+    def attn(X: T.Tensor((1, H), T.float16), Res: T.Tensor((1, H), T.float16),
+             WqkvP: T.Tensor(((NQKV // BN1) * BR1, H // 2), T.uint8), QNormW: T.Tensor((1, D), T.float16),
+             KNormW: T.Tensor((1, D), T.float16), CosSin: T.Tensor((2, ROT), T.float32), Pos: T.Tensor((1, 1), T.int32),
+             Kc: T.Tensor((NKV, SMAX, D), T.float16), Vt: T.Tensor((NKV, D, SMAX), T.float16),
+             WoP: T.Tensor(((NOUT_pad // BN2) * BR2, KO // 2), T.uint8),
+             Y: T.Tensor((1, NQKV), T.float16), QN: T.Tensor((NKV, GQ, D), T.float16),
+             Part: T.Tensor((NKV, GQ, tiles, PW), T.float32), O: T.Tensor((1, KO), T.float16),
+             Out: T.Tensor((1, NOUT_pad), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            x_cmx = T.alloc_shared((1, H), T.float16)
+            w1_cmx = T.alloc_shared((BR1, H // 2), T.uint8)
+            y1_cmx = T.alloc_local((1, BN1), T.float16)
+            pos_cmx = T.alloc_shared((1, 1), T.int32)
+            cs_cmx = T.alloc_shared((2, ROT), T.float32)
+            qw_cmx = T.alloc_shared((1, D), T.float16)
+            kw_cmx = T.alloc_shared((1, D), T.float16)
+            row = T.alloc_local((1, D), T.float16)
+            rowf = T.alloc_local((D,), T.float32)
+            rown = T.alloc_local((1, D), T.float16)
+            vcol = T.alloc_local((D, 1), T.float16)
+            ls = T.alloc_local((FL,), T.float32)
+            st = T.alloc_local((4,), T.float32)
+            q_cmx = T.alloc_shared((GQ, D), T.float16)
+            k_cmx = T.alloc_shared((BKV, D), T.float16)
+            v_cmx = T.alloc_shared((D, BKV), T.float16)
+            s_cmx = T.alloc_local((GQ, BKV), T.float16)
+            pv_cmx = T.alloc_local((GQ, D), T.float16)
+            o_acc = T.alloc_local((GQ, D), T.float32)
+            m_i = T.alloc_local((GQ,), T.float32)
+            l_i = T.alloc_local((GQ,), T.float32)
+            m_new = T.alloc_local((GQ,), T.float32)
+            corr = T.alloc_local((GQ,), T.float32)
+            mx = T.alloc_local((HL,), T.float16)
+            gh = T.alloc_local((FL,), T.float16)
+            part = T.alloc_shared((shaves, GQ, PW), T.float32)
+            pout = T.alloc_local((GQ, PW), T.float32)
+            p3 = T.alloc_local((tiles, PW), T.float32)
+            gate = T.alloc_local((1, D), T.float16)
+            oh = T.alloc_local((1, D), T.float16)
+            o_cmx = T.alloc_shared((1, KO), T.float16)
+            res_cmx = T.alloc_shared((1, NOUT_pad), T.float16)
+            w2_cmx = T.alloc_shared((BR2, KO // 2), T.uint8)
+            y2_cmx = T.alloc_local((1, BN2), T.float16)
+            # --- A. qkv GEMV -----------------------------------------------------------------------------------------
+            T.copy(X[0, 0], x_cmx)
+            for n in (T.Pipelined(C1, num_stages=num_stages) if pipelined else T.serial(C1)):
+                T.copy(WqkvP[(tile * C1 + n) * BR1, 0], w1_cmx)
+                for sub in T.serial(BN1 // R1):
+                    T.gemm_i4(x_cmx, w1_cmx, None, y1_cmx, group=G, row0=sub * R1, rows=R1, scales_row=BN1)
+                T.copy(y1_cmx, Y[0, (tile * C1 + n) * BN1])
+            T.sync_grid()
+            # --- B. norms, RoPE, cache append: NH q heads then NKV kv heads, dealt over the workers ------------------
+            T.copy(Pos[0, 0], pos_cmx)
+            T.copy(CosSin[0, 0], cs_cmx)
+            T.copy(QNormW[0, 0], qw_cmx)
+            T.copy(KNormW[0, 0], kw_cmx)
+            for it in T.serial(T.ceildiv(NIT, workers)):
+                item = it * workers + worker
+                if item < NIT:
+                    if item < NH:
+                        T.copy(Y[0, item * 2 * D], row)
+                    else:
+                        T.copy(Y[0, KOFF + (item - NH) * D], row)
+                    # zero-centred RMSNorm: x rsqrt(mean(x^2) + eps) (1 + w)
+                    for v in T.vectorized(FL):
+                        ls[v] = T.float32(0)
+                    for d0 in T.serial(D // FL):
+                        for v in T.vectorized(FL):
+                            rowf[d0 * FL + v] = T.cast(row[0, d0 * FL + v], T.float32)
+                            ls[v] = ls[v] + rowf[d0 * FL + v] * rowf[d0 * FL + v]
+                    st[0] = T.float32(1) / T.sqrt(T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL]) / T.float32(D) + T.float32(eps))
+                    for d0 in T.serial(D // FL):
+                        for v in T.vectorized(FL):
+                            if item < NH:
+                                rowf[d0 * FL + v] = rowf[d0 * FL + v] * st[0] * (T.float32(1) + T.cast(qw_cmx[0, d0 * FL + v], T.float32))
+                            else:
+                                rowf[d0 * FL + v] = rowf[d0 * FL + v] * st[0] * (T.float32(1) + T.cast(kw_cmx[0, d0 * FL + v], T.float32))
+                    # RoPE, rotate-half on the first ROT dims (cos / sin of this position from the host)
+                    for r in T.serial(HR):
+                        st[1] = rowf[r]
+                        st[2] = rowf[HR + r]
+                        rowf[r] = st[1] * cs_cmx[0, r] - st[2] * cs_cmx[1, r]
+                        rowf[HR + r] = st[2] * cs_cmx[0, HR + r] + st[1] * cs_cmx[1, HR + r]
+                    for d0 in T.serial(D // FL):
+                        for v in T.vectorized(FL):
+                            rown[0, d0 * FL + v] = T.cast(rowf[d0 * FL + v], T.float16)
+                    if item < NH:
+                        T.copy(rown, QN[item // GQ, item % GQ, 0])
+                    else:
+                        T.copy(rown, Kc[item - NH, pos_cmx[0, 0], 0])
+                        T.copy(Y[0, VOFF + (item - NH) * D], row)
+                        for d in T.serial(D):
+                            vcol[d, 0] = row[0, d]
+                        T.copy(vcol, Vt[item - NH, 0, pos_cmx[0, 0]])
+            T.sync_grid()
+            # --- C. flash-decoding over this tile's third of the positions, per kv group -----------------------------
+            for g in T.serial(NKV):
+                T.copy(QN[g, 0, 0], q_cmx)
+                for i, d0 in T.grid(GQ, D // FL):
+                    for v in T.vectorized(FL):
+                        o_acc[i, d0 * FL + v] = T.float32(0)
+                for i in T.serial(GQ):
+                    m_i[i] = T.float32(-1e30)
+                    l_i[i] = T.float32(0)
+                for kv in (T.Pipelined(CPT, num_stages=kv_stages) if pipelined else T.serial(CPT)):
+                    T.copy(Kc[g, (tile * CPT + kv) * BKV, 0], k_cmx)
+                    T.copy(Vt[g, 0, (tile * CPT + kv) * BKV], v_cmx)
+                    T.gemm(q_cmx, k_cmx, s_cmx, transpose_B=True, clear_accum=True)
+                    # positions past pos: their scores are 0 (zeroed cache) -> -65504 before the max, so P = 0
+                    if (tile * CPT + kv) * BKV + BKV > pos_cmx[0, 0] + 1:
+                        for i, j in T.grid(GQ, BKV):
+                            if (tile * CPT + kv) * BKV + j > pos_cmx[0, 0]:
+                                s_cmx[i, j] = T.float16(-65504)
+                    for i in T.serial(GQ):
+                        for v in T.vectorized(HL):
+                            mx[v] = s_cmx[i, v]
+                        for j0 in T.serial(1, BKV // HL):
+                            for v in T.vectorized(HL):
+                                mx[v] = T.max(mx[v], s_cmx[i, j0 * HL + v])
+                        m_new[i] = T.max(m_i[i], T.cast(T.call_extern(T.float16, "tl_npu_vmax", mx[0:HL]), T.float32) * scale)
+                        corr[i] = T.exp(m_i[i] - m_new[i])
+                        for j0 in T.serial(BKV // HL):
+                            for v in T.vectorized(HL):
+                                s_cmx[i, j0 * HL + v] = T.exp(s_cmx[i, j0 * HL + v] * T.float16(scale) - T.cast(m_new[i], T.float16))
+                        for v in T.vectorized(FL):
+                            ls[v] = T.cast(s_cmx[i, v], T.float32)
+                        for j0 in T.serial(1, BKV // FL):
+                            for v in T.vectorized(FL):
+                                ls[v] = ls[v] + T.cast(s_cmx[i, j0 * FL + v], T.float32)
+                        l_i[i] = l_i[i] * corr[i] + T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL])
+                        m_i[i] = m_new[i]
+                    T.gemm(s_cmx, v_cmx, pv_cmx, transpose_B=True, clear_accum=True)
+                    for i in T.serial(GQ):
+                        for d0 in T.serial(D // FL):
+                            for v in T.vectorized(FL):
+                                o_acc[i, d0 * FL + v] = o_acc[i, d0 * FL + v] * corr[i] + T.cast(pv_cmx[i, d0 * FL + v], T.float32)
+                # the tile's two partials -> one (unnormalised O, m, l) per row into Part[g, :, tile, :]
+                for i, d0 in T.grid(GQ, D // FL):
+                    for v in T.vectorized(FL):
+                        part[shave, i, d0 * FL + v] = o_acc[i, d0 * FL + v]
+                for i in T.serial(GQ):
+                    part[shave, i, D] = m_i[i]
+                    part[shave, i, D + 1] = l_i[i]
+                T.sync_threads()
+                if shave == 0:
+                    for i in T.serial(GQ):
+                        m_new[i] = T.max(part[0, i, D], part[1, i, D])
+                        corr[i] = T.exp(part[0, i, D] - m_new[i])
+                        l_i[i] = T.exp(part[1, i, D] - m_new[i])
+                        for d0 in T.serial(D // FL):
+                            for v in T.vectorized(FL):
+                                pout[i, d0 * FL + v] = part[0, i, d0 * FL + v] * corr[i] + part[1, i, d0 * FL + v] * l_i[i]
+                        pout[i, D] = m_new[i]
+                        pout[i, D + 1] = part[0, i, D + 1] * corr[i] + part[1, i, D + 1] * l_i[i]
+                    for i in T.serial(GQ):
+                        T.copy(pout[i:i + 1, 0:PW], Part[g, i, tile, 0])
+                T.sync_threads()
+            T.sync_grid()
+            # --- D. merge the tiles per head, apply the gate -> O ------------------------------------------------------
+            for it in T.serial(T.ceildiv(NH, workers)):
+                h = it * workers + worker
+                if h < NH:
+                    T.copy(Part[h // GQ, h % GQ, 0, 0], p3)
+                    T.copy(Y[0, h * 2 * D + D], gate)
+                    st[0] = p3[0, D]
+                    for t in T.serial(1, tiles):
+                        st[0] = T.max(st[0], p3[t, D])
+                    st[1] = T.float32(0)
+                    for t in T.serial(tiles):
+                        p3[t, D] = T.exp(p3[t, D] - st[0])     # the tile's weight
+                        st[1] = st[1] + p3[t, D] * p3[t, D + 1]
+                    st[1] = T.float32(1) / st[1]
+                    for d0 in T.serial(D // FL):
+                        for v in T.vectorized(FL):
+                            rowf[d0 * FL + v] = T.float32(0)
+                    for t in T.serial(tiles):
+                        for d0 in T.serial(D // FL):
+                            for v in T.vectorized(FL):
+                                rowf[d0 * FL + v] = rowf[d0 * FL + v] + p3[t, d0 * FL + v] * p3[t, D]
+                    for d0 in T.serial(D // FL):
+                        for v in T.vectorized(FL):
+                            gh[v] = T.exp(T.float16(0) - gate[0, d0 * FL + v])
+                            oh[0, d0 * FL + v] = T.cast(rowf[d0 * FL + v] * st[1] / (T.float32(1) + T.cast(gh[v], T.float32)), T.float16)
+                    T.copy(oh, O[0, h * D])
+            T.sync_grid()
+            # --- E. o_proj GEMV + residual ---------------------------------------------------------------------------
+            for c in T.serial(NOUT_pad - H):
+                if shave == 0:
+                    res_cmx[0, H + c] = T.float16(0)
+            T.copy(O[0, 0], o_cmx)
+            T.copy(Res[0:1, 0:H], res_cmx[0:1, 0:H])
+            for n in (T.Pipelined(C2, num_stages=num_stages2) if pipelined else T.serial(C2)):
+                T.copy(WoP[(tile * C2 + n) * BR2, 0], w2_cmx)
+                for sub in T.serial(BN2 // R2):
+                    T.gemm_i4(o_cmx, w2_cmx, None, y2_cmx, group=G, row0=sub * R2, rows=R2, scales_row=BN2)
+                for c in T.serial(BN2):
+                    y2_cmx[0, c] = T.cast(T.cast(y2_cmx[0, c], T.float32)
+                                          + T.cast(res_cmx[0, (tile * C2 + n) * BN2 + c], T.float32), T.float16)
+                T.copy(y2_cmx, Out[0, (tile * C2 + n) * BN2])
+
+    return attn
+
+
+def attn_sizes(H: int, NH: int, NKV: int, D: int, tiles: int = 3, BN2: int = 64, **_):
+    """make_attn_decode's scratch and output sizes: dict(NQKV, GQ, PW, KO, NOUT_pad)."""
+    return dict(NQKV=NH * 2 * D + 2 * NKV * D, GQ=NH // NKV, PW=D + 16, KO=NH * D,
+                NOUT_pad=-(-H // (BN2 * tiles)) * BN2 * tiles)
+
+
+def pack_attn(wqkv_int, wqkv_scales, wo_int, wo_scales, tiles: int = 3, BN1: int = 128, BN2: int = 64):
+    """make_attn_decode's weights: the qkv rows ([per q-head q | gate] x NH, k, v; int4 values with scales) as chunk
+    blocks of BN1 rows, the o_proj rows zero-padded to the tile multiple as chunk blocks of BN2 rows."""
+    import numpy as np
+    n_pad = -(-wo_int.shape[0] // (BN2 * tiles)) * BN2 * tiles
+    wo = np.zeros((n_pad, wo_int.shape[1]), np.int8)
+    so = np.zeros((n_pad, wo_scales.shape[1]), np.float16)
+    wo[: wo_int.shape[0]] = wo_int
+    so[: wo_scales.shape[0]] = wo_scales
+    return dict(WqkvP=pack_chunk_blocks(wqkv_int, wqkv_scales, BN1), WoP=pack_chunk_blocks(wo, so, BN2))
+
+
+def rope_cos_sin(pos: int, ROT: int, theta: float):
+    """cos / sin rows [2, ROT] of one position (emb = cat(freqs, freqs), as the reference)."""
+    import numpy as np
+    inv = 1.0 / (theta ** (np.arange(0, ROT, 2, dtype=np.float64) / ROT))
+    f = pos * inv
+    emb = np.concatenate([f, f])
+    return np.stack([np.cos(emb), np.sin(emb)]).astype(np.float32)
+
+
+def attn_reference(x, res, wqkv_int, wqkv_scales, wo_int, wo_scales, qnorm_w, knorm_w, cos_sin, pos, kc, vt,
+                   NH: int, NKV: int, D: int, ROT: int, G: int, eps: float = 1e-6):
+    """numpy oracle of make_attn_decode (fp32): returns out [H], the K cache and transposed V cache after the append."""
+    import numpy as np
+    GQ = NH // NKV
+    xf = x.astype(np.float32).reshape(-1)
+    w = wqkv_int.astype(np.float32) * np.repeat(wqkv_scales.astype(np.float32), G, axis=1)
+    y = w @ xf
+    KOFF, VOFF = NH * 2 * D, NH * 2 * D + NKV * D
+
+    def norm_rope(v, wn):
+        v = v * (1.0 / np.sqrt((v * v).mean() + eps)) * (1.0 + wn.astype(np.float32).reshape(-1))
+        r = v[:ROT].copy()
+        h = ROT // 2
+        rot = np.concatenate([-r[h:], r[:h]])
+        v = v.copy()
+        v[:ROT] = r * cos_sin[0] + rot * cos_sin[1]
+        return v
+
+    kc = kc.copy()
+    vt = vt.copy()
+    q = np.zeros((NH, D), np.float32)
+    for hh in range(NH):
+        q[hh] = norm_rope(y[hh * 2 * D:hh * 2 * D + D], qnorm_w)
+    for g in range(NKV):
+        kc[g, pos] = norm_rope(y[KOFF + g * D:KOFF + (g + 1) * D], knorm_w).astype(np.float16)
+        vt[g, :, pos] = y[VOFF + g * D:VOFF + (g + 1) * D].astype(np.float16)
+    o = np.zeros((NH, D), np.float32)
+    for hh in range(NH):
+        g = hh // GQ
+        sc = kc[g, :pos + 1].astype(np.float32) @ q[hh] / np.sqrt(D)
+        p = np.exp(sc - sc.max())
+        p /= p.sum()
+        gate = y[hh * 2 * D + D:hh * 2 * D + 2 * D]
+        o[hh] = (vt[g, :, :pos + 1].astype(np.float32) @ p) / (1 + np.exp(-gate))
+    wo = wo_int.astype(np.float32) * np.repeat(wo_scales.astype(np.float32), G, axis=1)
+    out = res.astype(np.float32).reshape(-1) + wo @ o.reshape(-1)
+    return out, kc, vt
+
+
 def pack_int4(w_int: "np.ndarray") -> "np.ndarray":
     """[N, K] signed int4 values in [-8, 7] -> [N, K/2] bytes, low nibble first (the reference packer)."""
     import numpy as np

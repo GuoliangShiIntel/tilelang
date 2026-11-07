@@ -6,6 +6,8 @@
 #define TILELANG_INTEL_NPU_CODEGEN_CODEGEN_INTEL_NPU_H_
 
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "backend/common/codegen/codegen_c_base.h"
@@ -59,6 +61,7 @@ private:
   // accumulator lives in a register: moviCompile keeps a CMX buffer in CMX and reloads it after every store
   // (the GDN scan spent 60% of its cycles in NOPs around such round trips, M4).
   std::unordered_map<const VarNode *, int> register_lanes_;
+  std::unordered_set<const VarNode *> variable_lane_;   // buffers read or written at a non-constant lane: stay in CMX
   bool IsRegisterBuffer(const VarNode *v) const { return register_lanes_.count(v) != 0; }
 };
 
