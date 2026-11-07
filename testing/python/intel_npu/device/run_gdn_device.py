@@ -62,7 +62,7 @@ def main(argv):
     p = gdn_problem(0, **cfg)
     if "--negative" in argv:
         p["ssm"][5] += 0.5
-    packed = pack_gdn(p["win_int"], p["win_scales"], p["wout_int"], p["wout_scales"], tiles=TILES, BN1=BN1, BN2=BN2)
+    packed = pack_gdn(p["win_int"], p["win_scales"], p["wout_int"], p["wout_scales"], wba=p["wba"], tiles=TILES, shaves=SHAVES, BN1=BN1, BN2=BN2)
     arrays = gdn_arrays(p, packed, **cfg)
     # npu_run re-uploads every input (inout included) before each launch, so the in-place states restart every
     # launch and the one-step oracle is the golden (verified: the 20-step iteration disagrees, the one-step agrees)
@@ -70,13 +70,13 @@ def main(argv):
     ref_p = gdn_problem(0, **cfg)   # the UNPERTURBED problem, so the negative must fail
     ref, ref_cs, ref_ssm = gdn_reference(ref_p["x"], ref_p["res"], ref_p["win_int"], ref_p["win_scales"], ref_p["wout_int"],
                                          ref_p["wout_scales"], ref_p["conv_w"], ref_p["a_log"], ref_p["dt_bias"], ref_p["g_norm"],
-                                         ref_p["conv_state"], ref_p["ssm"], KH=SHAPE["KH"], VH=SHAPE["VH"], DK=SHAPE["DK"], G=G)
+                                         ref_p["conv_state"], ref_p["ssm"], KH=SHAPE["KH"], VH=SHAPE["VH"], DK=SHAPE["DK"], G=G, wba=ref_p["wba"])
     print(f"problem + oracle + packing {time.time() - t0:.0f} s")
     profile = None
     if "--profile" in argv:
         (HERE / "evidence").mkdir(exist_ok=True)
         profile = HERE / "evidence" / f"{kernel}_trace.json"
-    io = {k: ("out" if k in ("ConvState", "Ssm", "Y", "CV", "O", "Out") else "in") for k in arrays}
+    io = {k: ("out" if k in ("ConvState", "Ssm", "Y", "BA", "CV", "O", "Out") else "in") for k in arrays}
     io["ConvState"] = io["Ssm"] = "inout"
     ordered = lowering.order_arrays(low, {k: (io[k], v) for k, v in arrays.items()})
     res = runner.run(db, ordered, TILES, SHAVES, HERE / "run_gdn", profile_json=profile, repeat=REPEAT, warmup=WARMUP, timeout_s=300)
@@ -91,7 +91,7 @@ def main(argv):
     cs_rel = float(np.abs(arrays["ConvState"].astype(np.float32) - ref_cs.astype(np.float32)).max() / np.abs(ref_cs.astype(np.float32)).max())
     ssm_rel = float(np.abs(arrays["Ssm"] - ref_ssm).max() / np.abs(ref_ssm).max())
     kind = runner.condition(res, profile is not None)
-    weight_bytes = packed["WinP"].nbytes + packed["WoutP"].nbytes
+    weight_bytes = packed["WinP"].nbytes + packed["WoutP"].nbytes + packed["Wba"].nbytes
     state_bytes = 2 * arrays["Ssm"].nbytes + 2 * arrays["ConvState"].nbytes
     idu_us = [float(res.status[t * SHAVES:(t + 1) * SHAVES, 5].astype(np.int64).sum()) / PERF_CLK_MHZ for t in range(TILES)]
     print(f"device: kernel-only {res.median_kernel_ms:.3f} ms (host wall {res.median_ms:.3f} ms) [{kind}]; "
@@ -102,7 +102,8 @@ def main(argv):
         # which phase diverges: the oracle's intermediates against the scratch read back (Y, CV, O)
         one, cs1, S1, d = gdn_reference(ref_p["x"], ref_p["res"], ref_p["win_int"], ref_p["win_scales"], ref_p["wout_int"],
                                         ref_p["wout_scales"], ref_p["conv_w"], ref_p["a_log"], ref_p["dt_bias"], ref_p["g_norm"],
-                                        ref_p["conv_state"], ref_p["ssm"], KH=SHAPE["KH"], VH=SHAPE["VH"], DK=SHAPE["DK"], G=G, details=True)
+                                        ref_p["conv_state"], ref_p["ssm"], KH=SHAPE["KH"], VH=SHAPE["VH"], DK=SHAPE["DK"], G=G, details=True,
+                                        wba=ref_p["wba"])
         NIN = d["y"].size
         yd = arrays["Y"][0, :NIN].astype(np.float32)
         print(f"  diag: Y vs y: rel {np.abs(yd - d['y']).max() / np.abs(d['y']).max():.2e}; "

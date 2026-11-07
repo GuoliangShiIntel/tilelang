@@ -488,7 +488,7 @@ device-verified and measured here.
 | MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | **have** (log 2026-11-08 M3): one launch at Qwen3.6's shape, device PASS (routing == oracle), **0.560 ms** TURBO = 28 GB/s of the 15.8 MB it reads; expert phase ~0.43 ms at 34 GB/s (DMA-latency bound, see the log's cost split) | M3 |
 | Head | final norm + lm_head (int8 g128) + greedy argmax | **have** (log 2026-11-08): one launch at Qwen3.6's vocabulary, device PASS, **8.78 ms** TURBO = 58.9 GB/s vs npu_dsl's head 9.44 ms same day; both at <50% of the DMA bound | M5 |
 | Compiler | layer table + device-side layer loop with two layer kinds; long-prompt chunk loop; CMX reuse across phases; barrier id reuse; `.text` per kernel | phases + derived `sync_grid`, budgets as sums (**have**); PlanCmx and id reuse open | M5 |
-| e2e | pack, export, fp32 reference on the quantised weights, golden, `longseq` | none here; npu_dsl's `qwen36_e2e` reference / pack / golden are reusable model-side code | M6 |
+| e2e | pack, export, fp32 reference on the quantised weights, golden, `longseq` | **decode have** (log 2026-11-08): the real checkpoint packed and resident, 40 layers through the session runner, golden 16/16 vs the reference, 57 ms of device time per token (185 ms host wall); prefill forms, `longseq`, the npu_dsl A/B open | M6 |
 | Measurement | kernel-only time, traces, flow check, VPUNN-planned workloads, DMA model | **have** | - |
 
 Baseline to beat: npu_dsl's Qwen3.6-35B-A3B numbers (`qwen36_e2e`, its `docs/design/fused_compiler_log.md`),
@@ -496,6 +496,23 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 
 ## 8. Log
 
+* 2026-11-08: **First end-to-end decode of Qwen3.8-35B-A3B-Distill on the device, golden 16/16** (`testing/python/intel_npu/e2e/`:
+  `checkpoint.py` reads the compressed-tensors checkpoint, `pack.py` packs every layer into the kernels' arrays (cached as
+  .npy under a pack dir; 8 s per layer the first time), `reference_golden.py` saves the fp32 reference's answer (npu_dsl's
+  `qwen36_e2e.reference`, model-side code from `NPU_DSL_ROOT`, run on its own), `decode.py` drives the device). Runtime: `npu_run
+  --session` (kernels created once, named resident buffers, launches over stdin; `runner.Session`, `build_all`): the 40 layers'
+  17.91 GB upload straight from the cache files in 19 s and stay resident; per token one launch per block (30 GDN + 10 attention
+  mixers, 40 MoE, the head) with the residual stream in fp32 and the two RMSNorms per layer on the host (a 4 KB round trip
+  each), the prompt run token by token through the decode kernels. **Layer by layer against the reference: worst h rel
+  2.4e-3 over 40 layers; 16/16 greedy tokens agree teacher-forced; free generation is coherent.** Per token: device launches
+  **57.4 ms** (mixer 32.9 + MoE 17.9 + head 6.3; kernel-only, TURBO) = 17 tok/s of device time, host wall 185 ms (the 81
+  launches' protocol and file transfers: what M5's single-kernel decode removes). Two model-side findings: (1) GDN's
+  `in_proj_a / in_proj_b` are bf16 in the checkpoint, and int4 g128 would put ~13% noise on the gates, so the kernel now
+  takes them as 64 fp16 rows (fp32 lane dot products dealt over the workers, their own DDR scratch so the derived sync sees
+  no WAW on Y; 0.811 ms, within the clock-step spread of 0.750); (2) running the fp32 reference in the same process as 18 GB
+  of pinned weights swaps a 32 GB box (its expert cache and dense fp32 layer caches reach ~17 GB), so the golden is a saved
+  file. **Open for M5/M6:** norms and the residual into the kernels, the layer loop in one launch, the head's DMA pattern,
+  prefill kernels (TTFT), the same-day A/B against npu_dsl's Qwen3.6 decode step.
 * 2026-11-08: **Decode head closed, and the same-day A/B against npu_dsl's head** (`kernels.make_head`, `device/run_head_device.py`,
   `test_intel_npu_m5_head.py`; `device/run_npudsl_head_device.py`). Qwen3.6's shape: the zero-centred final norm (SHAVE 0 of
   every tile) -> lm_head int8 g128 GEMV over 248320 rows (padded to 248832 = a multiple of BN x tiles x SHAVEs; int8 chunk

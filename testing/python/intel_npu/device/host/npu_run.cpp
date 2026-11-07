@@ -209,7 +209,7 @@ int run(int argc, char **argv) {
 // (one command per line, one reply line per command, flushed). A model's decode loop is a sequence of
 // launches over resident weights with the host reading back a few KB per token.
 //   alloc NAME BYTES              shared device buffer, zeroed
-//   load NAME FILE [OFFSET]       DIR/FILE -> buffer at OFFSET
+//   load NAME FILE [OFFSET [FILEOFF [SIZE]]]   FILE (DIR-relative, or absolute) from FILEOFF, SIZE bytes (0: to its end) -> buffer at OFFSET
 //   zero NAME
 //   save NAME FILE [OFFSET BYTES] buffer -> DIR/FILE
 //   kernel ALIAS ELFNAME [profile]
@@ -263,25 +263,36 @@ int session(const std::string &dir, int tiles, int shaves) {
         reply("ok");
       } else if (cmd == "load" || cmd == "save") {
         std::string name, file;
-        std::uint64_t off = 0, n = 0;
-        ls >> name >> file >> off >> n;
+        std::uint64_t off = 0, n = 0, foff = 0;
+        ls >> name >> file >> off;
+        if (cmd == "load")
+          ls >> foff >> n;
+        else
+          ls >> n;
         auto it = bufs.find(name);
         if (it == bufs.end()) {
           reply("error no buffer " + name);
           continue;
         }
+        const bool absolute = file.size() > 1 && (file[1] == ':' || file[0] == '/' || file[0] == '\\');
+        const std::string path = absolute ? file : dir + "/" + file;
         if (cmd == "load") {
-          std::ifstream f(dir + "/" + file, std::ios::binary | std::ios::ate);
+          std::ifstream f(path, std::ios::binary | std::ios::ate);
           if (!f) {
             reply("error cannot read " + file);
             continue;
           }
-          const std::uint64_t size = (std::uint64_t)f.tellg();
-          if (off + size > it->second.bytes) {
-            reply("error " + file + " (" + std::to_string(size) + " B at " + std::to_string(off) + ") exceeds " + name);
+          const std::uint64_t fsize = (std::uint64_t)f.tellg();
+          if (foff > fsize) {
+            reply("error file offset past the end of " + file);
             continue;
           }
-          f.seekg(0);
+          const std::uint64_t size = n ? n : fsize - foff;
+          if (foff + size > fsize || off + size > it->second.bytes) {
+            reply("error " + file + " (" + std::to_string(size) + " B at " + std::to_string(off) + ") exceeds " + name + " or the file");
+            continue;
+          }
+          f.seekg((std::streamoff)foff);
           f.read(static_cast<char *>(it->second.dev) + off, (std::streamsize)size);
           reply("ok " + std::to_string(size));
         } else {
@@ -291,7 +302,7 @@ int session(const std::string &dir, int tiles, int shaves) {
             reply("error range exceeds " + name);
             continue;
           }
-          std::ofstream f(dir + "/" + file, std::ios::binary);
+          std::ofstream f(path, std::ios::binary);
           f.write(static_cast<const char *>(it->second.dev) + off, (std::streamsize)n);
           reply("ok " + std::to_string(n));
         }

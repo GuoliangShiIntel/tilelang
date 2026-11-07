@@ -282,6 +282,19 @@ class Session:
         a.tofile(f)
         self._cmd(f"load {name} {f.name} {int(offset)}")
 
+    def upload_npy(self, name: str, path: Path) -> int:
+        """A .npy file straight into a new buffer `name` (its data read by npu_run itself: no copy through Python)."""
+        with open(path, "rb") as f:
+            version = np.lib.format.read_magic(f)
+            read_header = np.lib.format.read_array_header_1_0 if version == (1, 0) else np.lib.format.read_array_header_2_0
+            shape, fortran, dtype = read_header(f)
+            data_off = f.tell()
+        assert not fortran
+        nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        self.alloc(name, nbytes)
+        self._cmd(f"load {name} {Path(path).resolve()} 0 {data_off} {nbytes}")
+        return nbytes
+
     def download(self, name: str, dtype, shape, offset: int = 0) -> np.ndarray:
         n = int(np.prod(shape)) * np.dtype(dtype).itemsize
         self._n += 1

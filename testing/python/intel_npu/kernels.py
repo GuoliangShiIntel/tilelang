@@ -624,19 +624,22 @@ def make_gdn_decode(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV
     """M4 decode: one token through a Gated DeltaNet mixer layer in ONE launch (Qwen3.6's shape by default: hidden H,
     KH k-heads and VH v-heads of DK = DV = 128, conv kernel 4, int4 g128 projections).
 
-      mixed | z | b | a = x . Win^T            (in_proj GEMV, rows [q | k | v | z | b | a | pad])
+      mixed | z = x . Win^T                   (in_proj GEMV, int4 g128 rows [q | k | v | z | pad])
+      b | a = x . Wba^T                        (the 2 VH gate projections the checkpoint keeps in bf16: fp16 rows,
+                                                fp32 dot products on the SHAVE, dealt over the workers)
       conv  = silu(conv1d_k4(mixed; state))    (per channel, the state carried in place)
       q, k  = l2norm(conv_q) / sqrt(DK), l2norm(conv_k); v = conv_v;  beta = sigmoid(b);  g = -exp(A_log) softplus(a + dt_bias)
       S     = S e^g + k (v - e^g S^T k) beta^T;  o = S^T q           (per v-head, S [DK, DV] fp32 carried in place)
       out   = res + rmsnorm(o) * g_norm * silu(z) . Wout^T          (gated RMSNorm per head, out_proj GEMV)
 
-    Phases: A. in_proj GEMV, rows split over the tiles (chunk blocks, local rings) -> Y in DDR, T.sync_grid();
+    Phases: A. in_proj GEMV, rows split over the tiles (chunk blocks, local rings) -> Y in DDR, then each worker's
+    RBA rows of Wba as fp32 lane dot products -> BA; T.sync_grid();
     B1. causal conv + SiLU over CONV channels in blocks of CB dealt over the workers, conv state updated, -> CV;
     T.sync_grid(); B2. each worker takes HPW consecutive v-heads (whole k-heads): one DMA each for its q, k, v, z
     rows, then per head S in (64 KiB), the two-pass delta rule in fp32 on vector lanes, S out, gated norm -> O;
     T.sync_grid(); C. out_proj GEMV + residual, rows split over the tiles -> Out (padded to NOUT_pad); its ring has
     `num_stages2` slots (one per SHAVE by default: both rings at two slots exceed the CMX budget by 34 KiB).
-    Scratch (DDR): Y [1, YLEN], CV [1, CVLEN], O [1, workers x HPW x DV] (padded so the last worker's whole-block
+    Scratch (DDR): Y [1, YLEN], BA [1, BA_LEN] (b then a), CV [1, CVLEN], O [1, workers x HPW x DV] (padded so the last worker's whole-block
     row loads stay in bounds; a DDR read past a buffer hangs the device). Packing: `pack_gdn`; sizes: `gdn_sizes`.
     `probe_skip`: MEASUREMENT ARM ONLY (output wrong by design): 'conv' leaves out the conv SHAVE loop, 'scan' the
     per-head delta rule and gated norm, 'gemv' both GEMVs' DPU workloads (the rings still stream)."""
@@ -645,7 +648,7 @@ def make_gdn_decode(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV
     QK, VC = KH * DK, VH * DV
     CONV = 2 * QK + VC
     ZOFF, BOFF, AOFF = CONV, CONV + VC, CONV + VC + VH
-    NIN = CONV + VC + 2 * VH
+    NIN = CONV + VC
     NIN_pad = -(-NIN // (BN1 * tiles)) * BN1 * tiles
     NOUT_pad = -(-H // (BN2 * tiles)) * BN2 * tiles
     C1, C2 = NIN_pad // (BN1 * tiles), NOUT_pad // (BN2 * tiles)
@@ -655,9 +658,13 @@ def make_gdn_decode(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV
     SR1, SR2 = HG1 * BN1 * 2 // (H // 2), KG2 * BN2 * 2 // (VC // 2)
     BR1, BR2 = BN1 + SR1, BN2 + SR2
     workers = tiles * shaves
+    RBA = -(-2 * VH // workers)                # b / a rows per worker
+    assert RBA <= BN1
+    WBA_pad = workers * RBA
     HPW = -(-VH // workers)
     HPW += (-HPW) % REP                       # whole k-heads per worker
     KHW = HPW // REP
+    BA_LEN = max(WBA_pad, VH + workers * HPW)  # the last worker's a reads reach past VH heads (skipped, in bounds)
     assert CONV % CB == 0
     NB = CONV // CB
     OPAD = workers * HPW * DV
@@ -764,11 +771,13 @@ def make_gdn_decode(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV
 
     @T.prim_func
     def gdn(X: T.Tensor((1, H), T.float16), Res: T.Tensor((1, H), T.float16),
-            WinP: T.Tensor(((NIN_pad // BN1) * BR1, H // 2), T.uint8), ConvW: T.Tensor((4, CONV), T.float16),
+            WinP: T.Tensor(((NIN_pad // BN1) * BR1, H // 2), T.uint8), Wba: T.Tensor((WBA_pad, H), T.float16),
+            ConvW: T.Tensor((4, CONV), T.float16),
             ALog: T.Tensor((1, VH), T.float32), DtBias: T.Tensor((1, VH), T.float32), GNorm: T.Tensor((1, DV), T.float16),
             ConvState: T.Tensor((3, CONV), T.float16), Ssm: T.Tensor((VH, DK, DV), T.float32),
             WoutP: T.Tensor(((NOUT_pad // BN2) * BR2, VC // 2), T.uint8),
-            Y: T.Tensor((1, YLEN), T.float16), CV: T.Tensor((1, CVLEN), T.float16), O: T.Tensor((1, OPAD), T.float16),
+            Y: T.Tensor((1, YLEN), T.float16), BA: T.Tensor((1, BA_LEN), T.float16), CV: T.Tensor((1, CVLEN), T.float16),
+            O: T.Tensor((1, OPAD), T.float16),
             Out: T.Tensor((1, NOUT_pad), T.float16)):
         with T.Kernel(tiles, threads=shaves) as tile:
             shave = T.get_thread_binding()
@@ -776,6 +785,7 @@ def make_gdn_decode(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV
             x_cmx = T.alloc_shared((1, H), T.float16)
             w1_cmx = T.alloc_shared((BR1, H // 2), T.uint8)
             y1_cmx = T.alloc_local((1, BN1), T.float16)
+            wba_cmx = T.alloc_local((RBA, H), T.float16)
             cs_cmx = T.alloc_local((3, CB), T.float16)
             cw_cmx = T.alloc_local((4, CB), T.float16)
             cx_cmx = T.alloc_local((1, CB), T.float16)
@@ -813,7 +823,7 @@ def make_gdn_decode(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV
             res_cmx = T.alloc_shared((1, NOUT_pad), T.float16)
             w2_cmx = T.alloc_shared((BR2, VC // 2), T.uint8)
             y2_cmx = T.alloc_local((1, BN2), T.float16)
-            # --- A. in_proj GEMV: rows [q | k | v | z | b | a | pad] split over the tiles --------------------------
+            # --- A. in_proj GEMV: rows [q | k | v | z | pad] split over the tiles; b | a on the SHAVE ------------
             T.copy(X[0, 0], x_cmx)
             for n in (T.Pipelined(C1, num_stages=num_stages) if pipelined else T.serial(C1)):
                 T.copy(WinP[(tile * C1 + n) * BR1, 0], w1_cmx)
@@ -823,6 +833,15 @@ def make_gdn_decode(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV
                     for sub in T.serial(BN1 // R1):
                         T.gemm_i4(x_cmx, w1_cmx, None, y1_cmx, group=G, row0=sub * R1, rows=R1, scales_row=BN1)
                 T.copy(y1_cmx, Y[0, (tile * C1 + n) * BN1])
+            T.copy(Wba[worker * RBA, 0], wba_cmx)
+            for r in T.serial(RBA):
+                for v in T.vectorized(FL):
+                    ls[v] = T.float32(0)
+                for d0 in T.serial(H // FL):
+                    for v in T.vectorized(FL):
+                        ls[v] = ls[v] + T.cast(x_cmx[0, d0 * FL + v], T.float32) * T.cast(wba_cmx[r, d0 * FL + v], T.float32)
+                y1_cmx[0, r] = T.cast(T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL]), T.float16)
+            T.copy(y1_cmx[0:1, 0:RBA], BA[0, worker * RBA])
             T.sync_grid()
             # --- B1. causal conv1d (k = 4) + SiLU over the CONV channels, blocks of CB dealt over the workers -------
             for it in T.serial(T.ceildiv(NB, workers)):
@@ -856,8 +875,8 @@ def make_gdn_decode(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV
             T.copy(CV[0, QK + worker * KHW * DK], k_cmx)
             T.copy(CV[0, 2 * QK + worker * HPW * DV], v_cmx)
             T.copy(Y[0, ZOFF + worker * HPW * DV], z_cmx)
-            T.copy(Y[0, BOFF + worker * HPW], ba_cmx[0:1, 0:HPW])
-            T.copy(Y[0, AOFF + worker * HPW], ba_cmx[1:2, 0:HPW])
+            T.copy(BA[0, worker * HPW], ba_cmx[0:1, 0:HPW])
+            T.copy(BA[0, VH + worker * HPW], ba_cmx[1:2, 0:HPW])
             for j in T.serial(HPW):
                 if worker * HPW + j < VH:
                     T.copy(Ssm[worker * HPW + j, 0, 0], S_cmx)
@@ -888,24 +907,27 @@ def make_gdn_decode(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV
 
 
 def gdn_sizes(H: int, KH: int, VH: int, DK: int, tiles: int = 3, shaves: int = 2, BN1: int = 128, BN2: int = 64, **_):
-    """make_gdn_decode's scratch and output sizes: dict(YLEN, CVLEN, OPAD, NOUT_pad)."""
+    """make_gdn_decode's scratch and output sizes: dict(YLEN, BA_LEN, CVLEN, OPAD, NOUT_pad, WBA_pad)."""
     DV = DK
     QK, VC = KH * DK, VH * DV
     CONV = 2 * QK + VC
-    NIN = CONV + VC + 2 * VH
+    NIN = CONV + VC
     NIN_pad = -(-NIN // (BN1 * tiles)) * BN1 * tiles
     NOUT_pad = -(-H // (BN2 * tiles)) * BN2 * tiles
     workers = tiles * shaves
     HPW = -(-VH // workers)
     HPW += (-HPW) % (VH // KH)
     OPAD = workers * HPW * DV
-    return dict(YLEN=max(NIN_pad, CONV + OPAD), CVLEN=max(CONV, 2 * QK + OPAD), OPAD=OPAD, NOUT_pad=NOUT_pad)
+    WBA_pad = workers * (-(-2 * VH // workers))
+    return dict(YLEN=max(NIN_pad, CONV + OPAD), BA_LEN=max(WBA_pad, VH + workers * HPW), CVLEN=max(CONV, 2 * QK + OPAD),
+                OPAD=OPAD, NOUT_pad=NOUT_pad, WBA_pad=WBA_pad)
 
 
-def pack_gdn(win_int, win_scales, wout_int, wout_scales, tiles: int = 3, BN1: int = 128, BN2: int = 64):
+def pack_gdn(win_int, win_scales, wout_int, wout_scales, wba=None, tiles: int = 3, shaves: int = 2, BN1: int = 128, BN2: int = 64):
     """make_gdn_decode's weights from the in_proj rows (int4 values [NIN, H] in [-8, 7] with scales [NIN, H/G], rows
-    [q | k | v | z | b | a]) and the out_proj ([H, VC] with [H, VC/G]): zero-padded to the tile multiple, then chunk
-    blocks of BN1 / BN2 rows (`pack_chunk_blocks`)."""
+    [q | k | v | z]) and the out_proj ([H, VC] with [H, VC/G]): zero-padded to the tile multiple, then chunk
+    blocks of BN1 / BN2 rows (`pack_chunk_blocks`); `wba` [2 VH, H] (b rows then a rows, any float dtype) -> fp16 rows
+    zero-padded to the worker multiple."""
     import numpy as np
 
     def padded(w, s, BN):
@@ -916,13 +938,20 @@ def pack_gdn(win_int, win_scales, wout_int, wout_scales, tiles: int = 3, BN1: in
         sp[: s.shape[0]] = s
         return pack_chunk_blocks(wp, sp, BN)
 
-    return dict(WinP=padded(win_int, win_scales, BN1), WoutP=padded(wout_int, wout_scales, BN2))
+    out = dict(WinP=padded(win_int, win_scales, BN1), WoutP=padded(wout_int, wout_scales, BN2))
+    if wba is not None:
+        rows = -(-wba.shape[0] // (tiles * shaves)) * tiles * shaves
+        w = np.zeros((rows, wba.shape[1]), np.float16)
+        w[: wba.shape[0]] = wba.astype(np.float16)
+        out["Wba"] = w
+    return out
 
 
 def gdn_reference(x, res, win_int, win_scales, wout_int, wout_scales, conv_w, a_log, dt_bias, g_norm, conv_state, ssm,
-                  KH: int, VH: int, DK: int, G: int, eps: float = 1e-6, details: bool = False):
+                  KH: int, VH: int, DK: int, G: int, eps: float = 1e-6, details: bool = False, wba=None):
     """numpy oracle of make_gdn_decode (fp32; conv_state [3, CONV] and conv_w [4, CONV] time-major; returns out [H],
-    the new conv_state [3, CONV] and ssm [VH, DK, DV]; `details` adds a dict of the intermediates y, conv, on)."""
+    the new conv_state [3, CONV] and ssm [VH, DK, DV]; `details` adds a dict of the intermediates y, conv, on).
+    `wba` [2 VH, H]: the b / a projections (fp16-valued); None means they are the last 2 VH rows of win_int."""
     import numpy as np
     DV = DK
     QK, VC = KH * DK, VH * DV
@@ -931,7 +960,11 @@ def gdn_reference(x, res, win_int, win_scales, wout_int, wout_scales, conv_w, a_
     win = win_int.astype(np.float32) * np.repeat(win_scales.astype(np.float32), G, axis=1)
     y = win @ xf
     mixed, z = y[:CONV], y[CONV:CONV + VC]
-    b, a = y[CONV + VC:CONV + VC + VH], y[CONV + VC + VH:CONV + VC + 2 * VH]
+    if wba is not None:
+        ba = wba.astype(np.float32) @ xf
+        b, a = ba[:VH], ba[VH:2 * VH]
+    else:
+        b, a = y[CONV + VC:CONV + VC + VH], y[CONV + VC + VH:CONV + VC + 2 * VH]
     cs = conv_state.astype(np.float32)                                     # [3, CONV] time-major, oldest first
     seq = np.concatenate([cs, mixed[None, :]], axis=0)                      # [4, CONV]
     conv = (seq * conv_w.astype(np.float32)).sum(axis=0)
