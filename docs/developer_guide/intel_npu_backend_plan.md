@@ -369,10 +369,21 @@ interop; a Python `nl.*`-compatible shim.
 3. ~~Is a `sync_grid` across tiles implementable with one hardware barrier, or only as a software
    rendezvous through DDR/CMX flags?~~ **Done 2026-11-06**: three rotating hardware barriers per
    launch, 5.7 us faster per barrier than the toolkit's software rendezvous (Phase 3a log entry).
-4. **DMA DDR->CMX ceiling.** Measured ~17.5 GB/s on one port and ~21.7 GB/s on two, from one issuer,
+4. ~~**DMA DDR->CMX ceiling.** Measured ~17.5 GB/s on one port and ~21.7 GB/s on two, from one issuer,
    and no more with 3 or 6 concurrent issuers (`device/run_dma_rate_probe.py`, 128 KiB 1-D copies).
-   Is ~22 GB/s the expected DMA read bandwidth from DDR on this PTL box, or is a descriptor setting
-   (burst / `dst_width`, 2-D vs 1-D, 2 MiB pages) leaving bandwidth on the table?
+   Is ~22 GB/s the expected DMA read bandwidth from DDR on this PTL box?~~ **Answered by measurement
+   2026-11-06** (`<user>` suspected it low; the npu_dsl record has 28.7 / 51.6 GB/s with 512 KiB jobs,
+   `evidence/e7_20/multicast_probe`). A job-size sweep (`run_dma_rate_probe.py --kib 64..1024`, one issuer,
+   NCE_TIME, synchronous start/wait per job) gives, one port: 64 KiB 6.15 us, 128 7.51, 256 11.4, 512 19.1,
+   1024 34.6 us -> **~4.2 us fixed per job + ~34 GB/s streaming**; two ports: 5.47 / 6.07 / 8.12 / 12.0 / 19.7 us
+   -> **~4.5 us fixed + ~67 GB/s aggregate** (53 GB/s at 1 MiB; the npu_dsl 51.6 at 512 KiB is reproduced
+   within 15%). Multicast to 3 tiles costs nothing at any size; more issuers add bandwidth only above
+   ~512 KiB. So the ring's 64 KiB halves run at ~22 GB/s because the **fixed latency** (descriptor issue to
+   observed completion) dominates, not a bandwidth ceiling. TileGemm's DMA model is
+   `t_fill = 4.5 us + bytes / 67 GB/s` for a two-port fill, and the lever is fewer, larger fills (deeper K
+   per chunk), not more ports. Remaining hardware question: is ~34 GB/s per port the expected streaming
+   rate, and what the ~4 us per job is made of (descriptor fetch, link-agent arbitration, completion
+   write-back)?
 5. **fp16 x fp16 DPU rate.** The best measured fp16 workload reaches 2743 MAC/ns per tile (calibration,
    64x64x2048, CUBOID_8x16) and the flow's 32x256x2048 workload 1540 MAC/ns, against the 3790 MAC/ns
    implied by the 22.73 TOPS basis (2048 MAC/cycle x 1.85 GHz x 3 tiles). Is 2048 MAC/cycle the fp16 x fp16
@@ -405,6 +416,11 @@ interop; a Python `nl.*`-compatible shim.
   hardware. TileGemm has its two constants: VPUNN DPU cycles x ~1.6 and 22 GB/s. (5) Lessons: the host-sim
   library cache now keys on the runtime headers too (a stale 32-byte-status library passed as "unwritten
   status"); `--no-build` reuses stale device ELFs after a runtime header change, so rebuild after one.
+
+  > Amendment 2026-11-06, same day: the "~22 GB/s ceiling" in (4) is a 128 KiB-job artifact. The job-size
+  > sweep (section 7 question 4) shows ~4.5 us fixed per job plus ~67 GB/s streaming on two ports (~34 per
+  > port), reproducing the npu_dsl record's 51.6 GB/s at 512 KiB. TileGemm's constant is
+  > `4.5 us + bytes / 67 GB/s`, and the lever is larger fills, not more ports.
 * 2026-11-06: **Phase 3b step B: the compiler emits the flow from the author's loops.** Three Python
   passes after `LowerIntelNpuTileOp` (section 3 items 7, 9, 9b): `PlanIntelNpuDistribution`,
   `LowerIntelNpuPipelined`, `AssignIntelNpuBarriers`; `PlanIntelNpuWorkloads` now also plans

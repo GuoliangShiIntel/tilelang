@@ -8,7 +8,10 @@
 // Concurrent configurations are bracketed by sync_grid so every issuer starts together.
 #include <tl_templates/intel_npu/npu_rt.hpp>
 
-static constexpr std::uint32_t kBytes = 128 * 1024, kReps = 16;
+#ifndef TL_PROBE_KIB
+#define TL_PROBE_KIB 128
+#endif
+static constexpr std::uint32_t kBytes = TL_PROBE_KIB * 1024, kReps = 16;
 
 static inline std::uint32_t ticks() { return npu::getRegWordVal(0x2f020000U); }
 

@@ -1,7 +1,8 @@
-"""DMA rate probe (probes/dma_rate_probe.cpp): 128 KiB DDR -> CMX in six configurations, from tile 0
-SHAVE 0, timed with NCE_TIME. Prints GB/s per configuration.
+"""DMA rate probe (probes/dma_rate_probe.cpp): N KiB DDR -> CMX in six configurations, from tile 0
+SHAVE 0, timed with NCE_TIME. Prints GB/s per configuration. The job size separates the per-job
+fixed latency from the streaming bandwidth (the prior art's 28.7 / 51.6 GB/s used 512 KiB jobs).
 
-Usage: python testing/python/intel_npu/device/run_dma_rate_probe.py [--no-build]
+Usage: python testing/python/intel_npu/device/run_dma_rate_probe.py [--no-build] [--kib 128]
 """
 
 import sys
@@ -26,20 +27,24 @@ LABELS = ["unicast 1-D, 1 port, 1 issuer", "multicast 1-D, 1 port, 1 issuer",
 
 
 def main(argv):
-    source = (HERE / "probes" / "dma_rate_probe.cpp").read_text(encoding="utf-8")
+    kib = int(argv[argv.index("--kib") + 1]) if "--kib" in argv else 128
+    nbytes = kib * 1024
+    kernel = f"{KERNEL}_{kib}k"
+    source = (HERE / "probes" / "dma_rate_probe.cpp").read_text(encoding="utf-8").replace(
+        "#define TL_PROBE_KIB 128", f"#define TL_PROBE_KIB {kib}")
     if "--no-build" in argv:
-        _, sha = runner.write_kernel(source, KERNEL)
-        db = runner.DeviceBuild(build_dir=HERE / "build", exe=HERE / "build" / "Release" / "npu_run.exe", kernel=KERNEL, source_sha256=sha)
+        _, sha = runner.write_kernel(source, kernel)
+        db = runner.DeviceBuild(build_dir=HERE / "build", exe=HERE / "build" / "Release" / "npu_run.exe", kernel=kernel, source_sha256=sha)
     else:
-        db = runner.build(source, KERNEL)
-    x = np.random.default_rng(0).standard_normal((BYTES // 2,)).astype(np.float16)
+        db = runner.build(source, kernel)
+    x = np.random.default_rng(0).standard_normal((nbytes // 2,)).astype(np.float16)
     res = runner.run(db, [("in", x)], TILES, SHAVES, HERE / "run_dma_rate", repeat=5, warmup=2, timeout_s=120)
     runner.check_status(res.status)
     ticks = res.status[0, 10:16].astype(np.int64)
-    print(f"kernel sha256 {db.source_sha256[:12]}; {REPS} x {BYTES} B per configuration, tile 0 SHAVE 0, NCE_TIME 19.2 MHz")
+    print(f"kernel sha256 {db.source_sha256[:12]}; {REPS} x {nbytes} B per configuration, tile 0 SHAVE 0, NCE_TIME 19.2 MHz")
     for label, t in zip(LABELS, ticks):
         us = t / 19.2
-        print(f"  {label:82s}: {us / REPS:7.2f} us per 128 KiB, {REPS * BYTES / (us * 1e-6) / 1e9:6.2f} GB/s")
+        print(f"  {label:82s}: {us / REPS:7.2f} us per {kib} KiB, {REPS * nbytes / (us * 1e-6) / 1e9:6.2f} GB/s")
     return 0
 
 
