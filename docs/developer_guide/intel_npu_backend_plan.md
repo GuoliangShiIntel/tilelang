@@ -496,6 +496,13 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 
 ## 8. Log
 
+* 2026-11-08: **M5 step 1: same-day per-layer A/B against npu_dsl's decoder-layer kernels** (`device/run_npudsl_layer_device.py`,
+  real Qwen3.8 weights, the golden's first token): npu_dsl's GDN layer + MoE **1.165 ms** vs this backend's 0.811 + 0.560 =
+  1.37; its attention layer + MoE **1.058 ms** vs 0.563 + 0.560 = 1.12; head 9.44 vs 8.78. So the kernels are within
+  ~15% (GDN the one behind), and the whole gap between `<user>`'s measure (generate time / tokens: npu_dsl ~25 tok/s in its
+  `--single` mode = one launch per step; this backend 5.4 tok/s = 185 ms wall of which 57 ms device) is the 81 launches per
+  token and the host round trips. **Next: the single-launch decode kernel** (norms + fp32 residual in-kernel, layer table,
+  device-side layer loop, head), then the GDN gap.
 * 2026-11-08: **First end-to-end decode of Qwen3.8-35B-A3B-Distill on the device, golden 16/16** (`testing/python/intel_npu/e2e/`:
   `checkpoint.py` reads the compressed-tensors checkpoint, `pack.py` packs every layer into the kernels' arrays (cached as
   .npy under a pack dir; 8 s per layer the first time), `reference_golden.py` saves the fp32 reference's answer (npu_dsl's
