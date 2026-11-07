@@ -373,10 +373,19 @@ Rules carried into M1-M6:
 * A profiled trace reports per-SHAVE event counts; a count at the profiler's cap is SATURATED and
   inadmissible.
 * Every quoted TOPS states ops (`2 M N K`), the unprofiled kernel-only time, and the peak basis.
+* **Every timing runs under `NPU_TURBO=YES`** (the runner's default since 2026-11-07; `TL_NPU_TURBO=0` only
+  for an A/B) and says TURBO / NO TURBO. Without it the DPU and the SHAVE run at about half the clock: every
+  number in this plan dated before 2026-11-07 is NO TURBO (log entry of that date).
 * Evidence (traces, logs, generated `.cpp` with sha256 prefix) goes under
   `testing/python/intel_npu/device/evidence/` with an `INDEX.md` row per device session.
-* Hardware facts come from the hardware owner, never inferred from code or registry text. Open
-  questions are listed in section 7 and asked in chat, not answered by guessing.
+* **Hardware facts are looked up before they are measured and before they are asked** (`<user>`, 2026-11-07):
+  the VPUX knowledge base (`knowledges/hw/npu5/*.md`, `knowledges/compiler/platform-resources.md`; the
+  `intel-npu-hardware` skill) is the first stop; a measurement confirms a sourced fact or exposes a
+  difference; the hardware owner is asked what neither gives. Every constant the backend depends on is a
+  `Fact` in `tilelang/intel_npu/hw_facts.py` with its `file#section` and, if measured, the probe;
+  `test_intel_npu_hw_facts.py` checks the citations resolve and the target defaults equal the facts.
+  Numbers and citations travel; the knowledge text does not. Open questions stay in section 7 with what was
+  looked up and what was measured.
 
 ## 6. Out of scope for this plan
 
@@ -409,6 +418,11 @@ interop; a Python `nl.*`-compatible shim.
    per chunk), not more ports. Remaining hardware question: is ~34 GB/s per port the expected streaming
    rate, and what the ~4 us per job is made of (descriptor fetch, link-agent arbitration, completion
    write-back)?
+   **Knowledge base (2026-11-07):** `hw/npu5/dma-controller.md#1,#3`: one DMA engine with two compute
+   resource groups (the two "ports"), AXI DDR read 64 B/clk per group, 128 B/clk both, at the CMX clock
+   (4/7 of the DPU clock); the 6D cap is `min(64, SRC_WIDTH)` B/clk per job, so a 2-D fill narrower than 64 B
+   per row runs at the row width. The 34 / 67 GB/s above were measured **without turbo**; re-measure under
+   `NPU_TURBO=YES` before using them in TileGemm's DMA model. The ~4 us per job remains a question.
 5. **fp16 x fp16 DPU rate.** The best measured fp16 workload reaches 2743 MAC/ns per tile (calibration,
    64x64x2048, CUBOID_8x16) and the flow's 32x256x2048 workload 1540 MAC/ns, against the 3790 MAC/ns
    implied by the 22.73 TOPS basis (2048 MAC/cycle x 1.85 GHz x 3 tiles). Is 2048 MAC/cycle the fp16 x fp16
@@ -426,6 +440,15 @@ interop; a Python `nl.*`-compatible shim.
    here. Question for `<user>`: what changed on the box since early October (NPU driver/firmware, Windows
    power plan, DVFS cap, thermal)? Until it is answered, percentages are quoted against the measured
    same-day probe, not against the October table.
+   **CLOSED 2026-11-07, by the knowledge base and one environment variable.** (a) `hw/npu5/dpu.md#1,#3.4`:
+   the DPU has 4096 MACs (the 8-bit count) and FP16 runs **8 C steps per clock against INT8's 16**, so the dense
+   fp16 rate is **2048 MAC/clk per DPU**: the 22.73 / 25.13 TOPS bases were right, and `hw_facts.fp16_peak_tops`
+   now derives them. (b) Nothing changed on the box: npu_dsl's table was taken under `NPU_TURBO=YES` (its
+   Frequency Validation Rule) and every run of this backend before 2026-11-07 was without it. Under turbo
+   (`run_dpu_rate_compare.py`, same method and arms): **64x64x1600 8_8 x=8 = 96.9%** of 2048 x 2.0454 GHz
+   (October: 100.1%), 16x192x1600 4_16 = 43.7% (46.0%), 64x64x2048 8_8 x=8 = 96.1%. The ring flow:
+   **0.398 ms = 16.19 TOPS = 64.4% of 25.13** (was 0.806 ms NO TURBO). VPUNN recalibrated under turbo:
+   IDU / VPUNN@1950 median **0.92** (was 1.58), `evidence/vpunn_calibration.json`.
 6. **Two in-flight DMA jobs per port from one SHAVE (2026-11-07, M1).** Through the toolkit's `DmaDrv::start`
    (chained descriptors, one chain per SHAVE per port and direction), starting a second job on a port before
    the previous one completed left the previous job's barrier unproduced (READY stuck at p=1, observed for
@@ -433,6 +456,11 @@ interop; a Python `nl.*`-compatible shim.
    Is queueing a second descriptor chain behind a running one supported by the driver, or is one outstanding
    job per port per SHAVE the contract? The answer decides whether a kernel with several streams needs one
    linked chain per port per fill round (supported by `start(desc, tail, ...)`) or may keep the serialisation.
+   **Knowledge base (2026-11-07):** `hw/npu5/dma-controller.md#4`: each link agent holds a **FIFO of 8
+   entries** and a linked list completes before the next entry starts, so the hardware queues jobs per LA. The
+   lost READY is therefore a property of the toolkit's `DmaDrv40xx` trap/fence chain, not of the DMA; the
+   question to the toolkit owner is whether `start` may be called on a chain whose previous job is still in
+   flight.
 
 ## 9. Model target: Qwen3.8-35B-A3B-Distill, and what it needs (2026-11-06)
 
@@ -445,7 +473,7 @@ device-verified and measured here.
 | Projections, prefill | int4 group-128: SHAVE dequant -> fp16 DPU; fp16 (`baProj`) | fp16 DPU GEMM + multi-tile ring flow (**have**) | M2 (dequant) |
 | Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | none | M2 |
 | Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | `T.vectorized` loops lower to half32/float16 SHAVE vector ops with VAU exp/log/tanh (**have**, log 2026-11-07); the ops themselves not yet written | M1 |
-| Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**, 0.397 ms at 96x1024x64 vectorised (log 2026-11-07); GQA, gate, decode, KV cache open | M1 |
+| Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**; 960x1024x64 vectorised 1.765 ms TURBO (log 2026-11-07); GQA, gate, decode, KV cache open | M1 |
 | Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | none | M4 |
 | MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | none | M3 |
 | Head | final norm + lm_head (int8 g128) + greedy argmax | none | M2 / M5 |
@@ -461,6 +489,26 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-07: **Turbo, and hardware facts with provenance.** (1) `<user>` pointed at the VPUX knowledge base
+  (`applications.ai.vpu-accelerators.vpux-plugin/knowledges`): it already held what this plan had been
+  measuring and asking for: the NPU5010 CMX workspace of 1439 KiB (`compiler/platform-resources.md#3`; equals the
+  1,473,536 B `Ctx` sees), FP16 at 8 C steps per clock = 2048 MAC/clk per DPU (`hw/npu5/dpu.md#3.4`), the
+  512-bit SHAVE VRF (`hw/npu5/shave.md#2.1`), the DMA's 64 B/clk per group and 8-entry link-agent FIFOs
+  (`hw/npu5/dma-controller.md#1,#4`), 16 barriers per tile (`hw/npu5/nce-subsystem.md#4.2`). The facts the
+  backend depends on are now `tilelang/intel_npu/hw_facts.py` (value, `file#section`, measured value) checked by
+  `test_intel_npu_hw_facts.py` (every citation resolves to a file and section heading; the target defaults equal
+  the facts; the fp16 peak is derived), the device scripts take their peak basis from it, and the
+  `intel-npu-hardware` skill (`.agents/skills/intel-npu-hardware/SKILL.md`) makes the lookup the first step;
+  section 5 carries the rule. (2) **Every number before today was NO TURBO.** `NPU_TURBO=YES` is npu_dsl's
+  measurement condition and the runner's default now (`runner.turbo_requested`, `TL_NPU_TURBO=0` for an A/B;
+  every result line says TURBO / NO TURBO). Under turbo: ring flow **0.398 ms = 16.19 TOPS = 64.4%** of the
+  25.13 dense fp16 peak (was 35%); flash 960x1024x64 vectorised **1.765 ms** (was 3.588; npu_dsl 20.3 ms under
+  turbo -> 11.5x per op); DPU probe 64x64x1600 8_8 x=8 **96.9%** = npu_dsl's October 100.1%, which closes
+  question 5; VPUNN ratio **0.92** (full recalibration, `evidence/vpunn_calibration.json`). (3)
+  `run_dpu_rate_compare.py` keeps the shapes whose operands fit the 1439 KiB workspace over two SHAVE slots
+  (64x192 / 32x192 at K=1600 and 32x256 at K=2048 do not: status 2 CMX_EXHAUSTED); why the 2026-11-06 run of
+  the same script reported a 32x192 row is not established (the script, shapes and `Ctx` allocations are
+  unchanged in git; `Ctx` reads 1,473,536 B free today), so that row is not quoted again.
 * 2026-11-07: **M1 step 3b: same-shape A/B against npu_dsl's flash attention.** `make_flash_attention_phase`
   takes any `numQ` that is a multiple of `BQ x tiles`: Q blocks are dealt round-robin over the tiles in a serial
   loop around the phase (the resident Q fill becomes "SEGMENTED resident in a loop, tile sync before and after";

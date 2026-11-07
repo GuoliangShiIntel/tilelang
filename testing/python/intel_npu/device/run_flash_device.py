@@ -71,7 +71,7 @@ def main(argv):
     err = float(np.abs(o.astype(np.float32) - ref).max())
     rel = err / float(np.abs(ref).max())
     verdict = "PASS" if rel < 2e-2 else "FAIL"
-    kind = "PROFILED (observability, not a timing)" if profile else "UNPROFILED"
+    kind = runner.condition(res, profile is not None)
     flops = 4.0 * numQ * numKv * D
     idu_us = [float(res.status[t * SHAVES:(t + 1) * SHAVES, 5].astype(np.int64).sum()) / PERF_CLK_MHZ for t in range(TILES)]
     print(f"device: kernel-only {res.median_kernel_ms:.3f} ms (host wall {res.median_ms:.3f} ms) [{kind}]; "

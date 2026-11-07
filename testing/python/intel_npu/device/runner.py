@@ -149,6 +149,17 @@ class DeviceResult:
     times_ms: list[float]
     status: np.ndarray  # [workers, 16] uint32
     stdout: str
+    turbo: bool = True        # NPU_TURBO=YES was set for the run (the measurement condition of every quoted number)
+
+
+def turbo_requested() -> bool:
+    """NPU_TURBO=YES is the default (npu_dsl's Frequency Validation Rule; the DPU and SHAVE clocks are ~2x lower
+    without it). TL_NPU_TURBO=0 runs without it, for an A/B only."""
+    return os.environ.get("TL_NPU_TURBO", "1") not in ("0", "", "NO", "no")
+
+
+def condition(res: "DeviceResult", profiled: bool) -> str:
+    return ("PROFILED (observability, not a timing)" if profiled else "UNPROFILED") + (", TURBO" if res.turbo else ", NO TURBO")
 
 
 def run(db: DeviceBuild, arrays: list[tuple[str, np.ndarray]], tiles: int, shaves: int, run_dir: Path,
@@ -167,6 +178,11 @@ def run(db: DeviceBuild, arrays: list[tuple[str, np.ndarray]], tiles: int, shave
     cmd = [str(db.exe), "--kernel", db.kernel, "--dir", str(run_dir), "--tiles", str(tiles), "--shaves", str(shaves),
            "--repeat", str(repeat), "--warmup", str(warmup)]
     env = dict(os.environ)
+    turbo = turbo_requested()
+    if turbo:
+        env["NPU_TURBO"] = "YES"
+    else:
+        env.pop("NPU_TURBO", None)
     if profile_json is not None:
         cmd += ["--profile", str(profile_json)]
         env["NPU_PROFILE_FRC_MHZ"] = "19.2"  # the runtime's 38.4 default halves every duration on this box
@@ -182,7 +198,7 @@ def run(db: DeviceBuild, arrays: list[tuple[str, np.ndarray]], tiles: int, shave
     times = [float(ln.split()[3]) for ln in r.stdout.splitlines() if ln.startswith("run ")]
     median = float(r.stdout.split("median_ms")[1].split()[0])
     median_kernel = float(r.stdout.split("median_kernel_ms")[1].split()[0])
-    return DeviceResult(median_ms=median, median_kernel_ms=median_kernel, times_ms=times, status=status, stdout=r.stdout)
+    return DeviceResult(median_ms=median, median_kernel_ms=median_kernel, times_ms=times, status=status, stdout=r.stdout, turbo=turbo)
 
 
 def check_status(status: np.ndarray) -> None:

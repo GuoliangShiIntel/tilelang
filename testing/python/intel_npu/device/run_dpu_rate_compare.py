@@ -23,13 +23,16 @@ sys.path.insert(0, str(HERE))
 
 import tilelang  # noqa: E402,F401
 import runner  # noqa: E402
+from tilelang.intel_npu import hw_facts  # noqa: E402
 
 TILES, SHAVES = 3, 2
 ITERS = 64
 PERF_CLK_MHZ = 19.2
-NPU_DSL_BASIS_MAC_PER_NS = 2048 * 2.0454  # the prior art's 100%
+NPU_DSL_BASIS_MAC_PER_NS = hw_facts.fact("dpu_fp16_macs_per_clk") * hw_facts.fact("dpu_clk_turbo_ghz")  # the prior art's 100%: 2048 x 2.0454
 # (M, N, K): npu_dsl's fp16 shapes at K=1600 (its stencil table), plus our calibration's 64x64x2048.
-SHAPES = [(64, 64, 1600), (64, 192, 1600), (32, 192, 1600), (16, 192, 1600), (64, 64, 2048), (32, 256, 2048)]
+# Shapes whose operands fit the ~1.44 MiB of free CMX over two SHAVE slots (64x192 and 32x192 at K=1600 and
+# 32x256 at K=2048 do not: status 2 CMX_EXHAUSTED); the headline arm is 64x64x1600 8_8 x=8.
+SHAPES = [(64, 64, 1600), (16, 192, 1600), (64, 64, 2048)]
 # (nthw_ntk, odu_nthw): 99 = keep init's; "left" = ODU left at init's 3 (the npu_dsl table's best arms).
 STENCILS = [("init 16_4", 99, 99), ("8_8 odu left(3)", 0, 99), ("8_8 odu 2", 0, 2), ("4_16 odu left(3)", 1, 99), ("4_16 odu 1", 1, 1)]
 SPATIALS = [0, 8, 16]

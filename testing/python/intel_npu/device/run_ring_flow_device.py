@@ -26,6 +26,7 @@ import tilelang  # noqa: E402,F401  (puts tvm on the path for runner)
 import tvm  # noqa: E402
 import runner  # noqa: E402
 import lowering  # noqa: E402
+from tilelang.intel_npu import hw_facts  # noqa: E402
 from kernels import make_ring_flow, make_ring_flow_swapped, make_ring_flow_two_phase  # noqa: E402
 
 M, K, N = 2048, 2048, 768
@@ -117,7 +118,7 @@ def main(argv):
         print(f"phase 1 rel {rel:.2e}, phase 2 (reused ids) rel {rel2:.2e}")
         err, rel = max(err, err2), max(rel, rel2)
     verdict = "PASS" if rel < 2e-3 else "FAIL"
-    kind = "PROFILED (observability, not a timing)" if profile else "UNPROFILED"
+    kind = runner.condition(res, profile is not None)
     ops = 2.0 * M * N * K * (2 if two_phase else 1)
     idu_us_per_tile = [float(res.status[t * SHAVES:(t + 1) * SHAVES, 5].astype(np.int64).sum()) / PERF_CLK_MHZ for t in range(TILES)]
     wl_per_tile = [int(res.status[t * SHAVES:(t + 1) * SHAVES, 4].astype(np.int64).sum()) for t in range(TILES)]
@@ -127,8 +128,9 @@ def main(argv):
     print(f"DPU workloads per tile {wl_per_tile}; DPU IDU busy per tile {[f'{u:.0f}' for u in idu_us_per_tile]} us "
           f"of {kus:.0f} us kernel -> busy {[f'{100 * u / kus:.0f}%' for u in idu_us_per_tile]}")
     tops = ops / (res.median_kernel_ms * 1e-3) / 1e12
-    print(f"ops {ops / 1e9:.2f} GFLOP; {tops:.2f} TOPS kernel-only = {100 * tops / 22.73:.1f}% of 22.73 TOPS (peak basis 1.85 GHz; "
-          f"{100 * tops / 25.13:.1f}% of 25.13 turbo){' [PROFILED: not a timing claim]' if profile else ''}")
+    peak = hw_facts.fp16_peak_tops(hw_facts.fact("dpu_clk_turbo_ghz"), TILES)   # 2048 fp16 MAC/clk/DPU (dpu.md 3.4) x 2.0454 GHz x 3
+    print(f"ops {ops / 1e9:.2f} GFLOP; {tops:.2f} TOPS kernel-only = {100 * tops / peak:.1f}% of {peak:.2f} TOPS "
+          f"(dense fp16 peak, {TILES} tiles at {hw_facts.fact('dpu_clk_turbo_ghz')} GHz){' [PROFILED: not a timing claim]' if profile else ''}")
     if profile:
         print(f"trace: {profile}")
     if negative:

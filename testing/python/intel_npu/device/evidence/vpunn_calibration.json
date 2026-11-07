@@ -18,17 +18,17 @@
    "mpe": -1,
    "mpe_name": "default",
    "golden": true,
-   "t_low_ms": 0.13,
-   "t_high_ms": 1.5505,
-   "host_us_per_wl": 1.775625,
+   "t_low_ms": 0.0786,
+   "t_high_ms": 0.6132,
+   "host_us_per_wl": 0.6682499999999999,
    "dpu_workloads": 802,
-   "idu_us": 1.5644482543640899,
-   "odu_us": 1.7152431421446384,
+   "idu_us": 0.5095334580216127,
+   "odu_us": 0.6631208437240232,
    "vpunn_cycles": 1604,
    "vpunn_us_1950": 0.8225641025641026,
-   "ratio_idu": 1.9019165187094607,
-   "idu_mac_per_ns": 1340.505826351183,
-   "kernel_sha": "0c6a52307c96"
+   "ratio_idu": 0.6194452887419855,
+   "idu_mac_per_ns": 4115.827855824624,
+   "kernel_sha": "d9a794fd8f98"
   },
   {
    "shape": [
@@ -40,17 +40,17 @@
    "mpe": 0,
    "mpe_name": "CUBOID_4x16",
    "golden": true,
-   "t_low_ms": 0.1343,
-   "t_high_ms": 1.6107,
-   "host_us_per_wl": 1.8455,
+   "t_low_ms": 0.08,
+   "t_high_ms": 0.8524,
+   "host_us_per_wl": 0.9655000000000001,
    "dpu_workloads": 802,
-   "idu_us": 1.6233504779717374,
-   "odu_us": 1.7856400665004157,
+   "idu_us": 0.833852867830424,
+   "odu_us": 0.9173030964256028,
    "vpunn_cycles": 1585,
    "vpunn_us_1950": 0.8128205128205128,
-   "ratio_idu": 1.997181976053557,
-   "idu_mac_per_ns": 1291.8664382445893,
-   "kernel_sha": "fe31ae665022"
+   "ratio_idu": 1.0258757679932662,
+   "idu_mac_per_ns": 2515.0144358878506,
+   "kernel_sha": "2c3664bba4f5"
   },
   {
    "shape": [
@@ -62,17 +62,17 @@
    "mpe": 1,
    "mpe_name": "CUBOID_8x16",
    "golden": true,
-   "t_low_ms": 0.1326,
-   "t_high_ms": 1.5481,
-   "host_us_per_wl": 1.769375,
+   "t_low_ms": 0.0784,
+   "t_high_ms": 0.7834,
+   "host_us_per_wl": 0.88125,
    "dpu_workloads": 802,
-   "idu_us": 1.5260676433915212,
-   "odu_us": 1.7030340814630094,
+   "idu_us": 0.7835879052369077,
+   "odu_us": 0.8754156275976726,
    "vpunn_cycles": 1782,
    "vpunn_us_1950": 0.9138461538461539,
-   "ratio_idu": 1.6699393404115972,
-   "idu_mac_per_ns": 1374.2195564406995,
-   "kernel_sha": "d3bcb2b5dfee"
+   "ratio_idu": 0.8574615124646296,
+   "idu_mac_per_ns": 2676.3455458975636,
+   "kernel_sha": "47da3ed33df1"
   },
   {
    "shape": [
@@ -84,17 +84,17 @@
    "mpe": 2,
    "mpe_name": "CUBOID_16x16",
    "golden": true,
-   "t_low_ms": 0.13,
-   "t_high_ms": 1.5782,
-   "host_us_per_wl": 1.8102499999999997,
+   "t_low_ms": 0.0786,
+   "t_high_ms": 0.7887,
+   "host_us_per_wl": 0.8876249999999999,
    "dpu_workloads": 802,
-   "idu_us": 1.5659419160432253,
-   "odu_us": 1.716736803823774,
+   "idu_us": 0.8054083541147132,
+   "odu_us": 0.8841827722360764,
    "vpunn_cycles": 1604,
    "vpunn_us_1950": 0.8225641025641026,
-   "ratio_idu": 1.9037323792296066,
-   "idu_mac_per_ns": 1339.2271951561397,
-   "kernel_sha": "c046d9db27f1"
+   "ratio_idu": 0.9791435726456924,
+   "idu_mac_per_ns": 2603.8369099177553,
+   "kernel_sha": "fb12147125c4"
   },
   {
    "shape": [
@@ -106,17 +106,17 @@
    "mpe": 0,
    "mpe_name": "CUBOID_4x16",
    "golden": true,
-   "t_low_ms": 0.1294,
-   "t_high_ms": 1.3537,
-   "host_us_per_wl": 1.530375,
+   "t_low_ms": 0.0783,
+   "t_high_ms": 0.6697,
+   "host_us_per_wl": 0.73925,
    "dpu_workloads": 802,
-   "idu_us": 1.2122038653366582,
-   "odu_us": 1.4886611596009975,
+   "idu_us": 0.5868142144638404,
+   "odu_us": 0.7378688694929344,
    "vpunn_cycles": 1355,
    "vpunn_us_1950": 0.6948717948717948,
-   "ratio_idu": 1.744500027606261,
-   "idu_mac_per_ns": 1730.0324309868213,
-   "kernel_sha": "88e544b18fe0"
+   "ratio_idu": 0.8444927809627224,
+   "idu_mac_per_ns": 3573.7920934926956,
+   "kernel_sha": "8be1b53f284a"
   },
   {
    "shape": [
@@ -128,17 +128,17 @@
    "mpe": 1,
    "mpe_name": "CUBOID_8x16",
    "golden": true,
-   "t_low_ms": 0.1311,
-   "t_high_ms": 1.2256,
-   "host_us_per_wl": 1.368125,
+   "t_low_ms": 0.0807,
+   "t_high_ms": 0.6102,
+   "host_us_per_wl": 0.661875,
    "dpu_workloads": 802,
-   "idu_us": 1.0014676849542812,
-   "odu_us": 1.3208515170407316,
+   "idu_us": 0.5003766625103907,
+   "odu_us": 0.6605231712385703,
    "vpunn_cycles": 1235,
    "vpunn_us_1950": 0.6333333333333333,
-   "ratio_idu": 1.5812647657172862,
-   "idu_mac_per_ns": 2094.0785524155367,
-   "kernel_sha": "f1f4da5fc68d"
+   "ratio_idu": 0.7900684144900906,
+   "idu_mac_per_ns": 4191.146704321869,
+   "kernel_sha": "056e2874f8b6"
   },
   {
    "shape": [
@@ -150,17 +150,17 @@
    "mpe": 2,
    "mpe_name": "CUBOID_16x16",
    "golden": true,
-   "t_low_ms": 0.1425,
-   "t_high_ms": 1.6091,
-   "host_us_per_wl": 1.8332499999999998,
+   "t_low_ms": 0.0781,
+   "t_high_ms": 0.7994,
+   "host_us_per_wl": 0.9016250000000001,
    "dpu_workloads": 802,
-   "idu_us": 1.6369233167082295,
-   "odu_us": 1.7877182044887783,
+   "idu_us": 0.8228127597672485,
+   "odu_us": 0.8980803200332503,
    "vpunn_cycles": 1610,
    "vpunn_us_1950": 0.8256410256410256,
-   "ratio_idu": 1.982608986075185,
-   "idu_mac_per_ns": 1281.1546995477268,
-   "kernel_sha": "979739ccc4a3"
+   "ratio_idu": 0.9965744605876613,
+   "idu_mac_per_ns": 2548.7596966692977,
+   "kernel_sha": "4534816d2b58"
   },
   {
    "shape": [
@@ -172,17 +172,17 @@
    "mpe": 0,
    "mpe_name": "CUBOID_4x16",
    "golden": true,
-   "t_low_ms": 0.1294,
-   "t_high_ms": 1.7266,
-   "host_us_per_wl": 1.9965000000000002,
+   "t_low_ms": 0.0784,
+   "t_high_ms": 0.8939,
+   "host_us_per_wl": 1.019375,
    "dpu_workloads": 802,
-   "idu_us": 1.7250493557772237,
-   "odu_us": 1.879610868661679,
+   "idu_us": 0.93308395677473,
+   "odu_us": 1.0177680798004989,
    "vpunn_cycles": 1548,
    "vpunn_us_1950": 0.7938461538461539,
-   "ratio_idu": 2.1730272892542546,
-   "idu_mac_per_ns": 1215.7055060347097,
-   "kernel_sha": "5e04a6ffff77"
+   "ratio_idu": 1.17539645717747,
+   "idu_mac_per_ns": 2247.5490922048994,
+   "kernel_sha": "cb234576bb08"
   },
   {
    "shape": [
@@ -194,17 +194,17 @@
    "mpe": 1,
    "mpe_name": "CUBOID_8x16",
    "golden": true,
-   "t_low_ms": 0.1281,
-   "t_high_ms": 1.23,
-   "host_us_per_wl": 1.377375,
+   "t_low_ms": 0.081,
+   "t_high_ms": 0.61,
+   "host_us_per_wl": 0.66125,
    "dpu_workloads": 802,
-   "idu_us": 1.0293277223607649,
-   "odu_us": 1.3263715710723192,
+   "idu_us": 0.5093386325852037,
+   "odu_us": 0.6629260182876143,
    "vpunn_cycles": 1138,
    "vpunn_us_1950": 0.5835897435897436,
-   "ratio_idu": 1.7637865189837358,
-   "idu_mac_per_ns": 2037.3997070536277,
-   "kernel_sha": "509ed9e6908b"
+   "ratio_idu": 0.872768307153908,
+   "idu_mac_per_ns": 4117.4021875302815,
+   "kernel_sha": "522d6a25b09a"
   },
   {
    "shape": [
@@ -216,17 +216,17 @@
    "mpe": 2,
    "mpe_name": "CUBOID_16x16",
    "golden": true,
-   "t_low_ms": 0.1298,
-   "t_high_ms": 1.6004,
-   "host_us_per_wl": 1.8382500000000002,
+   "t_low_ms": 0.0773,
+   "t_high_ms": 0.8201,
+   "host_us_per_wl": 0.9285000000000001,
    "dpu_workloads": 802,
-   "idu_us": 1.654977140482128,
-   "odu_us": 1.79369285120532,
+   "idu_us": 0.8539198877805486,
+   "odu_us": 0.9249012884455529,
    "vpunn_cycles": 1658,
    "vpunn_us_1950": 0.8502564102564103,
-   "ratio_idu": 1.9464447671532867,
-   "idu_mac_per_ns": 1267.1788320828755,
-   "kernel_sha": "b62f0ec88da0"
+   "ratio_idu": 1.0043086738070384,
+   "idu_mac_per_ns": 2455.91188355008,
+   "kernel_sha": "54d5dd0f1a4f"
   },
   {
    "shape": [
@@ -238,17 +238,17 @@
    "mpe": -1,
    "mpe_name": "default",
    "golden": true,
-   "t_low_ms": 0.15,
-   "t_high_ms": 2.51,
-   "host_us_per_wl": 2.95,
+   "t_low_ms": 0.0826,
+   "t_high_ms": 1.0454,
+   "host_us_per_wl": 1.2035,
    "dpu_workloads": 802,
-   "idu_us": 2.6086476517040733,
-   "odu_us": 2.733920407315046,
+   "idu_us": 1.047251662510391,
+   "odu_us": 1.2008390482128015,
    "vpunn_cycles": 3417,
    "vpunn_us_1950": 1.7523076923076923,
-   "ratio_idu": 1.4886926897345458,
-   "idu_mac_per_ns": 1607.846117991486,
-   "kernel_sha": "fb462f6b093c"
+   "ratio_idu": 0.5976414228549202,
+   "idu_mac_per_ns": 4005.0583352102185,
+   "kernel_sha": "7eee742ef605"
   },
   {
    "shape": [
@@ -260,17 +260,17 @@
    "mpe": 0,
    "mpe_name": "CUBOID_4x16",
    "golden": true,
-   "t_low_ms": 0.1493,
-   "t_high_ms": 2.1898,
-   "host_us_per_wl": 2.5506249999999997,
+   "t_low_ms": 0.0827,
+   "t_high_ms": 1.1739,
+   "host_us_per_wl": 1.364,
    "dpu_workloads": 802,
-   "idu_us": 2.1294420199501247,
-   "odu_us": 2.329592684954281,
+   "idu_us": 1.241817331670823,
+   "odu_us": 1.3604660224438903,
    "vpunn_cycles": 2504,
    "vpunn_us_1950": 1.284102564102564,
-   "ratio_idu": 1.658311477197581,
-   "idu_mac_per_ns": 1969.6727878499544,
-   "kernel_sha": "6e4a503903b6"
+   "ratio_idu": 0.9670702063730451,
+   "idu_mac_per_ns": 3377.553117540006,
+   "kernel_sha": "3424fbf1924d"
   },
   {
    "shape": [
@@ -282,17 +282,17 @@
    "mpe": 1,
    "mpe_name": "CUBOID_8x16",
    "golden": true,
-   "t_low_ms": 0.137,
-   "t_high_ms": 2.5203,
-   "host_us_per_wl": 2.9791250000000002,
+   "t_low_ms": 0.0836,
+   "t_high_ms": 1.4246,
+   "host_us_per_wl": 1.6762500000000002,
    "dpu_workloads": 802,
-   "idu_us": 2.574358374896093,
-   "odu_us": 2.7222958229426437,
+   "idu_us": 1.583800914380715,
+   "odu_us": 1.6756286367414797,
    "vpunn_cycles": 3387,
    "vpunn_us_1950": 1.736923076923077,
-   "ratio_idu": 1.482137239754172,
-   "idu_mac_per_ns": 1629.2618933326607,
-   "kernel_sha": "ca765350d1e4"
+   "ratio_idu": 0.9118428647896056,
+   "idu_mac_per_ns": 2648.2520384451363,
+   "kernel_sha": "1d5ad8a0d974"
   },
   {
    "shape": [
@@ -304,17 +304,17 @@
    "mpe": 2,
    "mpe_name": "CUBOID_16x16",
    "golden": true,
-   "t_low_ms": 0.1374,
-   "t_high_ms": 2.5219,
-   "host_us_per_wl": 2.980625,
+   "t_low_ms": 0.0858,
+   "t_high_ms": 1.4447,
+   "host_us_per_wl": 1.698625,
    "dpu_workloads": 802,
-   "idu_us": 2.607933291770574,
-   "odu_us": 2.733335931005819,
+   "idu_us": 1.6102322319201996,
+   "odu_us": 1.6885520573566086,
    "vpunn_cycles": 3417,
    "vpunn_us_1950": 1.7523076923076923,
-   "ratio_idu": 1.4882850216425576,
-   "idu_mac_per_ns": 1608.2865360227102,
-   "kernel_sha": "0196efbaa25a"
+   "ratio_idu": 0.9189209400773747,
+   "idu_mac_per_ns": 2604.7820412825163,
+   "kernel_sha": "17108011f46a"
   },
   {
    "shape": [
@@ -326,17 +326,17 @@
    "mpe": 0,
    "mpe_name": "CUBOID_4x16",
    "golden": true,
-   "t_low_ms": 0.1372,
-   "t_high_ms": 2.1164,
-   "host_us_per_wl": 2.474,
+   "t_low_ms": 0.0829,
+   "t_high_ms": 1.0956,
+   "host_us_per_wl": 1.2658749999999999,
    "dpu_workloads": 802,
-   "idu_us": 1.8285666043225273,
-   "odu_us": 2.240362635078969,
+   "idu_us": 1.031730569409809,
+   "odu_us": 1.2644820241064008,
    "vpunn_cycles": 2200,
    "vpunn_us_1950": 1.1282051282051282,
-   "ratio_idu": 1.6207749447404218,
-   "idu_mac_per_ns": 2293.7660515537873,
-   "kernel_sha": "6930fe9cbdea"
+   "ratio_idu": 0.9144884592496033,
+   "idu_mac_per_ns": 4065.3094173601057,
+   "kernel_sha": "cf6233a415e1"
   },
   {
    "shape": [
@@ -348,17 +348,17 @@
    "mpe": 1,
    "mpe_name": "CUBOID_8x16",
    "golden": true,
-   "t_low_ms": 0.1474,
-   "t_high_ms": 2.0161,
-   "host_us_per_wl": 2.3358749999999997,
+   "t_low_ms": 0.0825,
+   "t_high_ms": 1.0433,
+   "host_us_per_wl": 1.2009999999999998,
    "dpu_workloads": 802,
-   "idu_us": 1.839152119700748,
-   "odu_us": 2.1212593516209477,
+   "idu_us": 1.0391988778054864,
+   "odu_us": 1.197786783042394,
    "vpunn_cycles": 2151,
    "vpunn_us_1950": 1.103076923076923,
-   "ratio_idu": 1.6672927166045834,
-   "idu_mac_per_ns": 2280.563937627119,
-   "kernel_sha": "0caa5d569f05"
+   "ratio_idu": 0.942091032878056,
+   "idu_mac_per_ns": 4036.093657892763,
+   "kernel_sha": "76013c1b5d2c"
   },
   {
    "shape": [
@@ -370,17 +370,17 @@
    "mpe": 2,
    "mpe_name": "CUBOID_16x16",
    "golden": true,
-   "t_low_ms": 0.1398,
-   "t_high_ms": 2.5296,
-   "host_us_per_wl": 2.9872499999999995,
+   "t_low_ms": 0.0838,
+   "t_high_ms": 1.4614,
+   "host_us_per_wl": 1.722,
    "dpu_workloads": 802,
-   "idu_us": 2.6587827306733165,
-   "odu_us": 2.7826917082294265,
+   "idu_us": 1.6423134871155445,
+   "odu_us": 1.7182304655029095,
    "vpunn_cycles": 3414,
    "vpunn_us_1950": 1.7507692307692309,
-   "ratio_idu": 1.5186368848309804,
-   "idu_mac_per_ns": 1577.5279234410496,
-   "kernel_sha": "27e575d2c4ec"
+   "ratio_idu": 0.9380525190027275,
+   "idu_mac_per_ns": 2553.8997474633243,
+   "kernel_sha": "8231ae5bd6e2"
   },
   {
    "shape": [
@@ -392,17 +392,17 @@
    "mpe": 0,
    "mpe_name": "CUBOID_4x16",
    "golden": true,
-   "t_low_ms": 0.1344,
-   "t_high_ms": 2.266,
-   "host_us_per_wl": 2.6645000000000003,
+   "t_low_ms": 0.0825,
+   "t_high_ms": 1.2494,
+   "host_us_per_wl": 1.458625,
    "dpu_workloads": 802,
-   "idu_us": 2.267768079800499,
-   "odu_us": 2.467074501246883,
+   "idu_us": 1.338840399002494,
+   "odu_us": 1.455475893599335,
    "vpunn_cycles": 2880,
    "vpunn_us_1950": 1.476923076923077,
-   "ratio_idu": 1.5354679706982544,
-   "idu_mac_per_ns": 1849.5295164261167,
-   "kernel_sha": "e0ccf90bc3e3"
+   "ratio_idu": 0.9065065201579385,
+   "idu_mac_per_ns": 3132.7886454016293,
+   "kernel_sha": "a8f1cb788be7"
   },
   {
    "shape": [
@@ -414,17 +414,17 @@
    "mpe": 1,
    "mpe_name": "CUBOID_8x16",
    "golden": true,
-   "t_low_ms": 0.1382,
-   "t_high_ms": 2.0132,
-   "host_us_per_wl": 2.34375,
+   "t_low_ms": 0.0833,
+   "t_high_ms": 1.065,
+   "host_us_per_wl": 1.227125,
    "dpu_workloads": 802,
-   "idu_us": 1.8533094347464671,
-   "odu_us": 2.1261949293433084,
+   "idu_us": 1.0464723607647548,
+   "odu_us": 1.2006442227763923,
    "vpunn_cycles": 2059,
    "vpunn_us_1950": 1.0558974358974358,
-   "ratio_idu": 1.7551983476229291,
-   "idu_mac_per_ns": 2263.1428521129724,
-   "kernel_sha": "324a5745b139"
+   "ratio_idu": 0.9910738725066888,
+   "idu_mac_per_ns": 4008.0408783418147,
+   "kernel_sha": "e0ce920ab252"
   },
   {
    "shape": [
@@ -436,17 +436,17 @@
    "mpe": 2,
    "mpe_name": "CUBOID_16x16",
    "golden": true,
-   "t_low_ms": 0.138,
-   "t_high_ms": 2.548,
-   "host_us_per_wl": 3.0125,
+   "t_low_ms": 0.083,
+   "t_high_ms": 1.5192,
+   "host_us_per_wl": 1.79525,
    "dpu_workloads": 802,
-   "idu_us": 2.7414536575228596,
-   "odu_us": 2.857764443059019,
+   "idu_us": 1.6972542601828764,
+   "odu_us": 1.767586242726517,
    "vpunn_cycles": 3588,
    "vpunn_us_1950": 1.84,
-   "ratio_idu": 1.4899204660450323,
-   "idu_mac_per_ns": 1529.9561925806604,
-   "kernel_sha": "ee759389b596"
+   "ratio_idu": 0.9224207935776502,
+   "idu_mac_per_ns": 2471.2290305567244,
+   "kernel_sha": "251dce09f8b7"
   },
   {
    "shape": [
@@ -458,17 +458,17 @@
    "mpe": -1,
    "mpe_name": "default",
    "golden": true,
-   "t_low_ms": 0.1342,
-   "t_high_ms": 2.5244,
-   "host_us_per_wl": 2.98775,
+   "t_low_ms": 0.0821,
+   "t_high_ms": 1.1024,
+   "host_us_per_wl": 1.275375,
    "dpu_workloads": 802,
-   "idu_us": 2.6101413133832088,
-   "odu_us": 2.7369726724854533,
+   "idu_us": 1.019586450540316,
+   "odu_us": 1.2552602867830425,
    "vpunn_cycles": 2946,
    "vpunn_us_1950": 1.5107692307692309,
-   "ratio_idu": 1.7276902787159731,
-   "idu_mac_per_ns": 1606.9260229299362,
-   "kernel_sha": "e114691c1696"
+   "ratio_idu": 0.6748790151234271,
+   "idu_mac_per_ns": 4113.730618700636,
+   "kernel_sha": "ba4cf6d3297e"
   },
   {
    "shape": [
@@ -480,17 +480,17 @@
    "mpe": 0,
    "mpe_name": "CUBOID_4x16",
    "golden": true,
-   "t_low_ms": 0.1357,
-   "t_high_ms": 2.5191,
-   "host_us_per_wl": 2.97925,
+   "t_low_ms": 0.0921,
+   "t_high_ms": 1.5012,
+   "host_us_per_wl": 1.761375,
    "dpu_workloads": 802,
-   "idu_us": 2.6603413341645883,
-   "odu_us": 2.794316292601829,
+   "idu_us": 1.6332216334164589,
+   "odu_us": 1.7173862219451372,
    "vpunn_cycles": 2979,
    "vpunn_us_1950": 1.5276923076923077,
-   "ratio_idu": 1.7414117494531545,
-   "idu_mac_per_ns": 1576.603703493226,
-   "kernel_sha": "96428b588843"
+   "ratio_idu": 1.069077604955386,
+   "idu_mac_per_ns": 2568.1168521054515,
+   "kernel_sha": "4dc4406f48f9"
   },
   {
    "shape": [
@@ -502,17 +502,17 @@
    "mpe": 1,
    "mpe_name": "CUBOID_8x16",
    "golden": true,
-   "t_low_ms": 0.1369,
-   "t_high_ms": 2.5152,
-   "host_us_per_wl": 2.972875,
+   "t_low_ms": 0.09,
+   "t_high_ms": 1.4318,
+   "host_us_per_wl": 1.67725,
    "dpu_workloads": 802,
-   "idu_us": 2.5770209891936826,
-   "odu_us": 2.7250233790523692,
+   "idu_us": 1.5904899210307564,
+   "odu_us": 1.6808889235245221,
    "vpunn_cycles": 3146,
    "vpunn_us_1950": 1.6133333333333333,
-   "ratio_idu": 1.597327059417572,
-   "idu_mac_per_ns": 1627.5785170505517,
-   "kernel_sha": "e2c5819a140e"
+   "ratio_idu": 0.9858408601430309,
+   "idu_mac_per_ns": 2637.1144793434323,
+   "kernel_sha": "2475838b3b0e"
   },
   {
    "shape": [
@@ -524,17 +524,17 @@
    "mpe": 2,
    "mpe_name": "CUBOID_16x16",
    "golden": true,
-   "t_low_ms": 0.1349,
-   "t_high_ms": 2.5216,
-   "host_us_per_wl": 2.9833749999999997,
+   "t_low_ms": 0.087,
+   "t_high_ms": 1.4393,
+   "host_us_per_wl": 1.690375,
    "dpu_workloads": 802,
-   "idu_us": 2.610660847880299,
-   "odu_us": 2.735543952618454,
+   "idu_us": 1.6097776392352454,
+   "odu_us": 1.688227348295927,
    "vpunn_cycles": 2946,
    "vpunn_us_1950": 1.5107692307692309,
-   "ratio_idu": 1.728034166112214,
-   "idu_mac_per_ns": 1606.6062366567166,
-   "kernel_sha": "a8be92a1a9ad"
+   "ratio_idu": 1.0655350972534718,
+   "idu_mac_per_ns": 2605.517617944166,
+   "kernel_sha": "ea2b2c1116e9"
   },
   {
    "shape": [
@@ -546,17 +546,17 @@
    "mpe": 0,
    "mpe_name": "CUBOID_4x16",
    "golden": true,
-   "t_low_ms": 0.1345,
-   "t_high_ms": 2.1268,
-   "host_us_per_wl": 2.490375,
+   "t_low_ms": 0.0816,
+   "t_high_ms": 1.1748,
+   "host_us_per_wl": 1.3665,
    "dpu_workloads": 802,
-   "idu_us": 2.120285224438903,
-   "odu_us": 2.3621285328345802,
+   "idu_us": 1.1959684123025769,
+   "odu_us": 1.3335151704073152,
    "vpunn_cycles": 2969,
    "vpunn_us_1950": 1.5225641025641026,
-   "ratio_idu": 1.39257534107641,
-   "idu_mac_per_ns": 1978.1791391344298,
-   "kernel_sha": "242463bd240a"
+   "ratio_idu": 0.785496262711359,
+   "idu_mac_per_ns": 3507.035768549088,
+   "kernel_sha": "052507d43e5a"
   },
   {
    "shape": [
@@ -568,17 +568,17 @@
    "mpe": 1,
    "mpe_name": "CUBOID_8x16",
    "golden": true,
-   "t_low_ms": 0.135,
-   "t_high_ms": 1.9982,
-   "host_us_per_wl": 2.329,
+   "t_low_ms": 0.0818,
+   "t_high_ms": 1.0521,
+   "host_us_per_wl": 1.2128750000000001,
    "dpu_workloads": 802,
-   "idu_us": 1.8387624688279303,
-   "odu_us": 2.1206099334995843,
+   "idu_us": 1.0384845178719868,
+   "odu_us": 1.1973971321695762,
    "vpunn_cycles": 2380,
    "vpunn_us_1950": 1.2205128205128206,
-   "ratio_idu": 1.5065490816027158,
-   "idu_mac_per_ns": 2281.047210341174,
-   "kernel_sha": "62088051e8ee"
+   "ratio_idu": 0.8508591638026782,
+   "idu_mac_per_ns": 4038.8700339941215,
+   "kernel_sha": "58230e721aa4"
   },
   {
    "shape": [
@@ -590,17 +590,17 @@
    "mpe": 2,
    "mpe_name": "CUBOID_16x16",
    "golden": true,
-   "t_low_ms": 0.1378,
-   "t_high_ms": 2.1499,
-   "host_us_per_wl": 2.5151250000000003,
+   "t_low_ms": 0.083,
+   "t_high_ms": 1.1684,
+   "host_us_per_wl": 1.3567500000000001,
    "dpu_workloads": 802,
-   "idu_us": 2.1493142144638404,
-   "odu_us": 2.344918952618454,
+   "idu_us": 1.2411029717373234,
+   "odu_us": 1.353841957605985,
    "vpunn_cycles": 3067,
    "vpunn_us_1950": 1.5728205128205128,
-   "ratio_idu": 1.3665349586581312,
-   "idu_mac_per_ns": 1951.4615274836838,
-   "kernel_sha": "7236c64bed6d"
+   "ratio_idu": 0.7890938359594981,
+   "idu_mac_per_ns": 3379.497185578986,
+   "kernel_sha": "69dbe9a0c9e6"
   },
   {
    "shape": [
@@ -612,17 +612,17 @@
    "mpe": 0,
    "mpe_name": "CUBOID_4x16",
    "golden": true,
-   "t_low_ms": 0.149,
-   "t_high_ms": 2.2554,
-   "host_us_per_wl": 2.6329999999999996,
+   "t_low_ms": 0.0829,
+   "t_high_ms": 1.2045,
+   "host_us_per_wl": 1.402,
    "dpu_workloads": 802,
-   "idu_us": 2.190357439733998,
-   "odu_us": 2.4262261014131337,
+   "idu_us": 1.2633780133000831,
+   "odu_us": 1.3984569825436408,
    "vpunn_cycles": 2661,
    "vpunn_us_1950": 1.3646153846153846,
-   "ratio_idu": 1.6051097359944746,
-   "idu_mac_per_ns": 1914.894767362429,
-   "kernel_sha": "23ad54ef1474"
+   "ratio_idu": 0.9258125238388434,
+   "idu_mac_per_ns": 3319.9121370206644,
+   "kernel_sha": "6c3468c382cb"
   },
   {
    "shape": [
@@ -634,17 +634,17 @@
    "mpe": 1,
    "mpe_name": "CUBOID_8x16",
    "golden": true,
-   "t_low_ms": 0.1479,
-   "t_high_ms": 2.0057,
-   "host_us_per_wl": 2.3222500000000004,
+   "t_low_ms": 0.0896,
+   "t_high_ms": 1.1013,
+   "host_us_per_wl": 1.264625,
    "dpu_workloads": 802,
-   "idu_us": 1.8081748753117208,
-   "odu_us": 2.2256857855361596,
+   "idu_us": 1.0193266832917707,
+   "odu_us": 1.2555200540315878,
    "vpunn_cycles": 2058,
    "vpunn_us_1950": 1.0553846153846154,
-   "ratio_idu": 1.7132852317093565,
-   "idu_mac_per_ns": 2319.634044952052,
-   "kernel_sha": "ae2b429ea118"
+   "ratio_idu": 0.9658343209032813,
+   "idu_mac_per_ns": 4114.778970030581,
+   "kernel_sha": "7bd0a874f7e5"
   },
   {
    "shape": [
@@ -656,17 +656,17 @@
    "mpe": 2,
    "mpe_name": "CUBOID_16x16",
    "golden": true,
-   "t_low_ms": 0.1383,
-   "t_high_ms": 2.2091,
-   "host_us_per_wl": 2.5885,
+   "t_low_ms": 0.0833,
+   "t_high_ms": 1.2064,
+   "host_us_per_wl": 1.403875,
    "dpu_workloads": 802,
-   "idu_us": 2.1547043848711556,
-   "odu_us": 2.344334476309227,
+   "idu_us": 1.2696773690773067,
+   "odu_us": 1.3808577514546967,
    "vpunn_cycles": 2809,
    "vpunn_us_1950": 1.4405128205128206,
-   "ratio_idu": 1.4957898008183528,
-   "idu_mac_per_ns": 1946.5797858163296,
-   "kernel_sha": "178c45f61353"
+   "ratio_idu": 0.8814065039874502,
+   "idu_mac_per_ns": 3303.440781218352,
+   "kernel_sha": "b2c19fd3b08c"
   },
   {
    "shape": [
@@ -678,17 +678,17 @@
    "mpe": -1,
    "mpe_name": "default",
    "golden": true,
-   "t_low_ms": 0.1561,
-   "t_high_ms": 3.9453,
-   "host_us_per_wl": 4.7365,
+   "t_low_ms": 0.096,
+   "t_high_ms": 1.9208,
+   "host_us_per_wl": 2.281,
    "dpu_workloads": 802,
-   "idu_us": 4.328501662510391,
-   "odu_us": 4.427018391521197,
+   "idu_us": 2.109504883624273,
+   "odu_us": 2.2525067539484622,
    "vpunn_cycles": 6316,
    "vpunn_us_1950": 3.238974358974359,
-   "ratio_idu": 1.3363803422886735,
-   "idu_mac_per_ns": 1937.9934799735943,
-   "kernel_sha": "53e95e56eb02"
+   "ratio_idu": 0.6512879232215536,
+   "idu_mac_per_ns": 3976.576714810823,
+   "kernel_sha": "ff03ce5e51ca"
   },
   {
    "shape": [
@@ -700,17 +700,17 @@
    "mpe": 0,
    "mpe_name": "CUBOID_4x16",
    "golden": true,
-   "t_low_ms": 0.1554,
-   "t_high_ms": 3.9548,
-   "host_us_per_wl": 4.74925,
+   "t_low_ms": 0.1033,
+   "t_high_ms": 2.9513,
+   "host_us_per_wl": 3.56,
    "dpu_workloads": 802,
-   "idu_us": 4.324735037406485,
-   "odu_us": 4.429421238570241,
+   "idu_us": 3.4521119077306737,
+   "odu_us": 3.5365362635078967,
    "vpunn_cycles": 5355,
    "vpunn_us_1950": 2.746153846153846,
-   "ratio_idu": 1.5748334870107648,
-   "idu_mac_per_ns": 1939.6813741057751,
-   "kernel_sha": "afcb9e941cdc"
+   "ratio_idu": 1.2570715630391809,
+   "idu_mac_per_ns": 2429.993066335572,
+   "kernel_sha": "95e09dc8212c"
   },
   {
    "shape": [
@@ -722,17 +722,17 @@
    "mpe": 1,
    "mpe_name": "CUBOID_8x16",
    "golden": true,
-   "t_low_ms": 0.1557,
-   "t_high_ms": 3.8498,
-   "host_us_per_wl": 4.617625,
+   "t_low_ms": 0.0971,
+   "t_high_ms": 2.7961,
+   "host_us_per_wl": 3.37375,
    "dpu_workloads": 802,
-   "idu_us": 4.093022651704073,
-   "odu_us": 4.2126454696591855,
+   "idu_us": 3.251961242726517,
+   "odu_us": 3.3466464048212803,
    "vpunn_cycles": 6429,
    "vpunn_us_1950": 3.296923076923077,
-   "ratio_idu": 1.2414674398542453,
-   "idu_mac_per_ns": 2049.4897570399517,
-   "kernel_sha": "8d8230d4e177"
+   "ratio_idu": 0.9863624861279684,
+   "idu_mac_per_ns": 2579.553498296555,
+   "kernel_sha": "b49994dfb077"
   },
   {
    "shape": [
@@ -744,17 +744,17 @@
    "mpe": 2,
    "mpe_name": "CUBOID_16x16",
    "golden": true,
-   "t_low_ms": 0.1562,
-   "t_high_ms": 3.9375,
-   "host_us_per_wl": 4.726624999999999,
+   "t_low_ms": 0.1024,
+   "t_high_ms": 2.9272,
+   "host_us_per_wl": 3.531,
    "dpu_workloads": 802,
-   "idu_us": 4.329086138819618,
-   "odu_us": 4.426109206151288,
+   "idu_us": 3.4320448877805485,
+   "odu_us": 3.5106894222776392,
    "vpunn_cycles": 6316,
    "vpunn_us_1950": 3.238974358974359,
-   "ratio_idu": 1.3365607933341126,
-   "idu_mac_per_ns": 1937.7318286134318,
-   "kernel_sha": "f5c79b98c506"
+   "ratio_idu": 1.059608538817617,
+   "idu_mac_per_ns": 2444.201132061762,
+   "kernel_sha": "3fe69df5425a"
   },
   {
    "shape": [
@@ -766,17 +766,17 @@
    "mpe": 0,
    "mpe_name": "CUBOID_4x16",
    "golden": true,
-   "t_low_ms": 0.1545,
-   "t_high_ms": 3.2663,
-   "host_us_per_wl": 3.8897500000000003,
+   "t_low_ms": 0.0962,
+   "t_high_ms": 2.2008,
+   "host_us_per_wl": 2.63075,
    "dpu_workloads": 802,
-   "idu_us": 3.4264598919368248,
-   "odu_us": 3.622129571903575,
+   "idu_us": 2.462073981712386,
+   "odu_us": 2.6043614921030755,
    "vpunn_cycles": 5237,
    "vpunn_us_1950": 2.6856410256410257,
-   "ratio_idu": 1.2758443363140746,
-   "idu_mac_per_ns": 2448.185084477465,
-   "kernel_sha": "addb0827a394"
+   "ratio_idu": 0.916754680988954,
+   "idu_mac_per_ns": 3407.1307614264615,
+   "kernel_sha": "586e67390b59"
   },
   {
    "shape": [
@@ -788,17 +788,17 @@
    "mpe": 1,
    "mpe_name": "CUBOID_8x16",
    "golden": true,
-   "t_low_ms": 0.1536,
-   "t_high_ms": 3.0263,
-   "host_us_per_wl": 3.5908749999999996,
+   "t_low_ms": 0.0967,
+   "t_high_ms": 1.9073,
+   "host_us_per_wl": 2.2632499999999998,
    "dpu_workloads": 802,
-   "idu_us": 3.0582398171238574,
-   "odu_us": 3.279106920199501,
+   "idu_us": 2.0992440773067336,
+   "odu_us": 2.252117103075644,
    "vpunn_cycles": 5041,
    "vpunn_us_1950": 2.585128205128205,
-   "ratio_idu": 1.183012823525396,
-   "idu_mac_per_ns": 2742.952973481695,
-   "kernel_sha": "617c2fb20ca8"
+   "ratio_idu": 0.8120464095909801,
+   "idu_mac_per_ns": 3996.013655907192,
+   "kernel_sha": "3c528b11a43a"
   },
   {
    "shape": [
@@ -810,17 +810,17 @@
    "mpe": 2,
    "mpe_name": "CUBOID_16x16",
    "golden": true,
-   "t_low_ms": 0.159,
-   "t_high_ms": 3.9419,
-   "host_us_per_wl": 4.728625,
+   "t_low_ms": 0.1006,
+   "t_high_ms": 2.9287,
+   "host_us_per_wl": 3.535125,
    "dpu_workloads": 802,
-   "idu_us": 4.327592477140482,
-   "odu_us": 4.423771300914381,
+   "idu_us": 3.4337983167082298,
+   "odu_us": 3.510559538653367,
    "vpunn_cycles": 6908,
    "vpunn_us_1950": 3.5425641025641026,
-   "ratio_idu": 1.2215989187064187,
-   "idu_mac_per_ns": 1938.4006336804828,
-   "kernel_sha": "67b4789e18f6"
+   "ratio_idu": 0.9692974402983567,
+   "idu_mac_per_ns": 2442.953029356028,
+   "kernel_sha": "cd1adc190f76"
   },
   {
    "shape": [
@@ -832,17 +832,17 @@
    "mpe": 0,
    "mpe_name": "CUBOID_4x16",
    "golden": true,
-   "t_low_ms": 0.1586,
-   "t_high_ms": 3.965,
-   "host_us_per_wl": 4.758,
+   "t_low_ms": 0.1006,
+   "t_high_ms": 2.9683,
+   "host_us_per_wl": 3.5846250000000004,
    "dpu_workloads": 802,
-   "idu_us": 4.31668225270158,
-   "odu_us": 4.420199501246883,
+   "idu_us": 3.471074916874481,
+   "odu_us": 3.554460203657523,
    "vpunn_cycles": 5600,
    "vpunn_us_1950": 2.871794871794872,
-   "ratio_idu": 1.5031304272800143,
-   "idu_mac_per_ns": 1943.2998559831503,
-   "kernel_sha": "41d25aa99da3"
+   "ratio_idu": 1.208677872840221,
+   "idu_mac_per_ns": 2416.717645366611,
+   "kernel_sha": "c23806e01d5d"
   },
   {
    "shape": [
@@ -854,17 +854,17 @@
    "mpe": 1,
    "mpe_name": "CUBOID_8x16",
    "golden": true,
-   "t_low_ms": 0.1509,
-   "t_high_ms": 3.0149,
-   "host_us_per_wl": 3.58,
+   "t_low_ms": 0.0972,
+   "t_high_ms": 1.9197,
+   "host_us_per_wl": 2.278125,
    "dpu_workloads": 802,
-   "idu_us": 3.0759689318370738,
-   "odu_us": 3.28443214879468,
+   "idu_us": 2.1085956982543643,
+   "odu_us": 2.2515975685785534,
    "vpunn_cycles": 5008,
    "vpunn_us_1950": 2.568205128205128,
-   "ratio_idu": 1.1977115449445475,
-   "idu_mac_per_ns": 2727.1432793666213,
-   "kernel_sha": "8d41b81cde6e"
+   "ratio_idu": 0.8210386604624622,
+   "idu_mac_per_ns": 3978.2913371893187,
+   "kernel_sha": "9d85059c6db6"
   },
   {
    "shape": [
@@ -876,17 +876,17 @@
    "mpe": 2,
    "mpe_name": "CUBOID_16x16",
    "golden": true,
-   "t_low_ms": 0.1559,
-   "t_high_ms": 3.9546,
-   "host_us_per_wl": 4.748375,
+   "t_low_ms": 0.0991,
+   "t_high_ms": 2.9449,
+   "host_us_per_wl": 3.5572500000000002,
    "dpu_workloads": 802,
-   "idu_us": 4.343698046550291,
-   "odu_us": 4.433902223607648,
+   "idu_us": 3.451267664172901,
+   "odu_us": 3.52517144638404,
    "vpunn_cycles": 7416,
    "vpunn_us_1950": 3.8030769230769232,
-   "ratio_idu": 1.1421536125637899,
-   "idu_mac_per_ns": 1931.2134292258472,
-   "kernel_sha": "954b597c7672"
+   "ratio_idu": 0.9074935201101884,
+   "idu_mac_per_ns": 2430.587487340057,
+   "kernel_sha": "6b105d88947d"
   }
  ],
  "summary": [
@@ -896,11 +896,11 @@
     64,
     512
    ],
-   "concordant_pairs": "30/45",
+   "concordant_pairs": "29/45",
    "golden_fail": [],
-   "best_measured": "x=8 CUBOID_8x16 1.001 us",
-   "best_vpunn": "x=16 CUBOID_8x16 1.029 us measured",
-   "regret_pct": 2.781920757408707
+   "best_measured": "x=8 CUBOID_8x16 0.500 us",
+   "best_vpunn": "x=16 CUBOID_8x16 0.509 us measured",
+   "regret_pct": 1.7910447761194215
   },
   {
    "shape": [
@@ -908,11 +908,11 @@
     128,
     512
    ],
-   "concordant_pairs": "39/45",
+   "concordant_pairs": "36/45",
    "golden_fail": [],
-   "best_measured": "x=8 CUBOID_4x16 1.829 us",
-   "best_vpunn": "x=16 CUBOID_8x16 1.853 us measured",
-   "regret_pct": 1.353127108711849
+   "best_measured": "x=8 CUBOID_4x16 1.032 us",
+   "best_vpunn": "x=16 CUBOID_8x16 1.046 us measured",
+   "regret_pct": 1.4288411909108012
   },
   {
    "shape": [
@@ -920,10 +920,10 @@
     64,
     512
    ],
-   "concordant_pairs": "31/45",
+   "concordant_pairs": "32/45",
    "golden_fail": [],
-   "best_measured": "x=16 CUBOID_8x16 1.808 us",
-   "best_vpunn": "x=16 CUBOID_8x16 1.808 us measured",
+   "best_measured": "x=16 CUBOID_8x16 1.019 us",
+   "best_vpunn": "x=16 CUBOID_8x16 1.019 us measured",
    "regret_pct": 0.0
   },
   {
@@ -932,12 +932,12 @@
     64,
     2048
    ],
-   "concordant_pairs": "36/45",
+   "concordant_pairs": "31/45",
    "golden_fail": [],
-   "best_measured": "x=8 CUBOID_8x16 3.058 us",
-   "best_vpunn": "x=16 CUBOID_8x16 3.076 us measured",
-   "regret_pct": 0.5797163000084815
+   "best_measured": "x=8 CUBOID_8x16 2.099 us",
+   "best_vpunn": "x=16 CUBOID_8x16 2.109 us measured",
+   "regret_pct": 0.4454756380510405
   }
  ],
- "ratio_idu_median": 1.5780491263640255
+ "ratio_idu_median": 0.9206708668275124
 }
