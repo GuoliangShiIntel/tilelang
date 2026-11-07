@@ -34,9 +34,16 @@ PERF_CLK_MHZ = 19.2
 
 
 def main(argv):
-    global M, N, BM, BN
+    global M, N, K, BM, BN
     hand = "--hand" in argv
     swapped = "--swapped" in argv
+    if "--bm" in argv:
+        BM = int(argv[argv.index("--bm") + 1])
+    if "--bn" in argv:
+        BN = int(argv[argv.index("--bn") + 1])
+        N = BN * TILES
+    if "--k" in argv:
+        K = int(argv[argv.index("--k") + 1])
     if hand:
         kernel = "tl_ring_flow_hand"
         source = (HERE / "probes" / "ring_flow_hand.cpp").read_text(encoding="utf-8")
@@ -51,7 +58,7 @@ def main(argv):
             if "// intel_npu:" in ln:
                 print(ln.strip())
     else:
-        kernel = "tl_ring_flow"
+        kernel = f"tl_ring_flow_bm{BM}_bn{BN}_k{K}"
         low = lowering.lower(make_ring_flow(M, N, K, BM=BM, BN=BN, tiles=TILES, shaves=SHAVES))
         source, names = low.source, low.param_names
         for ln in source.splitlines():
@@ -86,15 +93,18 @@ def main(argv):
     err = float(np.abs(y.astype(np.float32) - ref).max())
     rel = err / float(np.abs(ref).max())
     verdict = "PASS" if rel < 2e-3 else "FAIL"
-    kind = "PROFILED (observability, not a timing)" if profile else "UNPROFILED host-wall incl. submit"
+    kind = "PROFILED (observability, not a timing)" if profile else "UNPROFILED"
     ops = 2.0 * M * N * K
     idu_us_per_tile = [float(res.status[t * SHAVES:(t + 1) * SHAVES, 5].astype(np.int64).sum()) / PERF_CLK_MHZ for t in range(TILES)]
     wl_per_tile = [int(res.status[t * SHAVES:(t + 1) * SHAVES, 4].astype(np.int64).sum()) for t in range(TILES)]
-    print(f"device: median {res.median_ms:.3f} ms [{kind}]; max |y - ref| = {err:.4f} (rel {rel:.2e}) -> {verdict}; "
-          f"kernel sha256 {db.source_sha256[:12]}")
+    kus = res.median_kernel_ms * 1e3
+    print(f"device: median kernel-only {res.median_kernel_ms:.3f} ms (NCE_TIME stamps), host wall {res.median_ms:.3f} ms incl. submit "
+          f"[{kind}]; max |y - ref| = {err:.4f} (rel {rel:.2e}) -> {verdict}; kernel sha256 {db.source_sha256[:12]}")
     print(f"DPU workloads per tile {wl_per_tile}; DPU IDU busy per tile {[f'{u:.0f}' for u in idu_us_per_tile]} us "
-          f"of {res.median_ms * 1e3:.0f} us host wall -> busy {[f'{100 * u / (res.median_ms * 1e3):.0f}%' for u in idu_us_per_tile]} (lower bound: the wall includes submit)")
-    print(f"ops {ops / 1e9:.2f} GFLOP; {ops / (res.median_ms * 1e-3) / 1e12:.2f} TOPS over host wall (lower bound; peak basis 22.73 TOPS at 1.85 GHz)")
+          f"of {kus:.0f} us kernel -> busy {[f'{100 * u / kus:.0f}%' for u in idu_us_per_tile]}")
+    tops = ops / (res.median_kernel_ms * 1e-3) / 1e12
+    print(f"ops {ops / 1e9:.2f} GFLOP; {tops:.2f} TOPS kernel-only = {100 * tops / 22.73:.1f}% of 22.73 TOPS (peak basis 1.85 GHz; "
+          f"{100 * tops / 25.13:.1f}% of 25.13 turbo){' [PROFILED: not a timing claim]' if profile else ''}")
     if profile:
         print(f"trace: {profile}")
     if negative:

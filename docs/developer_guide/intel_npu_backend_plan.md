@@ -309,17 +309,16 @@ fail** on a negative fixture and then pass on the real one.
   tiles and resident; B broadcast (multicast), ping-ponged, each chunk split across both DMA ports;
   DPU FIFO alternated by the two SHAVEs with no sync between them.
 * 3a (closed): `sync_grid` on hardware barriers; see section 8.
-* 3b (steps A and B closed, C open): the pipelined flow above, with tile shape, distribution and stencil chosen by
-  the VPUNN-backed passes of section 3.2 (Step 0 cost model and calibration first). Open: the trace checker and a
-  kernel-only timing stamp for the TOPS claim (C); a host-simulation ring so the suite runs the flow without
-  hardware; `DeriveGlobalSync` does not yet see `ring_fill` as a DDR read; rounds for a resident operand larger
-  than CMX.
-* Acceptance: device trace admissible (per-SHAVE event count below the profiler's saturation
-  value; `NPU_PROFILE_FRC_MHZ=19.2` exported), a ported flow checker
-  (`testing/python/intel_npu/device/check_flow_trace.py`) exits 0, DPU busy % and TOPS at the
-  reference shape reported **unprofiled** with the peak basis stated. Negative: a source whose tile
-  split is on the streamed loop is refused; a per-tile unicast copy of a tile-invariant source is
-  refused.
+* 3b (closed 2026-11-06; A, B, C): the pipelined flow above, with tile shape, distribution and stencil chosen by
+  the VPUNN-backed passes of section 3.2 (Step 0 cost model and calibration first). Still open after 3b: a
+  host-simulation ring so the suite runs the flow without hardware; `DeriveGlobalSync` does not yet see
+  `ring_fill` as a DDR read; rounds for a resident operand larger than CMX; TileGemm (the shape search).
+* Acceptance (met, section 8 step C): device trace admissible (per-SHAVE event counts 32-66, cap 1984;
+  `NPU_PROFILE_FRC_MHZ=19.2` exported), the flow checker (`device/trace_timeline.py --check`) exits 0 on
+  the flow trace and 1 on a plain GEMM trace, DPU busy % and TOPS at the reference shape reported
+  **unprofiled, kernel-only** (NCE_TIME entry/finish stamps in the status record) with the peak basis stated.
+  Negatives: a source whose tile split is on the streamed loop is refused; a per-tile unicast copy of a
+  tile-invariant source is noted in the source (relaxed from refusal: fixtures and probes do it legitimately).
 
 ### Phase 4: SHAVE ops and quantised GEMM
 * Typed SHAVE op surface (`T.npu.rmsnorm`, `softmax`, `silu`, `dequant_i4`, ...) over
@@ -370,12 +369,42 @@ interop; a Python `nl.*`-compatible shim.
 3. ~~Is a `sync_grid` across tiles implementable with one hardware barrier, or only as a software
    rendezvous through DDR/CMX flags?~~ **Done 2026-11-06**: three rotating hardware barriers per
    launch, 5.7 us faster per barrier than the toolkit's software rendezvous (Phase 3a log entry).
+4. **DMA DDR->CMX ceiling.** Measured ~17.5 GB/s on one port and ~21.7 GB/s on two, from one issuer,
+   and no more with 3 or 6 concurrent issuers (`device/run_dma_rate_probe.py`, 128 KiB 1-D copies).
+   Is ~22 GB/s the expected DMA read bandwidth from DDR on this PTL box, or is a descriptor setting
+   (burst / `dst_width`, 2-D vs 1-D, 2 MiB pages) leaving bandwidth on the table?
+5. **fp16 x fp16 DPU rate.** The best measured fp16 workload reaches 2743 MAC/ns per tile (calibration,
+   64x64x2048, CUBOID_8x16) and the flow's 32x256x2048 workload 1540 MAC/ns, against the 3790 MAC/ns
+   implied by the 22.73 TOPS basis (2048 MAC/cycle x 1.85 GHz x 3 tiles). Is 2048 MAC/cycle the fp16 x fp16
+   rate on NPU5, or the int8 (or fp16 x int8 mixed) rate, with fp16 x fp16 at half? The answer sets the
+   honest peak basis for every TOPS percentage in this plan.
 
 ## 8. Log
 
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-06: **Phase 3b step C closed: the flow is measured kernel-only and checked from its trace.**
+  (1) Kernel-only time: the status record grew to 64 B with NCE_TIME stamps at `Ctx` entry and `finish`;
+  `npu_run` reports `median_kernel_ms` = max(finish) - min(entry) over the SHAVEs (19.2 MHz); the host wall
+  carries ~0.15-0.2 ms of submit on top. (2) `device/trace_timeline.py` renders one steady-state window per
+  cluster (DPU, SHAVE 0/1, the tile's DMA row) and `--check` is the flow verdict (same workload count on every
+  cluster, alternating SHAVE submissions, fills on tile 0's DMA row only, no row at the profiler cap, DPU busy
+  >= a bar): exit 0 on the flow trace, 1 on the Phase 1 GEMM trace; a hardware-free test pins both. (3) **Numbers
+  (UNPROFILED, kernel-only, 3 tiles x 2 SHAVEs, fp16 x fp16):** reference shape Y[2048, 768] = X[2048, 2048] .
+  W[768, 2048]^T, BM=32, BN=256: **0.799 ms = 8.07 TOPS = 35.5% of 22.73 TOPS** (basis 2048 MAC/cycle/tile at
+  1.85 GHz; 32.1% of 25.13 turbo), DPU IDU busy 87%, so the flow is DPU-bound and the DPU's own rate (10.9 us
+  per 32x256x2048 workload = 1540 MAC/ns) is the gap. Same ops at BM=64, BN=128 (N=384): 0.401 ms = 8.04 TOPS,
+  DPU 70% busy, DMA-bound; roles swapped (`make_ring_flow_swapped`): 1.090 ms = 5.91 TOPS. The compiled flow
+  equals the hand kernel (0.799 vs 0.799). (4) **DMA ceiling, measured** (`device/run_dma_rate_probe.py`,
+  128 KiB DDR->CMX, NCE_TIME): one issuer one port 17.5 GB/s, one issuer two ports **21.7 GB/s**, multicast to 3
+  tiles costs nothing (17.6 / 21.7), and more issuers do NOT add bandwidth (3 issuers x 2 ports 14.7, 6 x 2 8.7
+  GB/s). So the box's DMA DDR->CMX ceiling is ~22 GB/s and the fill-vs-compute balance is a shape property:
+  bytes per MAC = 2 / (3 BN) for the streamed operand, 14.8 GB/s needed at BN=256 (fits), 29.7 at BN=128 (does
+  not), matching the two measurements. The prior art's 62 GB/s "golden" was a vpuem simulator trace, not
+  hardware. TileGemm has its two constants: VPUNN DPU cycles x ~1.6 and 22 GB/s. (5) Lessons: the host-sim
+  library cache now keys on the runtime headers too (a stale 32-byte-status library passed as "unwritten
+  status"); `--no-build` reuses stale device ELFs after a runtime header change, so rebuild after one.
 * 2026-11-06: **Phase 3b step B: the compiler emits the flow from the author's loops.** Three Python
   passes after `LowerIntelNpuTileOp` (section 3 items 7, 9, 9b): `PlanIntelNpuDistribution`,
   `LowerIntelNpuPipelined`, `AssignIntelNpuBarriers`; `PlanIntelNpuWorkloads` now also plans

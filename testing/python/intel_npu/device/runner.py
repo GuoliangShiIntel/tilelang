@@ -24,7 +24,8 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 GENERATED = HERE / "generated"
-STATUS_BYTES_PER_SHAVE = 32
+STATUS_BYTES_PER_SHAVE = 64
+STATUS_WORDS = STATUS_BYTES_PER_SHAVE // 4
 STATUS_OK = 1
 STATUS_NAMES = {1: "OK", 2: "CMX_EXHAUSTED", 3: "BAD_PARAMS", 4: "UNSUPPORTED", 5: "BARRIER_NOT_LIVE(id=detail)", 6: "BARRIER_TIMEOUT(id=detail)",
                 7: "RING_REFUSED(1 slots!=shaves, 2 one tile, 3 barrier pool)", 8: "ORDER_TIMEOUT(need=detail)"}
@@ -142,9 +143,10 @@ def build(source: str, kernel: str, build_dir: Path | None = None, log=print, te
 
 @dataclass
 class DeviceResult:
-    median_ms: float
+    median_ms: float          # host wall incl. submit
+    median_kernel_ms: float   # earliest SHAVE entry stamp to latest finish stamp (NCE_TIME, 19.2 MHz)
     times_ms: list[float]
-    status: np.ndarray  # [workers, 8] uint32
+    status: np.ndarray  # [workers, 16] uint32
     stdout: str
 
 
@@ -175,10 +177,11 @@ def run(db: DeviceBuild, arrays: list[tuple[str, np.ndarray]], tiles: int, shave
             data = np.fromfile(run_dir / f"p{i}.bin", dtype=a.dtype)
             a[...] = data.reshape(a.shape)
     workers = tiles * shaves
-    status = np.fromfile(run_dir / "status.bin", dtype=np.uint32)[: workers * 8].reshape(workers, 8)
-    times = [float(ln.split()[-1]) for ln in r.stdout.splitlines() if ln.startswith("run ")]
+    status = np.fromfile(run_dir / "status.bin", dtype=np.uint32)[: workers * STATUS_WORDS].reshape(workers, STATUS_WORDS)
+    times = [float(ln.split()[3]) for ln in r.stdout.splitlines() if ln.startswith("run ")]
     median = float(r.stdout.split("median_ms")[1].split()[0])
-    return DeviceResult(median_ms=median, times_ms=times, status=status, stdout=r.stdout)
+    median_kernel = float(r.stdout.split("median_kernel_ms")[1].split()[0])
+    return DeviceResult(median_ms=median, median_kernel_ms=median_kernel, times_ms=times, status=status, stdout=r.stdout)
 
 
 def check_status(status: np.ndarray) -> None:

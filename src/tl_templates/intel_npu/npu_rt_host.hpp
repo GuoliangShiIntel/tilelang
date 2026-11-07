@@ -166,7 +166,7 @@ public:
   void finish() {
     if (statusAddr_ == 0)
       return;
-    auto *s = reinterpret_cast<std::uint32_t *>(ptr(statusAddr_ + 32ull * worker()));
+    auto *s = reinterpret_cast<std::uint32_t *>(ptr(statusAddr_ + 64ull * worker()));
     s[0] = ok_ ? kStatusOk : code_;
     s[1] = detail_;
     s[2] = env_.cmxBytes;

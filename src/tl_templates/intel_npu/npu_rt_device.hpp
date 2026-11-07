@@ -77,6 +77,7 @@ public:
       int numTensorParams, std::uint32_t syncBarrierBase = kNoHwSync)
       : env_(env), cmx_(env.getCmxAllocator()), dma_(env.getDmaDrv()),
         sync_(env.getSync()), syncBase_(syncBarrierBase) {
+    tStart_ = perf_ticks();
     const auto &info = env.getShaveInfo();
     shave_ = info.getShaveId();
     spt_ = info.getNumShavesPerTile();
@@ -426,14 +427,17 @@ public:
     return false;
   }
 
-  // Writes the per-SHAVE status record: {code, detail, cmx_free_at_entry, cmx_used,
-  // dpu_workloads, dpu_idu_ticks, dpu_odu_ticks, 0}.
-  void finish() {
+  // Writes the per-SHAVE status record (64 B): {code, detail, cmx_free_at_entry, cmx_used,
+  // dpu_workloads, dpu_idu_ticks, dpu_odu_ticks, 0, t_entry, t_finish, extra[0..5]}. The stamps
+  // are the NCE_TIME free-running counter (19.2 MHz perf clock on this box): the host takes
+  // max(t_finish) - min(t_entry) over the SHAVEs as the kernel-only time. `extra` is a probe's.
+  static constexpr std::uint32_t kStatusBytes = 64;
+  void finish(const std::uint32_t *extra = nullptr, std::uint32_t nExtra = 0) {
     if (statusAddr_ == 0)
       return;
-    const std::uint64_t a = statusAddr_ + 32ull * worker();
+    const std::uint64_t a = statusAddr_ + static_cast<std::uint64_t>(kStatusBytes) * worker();
     DdrAccessor<std::uint32_t> s0(a), s1(a + 4), s2(a + 8), s3(a + 12), s4(a + 16), s5(a + 20),
-        s6(a + 24), s7(a + 28);
+        s6(a + 24), s7(a + 28), s8(a + 32), s9(a + 36);
     s0 = ok_ ? kStatusOk : code_;
     s1 = detail_;
     s2 = cmxFree0_;
@@ -442,8 +446,17 @@ public:
     s5 = dpuIduTicks_;
     s6 = dpuOduTicks_;
     s7 = 0;
+    s8 = tStart_;
+    s9 = perf_ticks();
+    for (std::uint32_t i = 0; i < nExtra && i < 6; ++i) {
+      DdrAccessor<std::uint32_t> sx(a + 40 + 4 * i);
+      sx = extra[i];
+    }
     sync::memoryFence();
   }
+
+  // Hardware descriptors for a hand-written probe (the ring and the DMA/DPU paths use their own).
+  template <class T> T *alloc_descriptors(std::uint32_t count) { return alloc_hw<T>(count); }
 
 private:
   static constexpr std::uint32_t alignUp(std::uint32_t v, std::uint32_t a) {
@@ -453,6 +466,9 @@ private:
   static constexpr std::uint32_t kTrapLo = 0x12000, kTrapHi = 0x14000;
 
   std::uint32_t worker() const { return tile_ * spt_ + shave_; }
+
+  // NCE_TIME free-running counter (kernel_profiler.hpp NCE_TIME_FREE_RUNNING_ADR).
+  static std::uint32_t perf_ticks() { return getRegWordVal(0x2f020000U); }
 
   // Grid rendezvous on hardware barriers syncBase_ + (k mod 3): every SHAVE
   // produces, waits for the last producer, consumes; worker 0 re-arms the id
@@ -600,6 +616,7 @@ private:
   std::int32_t shave_{0}, spt_{1}, tile_{0}, tiles_{1};
   std::uint64_t statusAddr_{0};
   std::uint32_t cmxFree0_{0};
+  std::uint32_t tStart_{0};
   bool ok_{true};
   std::uint32_t code_{kStatusOk}, detail_{0};
   std::uint32_t syncBase_{kNoHwSync};

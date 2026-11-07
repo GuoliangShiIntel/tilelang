@@ -26,7 +26,11 @@
 
 namespace {
 
-constexpr std::uint32_t kStatusBytesPerShave = 32;
+constexpr std::uint32_t kStatusBytesPerShave = 64;
+constexpr std::uint32_t kStatusWords = kStatusBytesPerShave / 4;
+// Status words 8 and 9: NCE_TIME free-running counter at kernel entry and at finish (19.2 MHz on this box).
+constexpr std::uint32_t kStampStart = 8, kStampEnd = 9;
+constexpr double kPerfClkMHz = 19.2;
 constexpr std::uint32_t kStatusOk = 1;
 
 [[noreturn]] void die(const std::string &m) {
@@ -126,7 +130,7 @@ int run(int argc, char **argv) {
     params.push_back(p.dev);
   params.push_back(status);
 
-  std::vector<double> times;
+  std::vector<double> times, kernelTimes;
   for (int r = 0; r < warmup + repeat; ++r) {
     for (auto &p : ps) {
       if (!p.init.empty())
@@ -146,7 +150,7 @@ int run(int argc, char **argv) {
       die("device unhealthy after run " + std::to_string(r) + ": " + health);
     }
     for (std::uint32_t w = 0; w < workers; ++w) {
-      volatile std::uint32_t *word = status + w * 8;
+      volatile std::uint32_t *word = status + w * kStatusWords;
       if (*word == 0xFFFFFFFFu) {
         // Diagnostic for an intermittent unwritten record: is it late, or never written?
         int waited_ms = 0;
@@ -162,12 +166,23 @@ int run(int argc, char **argv) {
         dumpStatus();
         dumpOutputs();
         die("SHAVE " + std::to_string(w) + " status " + std::to_string(*word) + " detail " +
-            std::to_string(status[w * 8 + 1]) + " (status.bin and outputs written)");
+            std::to_string(status[w * kStatusWords + 1]) + " (status.bin and outputs written)");
       }
     }
+    // Kernel-only span: earliest entry stamp to latest finish stamp over every SHAVE, in
+    // perf-clock ticks (32-bit counter; differences are taken modulo 2^32).
+    std::uint32_t start0 = status[kStampStart];
+    for (std::uint32_t w = 1; w < workers; ++w)
+      if ((std::int32_t)(status[w * kStatusWords + kStampStart] - start0) < 0)
+        start0 = status[w * kStatusWords + kStampStart];
+    std::uint32_t spanTicks = 0;
+    for (std::uint32_t w = 0; w < workers; ++w)
+      spanTicks = std::max(spanTicks, status[w * kStatusWords + kStampEnd] - start0);
+    const double kernelMs = spanTicks / kPerfClkMHz / 1000.0;
     if (r >= warmup) {
       times.push_back(ms);
-      std::cout << "run " << r - warmup << " ms " << ms << std::endl;
+      kernelTimes.push_back(kernelMs);
+      std::cout << "run " << r - warmup << " ms " << ms << " kernel_ms " << kernelMs << std::endl;
     }
   }
   if (!profile.empty()) {
@@ -181,8 +196,10 @@ int run(int argc, char **argv) {
     }
   dumpStatus();
   std::sort(times.begin(), times.end());
+  std::sort(kernelTimes.begin(), kernelTimes.end());
   if (!times.empty())
-    std::cout << "median_ms " << times[times.size() / 2] << std::endl;
+    std::cout << "median_ms " << times[times.size() / 2] << " median_kernel_ms "
+              << kernelTimes[kernelTimes.size() / 2] << std::endl;
   return 0;
 }
 

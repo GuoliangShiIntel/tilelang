@@ -23,7 +23,8 @@ import numpy as np
 
 TL_ROOT = Path(__file__).resolve().parents[3]
 INCLUDE_ROOT = TL_ROOT / "src"  # generated code includes <tl_templates/intel_npu/npu_rt.hpp>
-STATUS_BYTES_PER_SHAVE = 32
+STATUS_BYTES_PER_SHAVE = 64
+STATUS_WORDS = STATUS_BYTES_PER_SHAVE // 4
 STATUS_OK = 1
 STATUS_NAMES = {1: "OK", 2: "CMX_EXHAUSTED", 3: "BAD_PARAMS", 4: "UNSUPPORTED", 5: "BARRIER_NOT_LIVE", 6: "BARRIER_TIMEOUT"}
 
@@ -39,7 +40,12 @@ def build(source: str, name: str, out_dir: str | Path | None = None) -> Path:
     """Compile `source` (generated kernel C++) into a shared library exporting npu_sim_run."""
     out_dir = Path(out_dir) if out_dir else Path(tempfile.gettempdir()) / "tl_intel_npu_sim"
     out_dir.mkdir(parents=True, exist_ok=True)
-    digest = hashlib.sha256(source.encode()).hexdigest()[:12]
+    # The cache key covers the runtime headers too: a header change with an unchanged kernel
+    # once reused a library with the old status layout.
+    h = hashlib.sha256(source.encode())
+    for hdr in sorted((INCLUDE_ROOT / "tl_templates" / "intel_npu").glob("*.hpp")):
+        h.update(hdr.read_bytes())
+    digest = h.hexdigest()[:12]
     src = out_dir / f"{name}_{digest}.cpp"
     lib = out_dir / f"{name}_{digest}.{'dll' if sys.platform == 'win32' else 'so'}"
     if lib.exists():
@@ -58,7 +64,7 @@ def build(source: str, name: str, out_dir: str | Path | None = None) -> Path:
 
 def run(lib_path: Path, arrays: list[np.ndarray], tiles: int, shaves: int, cmx_bytes: int = 1_572_864) -> np.ndarray:
     """Run the kernel with `arrays` as its tensor parameters (in order; modified in place).
-    Returns the per-SHAVE status records as an int array [tiles*shaves, 8]."""
+    Returns the per-SHAVE status records as an int array [tiles*shaves, 16]."""
     lib = ctypes.CDLL(str(lib_path))
     lib.npu_sim_run.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32]
     lib.npu_sim_run.restype = ctypes.c_int
@@ -71,7 +77,7 @@ def run(lib_path: Path, arrays: list[np.ndarray], tiles: int, shaves: int, cmx_b
     rc = lib.npu_sim_run(len(words), params, tiles, shaves, cmx_bytes)
     if rc != 0:
         raise RuntimeError(f"npu_sim_run returned {rc}")
-    return status.reshape(workers, 8)
+    return status.reshape(workers, STATUS_WORDS)
 
 
 def check_status(status: np.ndarray) -> None:

@@ -131,3 +131,27 @@ def test_barrier_pool_exhaustion_is_refused():
 
     with pytest.raises(Exception, match=r"3 ring\(s\) need 24 hardware barrier ids .* short by 3"):
         _src(three)
+
+
+# -- the flow checker on recorded traces (device/evidence) -------------------------------------
+
+EVIDENCE = Path(__file__).resolve().parent / "device" / "evidence"
+
+
+def _check(trace, **kw):
+    sys.path.insert(0, str(EVIDENCE.parent))
+    import trace_timeline
+    events, names = trace_timeline.load(trace)
+    return trace_timeline.check(events, names, **kw)
+
+
+def test_flow_checker_passes_the_flow_trace_and_fails_a_plain_gemm():
+    flow = EVIDENCE / "tl_ring_flow_bm64_bn128_k2048_2048x384x2048_trace.json"
+    gemm = EVIDENCE / "tl_gemm_f16_256x256x512_trace.json"
+    if not (flow.exists() and gemm.exists()):
+        pytest.skip("recorded traces missing")
+    assert _check(flow, chunks=32, tiles=3, min_busy=50) == []
+    problems = _check(gemm, tiles=2)
+    assert problems and any("multicast" in p for p in problems), problems
+    # the busy threshold is a live check: an impossible bar fails the flow trace too
+    assert any("DPU busy" in p for p in _check(flow, chunks=32, tiles=3, min_busy=99))
