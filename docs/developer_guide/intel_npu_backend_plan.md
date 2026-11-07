@@ -9,7 +9,10 @@ amendment, not a silent edit.
 Build a **pure TileLang target backend** for the Intel NPU5 (PTL), owned entirely by this repo:
 dialect, target, pass pipeline and C++ codegen, plus a small SHAVE runtime header of our own.
 Nothing imports or links the previous `npu_dsl` compiler (`D:\dsl\libraries.npu.dsl`). Its design
-documents are read as prior art only; its runtime headers (`fused_rt*.hpp`) are not reused.
+documents are read as prior art only; its runtime headers (`fused_rt*.hpp`) are not reused. Amended
+2026-11-06 (`<user>`): its hardware-verified SHAVE *algorithms* (vector math loops, dequant, the GDN scan in
+`kernels_poc/common/fused_ops.hpp` and siblings) may be ported into this backend's runtime with the origin
+named; the compiler side stays pure TileLang (section 4, M1-M6).
 
 The only external dependency is the hardware SDK: the `generic_compute` toolkit (SHAVE `kernel_entry`
 ABI, `npu::Environment`, DMA/DPU drivers, host `npu_runtime` over Level Zero) and MoviTools
@@ -320,26 +323,48 @@ fail** on a negative fixture and then pass on the real one.
   Negatives: a source whose tile split is on the streamed loop is refused; a per-tile unicast copy of a
   tile-invariant source is noted in the source (relaxed from refusal: fixtures and probes do it legitimately).
 
-### Phase 4: SHAVE ops and quantised GEMM
-* Typed SHAVE op surface (`T.npu.rmsnorm`, `softmax`, `silu`, `dequant_i4`, ...) over
-  `call_extern`, each backed by a function in `npu_rt.hpp`; int4 group-quantised weights:
-  dequantise on the SHAVE, fp16 DPU matmul (`DEQUANT_THEN_FP16`), later the DPU-native per-channel
-  path. K-split with a SHAVE accumulate.
-* Acceptance: conformance matrix {per-channel, grouped} x {int4, int8} x {M=1, M=32} vs numpy in
-  the host sim and on the device, with a negative control (wrong weight layout must miss).
-* Library guard rails carried over from npu_dsl's three bring-ups (`enable-new-model` skill,
-  "Pitfalls"), each as a refusal with a negative test: top-k gating with fewer than 32 experts;
-  an attention key chunk or head dim not a multiple of 32; two layouts for one state key across
-  decode and prefill kernels; a multicast round with a load in its epilogue.
+### Phase 4 and 5, re-planned 2026-11-06 around the model target (section 9): milestones M1-M6
 
-### Phase 5: one decoder layer, then a model, as one megakernel
-* Layer = norm -> qkv -> attention -> o_proj -> norm -> FFN, all in one `prim_func`, phases joined
-  by (derived) `sync_grid`; then `for layer in T.serial(L)`.
-* Acceptance: golden vs a PyTorch reference on a small model; `.text` under `text_limit_bytes`;
-  decode ms/token and prefill TTFT measured unprofiled as interleaved A/B against the recorded
-  npu_dsl numbers (external reference only; `docs/RUN_AND_RESULTS.md` in that repo), with repeats.
-* Decide here whether a real `intel_npu` execution backend (Build/JIT/Runtime over `npu_runtime`)
-  is worth it or the runner stays.
+`<user>`'s final target is **Qwen3.8-35B-A3B-Distill** (`empero-ai/Qwen3.8-35B-A3B-Distill`), a fine-tune of
+Qwen3.6-35B-A3B (`qwen3_5_moe`: 40 layers, hybrid Gated DeltaNet + full attention, 256 experts top-8 with a shared
+expert, int4 group-128 weights), enabled the way npu_dsl's `enable-new-model` skill prescribes. npu_dsl already runs
+Qwen3.6-35B-A3B, so section 9 lists what the model needs against what this backend has, and the milestones below
+replace the earlier Phase 4 / Phase 5 text. Every milestone: host sim first, device golden, then kernel-only time
+against npu_dsl's same-shape number (the standing bar: not slower than npu_dsl).
+
+* **M1 full-attention prefill phase** (in progress): the ring generalised to several streamed operands, SHAVE
+  statements in the body and "the slot's last reader produces FREE"; RMSNorm, RoPE, q/k norm as SHAVE ops;
+  fp16 qkv / o_proj. Acceptance: one attention block's prefill, device golden, kernel-only vs npu_dsl.
+* **M2 int4 group-128 weights**: SHAVE dequant feeding the fp16 DPU (prefill) and the SHAVE GEMV (decode, M=1);
+  int8 group-128 for the lm_head. Decides decode TPS.
+* **M3 MoE layer**: top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert
+  (sigmoid gate), combine; the routed-work distribution rule (npu_dsl's `e7_24_moe_routed_work.md` is the
+  readable precedent).
+* **M4 Gated DeltaNet layer**: causal conv1d and the delta-rule scan (the largest SHAVE op).
+* **M5 one-kernel model**: layer table with a device-side layer loop (`when` on the layer kind), long-prompt chunk
+  loop, `PlanCmx` live-range packing across phases, barrier id reuse across phases, `.text` budget per kernel;
+  one decode kernel and one prefill kernel.
+* **M6 e2e**: reuse npu_dsl's `qwen36_e2e` reference model, pack and golden check (model-side Python, reused
+  across models by that skill itself) on this backend's ABI; golden 32/32; `longseq` TTFT / TPS as an interleaved
+  A/B against npu_dsl's Qwen3.6 numbers.
+
+Rules carried into M1-M6:
+* **SHAVE algorithms may be ported from npu_dsl's hardware-verified runtime code** (`<user>`, 2026-11-06:
+  `kernels_poc/common/fused_ops.hpp` vector loops, dequant, GDN scan), with the origin named at the port;
+  the compiler side (IR, passes, emitter) stays pure TileLang. Section 0's "fused_rt not reused" is amended to
+  this.
+* **Performance is guaranteed by prune -> measure -> pin, not by a model** (`<user>`'s concern: npu_dsl's
+  tiling choices were ad hoc). `TileGemm`: legal candidates (CMX, 8192 points, 16-alignment, the window rule
+  (d - 1) x D >= chain) ranked by the composite model `t_chunk = max(DPU = VPUNN x calibration, fill = 4.5 us +
+  bytes / 67 GB/s + 2 barrier latencies, SHAVE = measured ns per element)`, top-k built and timed kernel-only
+  on the device in one build (80 kernels in ~30 s today), the measured best pinned with its evidence, and the
+  model's regret recorded. A GEMM class may skip the sweep only once the model's first pick has regret <= 3% on
+  every shape tried; MoE routed work is swept with representative routing, never random (skill 6b's lesson);
+  decode GEMV is SHAVE/bandwidth bound and is measured, not modelled. Whole-model A/B before any pin (skill 6b).
+* Library guard rails from npu_dsl's bring-ups stay as refusals with negative tests: top-k over fewer than 32
+  experts; an attention key chunk or head dim not a multiple of 32; two layouts for one state key across decode
+  and prefill; a multicast round with a load in its epilogue.
+* The execution-backend question (Build/JIT/Runtime over `npu_runtime` versus the runner) is decided at M6.
 
 ## 5. Measurement and evidence rules carried over
 
@@ -401,6 +426,28 @@ interop; a Python `nl.*`-compatible shim.
    here. Question for `<user>`: what changed on the box since early October (NPU driver/firmware, Windows
    power plan, DVFS cap, thermal)? Until it is answered, percentages are quoted against the measured
    same-day probe, not against the October table.
+
+## 9. Model target: Qwen3.8-35B-A3B-Distill, and what it needs (2026-11-06)
+
+The model is Qwen3.6-35B-A3B's architecture with new weights. The coverage matrix below is npu_dsl's
+`docs/design/lib_coverage.md` filtered to the rows Qwen3.6 uses, against this backend. "have" means lowered,
+device-verified and measured here.
+
+| Block | Needed | This backend | Milestone |
+|---|---|---|---|
+| Projections, prefill | int4 group-128: SHAVE dequant -> fp16 DPU; fp16 (`baProj`) | fp16 DPU GEMM + multi-tile ring flow (**have**) | M2 (dequant) |
+| Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | none | M2 |
+| Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | scalar loops compile; no vectorised SHAVE ops; math intrinsics lower (`intrin_rule_intel_npu.cc`) | M1 |
+| Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | the flow's ring for one streamed operand; flash phase source written, refused by the ring body rule | M1 |
+| Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | none | M4 |
+| MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | none | M3 |
+| Head | final norm + lm_head (int8 g128) + greedy argmax | none | M2 / M5 |
+| Compiler | layer table + device-side layer loop with two layer kinds; long-prompt chunk loop; CMX reuse across phases; barrier id reuse; `.text` per kernel | phases + derived `sync_grid`, budgets as sums (**have**); PlanCmx and id reuse open | M5 |
+| e2e | pack, export, fp32 reference on the quantised weights, golden, `longseq` | none here; npu_dsl's `qwen36_e2e` reference / pack / golden are reusable model-side code | M6 |
+| Measurement | kernel-only time, traces, flow check, VPUNN-planned workloads, DMA model | **have** | - |
+
+Baseline to beat: npu_dsl's Qwen3.6-35B-A3B numbers (`qwen36_e2e`, its `docs/design/fused_compiler_log.md`),
+re-measured on the same day as ours, since the box's DPU rate has changed since October (section 7 question 5).
 
 ## 8. Log
 

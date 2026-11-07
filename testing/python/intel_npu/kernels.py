@@ -127,7 +127,7 @@ def make_ring_flow_swapped(M: int, N: int, K: int, BM: int = 256, BN: int = 32, 
 
 
 def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32, BKV: int = 128, tiles: int = 3,
-                               shaves: int = 2, num_stages: int = 2):
+                               shaves: int = 2, num_stages: int = 2, pipelined: bool = True):
     """One attention phase of a megakernel, written in the flow's form (plan 3b, README 1-3):
     the tile's Q block is resident (SEGMENTED), K and V^T stream through the ring (DUPLICATED),
     chunk c -> SHAVE c % 2 keeps its own online-softmax partials (m, l, O) over its chunks, and
@@ -160,7 +160,7 @@ def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32,
             for i in T.serial(BQ):
                 m_i[i] = T.float16(-65504.0)
                 l_i[i] = T.float16(0)
-            for kv in T.Pipelined(NKV, num_stages=num_stages):
+            for kv in (T.Pipelined(NKV, num_stages=num_stages) if pipelined else T.serial(NKV)):
                 T.copy(K[kv * BKV, 0], k_cmx)
                 T.copy(Vt[0, kv * BKV], v_cmx)
                 T.gemm(q_cmx, k_cmx, s_cmx, transpose_B=True, clear_accum=True)

@@ -19,6 +19,20 @@
 
 typedef _Float16 half;
 
+#include <cmath>
+// fp16 math behind the intel_npu intrinsic rules (intrin_rule_intel_npu.cc), float math on the host.
+static inline half tl_npu_hexp(half x) { return (half)expf((float)x); }
+static inline half tl_npu_hexp2(half x) { return (half)exp2f((float)x); }
+static inline half tl_npu_hlog(half x) { return (half)logf((float)x); }
+static inline half tl_npu_hlog2(half x) { return (half)log2f((float)x); }
+static inline half tl_npu_hsqrt(half x) { return (half)sqrtf((float)x); }
+static inline half tl_npu_hrsqrt(half x) { return (half)(1.0f / sqrtf((float)x)); }
+static inline half tl_npu_htanh(half x) { return (half)tanhf((float)x); }
+static inline half tl_npu_hfabs(half x) { return (half)fabsf((float)x); }
+static inline half tl_npu_hfloor(half x) { return (half)floorf((float)x); }
+static inline half tl_npu_hceil(half x) { return (half)ceilf((float)x); }
+static inline half tl_npu_hround(half x) { return (half)roundf((float)x); }
+
 #if defined(_WIN32)
 #define NPU_SIM_EXPORT extern "C" __declspec(dllexport)
 #else
