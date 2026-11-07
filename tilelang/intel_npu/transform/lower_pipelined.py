@@ -39,6 +39,8 @@ RING_SLOT = "tl.intel_npu_ring_slot"
 RING_FILL = "tl.intel_npu_ring_fill"
 RING_SUBMIT = "tl.intel_npu_ring_dpu_submit"
 RING_WAIT = "tl.intel_npu_ring_dpu_wait"
+RING_ACQUIRE = "tl.intel_npu_ring_slot_acquire"
+RING_RELEASE = "tl.intel_npu_ring_slot_release"
 RING_END = "tl.intel_npu_ring_end"
 NOTES_ATTR = "intel_npu.notes"
 
@@ -105,6 +107,30 @@ class _Launch:
             raise ValueError("intel_npu: kernel has no blockIdx.x / threadIdx.x launch binding")
 
 
+def _reads_buffer(stmt, buf) -> bool:
+    hit = [False]
+
+    def visit(node):
+        if isinstance(node, tirx.BufferLoad) and node.buffer.same_as(buf):
+            hit[0] = True
+
+    post_order_visit(stmt, visit)
+    return hit[0]
+
+
+def _offset_loads(stmt, buf, row_offset):
+    """BufferLoads of `buf` inside `stmt` with `row_offset` added to the leading index (the slot of the use)."""
+
+    def rewrite(node):
+        if isinstance(node, tirx.BufferLoad) and node.buffer.same_as(buf):
+            idx = list(node.indices)
+            idx[0] = idx[0] + row_offset
+            return tirx.BufferLoad(node.buffer, idx)
+        return None
+
+    return ir_transform(stmt, None, rewrite, ["tirx.BufferLoad"])
+
+
 def _storage_sync_shared():
     return tirx.Evaluate(tirx.Call("int32", _op("tirx.tvm_storage_sync"), [tirx.StringImm("shared")]))
 
@@ -166,11 +192,11 @@ def PlanIntelNpuDistribution():
                 return None
             if pipelined_depth[0] > 0:
                 if src_tile:
-                    raise ValueError(
-                        f"intel_npu: the streamed fill {src.buffer.name} -> {dst.buffer.name} depends on the "
-                        f"tile: a tile split on the streamed loop is refused (README section 3); split the "
-                        f"resident operand across tiles instead")
-                notes.append(f"{dst.buffer.name}: DUPLICATED (streamed, one multicast per chunk)")
+                    # Each tile reads its own disjoint chunks: a split stream (one unicast fill per tile), legal by
+                    # the rule (split or broadcast, never copied per tile); the weights of an N-split projection.
+                    notes.append(f"{dst.buffer.name}: SEGMENTED (streamed, each tile fills its own slot)")
+                else:
+                    notes.append(f"{dst.buffer.name}: DUPLICATED (streamed, one multicast per chunk)")
                 return None
             # Resident SEGMENTED (or tile-invariant) fill into a tile-shared buffer: split the rows
             # over the tile's SHAVEs, one per DMA port, then meet.
@@ -285,13 +311,22 @@ class _Pipeline:
             if len(readers) > 1:
                 raise ValueError("intel_npu: a gemm reads two streamed operands; one slot per gemm is lowered")
         for st in self.streams:
-            if st.gemm is None:
-                raise ValueError(f"intel_npu: the streamed buffer {st.slot_buf.name} is filled but no gemm in the "
-                                 f"loop reads it")
+            if st.gemm is not None:
+                continue
+            # No gemm reads the slot: its readers are SHAVE statements (a dequant, a norm). The SHAVE acquires
+            # the slot (waits READY) before the first and releases it (produces FREE) after the last.
+            readers = [i for i, s in enumerate(self.stmts)
+                       if not (_is_call(s, DMA_COPY) and _const(s.value.args[6]) == 1) and _reads_buffer(s, st.slot_buf)]
+            if not readers:
+                raise ValueError(f"intel_npu: the streamed buffer {st.slot_buf.name} is filled but nothing in the loop "
+                                 f"reads it")
+            st.first_reader, st.last_reader = readers[0], readers[-1]
+        self.shave_streams = [st for st in self.streams if st.gemm is None]
         self.stores = [s for s in self.stmts if _is_call(s, DMA_COPY) and _const(s.value.args[6]) == 0]
         others = [s for s in self.stmts if not (_is_call(s, DMA_COPY) or _is_call(s, DPU_MATMUL))]
         # The simple body (one stream, its gemm, stores) gets the submit-ahead program.
-        self.simple = len(self.streams) == 1 and len(self.gemms) == 1 and bool(self.stores) and not others
+        self.simple = (len(self.streams) == 1 and len(self.gemms) == 1 and bool(self.stores) and not others
+                       and not self.shave_streams)
         for st in self.stores:
             if _load_of(st.value.args[1]).buffer.scope() != "local":
                 raise ValueError("intel_npu: a store in a pipelined loop must read a SHAVE-local buffer")
@@ -329,14 +364,26 @@ def LowerIntelNpuPipelined():
         def wait(st, use):
             return tirx.Evaluate(tirx.Call("handle", _op(RING_WAIT), [st.ring, use]))
 
+        def acquire(st, use):
+            return tirx.Evaluate(tirx.Call("handle", _op(RING_ACQUIRE), [st.ring, use]))
+
+        def release(st, use):
+            return tirx.Evaluate(tirx.Call("handle", _op(RING_RELEASE), [st.ring, use]))
+
+        def slot_rows(st, p, use):
+            # leading-index offset of this SHAVE's slot for `use` within the slots buffer
+            return (tx + spt * tirx.floormod(use, _i32(p.depth))) * _i32(int(st.slot_buf.shape[0]))
+
         def begin(st, p):
             # one stream: each fill split in two halves over both ports; several streams: stream i whole on
-            # port i % 2, so the streams' fills run concurrently (one job in flight per port per SHAVE)
+            # port i % 2, so the streams' fills run concurrently (one job in flight per port per SHAVE).
+            # A stream whose source reads the tile is split: every tile fills its own slot (no multicast).
             port = -1 if len(p.streams) == 1 else p.streams.index(st) % 2
+            multicast = 0 if _uses(st.src, launch.tile_var) else 1
             return tirx.Bind(st.ring, tirx.Call("handle", _op(RING_BEGIN),
                                                 [_address_of(st.slots, [_i32(0)] * len(st.slots.shape)),
                                                  _i32(st.slot_bytes), _i32(p.stages), _i32(p.total_chunks), _i32(-1),
-                                                 _i32(-1), _i32(port)]))
+                                                 _i32(-1), _i32(port), _i32(multicast)]))
 
         def end(st):
             return tirx.Evaluate(tirx.Call("handle", _op(RING_END), [st.ring]))
@@ -394,21 +441,32 @@ def LowerIntelNpuPipelined():
 
             def loop_body(g):
                 seq = []
-                for s in p.stmts:
+                for i, s in enumerate(p.stmts):
                     if _is_call(s, DMA_COPY) and _const(s.value.args[6]) == 1:
                         continue  # fills are issued by the ring, after the previous use's last reader
+                    for st in p.shave_streams:
+                        if st.first_reader == i:
+                            seq.append(acquire(st, g))
                     hit = [st for st in p.streams if st.gemm is not None and st.gemm.same_as(s)]
                     if hit:
                         st = hit[0]
                         seq += [submit(st, g, st.gemm.value.args[0]), wait(st, g), fill(st, g + p.depth)]
                     else:
-                        seq.append(substitute(s, {p.c: inner_chunk(p, g)}))
+                        s2 = s
+                        for st in p.shave_streams:
+                            if st.first_reader <= i <= st.last_reader:
+                                s2 = _offset_loads(s2, st.slot_buf, slot_rows(st, p, g))
+                        seq.append(substitute(s2, {p.c: inner_chunk(p, g)}))
+                    for st in p.shave_streams:
+                        if st.last_reader == i:
+                            seq += [release(st, g), fill(st, g + p.depth)]
                 return tirx.SeqStmt(seq)
 
             prologue = [begin(st, p) for st in p.streams] + [fill(st, _i32(k)) for k in range(p.depth) for st in p.streams]
+            kinds = (f"{len(p.gemms)} gemm(s)" + (f", {len(p.shave_streams)} slot(s) read by the SHAVE" if p.shave_streams else ""))
             notes.append(f"ring over {p.c.name} ({p.total_chunks} chunks; streams " +
                          ", ".join(f"{st.slot_buf.name}[{p.stages} slots, {st.slot_bytes} B]" for st in p.streams) +
-                         f"; SHAVE s owns {p.depth} slot(s), fills {p.depth} use(s) ahead; {len(p.gemms)} gemms with SHAVE "
+                         f"; SHAVE s owns {p.depth} slot(s), fills {p.depth} use(s) ahead; {kinds} with SHAVE "
                          f"statements between, no submit-ahead)")
             return prologue, use_loop(p, u, loop_body), [end(st) for st in p.streams]
 

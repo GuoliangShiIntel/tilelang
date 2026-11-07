@@ -296,6 +296,70 @@ def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32,
     return flash
 
 
+def make_w4a16_flow(M: int, N: int, K: int, BN: int = 64, G: int = 128, tiles: int = 3, shaves: int = 2,
+                    num_stages: int = 2, pipelined: bool = True, split: str = "m"):
+    """M2: Y[M, N] = X[M, K] . dequant(Wq[N, K])^T with symmetric signed int4 weights, two per byte (low
+    nibble first), one fp16 scale per group of G along K (npu_dsl's DEQUANT_I4 / W4A16 format).
+
+    Two role assignments (README section 1: roles, not names):
+      split="m": the activation rows are resident and SEGMENTED over the tiles (M / tiles rows each); the packed
+        weight chunk and its scales stream through two multicast rings (read from DDR once) and EVERY tile
+        dequantizes every chunk -- right when M is large (the DPU work per chunk grows with M, the dequant does not);
+      split="n": X is resident and tile-invariant (broadcast, one copy per tile); the weight chunks are split across
+        the tiles (each tile streams its own third: a SEGMENTED stream, unicast fills) so the dequant is done once
+        -- right when M is small (a short prompt, the W4A16 probe's shape).
+    Each SHAVE dequantizes its chunk into a private fp16 buffer with the runtime's int4 row op (LSU int4 -> int8
+    convert-load) and runs the DPU on it; the slots' last reader is the SHAVE, so it produces the ring's FREE."""
+    assert N % BN == 0 and K % 512 == 0 and G % 64 == 0 and K % G == 0 and split in ("m", "n")
+    KG = K // G
+    if split == "m":
+        assert M % tiles == 0
+        BM, chunks = M // tiles, N // BN
+    else:
+        assert (N // BN) % tiles == 0
+        BM, chunks = M, N // BN // tiles
+
+    @T.prim_func
+    def w4a16(X: T.Tensor((M, K), T.float16), Wq: T.Tensor((N, K // 2), T.uint8), S: T.Tensor((N, KG), T.float16),
+              Y: T.Tensor((M, N), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            x_cmx = T.alloc_shared((BM, K), T.float16)
+            wq_cmx = T.alloc_shared((BN, K // 2), T.uint8)
+            s_cmx = T.alloc_shared((BN, KG), T.float16)
+            w_cmx = T.alloc_local((BN, K), T.float16)
+            y_cmx = T.alloc_local((BM, BN), T.float16)
+            if split == "m":
+                T.copy(X[tile * BM, 0], x_cmx)
+            else:
+                T.copy(X[0, 0], x_cmx)
+            for n in (T.Pipelined(chunks, num_stages=num_stages) if pipelined else T.serial(chunks)):
+                if split == "m":
+                    T.copy(Wq[n * BN, 0], wq_cmx)
+                    T.copy(S[n * BN, 0], s_cmx)
+                else:
+                    T.copy(Wq[(tile * chunks + n) * BN, 0], wq_cmx)
+                    T.copy(S[(tile * chunks + n) * BN, 0], s_cmx)
+                # dequant: a row at a time through the runtime's int4 row op (LSU convert-load, loads of a 512-value
+                # block issued before its stores); the statement forms of the same math ran at 0.7 cycles per value
+                for r in T.serial(BN):
+                    T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(w_cmx[r, 0]), T.address_of(wq_cmx[r, 0]),
+                                  T.address_of(s_cmx[r, 0]), K, G)
+                T.gemm(x_cmx, w_cmx, y_cmx, transpose_B=True, clear_accum=True)
+                if split == "m":
+                    T.copy(y_cmx, Y[tile * BM, n * BN])
+                else:
+                    T.copy(y_cmx, Y[0, (tile * chunks + n) * BN])
+
+    return w4a16
+
+
+def pack_int4(w_int: "np.ndarray") -> "np.ndarray":
+    """[N, K] signed int4 values in [-8, 7] -> [N, K/2] bytes, low nibble first (the reference packer)."""
+    import numpy as np
+    q = (w_int.astype(np.int16) & 0xF).astype(np.uint8)
+    return (q[:, 0::2] | (q[:, 1::2] << 4)).astype(np.uint8)
+
+
 def make_gemm_two_phase(M: int, N: int, K: int, BM: int = 64, BN: int = 64, tiles: int = 2, shaves: int = 2,
                         with_sync: bool = True):
     """Megakernel shape: split-K partial products -> T.sync_grid() -> combine, one launch.

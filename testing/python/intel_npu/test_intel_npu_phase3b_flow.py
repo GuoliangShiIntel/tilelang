@@ -41,7 +41,7 @@ def test_flow_lowers_to_one_ring():
     assert "half* __restrict Y_cmx = ctx.alloc<half>(16384);" in src                  # 2 x 32 x 256, per SHAVE
     # resident fill split over the SHAVEs (128 of 256 rows each), then the tile sync
     assert re.search(r"ctx\.dma_load\(\(&\(W_cmx\[\(tx \* 262144\)\]\)\).*, 4096, 128, 4096, 4096\);\n\s*ctx\.sync_tile\(\);", src)
-    assert "npu::Ctx::Ring ring = ctx.ring_begin((&(X_cmx[0])), 131072, 2, 64, 8, 12, -1);" in src   # one stream: halves on both ports
+    assert "npu::Ctx::Ring ring = ctx.ring_begin((&(X_cmx[0])), 131072, 2, 64, 8, 12, -1, 1);" in src   # one stream: halves on both ports
     assert "ctx.ring_fill(ring, 0, (&(X[(tx * 65536)])), 4096, 32, 4096);" in src  # prologue: chunk = SHAVE index
     assert src.count("ctx.ring_dpu_submit(") == 2 and "ctx.ring_dpu_wait(ring, u);" in src
     assert "(&(Y_cmx[(((u + 1) & 1) * 8192)]))" in src                      # submit-ahead output parity
@@ -56,7 +56,7 @@ def test_flow_is_generic_over_roles_and_names():
     assert "rows_cmx: SEGMENTED resident" in src and "wstream: DUPLICATED (streamed" in src
     # the streamed operand is the gemm's second operand here
     assert re.search(r"ctx\.ring_dpu_submit\(ring, 0, \(&\(acc\[0\]\)\), \(&\(rows_cmx\[0\]\)\), ctx\.ring_slot<half>\(ring, 0\), 256, 32, 2048", src)
-    assert "ctx.ring_begin((&(wstream[0])), 131072, 2, 64, 8, 12, -1);" in src
+    assert "ctx.ring_begin((&(wstream[0])), 131072, 2, 64, 8, 12, -1, 1);" in src
 
 
 def test_ring_depth_must_match_shaves():
@@ -64,11 +64,13 @@ def test_ring_depth_must_match_shaves():
         _src(make_ring_flow(2048, 768, 2048, BM=32, BN=256, tiles=3, num_stages=3))
 
 
-def test_tile_split_on_streamed_loop_is_refused():
+def test_tile_split_on_streamed_loop_is_a_segmented_stream():
+    # Since M2 (2026-11-07): a streamed fill that depends on the tile is a SPLIT stream (each tile fills its own
+    # slot, unicast, the ring's multicast flag off), not a refusal; the resident operand is tile-invariant.
     M, N, K, BM, BN, tiles = 768, 768, 2048, 32, 256, 3
 
     @T.prim_func
-    def bad(X: T.Tensor((M, K), T.float16), W: T.Tensor((N, K), T.float16), Y: T.Tensor((M, N), T.float16)):
+    def split(X: T.Tensor((M, K), T.float16), W: T.Tensor((N, K), T.float16), Y: T.Tensor((M, N), T.float16)):
         with T.Kernel(tiles, threads=2) as tile:
             W_cmx = T.alloc_shared((BN, K), T.float16)
             X_cmx = T.alloc_shared((BM, K), T.float16)
@@ -79,8 +81,11 @@ def test_tile_split_on_streamed_loop_is_refused():
                 T.gemm(X_cmx, W_cmx, Y_cmx, transpose_B=True, clear_accum=True)
                 T.copy(Y_cmx, Y[(tile * (M // BM // tiles) + c) * BM, 0])
 
-    with pytest.raises(Exception, match="tile split on the streamed loop is refused"):
-        _src(bad)
+    src = _src(split)
+    assert "X_cmx: SEGMENTED (streamed, each tile fills its own slot)" in src
+    assert "W_cmx: tile-invariant resident" in src
+    assert "ctx.ring_begin((&(X_cmx[0])), 131072, 2, 8, 8, 12, -1, 0);" in src
+    assert "ctx.ring_fill(ring, 0, (&(X[((bx * 524288) + (tx * 65536))])), 4096, 32, 4096);" in src
 
 
 def test_one_tile_is_refused():
@@ -133,7 +138,7 @@ def test_barrier_pool_exhaustion_is_refused():
     src = _src(three)
     assert src.count("READY 8..11, FREE 12..15") == 3 and "READY 16" not in src
     assert "3 rings, 1 live at once, 8 ids by reuse" in src
-    assert src.count("ctx.ring_begin((&(X_cmx[0])), 65536, 2, 16, 8, 12, -1);") == 3
+    assert src.count("ctx.ring_begin((&(X_cmx[0])), 65536, 2, 16, 8, 12, -1, 1);") == 3
 
     # three operands streamed through ONE loop are three rings live at once: 24 ids do not fit in 21
     @T.prim_func

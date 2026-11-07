@@ -72,6 +72,39 @@ TL_NPU_HOST_REDUCE(float8, float, 8)
 TL_NPU_HOST_REDUCE(float4, float, 4)
 #undef TL_NPU_HOST_REDUCE
 
+// Packed signed int4 (two per byte, low nibble first, value = (n ^ 8) - 8) to fp16, 64 values
+// from 32 bytes as two half32 halves (the device's LSU convert-load).
+static inline half32 tl_npu_i4x64_part(const void *p, int first) {
+  const unsigned char *b = (const unsigned char *)p;
+  half32 r;
+  for (int i = 0; i < 32; ++i) {
+    const int e = first + i;
+    const int n = (e & 1) ? (b[e >> 1] >> 4) : (b[e >> 1] & 0xF);
+    r[i] = (half)((n ^ 8) - 8);
+  }
+  return r;
+}
+static inline half32 tl_npu_i4x64_lo(const void *p) { return tl_npu_i4x64_part(p, 0); }
+static inline half32 tl_npu_i4x64_hi(const void *p) { return tl_npu_i4x64_part(p, 32); }
+typedef signed char schar64 __attribute__((ext_vector_type(64)));
+typedef signed char schar32 __attribute__((ext_vector_type(32)));
+static inline schar64 tl_npu_ld_i4x64(const void *p) {
+  const unsigned char *b = (const unsigned char *)p;
+  schar64 r;
+  for (int e = 0; e < 64; ++e) {
+    const int n = (e & 1) ? (b[e >> 1] >> 4) : (b[e >> 1] & 0xF);
+    r[e] = (signed char)((n ^ 8) - 8);
+  }
+  return r;
+}
+static inline void tl_npu_dequant_i4_row(half *dst, const unsigned char *src, const half *scales, unsigned width,
+                                         unsigned group) {
+  for (unsigned k = 0; k < width; ++k) {
+    const int n = (k & 1) ? (src[k >> 1] >> 4) : (src[k >> 1] & 0xF);
+    dst[k] = (half)((float)((n ^ 8) - 8) * (float)scales[k / group]);
+  }
+}
+
 #if defined(_WIN32)
 #define NPU_SIM_EXPORT extern "C" __declspec(dllexport)
 #else

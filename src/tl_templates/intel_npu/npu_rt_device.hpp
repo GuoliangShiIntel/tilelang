@@ -104,6 +104,45 @@ static inline half tl_npu_vsum(half32 v) {
   return v[0];
 }
 
+// Packed signed int4 (two per byte, LOW nibble first, symmetric: value = (n ^ 8) - 8) to fp16:
+// the LSU converts in the load (`LSU.LD512.i4.i8`: 32 bytes -> 64 int8), lo = values 0..31,
+// hi = 32..63. The DSL writes `w[r, k:k+32] = tl_npu_i4x64_lo(&q[r, k/2]) * scale` (T.call_extern);
+// the fp16 product of |q| <= 8 by an fp16 scale is exact. Same format as npu_dsl's DEQUANT_I4.
+static inline half32 tl_npu_i4x64_lo(const void *p) {
+  const schar64 v = __builtin_shave_lsu_ld512_i4_i8_r((const char64 *)p);
+  return __builtin_convertvector(v.lo, half32);
+}
+static inline half32 tl_npu_i4x64_hi(const void *p) {
+  const schar64 v = __builtin_shave_lsu_ld512_i4_i8_r((const char64 *)p);
+  return __builtin_convertvector(v.hi, half32);
+}
+// The 64 int8 lanes themselves (`q[0:64] = tl_npu_ld_i4x64(p)` then `T.cast(q[0:32], float16x32)`).
+static inline schar64 tl_npu_ld_i4x64(const void *p) { return __builtin_shave_lsu_ld512_i4_i8_r((const char64 *)p); }
+
+// One row of int4 g`group` weights -> fp16 (`T.call_extern("handle", "tl_npu_dequant_i4_row", dst, src, scales,
+// width, group)`). Blocks of 512 values: the 8 convert-loads and the scale splats are issued before the
+// block's 16 stores, so the LSU latency is hidden (the schedule of npu_dsl's DEQUANT_I4 fast path, `E7-63`;
+// the generic DSL statement form loaded twice and stored the loads back to CMX: 0.7 cycles per value).
+// Requires width % 512 == 0 and group % 64 == 0; the fp16 product of |q| <= 8 by an fp16 scale is exact.
+static inline void tl_npu_dequant_i4_row(half *__restrict dst, const unsigned char *__restrict src,
+                                         const half *__restrict scales, std::uint32_t width, std::uint32_t group) {
+  for (std::uint32_t b = 0; b < width / 512; ++b) {
+    schar64 s[8];
+    half32 sc[8];
+#pragma unroll
+    for (std::uint32_t i = 0; i < 8; ++i) {
+      s[i] = __builtin_shave_lsu_ld512_i4_i8_r((const char64 *)(src + b * 256 + i * 32));
+      sc[i] = (half32)(scales[(b * 512 + i * 64) / group]);
+    }
+    half32 *d = reinterpret_cast<half32 *>(dst + b * 512);
+#pragma unroll
+    for (std::uint32_t i = 0; i < 8; ++i) {
+      d[2 * i] = __builtin_convertvector(s[i].lo, half32) * sc[i];
+      d[2 * i + 1] = __builtin_convertvector(s[i].hi, half32) * sc[i];
+    }
+  }
+}
+
 namespace npu {
 
 // Status word 0 per SHAVE, read by the host runner; word 1 is the detail.
@@ -265,6 +304,7 @@ public:
     std::uint32_t slots;
     std::uint32_t depth;      // slots / spt: this SHAVE's slots, fills in flight ahead
     std::int32_t port;        // -1: each fill in two halves on ports 0 and 1; 0/1: whole fill on that port
+    bool multicast;           // true: tile 0 fills every tile's slot; false: each tile fills its own (split stream)
     std::uint32_t total;      // chunks streamed in this ring
     std::uint32_t myUses;     // chunks of this SHAVE
     std::uint32_t readyBase;  // READY id = readyBase + slot * 2 + parity
@@ -308,7 +348,7 @@ public:
   // every config is live before any gate. `readyBase`/`freeBase` come from the
   // compiler's barrier assignment (2 x slots ids each).
   Ring ring_begin(void *slotBase, std::uint32_t slotBytes, std::uint32_t slots, std::uint32_t total,
-                  std::uint32_t readyBase, std::uint32_t freeBase, std::int32_t port = -1) {
+                  std::uint32_t readyBase, std::uint32_t freeBase, std::int32_t port = -1, bool multicast = true) {
     Ring r{};
     r.slotBase = static_cast<std::uint8_t *>(slotBase);
     r.slotBytes = slotBytes;
@@ -317,6 +357,7 @@ public:
     r.readyBase = readyBase;
     r.freeBase = freeBase;
     r.port = port < 0 ? -1 : (port & 1);
+    r.multicast = multicast;
     if (!ok_)
       return r;
     if (slots == 0 || static_cast<std::int32_t>(slots) % spt_ != 0) {
@@ -341,20 +382,32 @@ public:
       flushCmxWrites();
     }
     if (tile_ == 0) {
-      const std::uint8_t nt = static_cast<std::uint8_t>(tiles_);
-      for (std::uint32_t u = 0; u < 2 * r.depth && u < r.myUses; ++u) {
-        barrier_config(ring_ready(r, u), r.port < 0 ? 2 : 1, nt, false);
-        barrier_config(ring_free(r, u), nt, 1, false);
-      }
+      for (std::uint32_t u = 0; u < 2 * r.depth && u < r.myUses; ++u)
+        ring_config(r, u);
       r.armedUpTo = 2 * r.depth < r.myUses ? 2 * r.depth : r.myUses;
       for (std::uint32_t u = 0; u < r.armedUpTo; ++u)
-        if (!barrier_check_live(ring_ready(r, u), r.port < 0 ? 2 : 1, nt) || !barrier_check_live(ring_free(r, u), nt, 1))
+        if (!barrier_check_live(ring_ready(r, u), 0, ring_consumers(r)) || !barrier_check_live(ring_free(r, u), 0, ring_free_consumers(r)))
           return r;
     }
     sync_grid();
     r.armed = ok_;
     return r;
   }
+
+  // Barrier counts. Multicast: one issuer's fill (1 or 2 halves) produces READY, every tile's
+  // reader consumes; every tile's reader produces FREE, the issuer consumes. Split stream: the
+  // ids are still shared by the tiles, so every tile's fill produces READY and every tile's
+  // issuer consumes FREE (the counts scale by the tile count; a tile waits for its peers' fills).
+  std::uint8_t ring_ready_producers(const Ring &r) const {
+    return static_cast<std::uint8_t>((r.port < 0 ? 2 : 1) * (r.multicast ? 1 : tiles_));
+  }
+  std::uint8_t ring_consumers(const Ring &) const { return static_cast<std::uint8_t>(tiles_); }
+  std::uint8_t ring_free_consumers(const Ring &r) const { return static_cast<std::uint8_t>(r.multicast ? 1 : tiles_); }
+  void ring_config(const Ring &r, std::uint32_t use) {
+    barrier_config(ring_ready(r, use), ring_ready_producers(r), ring_consumers(r), false);
+    barrier_config(ring_free(r, use), ring_consumers(r), ring_free_consumers(r), false);
+  }
+  bool ring_issuer(const Ring &r) const { return r.multicast ? tile_ == 0 : true; }
 
   // Issuer: configure the ids of `use` once, at whichever of its fill or its submit
   // comes first. Valid because ids(use) == ids(use - 2 depth), whose READY every DPU
@@ -363,11 +416,8 @@ public:
   void ring_arm(Ring &r, std::uint32_t use) {
     if (tile_ != 0 || use < r.armedUpTo || use >= r.myUses)
       return;
-    const std::uint8_t nt = static_cast<std::uint8_t>(tiles_);
-    for (std::uint32_t u = r.armedUpTo; u <= use; ++u) {
-      barrier_config(ring_ready(r, u), r.port < 0 ? 2 : 1, nt, false);
-      barrier_config(ring_free(r, u), nt, 1, false);
-    }
+    for (std::uint32_t u = r.armedUpTo; u <= use; ++u)
+      ring_config(r, u);
     r.armedUpTo = use + 1;
   }
 
@@ -380,7 +430,7 @@ public:
   // before (use >= 2 x depth).
   void ring_fill(Ring &r, std::uint32_t use, std::uint64_t src, std::uint32_t width,
                  std::uint32_t rows, std::uint32_t srcStride) {
-    if (!ok_ || tile_ != 0 || use >= r.myUses)
+    if (!ok_ || !ring_issuer(r) || use >= r.myUses)
       return;
     DmaDescriptor *d = ring_fill_desc(r, use);
     std::uint32_t t0 = perf_ticks();
@@ -396,6 +446,9 @@ public:
     std::uint32_t t1 = perf_ticks();
     ringTicks_[kTickFreeWait] += t1 - t0;
     ring_arm(r, use);
+    // A split stream's issuer on another tile produces on ids tile 0 arms: wait for the config.
+    if (!r.multicast && tile_ != 0 && !barrier_wait_live(ring_ready(r, use)))
+      return;
     // One descriptor of this SHAVE in flight per port: a second start while another
     // ring's fill is still running on the port left one half unproduced (flash phase,
     // two rings; READY stuck at p=1). Before initDesc below: it clears the watermark
@@ -409,13 +462,16 @@ public:
     if (!ok_)
       return;
     const std::uint32_t mask = (1u << tiles_) - 1u;
-    std::uint8_t *dst = ring_slot(r, use);
+    std::uint8_t *dst0 = ring_slot(r, use);
+    // multicast: the CMX address that writes every tile's copy; split: this tile's own slot
+    auto cmx = [&](std::uint8_t *p) {
+      return reinterpret_cast<std::uint32_t>(r.multicast ? convertToCmxMulticastAddr(p, mask) : p);
+    };
     const std::uint32_t ready = ring_ready(r, use);
     DmaDrv::initDesc(d);
     if (r.port >= 0) {
       // whole fill, one descriptor on this ring's port (several streams share the two ports)
-      configDmaCopy2D(d, reinterpret_cast<std::uint32_t>(convertToCmxMulticastAddr(dst, mask)), src, width,
-                      rows, width, srcStride);
+      configDmaCopy2D(d, cmx(dst0), src, width, rows, width, srcStride);
       DmaDrv::setProducerBarrier(d, ready);
       DmaDrv::setConsumerBarriers(d, 0, 0);
       dma_.start(d, r.port);
@@ -426,16 +482,13 @@ public:
     DmaDrv::initDesc(d + 1);
     if (rows <= 1) {
       const std::uint32_t half0 = width / 2;
-      configDmaCopy(d, reinterpret_cast<std::uint32_t>(convertToCmxMulticastAddr(dst, mask)), src, half0);
-      configDmaCopy(d + 1, reinterpret_cast<std::uint32_t>(convertToCmxMulticastAddr(dst + half0, mask)),
-                    src + half0, width - half0);
+      configDmaCopy(d, cmx(dst0), src, half0);
+      configDmaCopy(d + 1, cmx(dst0 + half0), src + half0, width - half0);
     } else {
       const std::uint32_t rows0 = rows / 2;
-      configDmaCopy2D(d, reinterpret_cast<std::uint32_t>(convertToCmxMulticastAddr(dst, mask)), src, width,
-                      rows0, width, srcStride);
-      configDmaCopy2D(d + 1,
-                      reinterpret_cast<std::uint32_t>(convertToCmxMulticastAddr(dst + rows0 * width, mask)),
-                      src + static_cast<std::uint64_t>(rows0) * srcStride, width, rows - rows0, width, srcStride);
+      configDmaCopy2D(d, cmx(dst0), src, width, rows0, width, srcStride);
+      configDmaCopy2D(d + 1, cmx(dst0 + rows0 * width), src + static_cast<std::uint64_t>(rows0) * srcStride, width,
+                      rows - rows0, width, srcStride);
     }
     DmaDrv::setProducerBarrier(d, ready);
     DmaDrv::setProducerBarrier(d + 1, ready);
@@ -490,6 +543,25 @@ public:
     flushCmxWrites();
     ringTicks_[kTickSubmit] += perf_ticks() - t0;
   }
+  // A slot read by the SHAVE instead of the DPU (a dequant, a norm): the SHAVE is the
+  // READY consumer and the FREE producer, one per tile per slot, so the same counts hold.
+  void ring_slot_acquire(Ring &r, std::uint32_t use) {
+    if (!ok_ || !r.armed || use >= r.myUses)
+      return;
+    ring_arm(r, use);
+    const std::uint32_t ready = ring_ready(r, use);
+    const std::uint32_t t0 = perf_ticks();
+    if (!barrier_wait_live(ready) || !barrier_wait_produced(ready))
+      return;
+    barrier_consume(ready);
+    ringTicks_[kTickDpuWait] += perf_ticks() - t0;
+  }
+  void ring_slot_release(Ring &r, std::uint32_t use) {
+    if (!ok_ || !r.armed || use >= r.myUses)
+      return;
+    barrier_produce(ring_free(r, use));
+  }
+
   void ring_dpu_wait(Ring &r, std::uint32_t use) {
     if (!ok_ || !r.armed || use >= r.myUses)
       return;
@@ -520,7 +592,7 @@ public:
   // and the last FREE of every owned slot consumed so every id is quiescent (a
   // later ring may reuse the ids).
   void ring_end(Ring &r) {
-    if (!ok_ || tile_ != 0 || r.myUses == 0)
+    if (!ok_ || !ring_issuer(r) || r.myUses == 0)
       return;
     for (std::uint32_t k = 0; k < r.depth && k < r.myUses; ++k) {
       DmaDescriptor *d = r.fill + 2 * k;

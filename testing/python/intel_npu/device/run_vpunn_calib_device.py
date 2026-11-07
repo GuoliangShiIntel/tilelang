@@ -168,6 +168,7 @@ def main(argv):
         print(f"| {'x'.join(map(str, r['shape']))} | {r['spatial_x']} | {r['mpe_name']} | {'PASS' if r['golden'] else 'FAIL'} | "
               f"{r['idu_us']:.3f} | {r['vpunn_us_1950']:.3f} | {r['ratio_idu']:.2f} | {r['idu_mac_per_ns']:.0f} | "
               f"{r['host_us_per_wl']:.3f} |")
+    print(f"removed {runner.remove_kernels(j[4] for j in jobs)} sweep kernels from generated/ (every device build compiles the glob)")
     return 0
 
 

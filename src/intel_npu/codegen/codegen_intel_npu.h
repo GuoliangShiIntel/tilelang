@@ -30,6 +30,7 @@ public:
   void PrintType(DataType t, std::ostream &os) final; // NOLINT(*)
   void PrintStorageScope(const std::string &scope, std::ostream &os) final;
   void VisitStmt_(const AttrStmtNode *op) final;
+  void VisitStmt_(const ForNode *op) final;
   void VisitStmt_(const AllocBufferNode *op) final;
   void VisitStmt_(const BindNode *op) final;
   void VisitExpr_(const CallNode *op, std::ostream &os) final;

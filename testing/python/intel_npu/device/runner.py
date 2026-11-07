@@ -104,6 +104,18 @@ def write_kernel(source: str, kernel: str) -> tuple[Path, str]:
     return path, hashlib.sha256(source.encode()).hexdigest()
 
 
+def remove_kernels(names) -> int:
+    """Sweeps call this when done: every device build compiles the whole generated/ glob through MSBuild
+    (~0.2 s per kernel plus a 300-project configure), so 267 leftover sweep arms once made each build ~50 s."""
+    n = 0
+    for name in names:
+        p = GENERATED / f"{name}.cpp"
+        if p.exists():
+            p.unlink()
+            n += 1
+    return n
+
+
 def build(source: str, kernel: str, build_dir: Path | None = None, log=print, text_limit_bytes: int | None = None) -> DeviceBuild:
     """`text_limit_bytes` defaults to the intel_npu target's attribute; the build is refused above it."""
     if text_limit_bytes is None:

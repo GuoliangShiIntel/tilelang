@@ -36,7 +36,7 @@ void CodeGenTileLangIntelNpu::PrintType(DataType t, std::ostream &os) {
       os << "bfloat16";
       return;
     }
-  } else if (t.lanes() >= 2 && t.lanes() <= 32 && (t.lanes() & (t.lanes() - 1)) == 0) {
+  } else if (t.lanes() >= 2 && (t.lanes() <= 32 || (t.lanes() == 64 && t.bits() == 8)) && (t.lanes() & (t.lanes() - 1)) == 0) {
     // moviCompile's ext_vector typedefs: half8/16/32, float4/8/16, int4/8/16, ...
     // (VectorizeLoop decides the lanes; the SHAVE VRF is 512 bits).
     if (t.is_float16()) {
@@ -73,6 +73,15 @@ void CodeGenTileLangIntelNpu::PrintType(DataType t, std::ostream &os) {
     }
   }
   CodeGenC::PrintType(t, os);
+}
+
+void CodeGenTileLangIntelNpu::VisitStmt_(const ForNode *op) {
+  // T.unroll: moviCompile is clang; the pragma is how the author asks for straight-line code.
+  if (op->kind == tirx::ForKind::kUnrolled) {
+    PrintIndent();
+    stream << "#pragma unroll\n";
+  }
+  CodeGenC::VisitStmt_(op);
 }
 
 void CodeGenTileLangIntelNpu::VisitExpr_(const BroadcastNode *op, std::ostream &os) {
@@ -209,7 +218,7 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
     return;
   }
   if (op->op.same_as(tl::intel_npu_ring_begin())) {
-    os << "ctx.ring_begin(" << args(0, 7) << ")";
+    os << "ctx.ring_begin(" << args(0, 8) << ")";
     return;
   }
   if (op->op.same_as(tl::intel_npu_ring_uses())) {
@@ -219,6 +228,14 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
   if (op->op.same_as(tl::intel_npu_ring_slot())) {
     // fp16 is the only DPU operand type lowered today.
     os << "ctx.ring_slot<half>(" << args(0, 2) << ")";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_ring_slot_acquire())) {
+    os << "ctx.ring_slot_acquire(" << args(0, 2) << ")";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_ring_slot_release())) {
+    os << "ctx.ring_slot_release(" << args(0, 2) << ")";
     return;
   }
   if (op->op.same_as(tl::intel_npu_ring_fill())) {

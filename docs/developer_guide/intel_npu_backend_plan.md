@@ -480,7 +480,7 @@ device-verified and measured here.
 
 | Block | Needed | This backend | Milestone |
 |---|---|---|---|
-| Projections, prefill | int4 group-128: SHAVE dequant -> fp16 DPU; fp16 (`baProj`) | fp16 DPU GEMM + multi-tile ring flow (**have**) | M2 (dequant) |
+| Projections, prefill | int4 group-128: SHAVE dequant -> fp16 DPU; fp16 (`baProj`) | **have** (log 2026-11-07 M2): W4A16 flow in both role assignments, device PASS; 0.82x npu_dsl's tuned probe at its shape, dequant row op 0.26 cyc/value | M2 |
 | Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | none | M2 |
 | Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | `T.vectorized` loops lower to half32/float16 SHAVE vector ops with VAU exp/log/tanh (**have**, log 2026-11-07); the ops themselves not yet written | M1 |
 | Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**; 960x1024x64 vectorised 1.765 ms TURBO (log 2026-11-07); GQA, gate, decode, KV cache open | M1 |
@@ -499,6 +499,28 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-07: **M2 step 1: W4A16 projections on the device, both role assignments.** Source
+  `kernels.make_w4a16_flow` (int4 g128, two per byte low nibble first, fp16 scale per group: npu_dsl's
+  DEQUANT_I4 / W4A16 format, `pack_int4` the reference packer). Three generic capabilities landed for it:
+  (1) **slots the SHAVE reads** -- a streamed buffer no gemm reads gets `ring_slot_acquire` (wait READY, consume)
+  before its first SHAVE reader and `ring_slot_release` (produce FREE) + the refill after its last; the readers
+  index this SHAVE's slot of the use; nothing reading the slot is refused by name; (2) **split streams** -- a
+  streamed fill that reads the tile is SEGMENTED (each tile's SHAVE fills its own slot, unicast; the barrier
+  counts scale by the tile count on the shared ids), no longer a refusal: the weights of an N-split projection;
+  (3) `#pragma unroll` for `T.unroll` loops, and the runtime library op `tl_npu_dequant_i4_row(dst, src, scales,
+  width, group)` (LSU `LD512.i4.i8` convert-load, a 512-value block's 8 loads issued before its stores, after
+  npu_dsl's `E7-63` schedule) called through `T.call_extern` -- the same math written as DSL statements
+  (`tl_npu_i4x64_lo/hi` or an int8x64 register buffer) compiled to 0.7 cycles per value because moviCompile
+  loaded twice or round-tripped the register through CMX; the row op is 0.26 (npu_dsl's tuned body 0.13).
+  **Device (TURBO):** 96x2048x2048 split-m 0.414 ms (1.382 with the statement dequant); 96x1536x2048 split-m
+  0.319 vs split-n **0.199 ms** (every tile dequantizing everything is the 3x the role rule warns about: for a
+  small M the weights must be the split operand); npu_dsl's probe shape 16x3072x1024 **0.197 ms vs its 0.161**
+  (0.82x; its dequant body is 2x tighter and its rings are per tile without the shared-id coupling). Depth 2 per
+  SHAVE moved the wait from READY to FREE/port, total unchanged. Host-sim goldens for both splits with a
+  perturbed-nibble negative (`test_intel_npu_m2_w4a16.py`, 71 passed). Also: `generated/` held 300 sweep
+  kernels and every device build compiled the glob (~50 s); sweeps now remove their arms (`runner.remove_kernels`),
+  builds are ~21 s. Next for M2: the GEMV (decode, M = 1) on the SHAVE; the dequant row op's inner schedule
+  (0.26 -> 0.13) is a known, bounded item.
 * 2026-11-07: **M1 step 3c (end): ring hoisting; the split is now SHAVE math 57%, per-Q-block overhead 26%,
   ring protocol 17%.** `LowerIntelNpuPipelined` hoists a `T.Pipelined` loop out of an enclosing serial loop
   when no stream's fill reads the outer variable and the inner chunk count is a multiple of the SHAVEs: one

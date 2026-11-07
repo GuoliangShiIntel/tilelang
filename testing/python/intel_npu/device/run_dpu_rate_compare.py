@@ -98,6 +98,7 @@ def main(argv):
         ref = NPU_DSL_BEST.get((M, N)) if K == 1600 else None
         print(f"| {M}x{N}x{K} | {best_r[1]} x={best_r[2]} | {best_r[5]:.1f} | {best_z[5]:.1f} ({best_z[1]} x={best_z[2]}) | "
               f"{ref[0] if ref else '-'} | {ref[1] if ref else '-'} |")
+    print(f"removed {runner.remove_kernels(j[-2] for j in jobs)} sweep kernels from generated/ (every device build compiles the glob)")
     return 0
 
 
