@@ -32,10 +32,11 @@ PERF_CLK_MHZ = 19.2
 def main(argv):
     numKv = int(argv[argv.index("--kv") + 1]) if "--kv" in argv else 1024
     numQ = BQ * TILES
-    kernel = f"tl_flash_phase_q{numQ}_kv{numKv}_d{D}"
+    kernel = f"tl_flash_phase_q{numQ}_kv{numKv}_d{D}" + ("_vec" if "--vec" in argv else "")
     cfg = {"tl.intel_npu.plan_workloads": "off"} if "--no-vpunn" in argv else {}
     with tvm.transform.PassContext(config=cfg):
-        low = lowering.lower(make_flash_attention_phase(numQ, numKv, D=D, BQ=BQ, BKV=BKV, tiles=TILES, shaves=SHAVES))
+        low = lowering.lower(make_flash_attention_phase(numQ, numKv, D=D, BQ=BQ, BKV=BKV, tiles=TILES, shaves=SHAVES,
+                                                        vectorized="--vec" in argv))
     for ln in low.source.splitlines():
         if "// intel_npu:" in ln:
             print(ln.strip()[:220])

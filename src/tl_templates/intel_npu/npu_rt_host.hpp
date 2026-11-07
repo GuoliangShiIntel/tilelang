@@ -36,6 +36,18 @@ static inline half tl_npu_hround(half x) { return (half)roundf((float)x); }
 template <class T> static inline T max(T a, T b) { return a > b ? a : b; }
 template <class T> static inline T min(T a, T b) { return a < b ? a : b; }
 
+// The SHAVE compiler's ext_vector typedefs (the codegen prints half16, float8, ...).
+typedef half half8 __attribute__((ext_vector_type(8)));
+typedef half half16 __attribute__((ext_vector_type(16)));
+typedef half half32 __attribute__((ext_vector_type(32)));
+typedef float float4 __attribute__((ext_vector_type(4)));
+typedef float float8 __attribute__((ext_vector_type(8)));
+typedef float float16 __attribute__((ext_vector_type(16)));
+typedef int int4 __attribute__((ext_vector_type(4)));
+typedef int int8 __attribute__((ext_vector_type(8)));
+typedef int int16 __attribute__((ext_vector_type(16)));
+#include "npu_rt_vecmath.hpp"
+
 #if defined(_WIN32)
 #define NPU_SIM_EXPORT extern "C" __declspec(dllexport)
 #else

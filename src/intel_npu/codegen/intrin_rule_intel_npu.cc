@@ -5,7 +5,10 @@
  * fp16 math maps to `tl_npu_h<name>` helpers defined by the runtime headers
  * (npu_rt_device.hpp: SAU builtins where the SHAVE has them, float math
  * otherwise; npu_rt_host.hpp: float math), fp32 to the C library's `<name>f`.
- * Registered as "intel_npu.FLowerIntrinsic", picked up by LowerIntrin.
+ * Vectors (after VectorizeLoop): fp16 lanes to the same `tl_npu_h<name>`
+ * (overloaded on half8/half16/half32; VAU.EXP for exp), fp32 lanes to
+ * `tl_npu_<name>f` lane loops. Registered as "intel_npu.FLowerIntrinsic",
+ * picked up by LowerIntrin.
  */
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op_attr_types.h>
@@ -20,17 +23,16 @@ using tirx::FLowerIntrinsic;
 
 struct IntelNpuMath {
   std::string operator()(DataType t, std::string name) const {
-    if (t.is_float() && t.lanes() == 1) {
-      switch (t.bits()) {
-      case 32:
-        return name + 'f';
-      case 16:
-        return "tl_npu_h" + name;
-      default:
-        return "";
-      }
+    if (!t.is_float())
+      return "";
+    switch (t.bits()) {
+    case 32:
+      return t.lanes() == 1 ? name + 'f' : "tl_npu_" + name + 'f';
+    case 16:
+      return "tl_npu_h" + name;
+    default:
+      return "";
     }
-    return "";
   }
 };
 

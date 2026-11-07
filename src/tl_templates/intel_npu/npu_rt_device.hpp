@@ -45,6 +45,31 @@ static inline half tl_npu_hround(half x) { return (half)roundf((float)x); }
 template <class T> static inline T max(T a, T b) { return a > b ? a : b; }
 template <class T> static inline T min(T a, T b) { return a < b ? a : b; }
 
+// Vector fp16 transcendentals: the VAU has EXP/LOG/TANH on half32 only (the v8f16
+// forms are not on this SHAVE variant); half16/half8 widen to one half32 op.
+#define TL_NPU_VAU_F16(NAME, BUILTIN)                                          \
+  static inline half32 tl_npu_h##NAME(half32 x) { return BUILTIN(x); }         \
+  static inline half16 tl_npu_h##NAME(half16 x) {                              \
+    const half32 w = __builtin_shufflevector(x, x, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, \
+                                             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); \
+    const half32 e = BUILTIN(w);                                               \
+    return __builtin_shufflevector(e, e, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); \
+  }                                                                            \
+  static inline half8 tl_npu_h##NAME(half8 x) {                                \
+    const half32 w = __builtin_shufflevector(x, x, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, \
+                                             0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7); \
+    const half32 e = BUILTIN(w);                                               \
+    return __builtin_shufflevector(e, e, 0, 1, 2, 3, 4, 5, 6, 7);              \
+  }
+TL_NPU_VAU_F16(exp, __builtin_shave_vau_exp_r_half32)
+TL_NPU_VAU_F16(log, __builtin_shave_vau_log_r_half32)
+TL_NPU_VAU_F16(tanh, __builtin_shave_vau_tanh_r_half32)
+#undef TL_NPU_VAU_F16
+#define TL_NPU_VEC_HAS_VAU_EXP 1
+#define TL_NPU_VEC_HAS_VAU_LOG 1
+#define TL_NPU_VEC_HAS_VAU_TANH 1
+#include "npu_rt_vecmath.hpp"
+
 namespace npu {
 
 // Status word 0 per SHAVE, read by the host runner; word 1 is the detail.

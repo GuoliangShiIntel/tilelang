@@ -36,8 +36,61 @@ void CodeGenTileLangIntelNpu::PrintType(DataType t, std::ostream &os) {
       os << "bfloat16";
       return;
     }
+  } else if (t.lanes() >= 2 && t.lanes() <= 32 && (t.lanes() & (t.lanes() - 1)) == 0) {
+    // moviCompile's ext_vector typedefs: half8/16/32, float4/8/16, int4/8/16, ...
+    // (VectorizeLoop decides the lanes; the SHAVE VRF is 512 bits).
+    if (t.is_float16()) {
+      os << "half" << t.lanes();
+      return;
+    }
+    if (t.is_float() && t.bits() == 32) {
+      os << "float" << t.lanes();
+      return;
+    }
+    if (t.is_int() && t.bits() == 32) {
+      os << "int" << t.lanes();
+      return;
+    }
+    if (t.is_uint() && t.bits() == 32) {
+      os << "uint" << t.lanes();
+      return;
+    }
+    if (t.is_int() && t.bits() == 16) {
+      os << "short" << t.lanes();
+      return;
+    }
+    if (t.is_uint() && t.bits() == 16) {
+      os << "ushort" << t.lanes();
+      return;
+    }
+    if (t.is_int() && t.bits() == 8) {
+      os << "schar" << t.lanes();
+      return;
+    }
+    if (t.is_uint() && t.bits() == 8) {
+      os << "uchar" << t.lanes();
+      return;
+    }
   }
   CodeGenC::PrintType(t, os);
+}
+
+void CodeGenTileLangIntelNpu::VisitExpr_(const BroadcastNode *op, std::ostream &os) {
+  // A scalar cast to an ext_vector type splats.
+  os << "((";
+  PrintType(op->dtype, os);
+  os << ")(" << PrintExpr(op->value) << "))";
+}
+
+void CodeGenTileLangIntelNpu::VisitExpr_(const CastNode *op, std::ostream &os) {
+  if (op->dtype.lanes() == 1) {
+    CodeGenC::VisitExpr_(op, os);
+    return;
+  }
+  // A C cast between same-size vectors is a bitcast; lane-wise conversion is this builtin.
+  os << "__builtin_convertvector(" << PrintExpr(op->value) << ", ";
+  PrintType(op->dtype, os);
+  os << ")";
 }
 
 void CodeGenTileLangIntelNpu::PrintStorageScope(const std::string &scope,

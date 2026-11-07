@@ -154,15 +154,19 @@ def make_ring_flow_swapped(M: int, N: int, K: int, BM: int = 256, BN: int = 32, 
 
 
 def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32, BKV: int = 128, tiles: int = 3,
-                               shaves: int = 2, num_stages: int = 2, pipelined: bool = True):
+                               shaves: int = 2, num_stages: int = 2, pipelined: bool = True, vectorized: bool = False):
     """One attention phase of a megakernel, written in the flow's form (plan 3b, README 1-3):
     the tile's Q block is resident (SEGMENTED), K and V^T stream through the ring (DUPLICATED),
     chunk c -> SHAVE c % 2 keeps its own online-softmax partials (m, l, O) over its chunks, and
     the two partials are merged per tile at the end (flash-decoding's split-KV combine). Used
-    first as a probe of what the passes refuse (plan section 8), then as the Phase 4 target."""
+    first as a probe of what the passes refuse (plan section 8), then as the Phase 4 target.
+    `vectorized`: the same math with T.vectorized inner loops (half32 / float16 lanes on the
+    SHAVE: VAU.EXP for the fp16 exp, lane accumulators for the row max / sum)."""
     assert numQ == BQ * tiles and numKv % BKV == 0
     NKV = numKv // BKV
     scale = 1.0 / (D ** 0.5)
+    HL, FL = 32, 16   # fp16 and fp32 lanes of the 512-bit SHAVE vector unit
+    assert BKV % HL == 0 and D % FL == 0
 
     @T.prim_func
     def flash(Q: T.Tensor((numQ, D), T.float16), K: T.Tensor((numKv, D), T.float16),
@@ -180,6 +184,8 @@ def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32,
             l_i = T.alloc_local((BQ,), T.float32)
             m_new = T.alloc_local((BQ,), T.float32)
             corr = T.alloc_local((BQ,), T.float32)
+            mx = T.alloc_local((HL,), T.float16)           # lane accumulators (vectorized path)
+            ls = T.alloc_local((FL,), T.float32)
             part = T.alloc_shared((shaves, BQ, D + 2), T.float32)  # per-SHAVE (O, m, l) for the merge
             T.copy(Q[tile * BQ, 0], q_cmx)
             # T.fill is a Phase 4 tile op (refused today); the scalar loops lower
@@ -193,20 +199,51 @@ def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32,
                 T.copy(Vt[0, kv * BKV], v_cmx)
                 T.gemm(q_cmx, k_cmx, s_cmx, transpose_B=True, clear_accum=True)
                 # online softmax on the SHAVE: m_new = max(m_i, rowmax(S)); P = exp(S*scale - m_new); l = l*corr + rowsum(P)
-                for i in T.serial(BQ):
-                    m_new[i] = m_i[i]
-                    for j in T.serial(BKV):
-                        m_new[i] = T.max(m_new[i], T.cast(s_cmx[i, j], T.float32) * scale)
-                    corr[i] = T.exp(m_i[i] - m_new[i])
-                    l_i[i] = l_i[i] * corr[i]
-                    for j in T.serial(BKV):
-                        p = T.exp(T.cast(s_cmx[i, j], T.float32) * scale - m_new[i])
-                        s_cmx[i, j] = T.cast(p, T.float16)
-                        l_i[i] = l_i[i] + p
-                    m_i[i] = m_new[i]
+                if vectorized:
+                    for i in T.serial(BQ):
+                        for v in T.vectorized(HL):
+                            mx[v] = s_cmx[i, v]
+                        for j0 in T.serial(1, BKV // HL):
+                            for v in T.vectorized(HL):
+                                mx[v] = T.max(mx[v], s_cmx[i, j0 * HL + v])
+                        m_new[i] = m_i[i]
+                        for v in T.serial(HL):
+                            m_new[i] = T.max(m_new[i], T.cast(mx[v], T.float32) * scale)
+                        corr[i] = T.exp(m_i[i] - m_new[i])
+                        # P in fp16 on the VAU: exp(s * scale - m_new), |arg| <= ~11 so fp16 holds it
+                        for j0 in T.serial(BKV // HL):
+                            for v in T.vectorized(HL):
+                                s_cmx[i, j0 * HL + v] = T.exp(s_cmx[i, j0 * HL + v] * T.float16(scale) - T.cast(m_new[i], T.float16))
+                        for v in T.vectorized(FL):
+                            ls[v] = T.float32(0)
+                        for j0 in T.serial(BKV // FL):
+                            for v in T.vectorized(FL):
+                                ls[v] = ls[v] + T.cast(s_cmx[i, j0 * FL + v], T.float32)
+                        l_i[i] = l_i[i] * corr[i]
+                        for v in T.serial(FL):
+                            l_i[i] = l_i[i] + ls[v]
+                        m_i[i] = m_new[i]
+                else:
+                    for i in T.serial(BQ):
+                        m_new[i] = m_i[i]
+                        for j in T.serial(BKV):
+                            m_new[i] = T.max(m_new[i], T.cast(s_cmx[i, j], T.float32) * scale)
+                        corr[i] = T.exp(m_i[i] - m_new[i])
+                        l_i[i] = l_i[i] * corr[i]
+                        for j in T.serial(BKV):
+                            p = T.exp(T.cast(s_cmx[i, j], T.float32) * scale - m_new[i])
+                            s_cmx[i, j] = T.cast(p, T.float16)
+                            l_i[i] = l_i[i] + p
+                        m_i[i] = m_new[i]
                 T.gemm(s_cmx, v_cmx, pv_cmx, transpose_B=True, clear_accum=True)
-                for i, d in T.grid(BQ, D):
-                    o_acc[i, d] = o_acc[i, d] * corr[i] + T.cast(pv_cmx[i, d], T.float32)
+                if vectorized:
+                    for i in T.serial(BQ):
+                        for d0 in T.serial(D // FL):
+                            for v in T.vectorized(FL):
+                                o_acc[i, d0 * FL + v] = o_acc[i, d0 * FL + v] * corr[i] + T.cast(pv_cmx[i, d0 * FL + v], T.float32)
+                else:
+                    for i, d in T.grid(BQ, D):
+                        o_acc[i, d] = o_acc[i, d] * corr[i] + T.cast(pv_cmx[i, d], T.float32)
             # merge the two SHAVEs' partials in the tile, SHAVE 0 writes the block
             for i, d in T.grid(BQ, D):
                 part[shave, i, d] = o_acc[i, d]

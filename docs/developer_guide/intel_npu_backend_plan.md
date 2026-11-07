@@ -444,8 +444,8 @@ device-verified and measured here.
 |---|---|---|---|
 | Projections, prefill | int4 group-128: SHAVE dequant -> fp16 DPU; fp16 (`baProj`) | fp16 DPU GEMM + multi-tile ring flow (**have**) | M2 (dequant) |
 | Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | none | M2 |
-| Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | scalar loops compile; no vectorised SHAVE ops; math intrinsics lower (`intrin_rule_intel_npu.cc`) | M1 |
-| Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS** (log 2026-11-07); scalar SHAVE softmax is the whole time; GQA, gate, decode, KV cache open | M1 |
+| Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | `T.vectorized` loops lower to half32/float16 SHAVE vector ops with VAU exp/log/tanh (**have**, log 2026-11-07); the ops themselves not yet written | M1 |
+| Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**, 0.397 ms at 96x1024x64 vectorised (log 2026-11-07); GQA, gate, decode, KV cache open | M1 |
 | Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | none | M4 |
 | MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | none | M3 |
 | Head | final norm + lm_head (int8 g128) + greedy argmax | none | M2 / M5 |
@@ -461,6 +461,23 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-07: **M1 step 3a: SHAVE vector codegen; the flash phase's softmax is 9.4x faster from `T.vectorized`
+  alone.** Generic path, no per-kernel code: `VectorizeLoop` joins the pipeline after `ConfigIndexBitwidth`;
+  `CodeGenTileLangIntelNpu` prints moviCompile's ext_vector types (`half8/16/32`, `float4/8/16`, `int4/8/16`,
+  ...), splats a `Broadcast` as `((halfN)(x))`, lowers a vector `Cast` to `__builtin_convertvector` (a C cast
+  between same-size vectors is a bitcast), and CodeGenC's own `*(halfN*)(p + i)` loads/stores and infix
+  arithmetic do the rest. `intrin_rule_intel_npu.cc` maps vector fp16 math to the `tl_npu_h<name>` overloads
+  and vector fp32 math to `tl_npu_<name>f` lane loops (`npu_rt_vecmath.hpp`, shared by device and host sim);
+  the device defines `exp/log/tanh` on `half32` with `VAU.EXP/LOG/TANH` (the v8f16 forms and `SAU.SUMX.f32` are
+  **not on this SHAVE variant**: `moviCompile -mcpu=5000xx` refuses them; `half16`/`half8` widen to one half32
+  op). Probed first (`D:\\tmp\\vecprobe.cpp`): splat casts, `__builtin_convertvector`, `__builtin_elementwise_max`,
+  vector `?:`, `v[i]`/`v.s3` all compile. **Source**: `make_flash_attention_phase(vectorized=True)` writes the
+  online softmax with `T.vectorized(32)` over fp16 (row max into a 32-lane accumulator, `exp(s*scale - m)` on the
+  VAU) and `T.vectorized(16)` over fp32 (row sums, O update); reductions finish with a scalar lane loop. **Device**:
+  PASS rel 6.23e-4, negative FAIL, **0.397 ms vs 3.754 ms** scalar; DPU still 1% busy, so the SHAVE is still the
+  bound (next: register-resident accumulators, fewer scalar lane reductions, and the kernel-only A/B against
+  npu_dsl's flash at the same shape). Host sim of the vectorised serial phase passes at the same tolerance
+  (`test_intel_npu_m1_flash.py`, 61 passed).
 * 2026-11-07: **M1 step 2a: barrier id reuse across phases, device-verified.** `AssignIntelNpuBarriers`
   colours rings by live range (`ring_begin`..`ring_end` in program order, first fit): rings one after another
   share one block, rings live at once (the flash phase's two streams) never do; the note says `N rings, P live at

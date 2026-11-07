@@ -12,7 +12,7 @@ from tvm import IRModule, s_tir, tirx
 from tvm.target import Target
 
 import tilelang
-from tilelang.backend.pass_pipeline.pipeline_utils import should_force_let_inline
+from tilelang.backend.pass_pipeline.pipeline_utils import allow_vectorize, should_force_let_inline
 
 DEFAULT_SHAVES_PER_TILE = 2
 DERIVE_GLOBAL_SYNC_KEY = "tl.intel_npu.derive_global_sync"
@@ -74,6 +74,8 @@ def IntelNpuPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.FlattenBuffer()(mod)
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
     mod = tirx.transform.Simplify()(mod)
+    # T.vectorized loops become halfN/floatN lane ops (codegen prints moviCompile's vector types).
+    mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=tilelang.transform.get_pass_context()))(mod)
     mod = tirx.transform.RemoveNoOp()(mod)
     mod = s_tir.transform.HoistIfThenElse()(mod)
 

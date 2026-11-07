@@ -33,6 +33,8 @@ public:
   void VisitStmt_(const AllocBufferNode *op) final;
   void VisitStmt_(const BindNode *op) final;
   void VisitExpr_(const CallNode *op, std::ostream &os) final;
+  void VisitExpr_(const BroadcastNode *op, std::ostream &os) final;
+  void VisitExpr_(const CastNode *op, std::ostream &os) final;
   void PrintStorageSync(const CallNode *op) final;
 
 private:
