@@ -244,6 +244,24 @@ def PlanIntelNpuDistribution():
 # LowerIntelNpuPipelined
 # ---------------------------------------------------------------------------------------------
 
+_WIDENED: dict = {}   # hash(data var) -> the widened Buffer; one object per CMX buffer however many rings use it
+
+
+def _widen(buf, factor: int):
+    """`buf` with its leading extent x factor (slots, output parities) on the same data var. Rings one after
+    another over the same source buffer get the SAME Buffer object, so the allocation planner sees one buffer."""
+    key = hash(buf.data)
+    hit = _WIDENED.get(key)
+    if hit is not None:
+        if int(hit.shape[0]) != int(buf.shape[0]) * factor:
+            raise ValueError(f"intel_npu: {buf.name} is widened x{factor} by one ring and x{int(hit.shape[0]) // int(buf.shape[0])} "
+                             "by another; give each pipelined loop its own buffer")
+        return hit
+    new = tirx.decl_buffer([buf.shape[0] * factor] + list(buf.shape[1:]), buf.dtype, buf.name, data=buf.data, scope=buf.scope())
+    _WIDENED[key] = new
+    return new
+
+
 class _Stream:
     """One streamed operand of a pipelined loop: its fill, slot buffer and the gemm that reads it."""
 
@@ -260,9 +278,7 @@ class _Stream:
         self.src = fa[1]
         self.width, self.rows, self.src_stride = _const(fa[2]), _const(fa[3]), _const(fa[5])
         self.slot_bytes = self.width * self.rows
-        self.slots = tirx.decl_buffer([self.slot_buf.shape[0] * stages] + list(self.slot_buf.shape[1:]),
-                                      self.slot_buf.dtype, self.slot_buf.name, data=self.slot_buf.data,
-                                      scope=self.slot_buf.scope())
+        self.slots = _widen(self.slot_buf, stages)
         self.ring = tirx.Var("ring", "handle")
         self.gemm = None        # the one gemm that reads the slot (its last reader produces FREE)
         self.stream_is_a = None
@@ -344,6 +360,7 @@ def LowerIntelNpuPipelined():
     def _pass(func: tirx.PrimFunc, mod, ctx):
         launch = _Launch(func)
         remap = []  # (old Buffer, new Buffer) shape changes
+        _WIDENED.clear()
         notes = []
         spt = launch.shaves
         tx = launch.shave_var
@@ -443,8 +460,7 @@ def LowerIntelNpuPipelined():
             if out_buf.scope() != "local":
                 raise ValueError(f"intel_npu: the gemm output {out_buf.name} in a pipelined loop must be SHAVE-local")
             M = _const(st.gemm.value.args[3])
-            outs = tirx.decl_buffer([out_buf.shape[0] * 2] + list(out_buf.shape[1:]), out_buf.dtype, out_buf.name,
-                                    data=out_buf.data, scope=out_buf.scope())
+            outs = _widen(out_buf, 2)
             remap.append((out_buf, outs))
             u = tirx.Var("u", "int32")
 

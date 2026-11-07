@@ -16,6 +16,7 @@ from tilelang.backend.pass_pipeline.pipeline_utils import allow_vectorize, shoul
 
 DEFAULT_SHAVES_PER_TILE = 2
 DERIVE_GLOBAL_SYNC_KEY = "tl.intel_npu.derive_global_sync"
+SCOPED_CMX_KEY = "tl.intel_npu.scoped_cmx"
 
 
 def _shaves_per_tile(target: Target) -> int:
@@ -26,6 +27,11 @@ def _shaves_per_tile(target: Target) -> int:
 def _derive_global_sync_enabled() -> bool:
     pass_ctx = tilelang.transform.get_pass_context()
     return bool(pass_ctx.config.get(DERIVE_GLOBAL_SYNC_KEY, True)) if pass_ctx else True
+
+
+def _scoped_cmx_enabled() -> bool:
+    pass_ctx = tilelang.transform.get_pass_context()
+    return bool(pass_ctx.config.get(SCOPED_CMX_KEY, True)) if pass_ctx else True
 
 
 def IntelNpuPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
@@ -65,10 +71,15 @@ def IntelNpuPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     # Hardware barrier ids for every ring from the job's pool.
     mod = tilelang.intel_npu.transform.AssignIntelNpuBarriers()(mod)
 
-    # No PlanAndUpdateBufferAllocationLocation: it sinks CMX buffers into the
-    # loops that use them, and a CMX allocation is made once per kernel.
+    # CMX allocations sink to the innermost scope covering their uses; codegen frees a scope's
+    # allocations at its end (a bump-pointer mark / restore), so phases share CMX (plan M5 PlanCmx).
+    if _scoped_cmx_enabled():
+        mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
+    if _scoped_cmx_enabled():
+        # phases between grid barriers get their own CMX scope; allocations under SHAVE-dependent branches hoisted
+        mod = tilelang.intel_npu.transform.ScopeIntelNpuCmx()(mod)
     mod = tilelang.intel_npu.transform.CheckIntelNpuBudgets()(mod)
     mod = tirx.transform.NarrowDataType(32)(mod)
     mod = tilelang.transform.FlattenBuffer()(mod)

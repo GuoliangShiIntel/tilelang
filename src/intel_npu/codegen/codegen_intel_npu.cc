@@ -15,6 +15,7 @@
 #include "arith/pattern_match.h"
 
 #include "intel_npu/op/builtin.h"
+#include "op/builtin.h"
 #include "support/check.h"
 
 namespace tvm {
@@ -164,6 +165,17 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const AttrStmtNode *op) {
     PrintStmt(op->body);
     return;
   }
+  if (op->attr_key == tl::attr::kLexicalAllocScope) {
+    // A phase's allocations live in this block (ScopeIntelNpuCmx): the CmxScope inside releases them.
+    PrintIndent();
+    stream << "{\n";
+    int scope = BeginScope();
+    PrintStmt(op->body);
+    EndScope(scope);
+    PrintIndent();
+    stream << "}\n";
+    return;
+  }
   CodeGenC::VisitStmt_(op);
 }
 
@@ -202,6 +214,9 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const AllocBufferNode *op) {
     RegisterHandleType(op->buffer->data.get(), dt);
     return;
   }
+  PrintIndent();
+  // The scope object releases this block's allocations at its end (phases and loop bodies share CMX).
+  stream << "npu::Ctx::CmxScope cmx_scope_" << cmx_scope_count_++ << "(ctx);\n";
   PrintIndent();
   PrintType(op->buffer->dtype, stream);
   // Distinct allocations never alias; without __restrict moviCompile keeps every

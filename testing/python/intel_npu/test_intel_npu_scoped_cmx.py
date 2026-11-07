@@ -1,0 +1,103 @@
+"""Scoped CMX (plan M5, PlanCmx): allocations sink to the block that uses them (PlanAndUpdateBufferAllocationLocation
+for loops, ScopeIntelNpuCmx for the phases between grid barriers), codegen brackets every allocating block with
+`npu::Ctx::CmxScope`, and CheckIntelNpuBudgets charges the peak nesting instead of the sum.
+
+  * two phases with a big buffer each fit only with scoping: refused by name with `tl.intel_npu.scoped_cmx=False`
+    (the negative control of the budget rule) and accepted by default, each phase in its own C++ block;
+  * an allocation under a SHAVE-dependent branch is hoisted to the enclosing uniform block (every SHAVE must run the
+    same allocation sequence) while a tile-dependent branch keeps it;
+  * the host simulation runs a two-phase kernel whose phases reuse the same CMX (golden against numpy).
+"""
+
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+import tilelang  # noqa: F401
+import tilelang.intel_npu.language as T
+import tvm
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_sim  # noqa: E402
+import lowering  # noqa: E402
+
+TILES, SHAVES = 2, 2
+BIG = 384 * 1024   # halves: 768 KiB per buffer; two do not fit the 1439 KiB workspace next to the runtime reserve
+
+
+def _lower(func, **cfg):
+    config = {"tl.intel_npu.plan_workloads": "off"}
+    config.update(cfg)
+    with tvm.transform.PassContext(config=config):
+        return lowering.lower(func)
+
+
+def _has_host_cxx() -> bool:
+    try:
+        host_sim.find_clangxx()
+        return True
+    except RuntimeError:
+        return False
+
+
+def make_two_phase(n: int):
+    @T.prim_func
+    def two(A: T.Tensor((n,), T.float16), B: T.Tensor((n,), T.float16), Y: T.Tensor((2, n), T.float16)):
+        with T.Kernel(TILES, threads=SHAVES) as tile:
+            a_cmx = T.alloc_local((n,), T.float16)
+            b_cmx = T.alloc_local((n,), T.float16)
+            T.copy(A[0], a_cmx)
+            for i in T.serial(n):
+                a_cmx[i] = a_cmx[i] * T.float16(2)
+            T.copy(a_cmx, Y[0, 0])
+            T.sync_grid()
+            T.copy(B[0], b_cmx)
+            for i in T.serial(n):
+                b_cmx[i] = b_cmx[i] + T.float16(1)
+            T.copy(b_cmx, Y[1, 0])
+
+    return two
+
+
+def test_two_phases_share_cmx_and_the_sum_is_refused_without_scoping():
+    src = _lower(make_two_phase(BIG // SHAVES)).source
+    # each phase is a C++ block that allocates and releases its buffer
+    assert src.count("npu::Ctx::CmxScope") == 2
+    assert re.search(r"\{\n\s+npu::Ctx::CmxScope cmx_scope_0\(ctx\);\n\s+half\* __restrict a_cmx = ctx.alloc<half>\(196608\);", src)
+    assert re.search(r"\{\n\s+npu::Ctx::CmxScope cmx_scope_1\(ctx\);\n\s+half\* __restrict b_cmx = ctx.alloc<half>\(196608\);", src)
+    with pytest.raises(Exception, match="CMX budget exceeded"):
+        _lower(make_two_phase(BIG // SHAVES), **{"tl.intel_npu.scoped_cmx": False})
+
+
+def test_allocation_under_a_shave_branch_is_hoisted():
+    @T.prim_func
+    def k(A: T.Tensor((64,), T.float16), Y: T.Tensor((TILES * SHAVES, 64), T.float16)):
+        with T.Kernel(TILES, threads=SHAVES) as tile:
+            shave = T.get_thread_binding()
+            for it in T.serial(2):
+                if shave == 0:
+                    s_cmx = T.alloc_local((64,), T.float16)
+                    T.copy(A[0], s_cmx)
+                    T.copy(s_cmx, Y[tile * SHAVES, 0])
+
+    src = _lower(k).source
+    body = src.split("kernel_entry")[0]
+    s_pos, if_shave = body.index("half* __restrict s_cmx"), body.index("if (shave == 0)")
+    assert body.index("for (int32_t it") < s_pos < if_shave, "hoisted out of the SHAVE-dependent branch, inside the loop body"
+
+
+@pytest.mark.skipif(not _has_host_cxx(), reason="host sim needs clang++ (TL_HOST_CXX or PATH)")
+def test_two_phase_kernel_is_correct_in_the_host_sim():
+    n = 4096
+    low = _lower(make_two_phase(n))
+    lib = host_sim.build(low.source, "tl_scoped_two_phase")
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal(n).astype(np.float16)
+    b = rng.standard_normal(n).astype(np.float16)
+    y = np.zeros((2, n), np.float16)
+    host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, dict(A=a, B=b, Y=y)), TILES, SHAVES))
+    assert np.array_equal(y[0], (a.astype(np.float32) * 2).astype(np.float16))
+    assert np.array_equal(y[1], (b.astype(np.float32) + 1).astype(np.float16))

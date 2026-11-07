@@ -27,6 +27,9 @@ static constexpr const char *kIntelNpuDpuMpe = "tl.intel_npu.dpu_mpe";
 static constexpr const char *kIntelNpuPlanWorkloads = "tl.intel_npu.plan_workloads";
 // False: AssignBarriers gives every ring fresh ids (device A/B of the id reuse across phases).
 static constexpr const char *kIntelNpuBarrierReuse = "tl.intel_npu.barrier_reuse";
+// Pass config: scoped CMX (allocations sink to the block that uses them and are released at its end; default
+// true); false keeps every allocation for the whole kernel (the A/B of the scoping).
+static constexpr const char *kIntelNpuScopedCmx = "tl.intel_npu.scoped_cmx";
 // AttrStmt key: free-text notes a pass leaves for the reader of the generated source
 // (what was planned, or what was skipped and why); a StringImm value, printed as a comment.
 // An AttrStmt rather than a PrimFunc attribute because SplitHostDevice keeps only a fixed

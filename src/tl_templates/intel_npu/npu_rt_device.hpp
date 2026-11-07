@@ -248,6 +248,24 @@ public:
     }
     return reinterpret_cast<T *>(base);
   }
+  // Codegen brackets every C++ scope that allocates with a CmxScope: the toolkit's LinearAllocator is a
+  // (base, size) value, so a scope saves it and puts it back at its end, releasing the scope's allocations.
+  // Every SHAVE runs the same sequence (allocations never sit under a SHAVE-dependent branch: the compiler
+  // hoists them), so shared buffers keep one address per tile and one offset across tiles.
+  using CmxMark = LinearAllocator;
+  CmxMark cmx_mark() const { return cmx_; }
+  void cmx_restore(const CmxMark &m) { cmx_ = m; }
+  class CmxScope {
+  public:
+    explicit CmxScope(Ctx &c) : c_(c), m_(c.cmx_mark()) {}
+    ~CmxScope() { c_.cmx_restore(m_); }
+    CmxScope(const CmxScope &) = delete;
+    CmxScope &operator=(const CmxScope &) = delete;
+
+  private:
+    Ctx &c_;
+    CmxMark m_;
+  };
 
   void dma_load(void *dst, Ddr<void> src, std::uint32_t width, std::uint32_t rows,
                 std::uint32_t dstStride, std::uint32_t srcStride) {

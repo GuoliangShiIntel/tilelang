@@ -220,6 +220,22 @@ public:
     offset_ += bytes;
     return reinterpret_cast<T *>(base);
   }
+  // Codegen brackets every C++ scope that allocates with a CmxScope: the allocations of a phase or a
+  // loop body are released at its end, so sequential phases share CMX (the device runtime does the same).
+  using CmxMark = std::uint32_t;
+  CmxMark cmx_mark() const { return offset_; }
+  void cmx_restore(CmxMark m) { offset_ = m; }
+  class CmxScope {
+  public:
+    explicit CmxScope(Ctx &c) : c_(c), m_(c.cmx_mark()) {}
+    ~CmxScope() { c_.cmx_restore(m_); }
+    CmxScope(const CmxScope &) = delete;
+    CmxScope &operator=(const CmxScope &) = delete;
+
+  private:
+    Ctx &c_;
+    CmxMark m_;
+  };
 
   template <class T>
   void dma_load(T *dst, Ddr<T> src, std::uint32_t width, std::uint32_t rows,

@@ -20,6 +20,7 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuDpuSpatialX, Integer);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuDpuMpe, Integer);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuPlanWorkloads, ffi::String);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuBarrierReuse, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuScopedCmx, Bool);
 
 TIR_DEFINE_TL_BUILTIN(intel_npu_dma_copy)
     .set_num_inputs(7)
