@@ -28,7 +28,8 @@ STATUS_BYTES_PER_SHAVE = 64
 STATUS_WORDS = STATUS_BYTES_PER_SHAVE // 4
 STATUS_OK = 1
 STATUS_NAMES = {1: "OK", 2: "CMX_EXHAUSTED", 3: "BAD_PARAMS", 4: "UNSUPPORTED", 5: "BARRIER_NOT_LIVE(id=detail)", 6: "BARRIER_TIMEOUT(id=detail)",
-                7: "RING_REFUSED(1 slots!=shaves, 2 one tile, 3 barrier pool)", 8: "ORDER_TIMEOUT(need=detail)"}
+                7: "RING_REFUSED(1 slots!=shaves, 2 one tile, 3 barrier pool)", 8: "ORDER_TIMEOUT(need=detail)",
+                9: "DPU_TIMEOUT(ring use=detail)"}
 
 
 def require_env(name: str) -> str:

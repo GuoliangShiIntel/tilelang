@@ -32,6 +32,9 @@ static inline half tl_npu_hfabs(half x) { return (half)fabsf((float)x); }
 static inline half tl_npu_hfloor(half x) { return (half)floorf((float)x); }
 static inline half tl_npu_hceil(half x) { return (half)ceilf((float)x); }
 static inline half tl_npu_hround(half x) { return (half)roundf((float)x); }
+// CodeGenC prints tirx.max / tirx.min as max(a, b) / min(a, b).
+template <class T> static inline T max(T a, T b) { return a > b ? a : b; }
+template <class T> static inline T min(T a, T b) { return a < b ? a : b; }
 
 #if defined(_WIN32)
 #define NPU_SIM_EXPORT extern "C" __declspec(dllexport)
@@ -136,6 +139,17 @@ public:
     std::uint8_t *base = env_.cmx + offset_;
     offset_ += need;
     return reinterpret_cast<T *>(base + bytes * env_.shave);
+  }
+  // Tile-shared: both SHAVEs of a tile run the same allocation sequence on the same arena.
+  template <class T> T *alloc_shared(std::uint32_t count) {
+    const std::uint32_t bytes = alignUp(count * sizeof(T), kAlign);
+    if (offset_ + bytes > env_.cmxBytes) {
+      fail(kStatusCmxExhausted, bytes);
+      return nullptr;
+    }
+    std::uint8_t *base = env_.cmx + offset_;
+    offset_ += bytes;
+    return reinterpret_cast<T *>(base);
   }
 
   template <class T>

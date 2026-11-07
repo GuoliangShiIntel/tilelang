@@ -60,7 +60,7 @@ TVM_DLL const Op &intel_npu_dpu_matmul();
  *   ring = intel_npu_ring_begin(slot_base_ptr, slot_bytes, slots, total_chunks, ready_base, free_base)
  *   intel_npu_ring_uses(ring) -> int32         chunks of this SHAVE's slot
  *   intel_npu_ring_slot(ring) -> ptr           this SHAVE's slot
- *   intel_npu_ring_fill(ring, use, src_ptr, bytes)       issuer: multicast fill of chunk `use`
+ *   intel_npu_ring_fill(ring, use, src_ptr, width_bytes, rows, src_stride_bytes)   issuer: multicast fill of chunk `use`
  *   intel_npu_ring_dpu_submit(ring, use, out, a, bt, M, N, K, spatial_x, mpe)
  *   intel_npu_ring_dpu_wait(ring, use)
  *   intel_npu_ring_end(ring)

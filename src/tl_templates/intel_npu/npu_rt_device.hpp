@@ -41,6 +41,9 @@ static inline half tl_npu_hfabs(half x) { return (half)fabsf((float)x); }
 static inline half tl_npu_hfloor(half x) { return (half)floorf((float)x); }
 static inline half tl_npu_hceil(half x) { return (half)ceilf((float)x); }
 static inline half tl_npu_hround(half x) { return (half)roundf((float)x); }
+// CodeGenC prints tirx.max / tirx.min as max(a, b) / min(a, b).
+template <class T> static inline T max(T a, T b) { return a > b ? a : b; }
+template <class T> static inline T min(T a, T b) { return a < b ? a : b; }
 
 namespace npu {
 
@@ -54,6 +57,7 @@ enum : std::uint32_t {
   kStatusBarrierTimeout = 6, // detail: barrier id whose count never reached zero
   kStatusRingRefused = 7,    // detail: reason code (ring_* below)
   kStatusOrderTimeout = 8,   // detail: the DPU submission-order word waited for
+  kStatusDpuTimeout = 9,     // detail: the ring use whose DPU workload never completed
 };
 
 template <class T> struct Ddr;
@@ -269,9 +273,12 @@ public:
   }
 
   // Issuer (tile 0, SHAVE s): fill my slot with chunk `use * spt + s` from `src`
-  // (contiguous bytes), two halves on ports 0 and 1, both producing READY[use].
-  // For use > 0 it first waits until every tile's DPU has produced FREE[use-1].
-  void ring_fill(Ring &r, std::uint32_t use, std::uint64_t src, std::uint32_t bytes) {
+  // (`rows` rows of `width` bytes, `srcStride` bytes apart in DDR; contiguous in the
+  // slot), two halves on ports 0 and 1, both producing READY[use]. The halves split
+  // the rows (the bytes when there is one row). For use > 0 it first waits until
+  // every tile's DPU has produced FREE[use-1].
+  void ring_fill(Ring &r, std::uint32_t use, std::uint64_t src, std::uint32_t width,
+                 std::uint32_t rows, std::uint32_t srcStride) {
     if (!ok_ || tile_ != 0 || use >= r.myUses)
       return;
     if (use > 0) {
@@ -284,24 +291,41 @@ public:
       dma_.wait(r.fill + 1);
     }
     const std::uint32_t mask = (1u << tiles_) - 1u;
-    const std::uint32_t half0 = bytes / 2;
     std::uint8_t *dst = ring_slot(r);
     const std::uint32_t ready = ring_ready(r, use);
     DmaDrv::initDesc(r.fill);
     DmaDrv::initDesc(r.fill + 1);
-    configDmaCopy(r.fill, reinterpret_cast<std::uint32_t>(convertToCmxMulticastAddr(dst, mask)), src, half0);
-    configDmaCopy(r.fill + 1, reinterpret_cast<std::uint32_t>(convertToCmxMulticastAddr(dst + half0, mask)),
-                  src + half0, bytes - half0);
+    if (rows <= 1) {
+      const std::uint32_t half0 = width / 2;
+      configDmaCopy(r.fill, reinterpret_cast<std::uint32_t>(convertToCmxMulticastAddr(dst, mask)), src, half0);
+      configDmaCopy(r.fill + 1, reinterpret_cast<std::uint32_t>(convertToCmxMulticastAddr(dst + half0, mask)),
+                    src + half0, width - half0);
+    } else {
+      const std::uint32_t rows0 = rows / 2;
+      configDmaCopy2D(r.fill, reinterpret_cast<std::uint32_t>(convertToCmxMulticastAddr(dst, mask)), src, width,
+                      rows0, width, srcStride);
+      configDmaCopy2D(r.fill + 1,
+                      reinterpret_cast<std::uint32_t>(convertToCmxMulticastAddr(dst + rows0 * width, mask)),
+                      src + static_cast<std::uint64_t>(rows0) * srcStride, width, rows - rows0, width, srcStride);
+    }
     DmaDrv::setProducerBarrier(r.fill, ready);
     DmaDrv::setProducerBarrier(r.fill + 1, ready);
     DmaDrv::setConsumerBarriers(r.fill, 0, 0);
     DmaDrv::setConsumerBarriers(r.fill + 1, 0, 0);
+    // One descriptor of this SHAVE in flight per port: a second start while another
+    // ring's fill is still running on the port left one half unproduced (flash phase,
+    // two rings; READY stuck at p=1).
+    port_retire(0);
+    port_retire(1);
     dma_.start(r.fill, 0);
     dma_.start(r.fill + 1, 1);
+    lastOnPort_[0] = r.fill;
+    lastOnPort_[1] = r.fill + 1;
   }
   template <class T>
-  void ring_fill(Ring &r, std::uint32_t use, Ddr<T> src, std::uint32_t bytes) {
-    ring_fill(r, use, src.addr, bytes);
+  void ring_fill(Ring &r, std::uint32_t use, Ddr<T> src, std::uint32_t width, std::uint32_t rows,
+                 std::uint32_t srcStride) {
+    ring_fill(r, use, src.addr, width, rows, srcStride);
   }
 
   // Every SHAVE: submit the DPU workload of my `use`, gated on READY[use] (in
@@ -340,8 +364,24 @@ public:
   void ring_dpu_wait(Ring &r, std::uint32_t use) {
     if (!ok_ || !r.armed || use >= r.myUses)
       return;
-    mm_->wait();
-    dpu_account();
+    // The driver's wait spins forever on a workload whose READY gate never opens; the
+    // same watermark (DpuDrvBase::wait) with a bound, so a stuck gate is a report.
+    volatile const std::uint16_t *watermark = &dpuDesc_->hwpStats.odu_workload_id;
+    const std::uint16_t expected = dpuDesc_->variant.hwp_wload_id.hwp_wload_id_bf.wload_id;
+    for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
+      if (*watermark == expected) {
+        dpu_account();
+        return;
+      }
+    }
+    fail(kStatusDpuTimeout, use);
+    // Diagnostic detail: READY id and its (p, c) counters, FREE id's (p, c).
+    std::uint8_t rp = 0, rc = 0, fp = 0, fc = 0;
+    hw::nce::barriers::hgl::getCounters(ring_ready(r, use), &rp, &rc);
+    hw::nce::barriers::hgl::getCounters(ring_free(r, use), &fp, &fc);
+    detail_ = (ring_ready(r, use) << 24) | (static_cast<std::uint32_t>(use & 0xff) << 16) |
+              (static_cast<std::uint32_t>(rp & 0xf) << 12) | (static_cast<std::uint32_t>(rc & 0xf) << 8) |
+              (static_cast<std::uint32_t>(fp & 0xf) << 4) | static_cast<std::uint32_t>(fc & 0xf);
   }
 
   // Issuer: the last fills must be retired on their chains before the kernel ends.
@@ -350,6 +390,10 @@ public:
       return;
     dma_.wait(r.fill);
     dma_.wait(r.fill + 1);
+    if (lastOnPort_[0] == r.fill)
+      lastOnPort_[0] = nullptr;
+    if (lastOnPort_[1] == r.fill + 1)
+      lastOnPort_[1] = nullptr;
     // Clear the barriers' consumer side of the last FREE so the id is quiescent.
     const std::uint32_t freeId = ring_free(r, r.myUses - 1);
     if (barrier_wait_produced(freeId))
@@ -528,6 +572,13 @@ private:
     }
   }
 
+  void port_retire(int port) {
+    if (lastOnPort_[port] != nullptr) {
+      dma_.wait(lastOnPort_[port]);
+      lastOnPort_[port] = nullptr;
+    }
+  }
+
   bool order_wait(volatile std::uint32_t *word, std::uint32_t need) {
     for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
       if (*word >= need)
@@ -640,6 +691,7 @@ private:
 
   DmaDescriptor *desc_{nullptr};
   DpuMatMul::DescriptorsBuffer *dpuDesc_{nullptr};
+  DmaDescriptor *lastOnPort_[2]{nullptr, nullptr};
   std::uint32_t *wt_{nullptr};
   alignas(DpuMatMul) unsigned char mmStore_[sizeof(DpuMatMul)];
   DpuMatMul *mm_{nullptr};

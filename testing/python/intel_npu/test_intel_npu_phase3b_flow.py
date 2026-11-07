@@ -42,7 +42,7 @@ def test_flow_lowers_to_one_ring():
     # resident fill split over the SHAVEs (128 of 256 rows each), then the tile sync
     assert re.search(r"ctx\.dma_load\(\(&\(W_cmx\[\(tx \* 262144\)\]\)\).*, 4096, 128, 4096, 4096\);\n\s*ctx\.sync_tile\(\);", src)
     assert "npu::Ctx::Ring ring = ctx.ring_begin((&(X_cmx[0])), 131072, 2, 64, 8, 12);" in src
-    assert "ctx.ring_fill(ring, 0, (&(X[(tx * 65536)])), 131072);" in src  # prologue: chunk = SHAVE index
+    assert "ctx.ring_fill(ring, 0, (&(X[(tx * 65536)])), 4096, 32, 4096);" in src  # prologue: chunk = SHAVE index
     assert src.count("ctx.ring_dpu_submit(") == 2 and "ctx.ring_dpu_wait(ring, u);" in src
     assert "(&(Y_cmx[(((u + 1) & 1) * 8192)]))" in src                      # submit-ahead output parity
     assert "ctx.ring_end(ring);" in src

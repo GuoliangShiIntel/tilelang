@@ -166,7 +166,7 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
     return;
   }
   if (op->op.same_as(tl::intel_npu_ring_fill())) {
-    os << "ctx.ring_fill(" << args(0, 4) << ")";
+    os << "ctx.ring_fill(" << args(0, 6) << ")";
     return;
   }
   if (op->op.same_as(tl::intel_npu_ring_dpu_submit())) {

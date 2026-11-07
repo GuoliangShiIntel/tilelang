@@ -426,6 +426,13 @@ interop; a Python `nl.*`-compatible shim.
    here. Question for `<user>`: what changed on the box since early October (NPU driver/firmware, Windows
    power plan, DVFS cap, thermal)? Until it is answered, percentages are quoted against the measured
    same-day probe, not against the October table.
+6. **Two in-flight DMA jobs per port from one SHAVE (2026-11-07, M1).** Through the toolkit's `DmaDrv::start`
+   (chained descriptors, one chain per SHAVE per port and direction), starting a second job on a port before
+   the previous one completed left the previous job's barrier unproduced (READY stuck at p=1, observed for
+   seconds) in the flash phase's two-ring schedule, every run. Serialising this SHAVE's jobs per port fixes it.
+   Is queueing a second descriptor chain behind a running one supported by the driver, or is one outstanding
+   job per port per SHAVE the contract? The answer decides whether a kernel with several streams needs one
+   linked chain per port per fill round (supported by `start(desc, tail, ...)`) or may keep the serialisation.
 
 ## 9. Model target: Qwen3.8-35B-A3B-Distill, and what it needs (2026-11-06)
 
@@ -438,7 +445,7 @@ device-verified and measured here.
 | Projections, prefill | int4 group-128: SHAVE dequant -> fp16 DPU; fp16 (`baProj`) | fp16 DPU GEMM + multi-tile ring flow (**have**) | M2 (dequant) |
 | Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | none | M2 |
 | Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | scalar loops compile; no vectorised SHAVE ops; math intrinsics lower (`intrin_rule_intel_npu.cc`) | M1 |
-| Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | the flow's ring for one streamed operand; flash phase source written, refused by the ring body rule | M1 |
+| Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS** (log 2026-11-07); scalar SHAVE softmax is the whole time; GQA, gate, decode, KV cache open | M1 |
 | Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | none | M4 |
 | MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | none | M3 |
 | Head | final norm + lm_head (int8 g128) + greedy argmax | none | M2 / M5 |
@@ -454,6 +461,29 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-07: **M1 step 1: the flash-attention phase lowers through the generalised ring and passes its
+  device golden.** Source `kernels.make_flash_attention_phase` (Q resident, K and Vt streamed in one
+  `T.Pipelined` loop, two `T.gemm`, online softmax in fp32 scalar loops between them, merge of the two SHAVEs'
+  partials after `T.sync_threads`). Compiler: `LowerIntelNpuPipelined` grew a general body (any number of
+  streams and gemms, author order kept: gemm reading a slot -> submit, wait, that stream's next fill; no
+  submit-ahead when SHAVE statements sit between gemms) next to the simple submit-ahead body; a stream whose
+  DDR chunk is strided (Vt columns) is a **2-D multicast fill** (`ring_fill(ring, use, src, width, rows,
+  src_stride)`, the halves split the rows); a resident SEGMENTED fill inside a loop gets a tile sync before
+  and after. Two rings over the same loop get disjoint ids (8..15, 16..23). Math intrinsics lower via
+  `intrin_rule_intel_npu.cc` (fp16 `exp` -> `tl_npu_hexp`, SAU). **Device** (`device/run_flash_device.py`,
+  Q 96x64, KV 1024, 3 x 2): PASS rel 5.73e-4 (equal to the host sim of the serial phase), negative control
+  (K perturbed) FAIL, trace `evidence/tl_flash_phase_q96_kv1024_d64_trace.json`. Kernel-only **3.754 ms** of
+  which the DPU is 3 us: the scalar softmax is the whole time, which is the expected state before the SHAVE
+  ops are vectorised (M1 step 3); no TOPS claim. **Two defects found by the device, fixed in the runtime:**
+  (a) `ring_dpu_wait` used the driver's unbounded `wait()`, so a stuck gate hung the launch (120 s host
+  timeout, no status); it now spins on the same `odu_workload_id` watermark with the barrier bound and reports
+  status 9 `DPU_TIMEOUT` with the READY/FREE counters in the detail. (b) With two rings, a SHAVE issued a
+  second fill on a port while its previous fill (the other ring's) was still running; one half of the earlier
+  fill never produced READY (counters p=1 on READY 10 after seconds) and the in-order DPU FIFO stalled behind
+  it. The ring now retires this SHAVE's previous descriptor on a port before starting another
+  (`lastOnPort_`), which costs nothing in this schedule (the previous fill has long landed) and the golden
+  passes. Hardware question 6 records it. Tests: `test_intel_npu_m1_flash.py` (two rings over one loop, 2-D
+  fill, general body, serial phase host-sim golden with a negative) -- 59 passed.
 * 2026-11-06: **Phase 3b step C closed: the flow is measured kernel-only and checked from its trace.**
   (1) Kernel-only time: the status record grew to 64 B with NCE_TIME stamps at `Ctx` entry and `finish`;
   `npu_run` reports `median_kernel_ms` = max(finish) - min(entry) over the SHAVEs (19.2 MHz); the host wall
