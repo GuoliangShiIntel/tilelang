@@ -1285,6 +1285,177 @@ def pack_int4(w_int: "np.ndarray") -> "np.ndarray":
     return (q[:, 0::2] | (q[:, 1::2] << 4)).astype(np.uint8)
 
 
+def make_head(H: int = 2048, V: int = 248320, G: int = 128, tiles: int = 3, shaves: int = 2, BN: int = 128, R: int = 64,
+              num_stages: int = 4, eps: float = 1e-6, pipelined: bool = True):
+    """M5 decode head in ONE launch: logits = rmsnorm_zc(h) . dequant_i8(Wlm)^T over the vocabulary, greedy argmax.
+
+      x = h rsqrt(mean h^2 + eps) (1 + w)                 (every tile, SHAVE 0; the final norm)
+      logits[v] = x . Wlm[v]                              (int8 g128 rows as chunk blocks, split over the tiles, a
+                                                           local ring per SHAVE; the lm_head is the largest decode
+                                                           weight: V x H bytes)
+      tok = argmax_v logits[v]                            (per SHAVE on the fly: a lane max per chunk, the index scan
+                                                           only when the chunk beats the running max; the six partials
+                                                           meet in DDR and worker 0 picks the lowest index on a tie)
+
+    The vocabulary is zero-padded to a multiple of BN x tiles x shaves (`head_sizes`); padded columns are masked to
+    -65504 before the max. Each SHAVE keeps its chunks' logits in CMX and stores them once at the end (a strided
+    2-D job; `Logits` is [tiles, CS, shaves x BN] = the flat [V_pad] row). Partials: `Part[worker, 0:2]` = (max, index);
+    `Tok[0, 0]` the token. Packing: `pack_head`; sizes: `head_sizes`."""
+    assert H % G == 0 and BN % R == 0 and R % 16 == 0 and R * (H // G) <= 1024
+    ng = H // G
+    V_pad = -(-V // (BN * tiles * shaves)) * BN * tiles * shaves
+    C = V_pad // (BN * tiles)
+    CS = C // shaves
+    assert (ng * BN * 2) % H == 0
+    BR = BN + ng * BN * 2 // H
+    workers = tiles * shaves
+    HL, FL = 32, 16
+    PW = 32
+
+    @T.macro
+    def consume(x_cmx, w_cmx, y_cmx, yl, mx, st, bi, tile, n):
+        """One chunk after its fill: the BN / R merged-FC workloads, the pad mask, the running max, the logits row."""
+        for sub in T.serial(BN // R):
+            T.gemm_i8(x_cmx, w_cmx, None, y_cmx, group=G, row0=sub * R, rows=R, scales_row=BN)
+        if (tile * C + n) * BN + BN > V:
+            for c in T.serial(BN):
+                if (tile * C + n) * BN + c >= V:
+                    y_cmx[0, c] = T.float16(-65504)
+        for v in T.vectorized(HL):
+            mx[v] = y_cmx[0, v]
+        for j0 in T.serial(1, BN // HL):
+            for v in T.vectorized(HL):
+                mx[v] = T.max(mx[v], y_cmx[0, j0 * HL + v])
+        st[1] = T.cast(T.call_extern(T.float16, "tl_npu_vmax", mx[0:HL]), T.float32)
+        if st[1] > st[0]:
+            for c in T.serial(BN):
+                if T.cast(y_cmx[0, c], T.float32) > st[0]:
+                    st[0] = T.cast(y_cmx[0, c], T.float32)
+                    bi[0] = (tile * C + n) * BN + c
+        for j0 in T.serial(BN // HL):
+            for v in T.vectorized(HL):
+                yl[n // shaves, j0 * HL + v] = y_cmx[0, j0 * HL + v]
+
+    @T.prim_func
+    def head(Hs: T.Tensor((1, H), T.float16), NormW: T.Tensor((1, H), T.float16),
+             WlmP: T.Tensor(((V_pad // BN) * BR, H), T.int8),
+             Logits: T.Tensor((tiles, CS, shaves * BN), T.float16), Part: T.Tensor((workers, PW), T.float32),
+             Tok: T.Tensor((1, 8), T.int32)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            h_cmx = T.alloc_shared((1, H), T.float16)
+            nw_cmx = T.alloc_shared((1, H), T.float16)
+            x_cmx = T.alloc_shared((1, H), T.float16)
+            w_cmx = T.alloc_shared((BR, H), T.int8)
+            y_cmx = T.alloc_local((1, BN), T.float16)
+            yl = T.alloc_local((CS, BN), T.float16)
+            ls = T.alloc_local((FL,), T.float32)
+            st = T.alloc_local((4,), T.float32)
+            bi = T.alloc_local((4,), T.int32)
+            mx = T.alloc_local((HL,), T.float16)
+            pw = T.alloc_local((1, PW), T.float32)
+            pall = T.alloc_local((workers, PW), T.float32)
+            tok_cmx = T.alloc_local((1, 8), T.int32)
+            # --- A. final norm (zero-centred) on SHAVE 0 of every tile -----------------------------------------------
+            T.copy(Hs[0, 0], h_cmx)
+            T.copy(NormW[0, 0], nw_cmx)
+            if shave == 0:
+                for v in T.vectorized(FL):
+                    ls[v] = T.float32(0)
+                for d0 in T.serial(H // FL):
+                    for v in T.vectorized(FL):
+                        ls[v] = ls[v] + T.cast(h_cmx[0, d0 * FL + v], T.float32) * T.cast(h_cmx[0, d0 * FL + v], T.float32)
+                st[0] = T.float32(1) / T.sqrt(T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL]) / T.float32(H) + T.float32(eps))
+                for d0 in T.serial(H // FL):
+                    for v in T.vectorized(FL):
+                        x_cmx[0, d0 * FL + v] = T.cast(T.cast(h_cmx[0, d0 * FL + v], T.float32) * st[0]
+                                                       * (T.float32(1) + T.cast(nw_cmx[0, d0 * FL + v], T.float32)), T.float16)
+            T.sync_threads()
+            # --- B. lm_head GEMV over this tile's third of the rows, argmax on the fly ---------------------------------
+            # chunk n belongs to SHAVE n % shaves (the ring's dealing; the serial form deals it by hand)
+            st[0] = T.float32(-3e38)
+            bi[0] = 0
+            if pipelined:
+                for n in T.Pipelined(C, num_stages=num_stages):
+                    T.copy(WlmP[(tile * C + n) * BR, 0], w_cmx)
+                    consume(x_cmx, w_cmx, y_cmx, yl, mx, st, bi, tile, n)
+            else:
+                for n in T.serial(C):
+                    T.copy(WlmP[(tile * C + n) * BR, 0], w_cmx)
+                    if n % shaves == shave:
+                        consume(x_cmx, w_cmx, y_cmx, yl, mx, st, bi, tile, n)
+            T.copy(yl, Logits[tile, 0, shave * BN])
+            for c in T.serial(PW):
+                pw[0, c] = T.float32(0)
+            pw[0, 0] = st[0]
+            pw[0, 1] = T.cast(bi[0], T.float32)
+            T.copy(pw, Part[worker, 0])
+            T.sync_grid()
+            # --- C. worker 0: the lowest index among the partials sharing the max --------------------------------------
+            if worker == 0:
+                T.copy(Part[0, 0], pall)
+                st[0] = pall[0, 0]
+                bi[0] = T.cast(pall[0, 1], T.int32)
+                for w in T.serial(1, workers):
+                    if pall[w, 0] > st[0] or (pall[w, 0] == st[0] and T.cast(pall[w, 1], T.int32) < bi[0]):
+                        st[0] = pall[w, 0]
+                        bi[0] = T.cast(pall[w, 1], T.int32)
+                for c in T.serial(8):
+                    tok_cmx[0, c] = 0
+                tok_cmx[0, 0] = bi[0]
+                T.copy(tok_cmx, Tok[0, 0])
+
+    return head
+
+
+def head_sizes(H: int, V: int, G: int = 128, tiles: int = 3, shaves: int = 2, BN: int = 128, **_):
+    """make_head's padded vocabulary and block geometry: dict(V_pad, C, CS, BR, workers)."""
+    V_pad = -(-V // (BN * tiles * shaves)) * BN * tiles * shaves
+    C = V_pad // (BN * tiles)
+    return dict(V_pad=V_pad, C=C, CS=C // shaves, BR=BN + (H // G) * BN * 2 // H, workers=tiles * shaves)
+
+
+def pack_chunk_blocks_i8(w_int: "np.ndarray", scales: "np.ndarray", BN: int):
+    """`pack_chunk_blocks` for int8 weights (`T.gemm_i8(..., scales_row=BN)`): [N, K] int8 and [N, K/G] scales ->
+    int8 [N/BN x (BN + SR), K], each chunk's rows then its group-major fp16 scales [K/G, BN] in whole rows."""
+    import numpy as np
+    N, K = w_int.shape
+    ng = scales.shape[1]
+    assert N % BN == 0 and (ng * BN * 2) % K == 0
+    SR = ng * BN * 2 // K
+    blocks = []
+    for n0 in range(0, N, BN):
+        sT = np.ascontiguousarray(scales[n0:n0 + BN].astype(np.float16).T)   # [ng, BN]
+        blocks.append(np.concatenate([w_int[n0:n0 + BN].astype(np.int8), sT.view(np.int8).reshape(SR, K)], axis=0))
+    return np.concatenate(blocks, axis=0)
+
+
+def pack_head(wlm_int, wlm_scales, tiles: int = 3, shaves: int = 2, BN: int = 128):
+    """make_head's lm_head: int8 rows zero-padded to the V_pad multiple, as chunk blocks of BN rows."""
+    import numpy as np
+    V, H = wlm_int.shape
+    V_pad = head_sizes(H, V, tiles=tiles, shaves=shaves, BN=BN)["V_pad"]
+    w = np.zeros((V_pad, H), np.int8)
+    s = np.zeros((V_pad, wlm_scales.shape[1]), np.float16)
+    w[:V] = wlm_int
+    s[:V] = wlm_scales
+    return dict(WlmP=pack_chunk_blocks_i8(w, s, BN))
+
+
+def head_reference(h, norm_w, wlm_int, wlm_scales, G: int, eps: float = 1e-6, block: int = 8192):
+    """numpy oracle of make_head (fp32, the rows dequantised `block` at a time): returns logits [V] and the token."""
+    import numpy as np
+    hf = h.astype(np.float32).reshape(-1)
+    x = hf * (1.0 / np.sqrt((hf * hf).mean() + eps)) * (1.0 + norm_w.astype(np.float32).reshape(-1))
+    V = wlm_int.shape[0]
+    logits = np.empty(V, np.float32)
+    for v0 in range(0, V, block):
+        w = wlm_int[v0:v0 + block].astype(np.float32) * np.repeat(wlm_scales[v0:v0 + block].astype(np.float32), G, axis=1)
+        logits[v0:v0 + block] = w @ x
+    return logits, int(np.argmax(logits))
+
+
 def make_gemm_two_phase(M: int, N: int, K: int, BM: int = 64, BN: int = 64, tiles: int = 2, shaves: int = 2,
                         with_sync: bool = True):
     """Megakernel shape: split-K partial products -> T.sync_grid() -> combine, one launch.

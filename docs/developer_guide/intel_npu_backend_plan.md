@@ -486,7 +486,7 @@ device-verified and measured here.
 | Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash prefill phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**, 960x1024x64 vectorised 1.042 ms TURBO; **decode layer have** (log 2026-11-08): qkv GEMV, zero-centred q/k norm, RoPE, cache append, flash-decoding over 1536 positions with GQA 8:1 and the output gate, o_proj, in one launch, device PASS, **0.563 ms** TURBO; prefill GQA / gate / causal mask open | M1 |
 | Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | **decode have** (log 2026-11-08 M4): one launch at Qwen3.6's shape, device PASS with both states checked, **0.750 ms** TURBO; the chunked prefill scan open | M4 |
 | MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | **have** (log 2026-11-08 M3): one launch at Qwen3.6's shape, device PASS (routing == oracle), **0.560 ms** TURBO = 28 GB/s of the 15.8 MB it reads; expert phase ~0.43 ms at 34 GB/s (DMA-latency bound, see the log's cost split) | M3 |
-| Head | final norm + lm_head (int8 g128) + greedy argmax | none | M2 / M5 |
+| Head | final norm + lm_head (int8 g128) + greedy argmax | **have** (log 2026-11-08): one launch at Qwen3.6's vocabulary, device PASS, **8.78 ms** TURBO = 58.9 GB/s vs npu_dsl's head 9.44 ms same day; both at <50% of the DMA bound | M5 |
 | Compiler | layer table + device-side layer loop with two layer kinds; long-prompt chunk loop; CMX reuse across phases; barrier id reuse; `.text` per kernel | phases + derived `sync_grid`, budgets as sums (**have**); PlanCmx and id reuse open | M5 |
 | e2e | pack, export, fp32 reference on the quantised weights, golden, `longseq` | none here; npu_dsl's `qwen36_e2e` reference / pack / golden are reusable model-side code | M6 |
 | Measurement | kernel-only time, traces, flow check, VPUNN-planned workloads, DMA model | **have** | - |
@@ -496,6 +496,24 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 
 ## 8. Log
 
+* 2026-11-08: **Decode head closed, and the same-day A/B against npu_dsl's head** (`kernels.make_head`, `device/run_head_device.py`,
+  `test_intel_npu_m5_head.py`; `device/run_npudsl_head_device.py`). Qwen3.6's shape: the zero-centred final norm (SHAVE 0 of
+  every tile) -> lm_head int8 g128 GEMV over 248320 rows (padded to 248832 = a multiple of BN x tiles x SHAVEs; int8 chunk
+  blocks of 128 rows + 2 group-major scale rows, `pack_chunk_blocks_i8`, a local ring of 2 slots per SHAVE, two merged-FC
+  workloads per chunk) with the greedy argmax on the fly (half32 lane max per chunk, index scan only when a chunk beats the
+  running max, padded columns masked to -65504, each SHAVE's logit rows kept in CMX and stored once as a strided 2-D job)
+  -> (max, index) partials in DDR -> `T.sync_grid()` -> worker 0 takes the lowest index among equals. Device: PASS rel
+  4.6e-4, token = own argmax = oracle, negative FAIL as required; **8.780 ms** (8.10-8.96, TURBO, UNPROFILED) = 58.9 GB/s of
+  517.6 MB. **npu_dsl's `qwen36_head.cpp` on the same problem, same runner, same day: 9.441 ms (9.07-9.63) = 54.7 GB/s**, so
+  the bar holds (-7%); both are bound by the same DMA pattern (six unicast issuers, one job in flight per port per SHAVE,
+  acquire wait 6.3 of 8.8 ms) at less than half the two-port bound (517 MB / 126 GB/s = 4.1 ms, the "3-4 ms" `<user>`
+  remembered). Sweep: 256-row chunks x 1 slot 8.79 ms, 64-row x 4 slots 9.69 ms: the chunk size is not the lever; a
+  tile-shared chunk filled by one issuer and read by both SHAVEs (an M5 ring variant) is. Host-sim tests: the small
+  instance against the oracle with a perturbed-row negative, and a cross-tile tie (two equal maxima, tiles 0 and 2) that
+  must pick the lower index. The npu_dsl A/B probe wraps its generated kernel unchanged (its `kernel_entry` becomes a static
+  function; ours stamps NCE_TIME around it and writes this runner's status record), imports nothing, and takes the checkout
+  from `NPU_DSL_ROOT`. **The decode path now has every block; next is the host session (one process, weights resident,
+  per-token launch sequence over the layer kernels) and the real checkpoint.**
 * 2026-11-08: **Attention decode layer closed** (`kernels.make_attn_decode`, `device/run_attn_device.py`,
   `test_intel_npu_m1_attn_decode.py`): Qwen3.6's shape (16 q-heads over 2 kv-heads of 256, RoPE 64, output gate,
   zero-centred norms, int4 g128 qkv [9216, 2048] / o_proj [2048, 4096], a 1536-position cache). qkv GEMV -> the 18
