@@ -280,6 +280,146 @@ public:
     dpu_account();
   }
 
+  // out[M, N] = a[M, K] . (q * s)^T for packed int4 q [N, K] (two per byte, low nibble first) and fp16
+  // group scales s [N, K/G]: ONE mixed-mode DPU workload (fp16 activations x int4 weights read in place,
+  // no dequantisation) over the M x ng pseudo-rows a[m, g-th group] against C = N x ng output channels
+  // (channel g * N + n = row n's group g, through the weight table's per-channel offsets), then the SHAVE
+  // keeps the diagonal blocks and sums them with the scales (q_reduce). The DPU computes ng times the
+  // needed products, which at decode's M = 1 is free: the workload is bound by reading the weights.
+  // VPUX's merged FC; ported from npu_dsl's fused_rt.hpp matmul_qg / q_reduce (plan section 0 amendment).
+  // Scratch (part [M x ng, C] fp16, sT [ng, N] fp16) is allocated on first use at that call's size.
+  void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G) {
+    if (!ok_)
+      return;
+    const std::uint32_t ng = K / G, C = N * ng;
+    if (K % G != 0 || G % 16 != 0 || N % 16 != 0 || C > kMaxDpuN) {
+      fail(kStatusUnsupported, C);
+      return;
+    }
+    if (i4Part_ == nullptr) {
+      i4PartElems_ = M * ng * C;
+      i4STElems_ = ng * N;
+      i4Part_ = alloc<half>(i4PartElems_);
+      i4ST_ = alloc<half>(i4STElems_);
+      i4Desc_ = alloc_hw<DpuMatMul::DescriptorsBuffer>(1);
+      i4Wt_ = alloc<std::uint32_t>(4 * kMaxDpuN);
+      if (!ok_)
+        return;
+      i4Mm_ = new (i4Store_) DpuMatMul(env_.getDpuDrv(), i4Desc_, i4Wt_);
+    } else if (M * ng * C > i4PartElems_ || ng * N > i4STElems_) {
+      fail(kStatusUnsupported, M * ng * C);
+      return;
+    }
+    const std::uint64_t key = (static_cast<std::uint64_t>(M) << 40) | (static_cast<std::uint64_t>(N) << 20) |
+                              (static_cast<std::uint64_t>(K) << 8) | (G >> 4);
+    if (key != i4Key_) {
+      // weight table rows {byte offset of (row n, group g) in q, 0, PPE multiplier, 0}, channel g * N + n
+      union { float f; std::uint32_t u; } sc;
+      sc.f = kI4PartScale;
+      for (std::uint32_t g = 0; g < ng; ++g)
+        for (std::uint32_t n = 0; n < N; ++n) {
+          std::uint32_t *w = i4Wt_ + 4 * (g * N + n);
+          w[0] = n * (K / 2) + g * (G / 2);
+          w[1] = 0;
+          w[2] = sc.u;
+          w[3] = 0;
+        }
+      i4Mm_->initMixedDescOnly(M * ng, C, G);
+      i4Desc_->invariant.tensor_mode.tensor_mode_bf.wmode =
+          static_cast<std::uint32_t>(npu40xx::VpuInputTensorDType::I4);   // initMixed's default is I8
+      i4Key_ = key;
+    }
+    i4Mm_->setConsumerBarriers(0, 0);
+    i4Mm_->setProducerBarriers(0, 0);
+    const std::uint32_t t0 = perf_ticks();
+    i4Mm_->startMixed(i4Part_, const_cast<half *>(a), reinterpret_cast<std::int8_t *>(const_cast<std::uint8_t *>(q)));
+    // s [N, ng] -> sT [ng, N] while the DPU runs: 8x8 vector transposes (npu_dsl's transpose_h) when the
+    // shape allows, a scalar loop otherwise (1024 strided scalar copies cost ~9 us at N=64, ng=16).
+    if (N % 8 == 0 && ng % 8 == 0)
+      transpose_h(i4ST_, s, N, ng);
+    else
+      for (std::uint32_t n = 0; n < N; ++n)
+        for (std::uint32_t g = 0; g < ng; ++g)
+          i4ST_[g * N + n] = s[n * ng + g];
+    const std::uint32_t t1 = perf_ticks();
+    i4Mm_->wait();
+    const std::uint32_t t2 = perf_ticks();
+    dpuCount_ += 1;
+    dpuIduTicks_ += static_cast<volatile const DpuMatMul::DescriptorsBuffer *>(i4Desc_)->hwpStats.idu_workload_duration;
+    dpuOduTicks_ += static_cast<volatile const DpuMatMul::DescriptorsBuffer *>(i4Desc_)->hwpStats.odu_workload_duration;
+    q_reduce(out, i4Part_, i4ST_, M, N, ng, 1.0f / kI4PartScale);
+    const std::uint32_t t3 = perf_ticks();
+    ringTicks_[kTickSubmit] += (t1 - t0) + (t3 - t2);   // SHAVE side: start + transpose, reduce
+    ringTicks_[kTickDpuWait] += t2 - t1;                // DPU time not hidden behind the transpose
+  }
+
+  // dst[cols, rows] = src[rows, cols]^T in 8x8 blocks of half8 shuffles (npu_dsl's fused_rt.hpp transpose_h);
+  // rows % 8 == 0 and cols % 8 == 0.
+  static void transpose_h(half *__restrict dst, const half *__restrict src, std::uint32_t rows, std::uint32_t cols) {
+    for (std::uint32_t r0 = 0; r0 < rows; r0 += 8)
+      for (std::uint32_t c0 = 0; c0 < cols; c0 += 8) {
+        half8 r[8];
+        for (int i = 0; i < 8; ++i)
+          r[i] = *reinterpret_cast<const half8 *>(src + (r0 + i) * cols + c0);
+        const half8 t0 = __builtin_shufflevector(r[0], r[1], 0, 8, 1, 9, 2, 10, 3, 11), t1 = __builtin_shufflevector(r[0], r[1], 4, 12, 5, 13, 6, 14, 7, 15);
+        const half8 t2 = __builtin_shufflevector(r[2], r[3], 0, 8, 1, 9, 2, 10, 3, 11), t3 = __builtin_shufflevector(r[2], r[3], 4, 12, 5, 13, 6, 14, 7, 15);
+        const half8 t4 = __builtin_shufflevector(r[4], r[5], 0, 8, 1, 9, 2, 10, 3, 11), t5 = __builtin_shufflevector(r[4], r[5], 4, 12, 5, 13, 6, 14, 7, 15);
+        const half8 t6 = __builtin_shufflevector(r[6], r[7], 0, 8, 1, 9, 2, 10, 3, 11), t7 = __builtin_shufflevector(r[6], r[7], 4, 12, 5, 13, 6, 14, 7, 15);
+        const half8 u0 = __builtin_shufflevector(t0, t2, 0, 1, 8, 9, 2, 3, 10, 11), u1 = __builtin_shufflevector(t0, t2, 4, 5, 12, 13, 6, 7, 14, 15);
+        const half8 u2 = __builtin_shufflevector(t1, t3, 0, 1, 8, 9, 2, 3, 10, 11), u3 = __builtin_shufflevector(t1, t3, 4, 5, 12, 13, 6, 7, 14, 15);
+        const half8 u4 = __builtin_shufflevector(t4, t6, 0, 1, 8, 9, 2, 3, 10, 11), u5 = __builtin_shufflevector(t4, t6, 4, 5, 12, 13, 6, 7, 14, 15);
+        const half8 u6 = __builtin_shufflevector(t5, t7, 0, 1, 8, 9, 2, 3, 10, 11), u7 = __builtin_shufflevector(t5, t7, 4, 5, 12, 13, 6, 7, 14, 15);
+        half8 *d = reinterpret_cast<half8 *>(dst + c0 * rows + r0);
+        const std::uint32_t st = rows / 8;
+        d[0 * st] = __builtin_shufflevector(u0, u4, 0, 1, 2, 3, 8, 9, 10, 11);
+        d[1 * st] = __builtin_shufflevector(u0, u4, 4, 5, 6, 7, 12, 13, 14, 15);
+        d[2 * st] = __builtin_shufflevector(u1, u5, 0, 1, 2, 3, 8, 9, 10, 11);
+        d[3 * st] = __builtin_shufflevector(u1, u5, 4, 5, 6, 7, 12, 13, 14, 15);
+        d[4 * st] = __builtin_shufflevector(u2, u6, 0, 1, 2, 3, 8, 9, 10, 11);
+        d[5 * st] = __builtin_shufflevector(u2, u6, 4, 5, 6, 7, 12, 13, 14, 15);
+        d[6 * st] = __builtin_shufflevector(u3, u7, 0, 1, 2, 3, 8, 9, 10, 11);
+        d[7 * st] = __builtin_shufflevector(u3, u7, 4, 5, 6, 7, 12, 13, 14, 15);
+      }
+  }
+
+  // out[m, n] = inv x sum_g sT[g, n] x part[(m, g), g * N + n]: four 16-column blocks at a time (independent
+  // accumulators; the sum order per output is fixed, so the result is deterministic). N % 16 == 0.
+  static void q_reduce(half *__restrict out, const half *__restrict part, const half *__restrict sT, std::uint32_t M,
+                       std::uint32_t N, std::uint32_t ng, float inv) {
+    const std::uint32_t C = N * ng;
+    for (std::uint32_t m = 0; m < M; ++m) {
+      std::uint32_t n0 = 0;
+      for (; n0 + 64 <= N; n0 += 64) {
+        float16 a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        for (std::uint32_t g = 0; g < ng; ++g) {
+          const half *p = part + (m * ng + g) * C + g * N + n0;
+          const half *w = sT + g * N + n0;
+          a0 += __builtin_convertvector(*reinterpret_cast<const half16 *>(p), float16) *
+                __builtin_convertvector(*reinterpret_cast<const half16 *>(w), float16);
+          a1 += __builtin_convertvector(*reinterpret_cast<const half16 *>(p + 16), float16) *
+                __builtin_convertvector(*reinterpret_cast<const half16 *>(w + 16), float16);
+          a2 += __builtin_convertvector(*reinterpret_cast<const half16 *>(p + 32), float16) *
+                __builtin_convertvector(*reinterpret_cast<const half16 *>(w + 32), float16);
+          a3 += __builtin_convertvector(*reinterpret_cast<const half16 *>(p + 48), float16) *
+                __builtin_convertvector(*reinterpret_cast<const half16 *>(w + 48), float16);
+        }
+        half *o = out + m * N + n0;
+        *reinterpret_cast<half16 *>(o) = __builtin_convertvector(a0 * inv, half16);
+        *reinterpret_cast<half16 *>(o + 16) = __builtin_convertvector(a1 * inv, half16);
+        *reinterpret_cast<half16 *>(o + 32) = __builtin_convertvector(a2 * inv, half16);
+        *reinterpret_cast<half16 *>(o + 48) = __builtin_convertvector(a3 * inv, half16);
+      }
+      for (; n0 < N; n0 += 16) {
+        float16 acc = 0.f;
+        for (std::uint32_t g = 0; g < ng; ++g)
+          acc += __builtin_convertvector(*reinterpret_cast<const half16 *>(part + (m * ng + g) * C + g * N + n0), float16) *
+                 __builtin_convertvector(*reinterpret_cast<const half16 *>(sT + g * N + n0), float16);
+        *reinterpret_cast<half16 *>(out + m * N + n0) = __builtin_convertvector(acc * inv, half16);
+      }
+    }
+  }
+
   // ---- Streamed ping-pong ring (plan Phase 3b; the flow of
   // docs/examples/pingpong_multitile/README.md sections 1-3 and 6c) ----
   //
@@ -962,6 +1102,15 @@ private:
   std::uint32_t dpuStamp_{0};
   DpuMatMul *mm_{nullptr};                           // the set of the last prepared shape
   DpuMatMul::DescriptorsBuffer *dpuDesc_{nullptr};
+  // Mixed-mode (fp16 x int4 weights) set for dpu_matmul_i4g, allocated on first use.
+  static constexpr float kI4PartScale = 1.0f / 16.0f;  // PPE multiplier keeping the group partials in fp16 range
+  alignas(DpuMatMul) unsigned char i4Store_[sizeof(DpuMatMul)];
+  DpuMatMul *i4Mm_{nullptr};
+  DpuMatMul::DescriptorsBuffer *i4Desc_{nullptr};
+  std::uint32_t *i4Wt_{nullptr};
+  half *i4Part_{nullptr}, *i4ST_{nullptr};
+  std::uint32_t i4PartElems_{0}, i4STElems_{0};
+  std::uint64_t i4Key_{~0ull};
   std::uint32_t dpuCount_{0}, dpuIduTicks_{0}, dpuOduTicks_{0};
   // Ring path phase counters (19.2 MHz ticks), the status record's extra words when a
   // probe gives none: where a SHAVE's time in the ring protocol goes.

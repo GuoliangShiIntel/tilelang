@@ -72,6 +72,9 @@ TVM_DLL const Op &intel_npu_dpu_matmul();
 TVM_DLL const Op &intel_npu_ring_begin();
 TVM_DLL const Op &intel_npu_ring_uses();
 TVM_DLL const Op &intel_npu_ring_slot();
+// (out, a, q, s, M, N, K, G): fp16 activations x packed int4 weights with fp16 group scales, one mixed-mode
+// DPU workload + SHAVE group reduction (the decode GEMV path).
+TVM_DLL const Op &intel_npu_dpu_matmul_i4g();
 TVM_DLL const Op &intel_npu_ring_slot_acquire();   // (ring, use): SHAVE reader waits READY and consumes it
 TVM_DLL const Op &intel_npu_ring_slot_release();   // (ring, use): SHAVE reader produces FREE
 TVM_DLL const Op &intel_npu_ring_fill();

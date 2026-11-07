@@ -24,7 +24,7 @@ import tvm
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_sim  # noqa: E402
 import lowering  # noqa: E402
-from kernels import make_w4a16_flow, pack_int4  # noqa: E402
+from kernels import make_w4a16_flow, make_w4a16_gemv, pack_int4  # noqa: E402
 
 G, TILES = 128, 3
 
@@ -69,6 +69,35 @@ def test_pipelined_n_split_streams_each_tiles_own_weights():
     assert "ctx.ring_fill(ring, 0, (&(Wq[((bx * 524288) + (tx * 65536))])), 1024, 64, 1024);" in src
 
 
+def test_gemv_streams_split_weight_chunks_the_dpu_reads_in_place():
+    # decode: x resident (one row, filled by SHAVE 0), weight chunks of 256 rows per tile through split rings, each
+    # consumed by 4 mixed-mode DPU workloads of 64 rows (channel limit) reading this SHAVE's slot of the use
+    src = _lower(make_w4a16_gemv(6144, 2048, BN=256, G=G, tiles=TILES)).source
+    assert "x_cmx: tile-invariant resident, 1 row(s) filled by SHAVE 0, tile sync after" in src
+    assert "wq_cmx: SEGMENTED (streamed, each tile fills its own slot)" in src
+    assert "ctx.ring_begin((&(wq_cmx[0])), 262144, 2, 8, 8, 12, 0, 0);" in src
+    assert "0 gemm(s), 2 slot(s) read by the SHAVE" in src
+    assert re.search(r"for \(int32_t sub = 0; sub < 4; \+\+sub\) \{\s*ctx\.dpu_matmul_i4g\(\(&\(y_cmx\[\(sub \* 64\)\]\)\), \(&\(x_cmx\[0\]\)\), "
+                     r"\(&\(wq_cmx\[\(\(tx \* 262144\) \+ \(sub \* 65536\)\)\]\)\), \(&\(s_cmx\[\(\(tx \* 4096\) \+ \(sub \* 1024\)\)\]\)\), 1, 64, 2048, 128\);", src)
+    with pytest.raises(AssertionError):
+        make_w4a16_gemv(6144, 2048, BN=256, G=G, tiles=TILES, rows_per_workload=128)   # 128 x 16 groups > 1024 channels
+
+
+@needs_cxx
+def test_gemv_serial_form_matches_numpy_in_host_sim():
+    N, K, BN = 768, 1024, 64
+    low = _lower(make_w4a16_gemv(N, K, BN=BN, G=G, tiles=TILES, pipelined=False))
+    lib = host_sim.build(low.source, "tl_gemv_serial_sim")
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal((1, K)) * 0.5).astype(np.float16)
+    w_int = rng.integers(-8, 8, size=(N, K)).astype(np.int8)
+    scales = rng.uniform(0.01, 0.05, size=(N, K // G)).astype(np.float16)
+    y = np.zeros((1, N), np.float16)
+    host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, {"X": x, "Wq": pack_int4(w_int), "S": scales, "Y": y}), TILES, 2))
+    ref = x.astype(np.float32) @ (w_int.astype(np.float32) * np.repeat(scales.astype(np.float32), G, axis=1)).T
+    assert np.abs(y.astype(np.float32) - ref).max() / np.abs(ref).max() < 4e-3   # group partials rounded to fp16
+
+
 def test_streamed_buffer_nothing_reads_is_refused():
     @T.prim_func
     def bad(X: T.Tensor((96, 512), T.float16), W: T.Tensor((256, 512), T.float16), Y: T.Tensor((96, 256), T.float16)):
@@ -103,9 +132,9 @@ def test_serial_form_matches_numpy_in_host_sim(split):
     w = (w_int.astype(np.float32) * np.repeat(scales.astype(np.float32), G, axis=1)).astype(np.float16).astype(np.float32)
     ref = x.astype(np.float32) @ w.T
     assert np.abs(y.astype(np.float32) - ref).max() / np.abs(ref).max() < 2e-3
-    # negative: one nibble changed
+    # negative: one whole group of a row (a single nibble can meet a near-zero activation and stay under the bar)
     wq2 = wq.copy()
-    wq2[3, 5] ^= np.uint8(0x70)
+    wq2[3, :64] ^= np.uint8(0x77)
     y2 = np.zeros((M, N), np.float16)
     host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, {"X": x, "Wq": wq2, "S": scales, "Y": y2}), TILES, 2))
     assert np.abs(y2.astype(np.float32) - ref).max() / np.abs(ref).max() > 2e-3

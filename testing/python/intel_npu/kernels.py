@@ -353,6 +353,38 @@ def make_w4a16_flow(M: int, N: int, K: int, BN: int = 64, G: int = 128, tiles: i
     return w4a16
 
 
+def make_w4a16_gemv(N: int, K: int, BN: int = 256, G: int = 128, tiles: int = 3, shaves: int = 2, num_stages: int = 2,
+                    pipelined: bool = True, M: int = 1, rows_per_workload: int = 64):
+    """M2 decode: y[M, N] = x[M, K] . dequant(Wq[N, K])^T at M = 1 (a few rows at most) through the DPU's int4-weight
+    mode (`T.gemm_i4`: VPUX's merged FC, no SHAVE dequantisation). x is resident on every tile; the weight rows are
+    split over the tiles and stream through two rings (packed bytes, scales) the DPU reads in place, in chunks of BN
+    rows (one DMA job each: decode is bound by weight bytes, and the DMA wants few big jobs), each consumed by
+    BN / rows_per_workload DPU workloads (rows_per_workload x K / G <= 1024 channels)."""
+    assert N % (BN * tiles) == 0 and K % G == 0 and BN % rows_per_workload == 0 and rows_per_workload % 16 == 0
+    assert rows_per_workload * (K // G) <= 1024
+    chunks = N // BN // tiles
+    KG = K // G
+    R = rows_per_workload
+
+    @T.prim_func
+    def gemv(X: T.Tensor((M, K), T.float16), Wq: T.Tensor((N, K // 2), T.uint8), S: T.Tensor((N, KG), T.float16),
+             Y: T.Tensor((M, N), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            x_cmx = T.alloc_shared((M, K), T.float16)
+            wq_cmx = T.alloc_shared((BN, K // 2), T.uint8)
+            s_cmx = T.alloc_shared((BN, KG), T.float16)
+            y_cmx = T.alloc_local((M, BN), T.float16)
+            T.copy(X[0, 0], x_cmx)
+            for n in (T.Pipelined(chunks, num_stages=num_stages) if pipelined else T.serial(chunks)):
+                T.copy(Wq[(tile * chunks + n) * BN, 0], wq_cmx)
+                T.copy(S[(tile * chunks + n) * BN, 0], s_cmx)
+                for sub in T.serial(BN // R):
+                    T.gemm_i4(x_cmx, wq_cmx, s_cmx, y_cmx, group=G, row0=sub * R, rows=R)
+                T.copy(y_cmx, Y[0, (tile * chunks + n) * BN])
+
+    return gemv
+
+
 def pack_int4(w_int: "np.ndarray") -> "np.ndarray":
     """[N, K] signed int4 values in [-8, 7] -> [N, K/2] bytes, low nibble first (the reference packer)."""
     import numpy as np

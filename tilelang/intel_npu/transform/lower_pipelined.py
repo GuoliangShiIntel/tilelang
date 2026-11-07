@@ -202,12 +202,14 @@ def PlanIntelNpuDistribution():
             # over the tile's SHAVEs, one per DMA port, then meet.
             rows = _const(args[3])
             spt = launch.shaves
-            if rows % spt != 0:
-                raise ValueError(
-                    f"intel_npu: resident fill {src.buffer.name} -> {dst.buffer.name} has {rows} rows, not a "
-                    f"multiple of the {spt} SHAVEs that share the load")
-            per = rows // spt
             tx = launch.shave_var
+            kind = 'SEGMENTED' if src_tile else 'tile-invariant'
+            if rows % spt != 0:
+                # Too few rows to share (a decode activation row): SHAVE 0 does the whole fill, the tile meets.
+                fill = tirx.IfThenElse(tx == 0, stmt, None)
+                notes.append(f"{dst.buffer.name}: {kind} resident, {rows} row(s) filled by SHAVE 0, tile sync after")
+                return tirx.SeqStmt(([_storage_sync_shared()] if loop_depth[0] > 0 else []) + [fill, _storage_sync_shared()])
+            per = rows // spt
             dst_idx = list(dst.indices)
             src_idx = list(src.indices)
             dst_idx[0] = dst_idx[0] + tx * per
@@ -303,9 +305,9 @@ class _Pipeline:
         if not fills:
             raise ValueError("intel_npu: a pipelined loop has no DDR -> CMX fill to stream")
         self.streams = [_Stream(f, self.stages) for f in fills]
+        # Ring-submitted gemms read a slot through the DPU FIFO; any other reader of a slot (a SHAVE loop, a
+        # synchronous DPU op such as gemm_i4) goes through acquire/release below.
         self.gemms = [s for s in self.stmts if _is_call(s, DPU_MATMUL)]
-        if not self.gemms:
-            raise ValueError("intel_npu: a pipelined loop has no gemm reading its streamed operand")
         for g in self.gemms:
             readers = [st for st in self.streams if st.bind_gemm(g)]
             if len(readers) > 1:

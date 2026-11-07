@@ -23,7 +23,7 @@ sys.path.insert(0, str(HERE))
 import tilelang  # noqa: E402,F401
 import runner  # noqa: E402
 import lowering  # noqa: E402
-from kernels import make_w4a16_flow, pack_int4  # noqa: E402
+from kernels import make_w4a16_flow, make_w4a16_gemv, pack_int4  # noqa: E402
 from tilelang.intel_npu import hw_facts  # noqa: E402
 
 TILES, SHAVES = 3, 2
@@ -39,8 +39,14 @@ def main(argv):
     M, N, K, BN = arg(argv, "--m", 96), arg(argv, "--n", 2048), arg(argv, "--k", 2048), arg(argv, "--bn", 64)
     split = "n" if "--split-n" in argv else "m"
     stages = arg(argv, "--stages", 2)
-    kernel = f"tl_w4a16_m{M}_n{N}_k{K}_bn{BN}_split{split}" + (f"_s{stages}" if stages != 2 else "")
-    low = lowering.lower(make_w4a16_flow(M, N, K, BN=BN, G=G, tiles=TILES, shaves=SHAVES, split=split, num_stages=stages))
+    gemv = "--gemv" in argv
+    if gemv:
+        M = arg(argv, "--m", 1)
+        kernel = f"tl_w4a16_gemv_m{M}_n{N}_k{K}_bn{BN}" + (f"_s{stages}" if stages != 2 else "")
+        low = lowering.lower(make_w4a16_gemv(N, K, BN=BN, G=G, tiles=TILES, shaves=SHAVES, num_stages=stages, M=M))
+    else:
+        kernel = f"tl_w4a16_m{M}_n{N}_k{K}_bn{BN}_split{split}" + (f"_s{stages}" if stages != 2 else "")
+        low = lowering.lower(make_w4a16_flow(M, N, K, BN=BN, G=G, tiles=TILES, shaves=SHAVES, split=split, num_stages=stages))
     for ln in low.source.splitlines():
         if "// intel_npu:" in ln:
             print(ln.strip()[:220])
@@ -59,7 +65,7 @@ def main(argv):
     wq_dev = wq.copy()
     negative = "--negative" in argv
     if negative:
-        wq_dev[3, 5] ^= np.uint8(0x70)   # one weight's value changes by several steps
+        wq_dev[3, :64] ^= np.uint8(0x77)   # one whole group of row 3 (a single nibble can meet a near-zero activation)
     y = np.zeros((M, N), np.float16)
     profile = None
     if "--profile" in argv:
@@ -73,7 +79,7 @@ def main(argv):
     ref = x.astype(np.float32) @ w.T
     err = float(np.abs(y.astype(np.float32) - ref).max())
     rel = err / float(np.abs(ref).max())
-    verdict = "PASS" if rel < 2e-3 else "FAIL"
+    verdict = "PASS" if rel < (4e-3 if gemv else 2e-3) else "FAIL"   # the merged-FC path rounds each group partial to fp16
     kind = runner.condition(res, profile is not None)
     ops = 2.0 * M * N * K
     tops = ops / (res.median_kernel_ms * 1e-3) / 1e12

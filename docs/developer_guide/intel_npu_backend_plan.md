@@ -481,7 +481,7 @@ device-verified and measured here.
 | Block | Needed | This backend | Milestone |
 |---|---|---|---|
 | Projections, prefill | int4 group-128: SHAVE dequant -> fp16 DPU; fp16 (`baProj`) | **have** (log 2026-11-07 M2): W4A16 flow in both role assignments, device PASS; 0.82x npu_dsl's tuned probe at its shape, dequant row op 0.26 cyc/value | M2 |
-| Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | none | M2 |
+| Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | **have** int4 (log 2026-11-07 M2 step 2): `T.gemm_i4` merged-FC DPU path, device PASS, 20-29 GB/s of weights (DMA bound ~126); int8 not yet | M2 |
 | Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | `T.vectorized` loops lower to half32/float16 SHAVE vector ops with VAU exp/log/tanh (**have**, log 2026-11-07); the ops themselves not yet written | M1 |
 | Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**; 960x1024x64 vectorised 1.765 ms TURBO (log 2026-11-07); GQA, gate, decode, KV cache open | M1 |
 | Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | none | M4 |
@@ -499,6 +499,22 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-07: **M2 step 2: the decode GEMV through the DPU's int4-weight mode.** New dialect op `T.gemm_i4(a, wq, s,
+  out, group, row0, rows)` -> runtime `dpu_matmul_i4g`: one mixed-mode DPU workload (fp16 activations x packed int4
+  weights read in place, `wmode = I4`) over the M x ng pseudo-rows against N x ng channels whose weight-table
+  offsets point at (row, group), PPE multiplier 1/16, then the SHAVE keeps the diagonal blocks and sums them with the
+  scales (VPUX's merged FC; ported from npu_dsl's `fused_rt.hpp` `matmul_qg` / `q_reduce` / `transpose_h` under the
+  section 0 amendment). Dequantising first would cost the SHAVE ~10x the weight DMA at M = 1. Also: a resident fill
+  of fewer rows than SHAVEs is done by SHAVE 0 (a decode activation row); a pipelined loop needs no ring-submitted
+  gemm when its slots have SHAVE-side readers (the synchronous `gemm_i4` is one). **Device** (`--gemv`, N 6144 K 2048,
+  256-row chunks): PASS rel 4.5e-4, 0.22-0.32 ms over 5 runs = 20-29 GB/s of weights against a ~126 GB/s DMA bound.
+  Per workload: DPU ~2 us, SHAVE transpose + reduce 2.1 us (the scalar transpose was 9 us: `transpose_h` vector
+  shuffles), slot wait ~2 us; 6 concurrent unicast issuers of 256 KiB each is also the DMA pattern the Phase 3b probe
+  measured lowest. Levers, recorded: scales packed group-major by the model packer (no transpose), 512-row chunks with
+  one issuer per tile, the run-to-run variance (0.22-0.32) to be understood before any further number is quoted.
+  Tests: `test_intel_npu_m2_w4a16.py` (GEMV lowering, host-sim golden), 73 passed. The negative controls of the W4A16
+  runner now perturb a whole group of a row: one nibble met a 0.02 activation and stayed under the bar (a gate seen
+  to pass is not evidence; this one was caught by the rule).
 * 2026-11-07: **M2 step 1: W4A16 projections on the device, both role assignments.** Source
   `kernels.make_w4a16_flow` (int4 g128, two per byte low nibble first, fp16 scale per group: npu_dsl's
   DEQUANT_I4 / W4A16 format, `pack_int4` the reference packer). Three generic capabilities landed for it:

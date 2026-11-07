@@ -40,6 +40,9 @@ TIR_DEFINE_TL_BUILTIN(intel_npu_ring_uses)
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_slot)
     .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure));
+TIR_DEFINE_TL_BUILTIN(intel_npu_dpu_matmul_i4g)
+    .set_num_inputs(8)
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_slot_acquire)
     .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));

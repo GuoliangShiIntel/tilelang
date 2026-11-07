@@ -257,6 +257,34 @@ public:
     }
   }
 
+  // The device's merged-FC quantised GEMV, with its rounding points: each (row, group) partial product is
+  // scaled by 1/16 and rounded to fp16 by the DPU's ODU, the SHAVE sums partial x scale in fp32, x16, fp16.
+  void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G) {
+    if (!ok_)
+      return;
+    const std::uint32_t ng = K / G;
+    if (K % G != 0 || G % 16 != 0 || N % 16 != 0 || N * ng > kMaxDpuN) {
+      fail(kStatusUnsupported, N * ng);
+      return;
+    }
+    for (std::uint32_t m = 0; m < M; ++m)
+      for (std::uint32_t n = 0; n < N; ++n) {
+        float acc = 0.f;
+        for (std::uint32_t g = 0; g < ng; ++g) {
+          float part = 0.f;
+          for (std::uint32_t k = g * G; k < (g + 1) * G; ++k) {
+            const unsigned byte = q[static_cast<std::size_t>(n) * (K / 2) + k / 2];
+            const int nib = (k & 1) ? (byte >> 4) : (byte & 0xF);
+            part += static_cast<float>(a[static_cast<std::size_t>(m) * K + k]) * static_cast<float>((nib ^ 8) - 8);
+          }
+          const half p16 = static_cast<half>(part * (1.0f / 16.0f));
+          acc += static_cast<float>(p16) * static_cast<float>(s[static_cast<std::size_t>(n) * ng + g]);
+        }
+        out[static_cast<std::size_t>(m) * N + n] = static_cast<half>(acc * 16.0f);
+      }
+  }
+
   void sync_grid() { env_.grid->wait(); }
   void sync_tile() { env_.tileBarrier->wait(); }
 
