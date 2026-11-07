@@ -118,6 +118,12 @@ def remove_kernels(names) -> int:
 
 def build(source: str, kernel: str, build_dir: Path | None = None, log=print, text_limit_bytes: int | None = None) -> DeviceBuild:
     """`text_limit_bytes` defaults to the intel_npu target's attribute; the build is refused above it."""
+    return build_all({kernel: source}, build_dir=build_dir, log=log, text_limit_bytes=text_limit_bytes)[kernel]
+
+
+def build_all(sources: dict[str, str], build_dir: Path | None = None, log=print,
+              text_limit_bytes: int | None = None) -> dict[str, DeviceBuild]:
+    """Writes every kernel, builds the project once (the glob compiles all of generated/), checks each `.text`."""
     if text_limit_bytes is None:
         from tvm.target import Target
 
@@ -125,8 +131,10 @@ def build(source: str, kernel: str, build_dir: Path | None = None, log=print, te
     gc_root = require_env("GENERIC_COMPUTE_ROOT")
     mv_tools = require_env("MV_TOOLS_PATH")
     build_dir = build_dir or (HERE / "build")
-    path, sha = write_kernel(source, kernel)
-    log(f"kernel source: {path} sha256 {sha[:12]}")
+    shas = {}
+    for kernel, source in sources.items():
+        path, shas[kernel] = write_kernel(source, kernel)
+        log(f"kernel source: {path} sha256 {shas[kernel][:12]}")
     cmake = find_cmake()
     env = dict(os.environ)
     # Always configure: the kernel list is a CMake glob, so a new generated/<kernel>.cpp needs a re-run.
@@ -144,14 +152,17 @@ def build(source: str, kernel: str, build_dir: Path | None = None, log=print, te
     exe = build_dir / "Release" / "npu_run.exe"
     if not exe.exists():
         raise RuntimeError(f"runner not found at {exe}")
-    elf = next(build_dir.rglob(f"*{kernel}*.elf"), None)
-    if elf is None:
-        raise RuntimeError(f"no .elf for kernel {kernel} under {build_dir}")
-    text = text_bytes(elf)
-    log(f"built {exe.name} and {elf.name}; SHAVE .text {text} B of {text_limit_bytes} B ({100.0 * text / text_limit_bytes:.1f}%)")
-    if text > text_limit_bytes:
-        raise RuntimeError(f"kernel {kernel}: SHAVE .text {text} B exceeds text_limit_bytes {text_limit_bytes}")
-    return DeviceBuild(build_dir=build_dir, exe=exe, kernel=kernel, source_sha256=sha, text_bytes=text)
+    out = {}
+    for kernel, sha in shas.items():
+        elf = next(build_dir.rglob(f"*{kernel}*.elf"), None)
+        if elf is None:
+            raise RuntimeError(f"no .elf for kernel {kernel} under {build_dir}")
+        text = text_bytes(elf)
+        log(f"built {exe.name} and {elf.name}; SHAVE .text {text} B of {text_limit_bytes} B ({100.0 * text / text_limit_bytes:.1f}%)")
+        if text > text_limit_bytes:
+            raise RuntimeError(f"kernel {kernel}: SHAVE .text {text} B exceeds text_limit_bytes {text_limit_bytes}")
+        out[kernel] = DeviceBuild(build_dir=build_dir, exe=exe, kernel=kernel, source_sha256=sha, text_bytes=text)
+    return out
 
 
 @dataclass
@@ -221,3 +232,90 @@ def check_status(status: np.ndarray) -> None:
     if bad:
         desc = ", ".join(f"shave {w}: {STATUS_NAMES.get(c, c)} detail={d}" for w, c, d in bad)
         raise RuntimeError(f"kernel reported failure: {desc}")
+
+
+class Session:
+    """`npu_run --session`: one process, kernels created once, device buffers resident across launches. Buffers are
+    named; `launch` takes the names in the kernel's device parameter order and returns (host_ms, kernel_ms).
+    Host <-> device bytes go through files in `run_dir` (a one-time cost for weights; a few KB per token after)."""
+
+    def __init__(self, exe: Path, run_dir: Path, tiles: int, shaves: int):
+        self.run_dir = Path(run_dir)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        if turbo_requested():
+            env["NPU_TURBO"] = "YES"
+        else:
+            env.pop("NPU_TURBO", None)
+        self.turbo = turbo_requested()
+        self.proc = subprocess.Popen([str(exe), "--session", "--dir", str(self.run_dir), "--tiles", str(tiles), "--shaves", str(shaves)],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                     bufsize=1, cwd=str(Path(exe).parent), env=env)
+        ready = self.proc.stdout.readline()
+        if not ready.startswith("session ready"):
+            raise RuntimeError(f"session did not start: {ready!r}\n{self.proc.stderr.read()[-2000:]}")
+        self.sizes: dict[str, int] = {}
+        self.launches: list[tuple[str, float, float]] = []   # (alias, host_ms, kernel_ms)
+        self._n = 0
+
+    def _cmd(self, line: str) -> str:
+        self.proc.stdin.write(line + "\n")
+        self.proc.stdin.flush()
+        r = self.proc.stdout.readline().rstrip("\n")
+        if not r:
+            raise RuntimeError(f"session died on {line!r}: {self.proc.stderr.read()[-3000:]}")
+        if r.startswith("error") or r.startswith("fatal"):
+            raise RuntimeError(f"session {line.split()[0]} {line.split()[1] if len(line.split()) > 1 else ''}: {r}")
+        return r
+
+    def alloc(self, name: str, nbytes: int) -> None:
+        self._cmd(f"alloc {name} {int(nbytes)}")
+        self.sizes[name] = int(nbytes)
+
+    def upload(self, name: str, a: np.ndarray, offset: int = 0) -> None:
+        """Allocates `name` on first use (exact size), then copies `a` in."""
+        a = np.ascontiguousarray(a)
+        if name not in self.sizes:
+            self.alloc(name, a.nbytes)
+        self._n += 1
+        f = self.run_dir / f"xfer_{self._n % 4}.bin"
+        a.tofile(f)
+        self._cmd(f"load {name} {f.name} {int(offset)}")
+
+    def download(self, name: str, dtype, shape, offset: int = 0) -> np.ndarray:
+        n = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        self._n += 1
+        f = self.run_dir / f"xfer_{self._n % 4}.bin"
+        self._cmd(f"save {name} {f.name} {int(offset)} {n}")
+        return np.fromfile(f, dtype=dtype).reshape(shape)
+
+    def zero(self, name: str) -> None:
+        self._cmd(f"zero {name}")
+
+    def kernel(self, alias: str, elf_name: str, profile: bool = False) -> None:
+        self._cmd(f"kernel {alias} {elf_name}" + (" profile" if profile else ""))
+
+    def launch(self, alias: str, *buffers: str) -> tuple[float, float]:
+        r = self._cmd(f"launch {alias} " + " ".join(buffers))
+        parts = r.split()
+        host_ms, kernel_ms = float(parts[2]), float(parts[4])
+        self.launches.append((alias, host_ms, kernel_ms))
+        return host_ms, kernel_ms
+
+    def profile(self, alias: str, path: Path) -> None:
+        self._cmd(f"profile {alias} {path}")
+
+    def close(self) -> None:
+        if self.proc.poll() is None:
+            try:
+                self.proc.stdin.write("quit\n")
+                self.proc.stdin.flush()
+            except OSError:
+                pass
+            self.proc.wait(timeout=30)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
