@@ -68,7 +68,7 @@ def test_pipelined_phase_lowers_to_two_rings_over_one_loop():
     assert "ring: READY 8..11, FREE 12..15; ring_1: READY 16..19, FREE 20..23" in src
     assert "by reuse" not in src                                             # both live at once: no sharing
     assert "2 gemms with SHAVE statements between, no submit-ahead" in src
-    assert "q_cmx: SEGMENTED resident, 32 rows split 16 per SHAVE, tile sync after" in src
+    assert "q_cmx: SEGMENTED resident in a loop, 32 rows split 16 per SHAVE, tile sync before and after" in src
     assert "ctx.dpu_matmul(" not in src
 
 

@@ -461,6 +461,20 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-07: **M1 step 3b: same-shape A/B against npu_dsl's flash attention.** `make_flash_attention_phase`
+  takes any `numQ` that is a multiple of `BQ x tiles`: Q blocks are dealt round-robin over the tiles in a serial
+  loop around the phase (the resident Q fill becomes "SEGMENTED resident in a loop, tile sync before and after";
+  the two rings are re-begun per block on the same ids). **Sq 960 x Skv 1024 x d 64, vectorised, 3 x 2: 3.588 ms
+  kernel-only = 0.070 TOPS on the `4 Sq Skv d` basis (0.28% of 25.13 turbo)**, PASS rel 6.19e-4. npu_dsl's record
+  for its 32x8 class (Sq = Skv = 1024, same basis, `docs/RUN_AND_RESULTS.md` section 2, Round 1195, UNPROFILED
+  NCE_TIME): walker 20.38 ms / legacy 20.32 ms = 0.0132 TOPS. **So this backend's flash phase is 5.3x faster per op
+  than npu_dsl's, with the DPU at 1% on both sides**: the difference is the K/V hardware rings (npu_dsl's W3, not
+  built) and the vector softmax. Both are still SHAVE-bound by a wide margin: 3.588 ms over 40 chunk steps per
+  SHAVE is ~90 us per 32 x 128 score block (~22 ns per score), far from 32-lane throughput; the next step is a
+  SHAVE-side cost breakdown (`ScopedVecCompute` brackets or the static cycle count of the `.s`) before touching
+  the source. Caveat for the comparison: npu_dsl's figures are its October record on a box whose DPU is now ~2.1x
+  slower (section 7 question 5); the DPU is ~1% of either kernel, so the SHAVE-bound comparison stands, but a
+  same-day re-run of its harness would make it exact.
 * 2026-11-07: **M1 step 3a: SHAVE vector codegen; the flash phase's softmax is 9.4x faster from `T.vectorized`
   alone.** Generic path, no per-kernel code: `VectorizeLoop` joins the pipeline after `ConfigIndexBitwidth`;
   `CodeGenTileLangIntelNpu` prints moviCompile's ext_vector types (`half8/16/32`, `float4/8/16`, `int4/8/16`,

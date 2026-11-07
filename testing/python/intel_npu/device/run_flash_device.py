@@ -31,7 +31,7 @@ PERF_CLK_MHZ = 19.2
 
 def main(argv):
     numKv = int(argv[argv.index("--kv") + 1]) if "--kv" in argv else 1024
-    numQ = BQ * TILES
+    numQ = int(argv[argv.index("--q") + 1]) if "--q" in argv else BQ * TILES   # a multiple of BQ x TILES
     kernel = f"tl_flash_phase_q{numQ}_kv{numKv}_d{D}" + ("_vec" if "--vec" in argv else "")
     cfg = {"tl.intel_npu.plan_workloads": "off"} if "--no-vpunn" in argv else {}
     with tvm.transform.PassContext(config=cfg):
