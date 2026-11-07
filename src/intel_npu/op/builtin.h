@@ -18,6 +18,11 @@ static constexpr const char *kIntelNpuDeriveGlobalSync = "tl.intel_npu.derive_gl
 // Pass config: implement sync_grid on hardware barriers (default true); false
 // selects the toolkit's software rendezvous, for A/B measurement only.
 static constexpr const char *kIntelNpuHwSyncGrid = "tl.intel_npu.hw_sync_grid";
+// Pass configs: kernel-wide DPU workload shape, used by the VPUNN calibration sweep
+// until PlanWorkloads sets them per op. spatial_x 0 = the runtime's own split;
+// mpe -1 = the runtime's own stencil, else 0 CUBOID_4x16, 1 CUBOID_8x16, 2 CUBOID_16x16.
+static constexpr const char *kIntelNpuDpuSpatialX = "tl.intel_npu.dpu_spatial_x";
+static constexpr const char *kIntelNpuDpuMpe = "tl.intel_npu.dpu_mpe";
 
 /*!
  * \brief 2-D DMA between DDR and CMX.
@@ -34,7 +39,10 @@ TVM_DLL const Op &intel_npu_dma_copy();
  * \brief One DPU fp16 matmul workload: out[M,N] = a[M,K] . bt[N,K]^T, every
  * operand contiguous in CMX. Overwrites `out`.
  *
- *   intel_npu_dpu_matmul(out_ptr, a_ptr, bt_ptr, M, N, K)
+ *   intel_npu_dpu_matmul(out_ptr, a_ptr, bt_ptr, M, N, K, spatial_x, mpe)
+ *
+ * `spatial_x` splits the M rows over an x-by-(M/x) grid (0 = runtime default);
+ * `mpe` selects the accumulator stencil (-1 = runtime default, see kIntelNpuDpuMpe).
  */
 TVM_DLL const Op &intel_npu_dpu_matmul();
 

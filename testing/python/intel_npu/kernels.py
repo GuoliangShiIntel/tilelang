@@ -55,6 +55,31 @@ def make_gemm_ksplit(M: int, N: int, K: int, BM: int = 64, BN: int = 64, BK: int
     return gemm_ksplit
 
 
+def make_gemm_repeat(BM: int, BN: int, K: int, repeat: int, tiles: int = 1, shaves: int = 2):
+    """DPU rate probe: every worker loads one [BM, K] x [BN, K] block pair once and runs the
+    same workload `repeat` times before storing. The difference between two repeat counts
+    isolates the DPU time per workload from launch, DMA and store costs; the result is the
+    same for any repeat, so the golden still applies. Used to calibrate VPUNN (plan 3.2)."""
+    workers = tiles * shaves
+    M, N = BM * workers, BN
+
+    @T.prim_func
+    def gemm_repeat(A: T.Tensor((M, K), T.float16), B: T.Tensor((N, K), T.float16), C: T.Tensor((M, N), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            A_cmx = T.alloc_local((BM, K), T.float16)
+            B_cmx = T.alloc_local((BN, K), T.float16)
+            C_cmx = T.alloc_local((BM, BN), T.float16)
+            T.copy(A[worker * BM, 0], A_cmx)
+            T.copy(B[0, 0], B_cmx)
+            for _ in T.serial(repeat):
+                T.gemm(A_cmx, B_cmx, C_cmx, transpose_B=True, clear_accum=True)
+            T.copy(C_cmx, C[worker * BM, 0])
+
+    return gemm_repeat
+
+
 def make_gemm_two_phase(M: int, N: int, K: int, BM: int = 64, BN: int = 64, tiles: int = 2, shaves: int = 2,
                         with_sync: bool = True):
     """Megakernel shape: split-K partial products -> T.sync_grid() -> combine, one launch.

@@ -124,7 +124,7 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
     return;
   }
   if (op->op.same_as(tl::intel_npu_dpu_matmul())) {
-    os << "ctx.dpu_matmul(" << args(0, 6) << ")";
+    os << "ctx.dpu_matmul(" << args(0, 8) << ")";
     return;
   }
   if (op->op.same_as(tl::sync_grid())) {

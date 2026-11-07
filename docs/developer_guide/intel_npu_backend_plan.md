@@ -25,6 +25,13 @@ claim is **not verified** against upstream. Every device result in this plan cit
 `gc_dsl_barrier` commit it was built against, and any edit to that tree is its own commit there.
 `MV_TOOLS_PATH=C:\Intel\xiong\applications.ai.vpu-accelerators.vpux-plugin\bin\MoviTools\26.08.2-internal`.
 
+**Cost model (2026-11-06, section 3.2).** VPUNN is the second external dependency, pinned like the SDK:
+`VPUNN_ROOT=D:\dsl\vpunn`, a standalone clone of `intel-innersource/libraries.performance.modeling.vpu.nn-cost-model`
+at tag **v1.10.2** (`8fbfa294`, the version `vpux-plugin` pins). It is Intel innersource with embargo markers,
+so it is **never vendored** into this public tree; `maint/scripts/build_intel_npu_vpunn.py` builds its pybind
+module (MSVC; `--deps-dir` points at a vpux-plugin build's `_deps` when GitHub is unreachable) and
+`tilelang.intel_npu.vpunn` loads it. A tree without it still compiles and runs; the cost tests SKIP by name.
+
 Why pure rather than a TIR-to-npu_dsl bridge: one IR (TIR), one pass framework, TileLang's
 verifiers/arith/layout/autotune for free, and no second schema to keep in sync. The cost is accepted:
 the NPU5-specific derivations (split vs broadcast, dual-port DMA, barrier derivation, CMX budget,
@@ -336,6 +343,24 @@ interop; a Python `nl.*`-compatible shim.
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-06: **Phase 3b Step 0 done: VPUNN wired and calibrated on the device.** (1) VPUNN v1.10.2
+  built as a pybind module from a standalone clone (section 0); `tilelang/intel_npu/vpunn.py` costs a
+  GEMM tile as VPUX does (1x1 CONVOLUTION, ZXY, `W x H = M`, `N` output channels), plus a 1-D DMA cost.
+  (2) The DPU builtin gained the two workload-shape knobs VPUX chooses per workload, `spatial_x` and
+  `mpe` (CUBOID_4x16/8x16/16x16 as `(nthw_ntk, odu_nthw)` pairs (1,1)/(0,2)/(3,3), the ODU field set
+  with the stencil), reachable kernel-wide through `tl.intel_npu.dpu_spatial_x` / `dpu_mpe` until
+  `PlanWorkloads` sets them per op; the runtime publishes the DPU's own HWP counters (workloads, IDU and
+  ODU durations) in status words 4-6. (3) Calibration, `device/run_vpunn_calib_device.py`, 4 tile shapes
+  x 10 configurations x 2 repeat counts = 80 kernels, every golden PASS, UNPROFILED: **VPUNN's pick is
+  within 0.0-2.8% of the measured best on every shape** (ranking concordance 30-39 of 45 pairs), while the
+  runtime's default (x=4, CUBOID_16x16) is **36-42% slower than the best** (64x64x512: 1.564 vs 1.001 us;
+  64x64x2048: 4.33 vs 3.06 us = 2743 MAC/ns). Absolute: measured IDU time / VPUNN time at 1950 MHz has
+  median **1.58** (1.14-2.17; small workloads worst), so VPUNN is used for *ranking* and the ratio is the
+  calibration constant, as in VPUX. Evidence: `device/evidence/vpunn_calibration.json`, INDEX row.
+  Two findings recorded: the HWP `idu/odu_workload_duration` counters tick at the 19.2 MHz perf clock on
+  this box (npu_dsl SS690.2), so they are reported in microseconds; and a function-local `static constexpr`
+  array in SHAVE runtime code reads back wrong under moviCompile (it produced a full sweep of golden FAILs
+  before being replaced by ternaries), so the runtime holds no static tables.
 * 2026-11-06: **Pre-3b research filed (section 3.2).** `<user>` asked how VPUX tiles a GEMM and whether its
   tiling / multi-cluster / scheduling code can be used. Findings: MatMul is a grouped 1x1 convolution;
   tile count, SOH/SOK/Clustering and the DPU stencil per workload are all chosen by the VPUNN cost

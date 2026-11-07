@@ -107,8 +107,10 @@ PrimExpr AddressOf(const RegionInfo &r) {
 
 class IntelNpuTileOpLowerer : public StmtExprMutator {
 public:
-  IntelNpuTileOpLowerer(int64_t dpu_z_align, int64_t dpu_max_output_points)
-      : dpu_z_align_(dpu_z_align), dpu_max_output_points_(dpu_max_output_points) {}
+  IntelNpuTileOpLowerer(int64_t dpu_z_align, int64_t dpu_max_output_points, int64_t spatial_x,
+                        int64_t mpe)
+      : dpu_z_align_(dpu_z_align), dpu_max_output_points_(dpu_max_output_points),
+        spatial_x_(spatial_x), mpe_(mpe) {}
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const auto *call = op->value.as<CallNode>();
@@ -244,13 +246,25 @@ private:
           << " points exceeds the DPU's " << dpu_max_output_points_
           << " output points per workload; split the output tile";
     }
+    if (spatial_x_ < 0 || (spatial_x_ > 0 && M % spatial_x_ != 0)) {
+      TVM_FFI_THROW(ValueError) << "intel_npu: " << kIntelNpuDpuSpatialX << "=" << spatial_x_
+                                << " must be 0 or divide the gemm's M=" << M;
+    }
+    if (mpe_ < -1 || mpe_ > 2) {
+      TVM_FFI_THROW(ValueError) << "intel_npu: " << kIntelNpuDpuMpe << "=" << mpe_
+                                << " is not -1 (default), 0 (CUBOID_4x16), 1 (CUBOID_8x16) or 2 "
+                                   "(CUBOID_16x16)";
+    }
     auto i32 = [](int64_t v) { return IntImm(DataType::Int(32), v); };
     return Evaluate(Call(DataType::Handle(), intel_npu_dpu_matmul(),
-                         {AddressOf(c), AddressOf(a), AddressOf(b), i32(M), i32(N), i32(K)}));
+                         {AddressOf(c), AddressOf(a), AddressOf(b), i32(M), i32(N), i32(K),
+                          i32(spatial_x_), i32(mpe_)}));
   }
 
   int64_t dpu_z_align_;
   int64_t dpu_max_output_points_;
+  int64_t spatial_x_;
+  int64_t mpe_;
 };
 
 } // namespace
@@ -266,7 +280,10 @@ tvm::transform::Pass LowerIntelNpuTileOp() {
       max_points =
           target.value()->GetAttr<Integer>("dpu_max_output_points").value_or(Integer(8192)).IntValue();
     }
-    IntelNpuTileOpLowerer lowerer(z_align, max_points);
+    const int64_t spatial_x =
+        ctx->GetConfig<Integer>(kIntelNpuDpuSpatialX, Integer(0)).value().IntValue();
+    const int64_t mpe = ctx->GetConfig<Integer>(kIntelNpuDpuMpe, Integer(-1)).value().IntValue();
+    IntelNpuTileOpLowerer lowerer(z_align, max_points, spatial_x, mpe);
     func.CopyOnWrite()->body = lowerer(func->body);
     return func;
   };

@@ -127,21 +127,51 @@ public:
   }
 
   // out[M,N] = a[M,K] . bt[N,K]^T, fp16, one DPU workload. Overwrites out.
+  // spatialX 0 keeps DpuMatMul::init's M split; mpe -1 keeps its stencil, else
+  // 0/1/2 = CUBOID_4x16/8x16/16x16 as (nthw_ntk, odu_nthw) pairs. The ODU nthw
+  // must change with nthw_ntk or output rows come back permuted (npu_dsl Round 705).
   void dpu_matmul(half *out, const half *a, const half *bt, std::uint32_t M,
-                  std::uint32_t N, std::uint32_t K) {
+                  std::uint32_t N, std::uint32_t K, std::uint32_t spatialX = 0,
+                  std::int32_t mpe = -1) {
     if (!ok_)
       return;
     if (N > kMaxDpuN) {
       fail(kStatusUnsupported, N);
       return;
     }
+    if (spatialX != 0 && M % spatialX != 0) {
+      fail(kStatusBadParams, spatialX);
+      return;
+    }
+    if (mpe < -1 || mpe > 2) {
+      fail(kStatusBadParams, static_cast<std::uint32_t>(mpe));
+      return;
+    }
     const std::uint64_t key = (static_cast<std::uint64_t>(M) << 40) |
                               (static_cast<std::uint64_t>(N) << 20) | K;
-    if (key != mmKey_) {
+    const std::uint32_t shapeKey = (spatialX << 8) | static_cast<std::uint32_t>(mpe + 1);
+    if (key != mmKey_ || shapeKey != mmShapeKey_) {
       mm_->init(M, N, K);
+      if (spatialX != 0)
+        mm_->setSpatial(M, spatialX);
+      if (mpe >= 0) {
+        // No static tables: a function-local static array misreads on the SHAVE.
+        const std::uint32_t nthwNtk = mpe == 0 ? 1u : (mpe == 1 ? 0u : 3u);
+        const std::uint32_t oduNthw = mpe == 0 ? 1u : (mpe == 1 ? 2u : 3u);
+        mm_->setStencil(nthwNtk, oduNthw);
+      }
       mmKey_ = key;
+      mmShapeKey_ = shapeKey;
     }
     mm_->run(out, const_cast<half *>(a), const_cast<half *>(bt));
+    // DPU hardware profile of the workload just completed. The duration fields
+    // sit before the odu_workload_id watermark wait() spins on, so they are
+    // committed; the timestamps after it may still be in flight and are not read.
+    // Durations count 19.2 MHz perf-clock ticks on this box (npu_dsl SS690.2).
+    volatile const DpuMatMul::DescriptorsBuffer *d = dpuDesc_;
+    dpuCount_ += 1;
+    dpuIduTicks_ += d->hwpStats.idu_workload_duration;
+    dpuOduTicks_ += d->hwpStats.odu_workload_duration;
   }
 
   // Barriers. DMA is synchronous in Phase 1-2, so only SHAVE-side writes need
@@ -213,16 +243,22 @@ public:
     return false;
   }
 
-  // Writes the per-SHAVE status record: {code, detail, cmx_free_at_entry, cmx_used}.
+  // Writes the per-SHAVE status record: {code, detail, cmx_free_at_entry, cmx_used,
+  // dpu_workloads, dpu_idu_ticks, dpu_odu_ticks, 0}.
   void finish() {
     if (statusAddr_ == 0)
       return;
     const std::uint64_t a = statusAddr_ + 32ull * worker();
-    DdrAccessor<std::uint32_t> s0(a), s1(a + 4), s2(a + 8), s3(a + 12);
+    DdrAccessor<std::uint32_t> s0(a), s1(a + 4), s2(a + 8), s3(a + 12), s4(a + 16), s5(a + 20),
+        s6(a + 24), s7(a + 28);
     s0 = ok_ ? kStatusOk : code_;
     s1 = detail_;
     s2 = cmxFree0_;
     s3 = cmxFree0_ - cmx_.getAvailableSize();
+    s4 = dpuCount_;
+    s5 = dpuIduTicks_;
+    s6 = dpuOduTicks_;
+    s7 = 0;
     sync::memoryFence();
   }
 
@@ -337,6 +373,8 @@ private:
   alignas(DpuMatMul) unsigned char mmStore_[sizeof(DpuMatMul)];
   DpuMatMul *mm_{nullptr};
   std::uint64_t mmKey_{~0ull};
+  std::uint32_t mmShapeKey_{~0u};
+  std::uint32_t dpuCount_{0}, dpuIduTicks_{0}, dpuOduTicks_{0};
 };
 
 } // namespace npu

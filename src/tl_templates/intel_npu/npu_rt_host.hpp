@@ -136,11 +136,16 @@ public:
   }
 
   void dpu_matmul(half *out, const half *a, const half *bt, std::uint32_t M, std::uint32_t N,
-                  std::uint32_t K) {
+                  std::uint32_t K, std::uint32_t spatialX = 0, std::int32_t mpe = -1) {
     if (!ok_)
       return;
     if (N > kMaxDpuN) {
       fail(kStatusUnsupported, N);
+      return;
+    }
+    // The workload shape only changes the DPU's rate, never its result.
+    if ((spatialX != 0 && M % spatialX != 0) || mpe < -1 || mpe > 2) {
+      fail(kStatusBadParams, spatialX);
       return;
     }
     for (std::uint32_t m = 0; m < M; ++m) {

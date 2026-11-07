@@ -46,7 +46,8 @@ def test_gemm_source_has_dma_and_dpu_calls():
     assert "ctx.alloc<half>(32768);" in src  # A tile: 64 x 512
     # A tile: 64 rows of 512 halves = 1024 B, source row stride 1024 B
     assert ", 1024, 64, 1024, 1024);" in src
-    assert "ctx.dpu_matmul(" in src and ", 64, 64, 512);" in src
+    # default workload shape: runtime's own spatial split (0) and stencil (-1)
+    assert "ctx.dpu_matmul(" in src and ", 64, 64, 512, 0, -1);" in src
     # C block: 64 rows of 64 halves = 128 B into rows of 256 halves = 512 B
     assert "ctx.dma_store(" in src and ", 128, 64, 512, 128);" in src
 
