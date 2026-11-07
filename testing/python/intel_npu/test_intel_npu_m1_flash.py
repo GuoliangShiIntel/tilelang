@@ -55,21 +55,38 @@ def _reference(q, k, vt):
 
 def test_pipelined_phase_lowers_to_two_rings_over_one_loop():
     src = _lower(make_flash_attention_phase(NUMQ, NUMKV, D=D, BQ=BQ, BKV=BKV, tiles=TILES)).source
-    assert "npu::Ctx::Ring ring = ctx.ring_begin((&(k_cmx[0])), 16384, 2, 8, 8, 12);" in src
-    assert "npu::Ctx::Ring ring_1 = ctx.ring_begin((&(v_cmx[0])), 16384, 2, 8, 16, 20);" in src
+    assert "npu::Ctx::Ring ring = ctx.ring_begin((&(k_cmx[0])), 16384, 2, 8, 8, 12, 0);" in src       # stream 0 on port 0
+    assert "npu::Ctx::Ring ring_1 = ctx.ring_begin((&(v_cmx[0])), 16384, 2, 8, 16, 20, 1);" in src   # stream 1 on port 1
     # K chunk: 128 rows of 128 B, contiguous; Vt chunk: 64 rows of 256 B, 2048 B apart (2-D fill)
     assert "ctx.ring_fill(ring, 0, (&(K[(shave * 8192)])), 128, 128, 128);" in src
     assert "ctx.ring_fill(ring_1, 0, (&(Vt[(shave * 128)])), 256, 64, 2048);" in src
     # general body: each gemm reads its ring's slot, waits, then the issuer fills use u+1
-    assert re.search(r"ring_dpu_submit\(ring, u, \(&\(s_cmx\[0\]\)\), \(&\(q_cmx\[0\]\)\), ctx\.ring_slot<half>\(ring\), 32, 128, 64", src)
-    assert re.search(r"ring_dpu_submit\(ring_1, u, \(&\(pv_cmx\[0\]\)\), \(&\(s_cmx\[0\]\)\), ctx\.ring_slot<half>\(ring_1\), 32, 64, 128", src)
+    assert re.search(r"ring_dpu_submit\(ring, u, \(&\(s_cmx\[0\]\)\), \(&\(q_cmx\[0\]\)\), ctx\.ring_slot<half>\(ring, u\), 32, 128, 64", src)
+    assert re.search(r"ring_dpu_submit\(ring_1, u, \(&\(pv_cmx\[0\]\)\), \(&\(s_cmx\[0\]\)\), ctx\.ring_slot<half>\(ring_1, u\), 32, 64, 128", src)
     assert "ctx.ring_dpu_wait(ring, u);\n  ctx.ring_fill(ring, (u + 1)," in src.replace("    ", "  ")
     assert src.count("ctx.ring_end(") == 2
     assert "ring: READY 8..11, FREE 12..15; ring_1: READY 16..19, FREE 20..23" in src
     assert "by reuse" not in src                                             # both live at once: no sharing
     assert "2 gemms with SHAVE statements between, no submit-ahead" in src
+    assert "SHAVE s owns 1 slot(s), fills 1 use(s) ahead" in src
     assert "q_cmx: SEGMENTED resident in a loop, 32 rows split 16 per SHAVE, tile sync before and after" in src
     assert "ctx.dpu_matmul(" not in src
+
+
+def test_ring_depth_two_per_shave_fills_two_uses_ahead():
+    # num_stages=4 on 2 SHAVEs: each SHAVE owns 2 slots, the prologue fills uses 0 and 1 of every stream,
+    # the body refills use u+2 after use u's gemm, and each ring takes 4 x 4 = 16 ids.
+    src = _lower(make_flash_attention_phase(NUMQ, NUMKV, D=D, BQ=BQ, BKV=BKV, tiles=TILES, num_stages=4)).source
+    assert "half* __restrict k_cmx = ctx.alloc_shared<half>(32768);" in src        # 4 slots x 128 x 64
+    assert "ctx.ring_begin((&(k_cmx[0])), 16384, 4, 8, 8, 16, 0);" in src
+    assert "ctx.ring_begin((&(v_cmx[0])), 16384, 4, 8, 24, 32, 1);" in src
+    assert "ctx.ring_fill(ring, 0, (&(K[(shave * 8192)])), 128, 128, 128);" in src
+    assert "ctx.ring_fill(ring, 1, (&(K[((shave * 8192) + 16384)])), 128, 128, 128);" in src
+    assert "ctx.ring_fill(ring, (u + 2)," in src and "ctx.ring_fill(ring_1, (u + 2)," in src
+    assert "READY 8..15, FREE 16..23; ring_1: READY 24..31, FREE 32..39" in src
+    assert "SHAVE s owns 2 slot(s), fills 2 use(s) ahead" in src
+    with pytest.raises(Exception, match=r"num_stages=3\) on a tile with 2 SHAVEs: the ring depth must be a multiple"):
+        _lower(make_flash_attention_phase(NUMQ, NUMKV, D=D, BQ=BQ, BKV=BKV, tiles=TILES, num_stages=3))
 
 
 def test_serial_phase_has_no_ring():

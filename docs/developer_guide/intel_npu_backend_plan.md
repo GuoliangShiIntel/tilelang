@@ -465,6 +465,12 @@ interop; a Python `nl.*`-compatible shim.
    lost READY is therefore a property of the toolkit's `DmaDrv40xx` trap/fence chain, not of the DMA; the
    question to the toolkit owner is whether `start` may be called on a chain whose previous job is still in
    flight.
+7. **Per-workload latency of a barrier-gated DPU workload (2026-11-07, M1 3c).** With the SHAVE submitting one
+   0.2 us workload and waiting for it, the round trip costs 2-3 us: ~0.7 us on the SHAVE (descriptor writes,
+   barrier fields, FIFO push, CMX flush) and the rest between the consumer barrier lifting and the IDU starting,
+   and between the ODU finishing and the producer barrier decrementing / the watermark landing. What are those
+   two hardware latencies on NPU5? They bound how far "submit ahead and never wait per workload" can go, and
+   whether tiny workloads (decode, M = 1) should be batched into one DPU task list the way VPUX does.
 
 ## 9. Model target: Qwen3.8-35B-A3B-Distill, and what it needs (2026-11-06)
 
@@ -493,6 +499,26 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-07: **M1 step 3c (continued): where the flash phase's time goes, and four generic fixes.** Instrument
+  first: the ring path now accumulates six per-SHAVE phase counters (live-wait, order-wait, submit, dpu-wait,
+  free-wait, fill-issue; NCE_TIME ticks) into the status record's extra words, and `run_flash_device.py --floor`
+  runs the phase with no SHAVE math (output wrong by design) to expose the protocol floor. Findings on
+  960x1024x64 TURBO: floor 0.675 ms of 1.327; per workload the **submit cost 1.9 us** because the two gemm
+  shapes (QK^T 32x128x64, PV 32x64x128) alternate and the one DPU descriptor set was re-initialised every time
+  (the single-shape flow: 0.66 us); **fill issue 1.5 us** because both rings split every fill over both ports and
+  the one-in-flight-per-port rule serialised K behind V; the fill's fixed latency was NOT on the critical path
+  (ring depth 4 -- two slots per SHAVE, fills two uses ahead, now supported: `num_stages` a multiple of the
+  SHAVEs, ids 4 x slots, `ring_arm` at fill-or-submit -- moved nothing). Fixes, all generic: (1) `Ctx` keeps
+  **two DPU descriptor sets, LRU by shape** (budget reserve 32 -> 72 KiB); (2) with several streams in one loop
+  **each stream's fill is one descriptor on its own port** (`ring_begin(..., port)`, -1 = halves on both for a
+  single stream), so K and V fills run concurrently; (3) `__restrict` on allocations and `tl_npu_vmax/vsum`
+  lane reductions (above); (4) the per-Q-block init, partial copy and merge vectorised in the source (`part` row
+  stride padded to a vector multiple). **Result: 1.181 ms, floor 0.536 ms**; ring phases are now 0.13-0.2 ms of
+  the 1.18. What remains: SHAVE math ~0.55 ms (static count; the row loop is still 57% NOP) and **~35 us per
+  Q block outside the ring**: two `ring_begin` grid rendezvous, the Q fill with two tile syncs, the merge. Next:
+  hoist a ring whose fills do not reference the enclosing serial loop's variable out of that loop (one
+  begin/end per kernel instead of per Q block), then submit QK^T(u+1) before softmax(u) (multi-gemm
+  submit-ahead). Hardware question 7 asks for the DPU gate/complete latencies this protocol pays per workload.
 * 2026-11-07: **Turbo, and hardware facts with provenance.** (1) `<user>` pointed at the VPUX knowledge base
   (`applications.ai.vpu-accelerators.vpux-plugin/knowledges`): it already held what this plan had been
   measuring and asking for: the NPU5010 CMX workspace of 1439 KiB (`compiler/platform-resources.md#3`; equals the

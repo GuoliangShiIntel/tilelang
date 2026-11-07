@@ -30,7 +30,7 @@ namespace {
 // Mirrors Ctx in src/tl_templates/intel_npu/npu_rt_device.hpp: alignment of
 // every allocation, and the bytes the runtime takes before the kernel's first.
 constexpr int64_t kAlign = 64;
-constexpr int64_t kRuntimeReserveBytes = 32 * 1024;
+constexpr int64_t kRuntimeReserveBytes = 72 * 1024;  // 2 DPU descriptor sets x 2 SHAVEs x 16 KiB weight table + descriptors
 
 int64_t AlignUp(int64_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
 

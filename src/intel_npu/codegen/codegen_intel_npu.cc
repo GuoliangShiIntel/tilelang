@@ -209,7 +209,7 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
     return;
   }
   if (op->op.same_as(tl::intel_npu_ring_begin())) {
-    os << "ctx.ring_begin(" << args(0, 6) << ")";
+    os << "ctx.ring_begin(" << args(0, 7) << ")";
     return;
   }
   if (op->op.same_as(tl::intel_npu_ring_uses())) {
@@ -218,7 +218,7 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
   }
   if (op->op.same_as(tl::intel_npu_ring_slot())) {
     // fp16 is the only DPU operand type lowered today.
-    os << "ctx.ring_slot<half>(" << args(0, 1) << ")";
+    os << "ctx.ring_slot<half>(" << args(0, 2) << ")";
     return;
   }
   if (op->op.same_as(tl::intel_npu_ring_fill())) {

@@ -27,13 +27,12 @@ static inline void ring_flow(npu::Ctx &ctx, npu::Ddr<half> X, npu::Ddr<half> W, 
   ctx.sync_tile();
   const std::uint32_t nchunks = M / BM;
   npu::Ctx::Ring ring = ctx.ring_begin(X_cmx, BM * K * sizeof(half), 2, nchunks, kReadyBase, kFreeBase);
-  const half *X_slot = ctx.ring_slot<half>(ring);
   ctx.ring_fill(ring, 0, (&(X[(ctx.ring_chunk(0) * BM) * K])), K * 2, BM, K * 2);
-  ctx.ring_dpu_submit(ring, 0, Y_cmx, X_slot, W_cmx, BM, BN, K, 4, 0);  // VPUNN: CUBOID_4x16 x=4 for 32x256x1024
+  ctx.ring_dpu_submit(ring, 0, Y_cmx, ctx.ring_slot<half>(ring, 0), W_cmx, BM, BN, K, 4, 0);  // VPUNN: CUBOID_4x16 x=4 for 32x256x1024
   for (std::uint32_t u = 0; u < ctx.ring_uses(ring); ++u) {
     const std::uint32_t c = ctx.ring_chunk(u);
     ctx.ring_dpu_wait(ring, u);
-    ctx.ring_dpu_submit(ring, u + 1, Y_cmx + ((u + 1) & 1u) * BM * BN, X_slot, W_cmx, BM, BN, K, 4, 0);
+    ctx.ring_dpu_submit(ring, u + 1, Y_cmx + ((u + 1) & 1u) * BM * BN, ctx.ring_slot<half>(ring, u + 1), W_cmx, BM, BN, K, 4, 0);
     ctx.ring_fill(ring, u + 1, (&(X[(ctx.ring_chunk(u + 1) * BM) * K])), K * 2, BM, K * 2);
     ctx.dma_store(&(Y[(c * BM) * N + tile * BN]), Y_cmx + (u & 1u) * BM * BN, BN * 2, BM, N * 2, BN * 2);
   }

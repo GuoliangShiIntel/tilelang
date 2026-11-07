@@ -259,10 +259,12 @@ class _Pipeline:
         self.stages = int(loop.annotations["num_stages"])
         if _const(loop.min) != 0:
             raise ValueError("intel_npu: a pipelined loop must start at 0")
-        if self.stages != launch.shaves:
+        if self.stages % launch.shaves != 0 or self.stages == 0:
             raise ValueError(
                 f"intel_npu: T.Pipelined(num_stages={self.stages}) on a tile with {launch.shaves} SHAVEs: the "
-                f"ring depth must equal the SHAVEs per tile (slot = SHAVE, README section 3)")
+                f"ring depth must be a multiple of the SHAVEs per tile (SHAVE s owns slots s, s + {launch.shaves}, "
+                f"...; README section 3)")
+        self.depth = self.stages // launch.shaves   # slots per SHAVE: fills issued this many uses ahead
         if launch.tiles < 2:
             raise ValueError(
                 "intel_npu: the hardware ring needs at least 2 tiles (one tile has no multicast and a barrier "
@@ -312,7 +314,7 @@ def LowerIntelNpuPipelined():
 
         def submit(st, use, out_addr):
             da = list(st.gemm.value.args)
-            slot = tirx.Call("handle", _op(RING_SLOT), [st.ring])
+            slot = tirx.Call("handle", _op(RING_SLOT), [st.ring, use])
             a = slot if st.stream_is_a else da[1]
             bt = da[2] if st.stream_is_a else slot
             args = [st.ring, use, out_addr, a, bt] + list(da[3:8])
@@ -322,9 +324,13 @@ def LowerIntelNpuPipelined():
             return tirx.Evaluate(tirx.Call("handle", _op(RING_WAIT), [st.ring, use]))
 
         def begin(st, p):
+            # one stream: each fill split in two halves over both ports; several streams: stream i whole on
+            # port i % 2, so the streams' fills run concurrently (one job in flight per port per SHAVE)
+            port = -1 if len(p.streams) == 1 else p.streams.index(st) % 2
             return tirx.Bind(st.ring, tirx.Call("handle", _op(RING_BEGIN),
                                                 [_address_of(st.slots, [_i32(0)] * len(st.slots.shape)),
-                                                 _i32(st.slot_bytes), _i32(p.stages), _i32(p.total), _i32(-1), _i32(-1)]))
+                                                 _i32(st.slot_bytes), _i32(p.stages), _i32(p.total), _i32(-1), _i32(-1),
+                                                 _i32(port)]))
 
         def end(st):
             return tirx.Evaluate(tirx.Call("handle", _op(RING_END), [st.ring]))
@@ -354,13 +360,14 @@ def LowerIntelNpuPipelined():
                 return substitute(tirx.Evaluate(tirx.Call(s.value.dtype, s.value.op, sa)), {p.c: chunk(use)})
 
             uses = tirx.floordiv(_i32(p.total) - tx + _i32(spt - 1), _i32(spt))
-            loop_body = tirx.SeqStmt([wait(st, u), submit(st, u + 1, out_addr(tirx.floormod(u + 1, 2))), fill(st, u + 1)]
+            loop_body = tirx.SeqStmt([wait(st, u), submit(st, u + 1, out_addr(tirx.floormod(u + 1, 2))), fill(st, u + p.depth)]
                                      + [store(s, u, tirx.floormod(u, 2)) for s in p.stores])
             notes.append(f"ring over {p.c.name} ({p.total} chunks of {st.slot_bytes} B into {st.slot_buf.name}"
-                         f"[{p.stages} slots], SHAVE s owns slot s, output {out_buf.name} x2 by use parity, "
-                         f"submit-ahead; issuer tile 0, two halves on ports 0/1)")
-            return tirx.SeqStmt([begin(st, p), fill(st, _i32(0)), submit(st, _i32(0), out_addr(_i32(0))),
-                                 tirx.For(u, _i32(0), uses, tirx.ForKind.SERIAL, loop_body), end(st)])
+                         f"[{p.stages} slots], SHAVE s owns {p.depth} slot(s), fills {p.depth} use(s) ahead, output "
+                         f"{out_buf.name} x2 by use parity, submit-ahead; issuer tile 0, two halves on ports 0/1)")
+            return tirx.SeqStmt([begin(st, p)] + [fill(st, _i32(k)) for k in range(p.depth)]
+                                + [submit(st, _i32(0), out_addr(_i32(0))),
+                                   tirx.For(u, _i32(0), uses, tirx.ForKind.SERIAL, loop_body), end(st)])
 
         def lower_general(p: _Pipeline):
             # Several streams and SHAVE statements between the gemms: the body runs in the author's order
@@ -378,13 +385,14 @@ def LowerIntelNpuPipelined():
                 if hit:
                     st = hit[0]
                     out_addr = st.gemm.value.args[0]
-                    seq += [submit(st, u, out_addr), wait(st, u), fill(st, u + 1)]
+                    seq += [submit(st, u, out_addr), wait(st, u), fill(st, u + p.depth)]
                 else:
                     seq.append(substitute(s, {p.c: chunk(u)}))
-            prologue = [begin(st, p) for st in p.streams] + [fill(st, _i32(0)) for st in p.streams]
+            prologue = [begin(st, p) for st in p.streams] + [fill(st, _i32(k)) for k in range(p.depth) for st in p.streams]
             notes.append(f"ring over {p.c.name} ({p.total} chunks; streams " +
                          ", ".join(f"{st.slot_buf.name}[{p.stages} slots, {st.slot_bytes} B]" for st in p.streams) +
-                         f"; SHAVE s owns slot s; {len(p.gemms)} gemms with SHAVE statements between, no submit-ahead)")
+                         f"; SHAVE s owns {p.depth} slot(s), fills {p.depth} use(s) ahead; {len(p.gemms)} gemms with SHAVE "
+                         f"statements between, no submit-ahead)")
             return tirx.SeqStmt(prologue + [tirx.For(u, _i32(0), uses, tirx.ForKind.SERIAL, tirx.SeqStmt(seq))]
                                 + [end(st) for st in p.streams])
 

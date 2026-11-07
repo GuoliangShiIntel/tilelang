@@ -32,13 +32,13 @@ TIR_DEFINE_TL_BUILTIN(intel_npu_dpu_matmul)
                                Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_begin)
-    .set_num_inputs(6)
+    .set_num_inputs(7)
     .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_uses)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure));
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_slot)
-    .set_num_inputs(1)
+    .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure));
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_fill)
     .set_num_inputs(6)

@@ -189,13 +189,18 @@ def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32,
             corr = T.alloc_local((BQ,), T.float32)
             mx = T.alloc_local((HL,), T.float16)           # lane accumulators (vectorized path)
             ls = T.alloc_local((FL,), T.float32)
-            part = T.alloc_shared((shaves, BQ, D + 2), T.float32)  # per-SHAVE (O, m, l) for the merge
+            part = T.alloc_shared((shaves, BQ, D + FL), T.float32)  # per-SHAVE (O, m, l) for the merge; row stride a vector multiple
             # Q blocks dealt round-robin over the tiles; each block is one pass over the whole KV
             for qb in T.serial(QB):
                 T.copy(Q[(qb * tiles + tile) * BQ, 0], q_cmx)
                 # T.fill is a Phase 4 tile op (refused today); the scalar loops lower
-                for i, d in T.grid(BQ, D):
-                    o_acc[i, d] = T.float32(0)
+                if vectorized:
+                    for i, d0 in T.grid(BQ, D // FL):
+                        for v in T.vectorized(FL):
+                            o_acc[i, d0 * FL + v] = T.float32(0)
+                else:
+                    for i, d in T.grid(BQ, D):
+                        o_acc[i, d] = T.float32(0)
                 for i in T.serial(BQ):
                     m_i[i] = T.float32(-1e30)
                     l_i[i] = T.float32(0)
@@ -252,8 +257,13 @@ def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32,
                         for i, d in T.grid(BQ, D):
                             o_acc[i, d] = o_acc[i, d] * corr[i] + T.cast(pv_cmx[i, d], T.float32)
                 # merge the two SHAVEs' partials in the tile, SHAVE 0 writes the block
-                for i, d in T.grid(BQ, D):
-                    part[shave, i, d] = o_acc[i, d]
+                if vectorized:
+                    for i, d0 in T.grid(BQ, D // FL):
+                        for v in T.vectorized(FL):
+                            part[shave, i, d0 * FL + v] = o_acc[i, d0 * FL + v]
+                else:
+                    for i, d in T.grid(BQ, D):
+                        part[shave, i, d] = o_acc[i, d]
                 for i in T.serial(BQ):
                     part[shave, i, D] = m_i[i]
                     part[shave, i, D + 1] = l_i[i]
@@ -263,9 +273,18 @@ def make_flash_attention_phase(numQ: int, numKv: int, D: int = 64, BQ: int = 32,
                         m_new[i] = T.max(part[0, i, D], part[1, i, D])
                         corr[i] = T.exp(part[0, i, D] - m_new[i])
                         l_i[i] = T.exp(part[1, i, D] - m_new[i])
-                        for d in T.serial(D):
-                            o_out[i, d] = T.cast((part[0, i, d] * corr[i] + part[1, i, d] * l_i[i]) /
-                                                 (part[0, i, D + 1] * corr[i] + part[1, i, D + 1] * l_i[i]), T.float16)
+                        if vectorized:
+                            # the row's two weights over the merged denominator, then one fused vector update
+                            m_i[i] = T.float32(1) / (part[0, i, D + 1] * corr[i] + part[1, i, D + 1] * l_i[i])
+                            corr[i] = corr[i] * m_i[i]
+                            l_i[i] = l_i[i] * m_i[i]
+                            for d0 in T.serial(D // FL):
+                                for v in T.vectorized(FL):
+                                    o_out[i, d0 * FL + v] = T.cast(part[0, i, d0 * FL + v] * corr[i] + part[1, i, d0 * FL + v] * l_i[i], T.float16)
+                        else:
+                            for d in T.serial(D):
+                                o_out[i, d] = T.cast((part[0, i, d] * corr[i] + part[1, i, d] * l_i[i]) /
+                                                     (part[0, i, D + 1] * corr[i] + part[1, i, D + 1] * l_i[i]), T.float16)
                     T.copy(o_out, O[(qb * tiles + tile) * BQ, 0])
 
     return flash
