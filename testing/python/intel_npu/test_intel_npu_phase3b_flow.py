@@ -129,8 +129,39 @@ def test_barrier_pool_exhaustion_is_refused():
                 T.gemm(X_cmx, W_cmx, Y_cmx, transpose_B=True, clear_accum=True)
                 T.copy(Y_cmx, Y[c * BM, tile * BN])
 
-    with pytest.raises(Exception, match=r"3 ring\(s\) need 24 hardware barrier ids .* short by 3"):
-        _src(three)
+    # three rings one after another: each begins after the previous ended, so all three share one block
+    src = _src(three)
+    assert src.count("READY 8..11, FREE 12..15") == 3 and "READY 16" not in src
+    assert "3 rings, 1 live at once, 8 ids by reuse" in src
+    assert src.count("ctx.ring_begin((&(X_cmx[0])), 65536, 2, 16, 8, 12);") == 3
+
+    # three operands streamed through ONE loop are three rings live at once: 24 ids do not fit in 21
+    @T.prim_func
+    def three_at_once(X1: T.Tensor((M, K), T.float16), X2: T.Tensor((M, K), T.float16), X3: T.Tensor((M, K), T.float16),
+                      W: T.Tensor((N, K), T.float16), Y1: T.Tensor((M, N), T.float16), Y2: T.Tensor((M, N), T.float16),
+                      Y3: T.Tensor((M, N), T.float16)):
+        with T.Kernel(tiles, threads=2) as tile:
+            W_cmx = T.alloc_shared((BN, K), T.float16)
+            X1_cmx = T.alloc_shared((BM, K), T.float16)
+            X2_cmx = T.alloc_shared((BM, K), T.float16)
+            X3_cmx = T.alloc_shared((BM, K), T.float16)
+            Y1_cmx = T.alloc_local((BM, BN), T.float16)
+            Y2_cmx = T.alloc_local((BM, BN), T.float16)
+            Y3_cmx = T.alloc_local((BM, BN), T.float16)
+            T.copy(W[tile * BN, 0], W_cmx)
+            for c in T.Pipelined(M // BM, num_stages=2):
+                T.copy(X1[c * BM, 0], X1_cmx)
+                T.copy(X2[c * BM, 0], X2_cmx)
+                T.copy(X3[c * BM, 0], X3_cmx)
+                T.gemm(X1_cmx, W_cmx, Y1_cmx, transpose_B=True, clear_accum=True)
+                T.gemm(X2_cmx, W_cmx, Y2_cmx, transpose_B=True, clear_accum=True)
+                T.gemm(X3_cmx, W_cmx, Y3_cmx, transpose_B=True, clear_accum=True)
+                T.copy(Y1_cmx, Y1[c * BM, tile * BN])
+                T.copy(Y2_cmx, Y2[c * BM, tile * BN])
+                T.copy(Y3_cmx, Y3[c * BM, tile * BN])
+
+    with pytest.raises(Exception, match=r"3 ring\(s\), 3 live at once, need 24 hardware barrier ids .* short by 3"):
+        _src(three_at_once)
 
 
 # -- the flow checker on recorded traces (device/evidence) -------------------------------------

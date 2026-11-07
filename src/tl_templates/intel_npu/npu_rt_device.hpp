@@ -58,6 +58,7 @@ enum : std::uint32_t {
   kStatusRingRefused = 7,    // detail: reason code (ring_* below)
   kStatusOrderTimeout = 8,   // detail: the DPU submission-order word waited for
   kStatusDpuTimeout = 9,     // detail: the ring use whose DPU workload never completed
+  kStatusDmaTimeout = 10,    // detail: which ring fill descriptor never set its watermark (see dma_wait)
 };
 
 template <class T> struct Ddr;
@@ -287,9 +288,17 @@ public:
         return;
       barrier_consume(freeId);
       // The previous halves have completed (READY lifted); the chains still need the wait.
-      dma_.wait(r.fill);
-      dma_.wait(r.fill + 1);
+      if (!dma_wait(r.fill, 1) || !dma_wait(r.fill + 1, 2))
+        return;
     }
+    // One descriptor of this SHAVE in flight per port: a second start while another
+    // ring's fill is still running on the port left one half unproduced (flash phase,
+    // two rings; READY stuck at p=1). Before initDesc below: it clears the watermark
+    // this wait reads when the previous descriptor is this ring's own.
+    port_retire(0);
+    port_retire(1);
+    if (!ok_)
+      return;
     const std::uint32_t mask = (1u << tiles_) - 1u;
     std::uint8_t *dst = ring_slot(r);
     const std::uint32_t ready = ring_ready(r, use);
@@ -312,11 +321,6 @@ public:
     DmaDrv::setProducerBarrier(r.fill + 1, ready);
     DmaDrv::setConsumerBarriers(r.fill, 0, 0);
     DmaDrv::setConsumerBarriers(r.fill + 1, 0, 0);
-    // One descriptor of this SHAVE in flight per port: a second start while another
-    // ring's fill is still running on the port left one half unproduced (flash phase,
-    // two rings; READY stuck at p=1).
-    port_retire(0);
-    port_retire(1);
     dma_.start(r.fill, 0);
     dma_.start(r.fill + 1, 1);
     lastOnPort_[0] = r.fill;
@@ -388,8 +392,8 @@ public:
   void ring_end(Ring &r) {
     if (!ok_ || tile_ != 0 || r.myUses == 0)
       return;
-    dma_.wait(r.fill);
-    dma_.wait(r.fill + 1);
+    if (!dma_wait(r.fill, 3) || !dma_wait(r.fill + 1, 4))
+      return;
     if (lastOnPort_[0] == r.fill)
       lastOnPort_[0] = nullptr;
     if (lastOnPort_[1] == r.fill + 1)
@@ -574,9 +578,21 @@ private:
 
   void port_retire(int port) {
     if (lastOnPort_[port] != nullptr) {
-      dma_.wait(lastOnPort_[port]);
+      dma_wait(lastOnPort_[port], 5 + port);
       lastOnPort_[port] = nullptr;
     }
+  }
+
+  // The driver's wait (DmaDrvBase::wait) spins on the tail descriptor's watermark without a
+  // bound; the same test with one, so a fill that never completes is a report. `where`:
+  // 1/2 ring_fill previous halves, 3/4 ring_end, 5/6 port_retire.
+  bool dma_wait(volatile DmaDescriptor *tail, std::uint32_t where) {
+    for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
+      if (tail->watermark != 0)
+        return true;
+    }
+    fail(kStatusDmaTimeout, where);
+    return false;
   }
 
   bool order_wait(volatile std::uint32_t *word, std::uint32_t need) {

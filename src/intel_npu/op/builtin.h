@@ -25,6 +25,8 @@ static constexpr const char *kIntelNpuDpuSpatialX = "tl.intel_npu.dpu_spatial_x"
 static constexpr const char *kIntelNpuDpuMpe = "tl.intel_npu.dpu_mpe";
 // Pass config: PlanIntelNpuWorkloads mode, "auto" (VPUNN when available), "off", "require".
 static constexpr const char *kIntelNpuPlanWorkloads = "tl.intel_npu.plan_workloads";
+// False: AssignBarriers gives every ring fresh ids (device A/B of the id reuse across phases).
+static constexpr const char *kIntelNpuBarrierReuse = "tl.intel_npu.barrier_reuse";
 // AttrStmt key: free-text notes a pass leaves for the reader of the generated source
 // (what was planned, or what was skipped and why); a StringImm value, printed as a comment.
 // An AttrStmt rather than a PrimFunc attribute because SplitHostDevice keeps only a fixed

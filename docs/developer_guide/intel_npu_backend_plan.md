@@ -461,6 +461,24 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 * 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
+* 2026-11-07: **M1 step 2a: barrier id reuse across phases, device-verified.** `AssignIntelNpuBarriers`
+  colours rings by live range (`ring_begin`..`ring_end` in program order, first fit): rings one after another
+  share one block, rings live at once (the flash phase's two streams) never do; the note says `N rings, P live at
+  once, I ids by reuse`; the refusal counts live rings (`test_barrier_pool_exhaustion_is_refused`: three
+  sequential rings now fit in 8 ids, three operands streamed through one loop at 2 tiles are refused `3 live at
+  once, need 24 .. short by 3`). Soundness: `ring_end` leaves the issuer's slot ids quiescent (last FREE produced
+  by every DPU and consumed; READYs consumed before that) and `ring_begin` re-arms on the same SHAVE behind a
+  grid rendezvous. **Device** (`run_ring_flow_device.py --two-phase`, `kernels.make_ring_flow_two_phase`): both
+  phases PASS on ids 8..15, 1.563 ms for two flows = 2 x the single flow, so a phase boundary costs nothing;
+  `--no-reuse` (`tl.intel_npu.barrier_reuse=False`) is the A/B arm. **Found on the way, both in the runtime:**
+  (a) the per-port retire added in step 1 ran after `initDesc` of the same descriptor, so a single ring's next
+  fill waited on a watermark it had just cleared -- every single-ring kernel hung since step 1 (the flash phase,
+  with two rings alternating descriptors, could not see it); retire now precedes `initDesc`, and the single flow
+  (0.804 ms) and the flash phase (3.710 ms) re-pass. (b) The toolkit's `DmaDrvBase::wait` is unbounded; the ring
+  paths now use `dma_wait` with the barrier bound and status 10 `DMA_TIMEOUT` (detail says which wait), which is
+  how (a) became a status instead of a 120 s host timeout. Standing rule from the two: **no toolkit wait without a
+  bound on the kernel's control path** -- `mm_->wait()` and `dma_.wait()` remain only in the synchronous
+  Phase 1-2 paths (`dpu_matmul`, `dma_load/store`).
 * 2026-11-07: **M1 step 1: the flash-attention phase lowers through the generalised ring and passes its
   device golden.** Source `kernels.make_flash_attention_phase` (Q resident, K and Vt streamed in one
   `T.Pipelined` loop, two `T.gemm`, online softmax in fp32 scalar loops between them, merge of the two SHAVEs'

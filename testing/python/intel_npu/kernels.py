@@ -103,6 +103,33 @@ def make_ring_flow(M: int, N: int, K: int, BM: int = 32, BN: int = 256, tiles: i
     return ring_flow
 
 
+def make_ring_flow_two_phase(M: int, N: int, K: int, BM: int = 32, BN: int = 256, tiles: int = 3, shaves: int = 2,
+                             num_stages: int = 2):
+    """Two flows one after the other against the same resident W: Y1 = X1 . W^T then Y2 = X2 . W^T.
+    The second ring begins after the first has ended, so AssignBarriers gives both the same ids
+    (barrier id reuse across phases); the device golden checks both outputs."""
+    assert N == BN * tiles and M % BM == 0
+
+    @T.prim_func
+    def ring_flow_two_phase(X1: T.Tensor((M, K), T.float16), X2: T.Tensor((M, K), T.float16), W: T.Tensor((N, K), T.float16),
+                            Y1: T.Tensor((M, N), T.float16), Y2: T.Tensor((M, N), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            W_cmx = T.alloc_shared((BN, K), T.float16)
+            X_cmx = T.alloc_shared((BM, K), T.float16)
+            Y_cmx = T.alloc_local((BM, BN), T.float16)
+            T.copy(W[tile * BN, 0], W_cmx)
+            for c in T.Pipelined(M // BM, num_stages=num_stages):
+                T.copy(X1[c * BM, 0], X_cmx)
+                T.gemm(X_cmx, W_cmx, Y_cmx, transpose_B=True, clear_accum=True)
+                T.copy(Y_cmx, Y1[c * BM, tile * BN])
+            for c in T.Pipelined(M // BM, num_stages=num_stages):
+                T.copy(X2[c * BM, 0], X_cmx)
+                T.gemm(X_cmx, W_cmx, Y_cmx, transpose_B=True, clear_accum=True)
+                T.copy(Y_cmx, Y2[c * BM, tile * BN])
+
+    return ring_flow_two_phase
+
+
 def make_ring_flow_swapped(M: int, N: int, K: int, BM: int = 256, BN: int = 32, tiles: int = 3, shaves: int = 2,
                           num_stages: int = 2):
     """The flow with the roles swapped (activation-stationary, README section 1 "roles, not names"):

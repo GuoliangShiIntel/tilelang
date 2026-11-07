@@ -65,7 +65,8 @@ def test_pipelined_phase_lowers_to_two_rings_over_one_loop():
     assert re.search(r"ring_dpu_submit\(ring_1, u, \(&\(pv_cmx\[0\]\)\), \(&\(s_cmx\[0\]\)\), ctx\.ring_slot<half>\(ring_1\), 32, 64, 128", src)
     assert "ctx.ring_dpu_wait(ring, u);\n  ctx.ring_fill(ring, (u + 1)," in src.replace("    ", "  ")
     assert src.count("ctx.ring_end(") == 2
-    assert "READY 8..11, FREE 12..15; ring: READY 16..19, FREE 20..23" in src
+    assert "ring: READY 8..11, FREE 12..15; ring_1: READY 16..19, FREE 20..23" in src
+    assert "by reuse" not in src                                             # both live at once: no sharing
     assert "2 gemms with SHAVE statements between, no submit-ahead" in src
     assert "q_cmx: SEGMENTED resident, 32 rows split 16 per SHAVE, tile sync after" in src
     assert "ctx.dpu_matmul(" not in src

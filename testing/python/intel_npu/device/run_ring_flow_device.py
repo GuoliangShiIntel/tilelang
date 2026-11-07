@@ -23,9 +23,10 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
 import tilelang  # noqa: E402,F401  (puts tvm on the path for runner)
+import tvm  # noqa: E402
 import runner  # noqa: E402
 import lowering  # noqa: E402
-from kernels import make_ring_flow, make_ring_flow_swapped  # noqa: E402
+from kernels import make_ring_flow, make_ring_flow_swapped, make_ring_flow_two_phase  # noqa: E402
 
 M, K, N = 2048, 2048, 768
 BM, BN = 32, 256
@@ -37,6 +38,7 @@ def main(argv):
     global M, N, K, BM, BN
     hand = "--hand" in argv
     swapped = "--swapped" in argv
+    two_phase = "--two-phase" in argv
     if "--bm" in argv:
         BM = int(argv[argv.index("--bm") + 1])
     if "--bn" in argv:
@@ -57,6 +59,18 @@ def main(argv):
         for ln in source.splitlines():
             if "// intel_npu:" in ln:
                 print(ln.strip())
+    elif two_phase:
+        # two sequential rings on the same barrier ids (AssignBarriers reuse); both outputs checked.
+        # --no-reuse gives the second ring fresh ids: the A/B that isolates the reuse.
+        reuse = "--no-reuse" not in argv
+        kernel = f"tl_ring_flow_two_phase_bm{BM}_bn{BN}_k{K}" + ("" if reuse else "_noreuse")
+        with tvm.transform.PassContext(config={"tl.intel_npu.barrier_reuse": reuse}):
+            low = lowering.lower(make_ring_flow_two_phase(M, N, K, BM=BM, BN=BN, tiles=TILES, shaves=SHAVES))
+        source, names = low.source, low.param_names
+        for ln in source.splitlines():
+            if "// intel_npu:" in ln:
+                print(ln.strip())
+        assert ("2 rings, 1 live at once, 8 ids by reuse" in source) == reuse
     else:
         kernel = f"tl_ring_flow_bm{BM}_bn{BN}_k{K}"
         low = lowering.lower(make_ring_flow(M, N, K, BM=BM, BN=BN, tiles=TILES, shaves=SHAVES))
@@ -85,6 +99,10 @@ def main(argv):
         (HERE / "evidence").mkdir(exist_ok=True)
         profile = HERE / "evidence" / f"{kernel}_{M}x{N}x{K}_trace.json"
     by_name = {"X": ("in", x), "W": ("in", w_dev), "Y": ("out", y)}
+    if two_phase:
+        x2 = rng.standard_normal((M, K)).astype(np.float16)
+        y2 = np.zeros((M, N), np.float16)
+        by_name = {"X1": ("in", x), "X2": ("in", x2), "W": ("in", w_dev), "Y1": ("out", y), "Y2": ("out", y2)}
     res = runner.run(db, [by_name[n] for n in names], TILES, SHAVES, HERE / "run_ring_flow",
                      profile_json=profile, repeat=10, warmup=3, timeout_s=120)
     print(f"status per SHAVE (code, detail): {res.status[:, :2].tolist()}")
@@ -92,9 +110,15 @@ def main(argv):
     ref = x.astype(np.float32) @ w.astype(np.float32).T
     err = float(np.abs(y.astype(np.float32) - ref).max())
     rel = err / float(np.abs(ref).max())
+    if two_phase:
+        ref2 = x2.astype(np.float32) @ w.astype(np.float32).T
+        err2 = float(np.abs(y2.astype(np.float32) - ref2).max())
+        rel2 = err2 / float(np.abs(ref2).max())
+        print(f"phase 1 rel {rel:.2e}, phase 2 (reused ids) rel {rel2:.2e}")
+        err, rel = max(err, err2), max(rel, rel2)
     verdict = "PASS" if rel < 2e-3 else "FAIL"
     kind = "PROFILED (observability, not a timing)" if profile else "UNPROFILED"
-    ops = 2.0 * M * N * K
+    ops = 2.0 * M * N * K * (2 if two_phase else 1)
     idu_us_per_tile = [float(res.status[t * SHAVES:(t + 1) * SHAVES, 5].astype(np.int64).sum()) / PERF_CLK_MHZ for t in range(TILES)]
     wl_per_tile = [int(res.status[t * SHAVES:(t + 1) * SHAVES, 4].astype(np.int64).sum()) for t in range(TILES)]
     kus = res.median_kernel_ms * 1e3
