@@ -496,6 +496,21 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 
 ## 8. Log
 
+* 2026-11-08: **M5 step 2: scoped CMX, and one launch per decoder layer: 5.4 -> 13.7 tok/s by `<user>`'s measure.** (1)
+  **Scoped CMX** (the PlanCmx item, as scopes rather than live-range packing): `PlanAndUpdateBufferAllocationLocation`
+  sinks allocations into the loops that use them, `ScopeIntelNpuCmx` gives the phases between grid barriers their own
+  `lexical_alloc_scope` block and hoists any allocation out of a SHAVE-dependent branch (every SHAVE must run one
+  allocation sequence or shared buffers split), codegen brackets each allocating block with `npu::Ctx::CmxScope` (the
+  toolkit's `LinearAllocator` is a value: save, restore), `CheckIntelNpuBudgets` charges the peak nesting; kill switch
+  `tl.intel_npu.scoped_cmx=False` is the budget negative (`test_intel_npu_scoped_cmx.py`). The four decode kernels
+  re-pass on the device unchanged in time. (2) The three block kernels became `T.macro`s that allocate their own CMX
+  (`gdn_block`, `attn_block`, `moe_block`; the standalone kernels are thin wrappers, their tests unchanged), plus
+  `norm_block` (zero-centred RMSNorm and the fp32 residual adds), and **`make_gdn_layer` / `make_attn_layer`** run a whole
+  decoder layer per launch with the residual stream `Hio` fp32 in DDR; both fit the budget only because the phases
+  release their CMX. Host sim: the small GDN layer matches the composed oracle with a perturbed-expert negative
+  (`test_intel_npu_m5_layer.py`). **Device, whole model: golden 16/16, worst h rel 2.06e-3; host wall 73 ms per token =
+  13.7 tok/s** (device launches 55.5 ms: layers 49.2 + head 6.4); the 41 launches still cost ~0.43 ms each of submit +
+  protocol, which the device-side layer loop (one launch per token) removes next. 89 passed.
 * 2026-11-08: **M5 step 1: same-day per-layer A/B against npu_dsl's decoder-layer kernels** (`device/run_npudsl_layer_device.py`,
   real Qwen3.8 weights, the golden's first token): npu_dsl's GDN layer + MoE **1.165 ms** vs this backend's 0.811 + 0.560 =
   1.37; its attention layer + MoE **1.058 ms** vs 0.563 + 0.560 = 1.12; head 9.44 vs 8.78. So the kernels are within

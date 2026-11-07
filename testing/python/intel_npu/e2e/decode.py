@@ -1,7 +1,8 @@
-"""Decode a Qwen3.5-MoE-family model on the NPU with this backend's decode kernels, one launch per block
-(mixer, MoE, head), weights resident in one `npu_run --session`, the residual stream in fp32 on the host and the two
-RMSNorms per layer on the host for now (M5 moves both into the kernels). The prompt is run token by token through the
-same decode kernels (correct, slow: prefill kernels are a later milestone).
+"""Decode a Qwen3.5-MoE-family model on the NPU with this backend's fused decoder-layer kernels: one launch per layer
+(mixer + MoE, both RMSNorms and the fp32 residual stream inside, `kernels.make_gdn_layer` / `make_attn_layer`) and one for
+the head, weights and the residual stream resident in one `npu_run --session`; the host uploads the embedding row,
+launches, and reads the token back. The prompt is run token by token through the same decode kernels (correct, slow:
+prefill kernels are a later milestone).
 
     python testing/python/intel_npu/e2e/decode.py --ckpt D:\\models\\... --pack-dir D:\\models\\..._tlpack
         [--layers N] [--prompt "text" | --ids 1,2,3] [--new 16] [--smax 1536] [--golden golden.npz] [--no-build]
@@ -30,15 +31,12 @@ sys.path.insert(0, str(HERE))
 import tilelang  # noqa: E402,F401
 import lowering  # noqa: E402
 import runner  # noqa: E402
-from kernels import attn_sizes, gdn_sizes, head_sizes, make_attn_decode, make_gdn_decode, make_head, make_moe_decode, rope_cos_sin  # noqa: E402
+from kernels import attn_sizes, gdn_sizes, head_sizes, make_attn_layer, make_gdn_layer, make_head, rope_cos_sin  # noqa: E402
+import tilelang.intel_npu.language as T  # noqa: E402
 from checkpoint import Checkpoint, LM  # noqa: E402
 import pack  # noqa: E402
 
 TILES, SHAVES = 3, 2
-
-
-def rmsnorm_zc(h: np.ndarray, w: np.ndarray, eps: float) -> np.ndarray:
-    return (h * (1.0 / np.sqrt((h * h).mean() + eps)) * (1.0 + w)).astype(np.float16)
 
 
 class DeviceModel:
@@ -48,17 +46,18 @@ class DeviceModel:
         self.L = layers
         self.smax = smax
         G = pack.GEOM
+        moe_kw = dict(BNR=G["moe_BNR"], BNG=G["moe_BNG"], BND=G["moe_BND"])
         kernels = {
-            "gdn": make_gdn_decode(H=c.hidden, KH=c.lin_kh, VH=c.lin_vh, DK=c.lin_dk, DV=c.lin_dv, G=ck.group, tiles=TILES,
-                                   shaves=SHAVES, BN1=G["gdn_BN1"], BN2=G["gdn_BN2"], eps=c.eps),
-            "attn": make_attn_decode(H=c.hidden, NH=c.n_heads, NKV=c.n_kv, D=c.head_dim, ROT=c.rot_dim, SMAX=smax, G=ck.group,
-                                     tiles=TILES, shaves=SHAVES, BN1=G["attn_BN1"], BN2=G["attn_BN2"], eps=c.eps),
-            "moe": make_moe_decode(H=c.hidden, I=c.moe_inter, E=c.n_experts, TOPK=c.top_k, G=ck.group, tiles=TILES, shaves=SHAVES,
-                                   BNR=G["moe_BNR"], BNG=G["moe_BNG"], BND=G["moe_BND"]),
-            "head": make_head(H=c.hidden, V=c.vocab, G=ck.group, tiles=TILES, shaves=SHAVES, BN=G["head_BN"], eps=c.eps),
+            "gdn": make_gdn_layer(H=c.hidden, KH=c.lin_kh, VH=c.lin_vh, DK=c.lin_dk, DV=c.lin_dv, I=c.moe_inter, E=c.n_experts,
+                                  TOPK=c.top_k, G=ck.group, tiles=TILES, shaves=SHAVES, eps=c.eps,
+                                  gdn_kw=dict(BN1=G["gdn_BN1"], BN2=G["gdn_BN2"]), moe_kw=moe_kw),
+            "attn": make_attn_layer(H=c.hidden, NH=c.n_heads, NKV=c.n_kv, D=c.head_dim, ROT=c.rot_dim, SMAX=smax, I=c.moe_inter,
+                                    E=c.n_experts, TOPK=c.top_k, G=ck.group, tiles=TILES, shaves=SHAVES, eps=c.eps,
+                                    attn_kw=dict(BN1=G["attn_BN1"], BN2=G["attn_BN2"]), moe_kw=moe_kw),
+            "head": make_head(H=c.hidden, V=c.vocab, G=ck.group, tiles=TILES, shaves=SHAVES, BN=G["head_BN"], eps=c.eps, h_dtype=T.float32),
         }
-        names = {"gdn": f"tl_e2e_gdn_h{c.hidden}", "attn": f"tl_e2e_attn_h{c.hidden}_s{smax}", "moe": f"tl_e2e_moe_h{c.hidden}",
-                 "head": f"tl_e2e_head_h{c.hidden}_v{c.vocab}"}
+        names = {"gdn": f"tl_e2e_gdn_layer_h{c.hidden}", "attn": f"tl_e2e_attn_layer_h{c.hidden}_s{smax}",
+                 "head": f"tl_e2e_head32_h{c.hidden}_v{c.vocab}"}
         self.low = {k: lowering.lower(f) for k, f in kernels.items()}
         if build:
             t0 = time.time()
@@ -81,8 +80,7 @@ class DeviceModel:
         H = c.hidden
         t0 = time.time()
         total = 0
-        s.upload("Zero", np.zeros((1, H), np.float16))
-        s.upload("X", np.zeros((1, H), np.float16))
+        s.upload("Hio", np.zeros((1, H), np.float32))
         s.upload("Pos", np.zeros((1, 1), np.int32))
         s.upload("CosSin", np.zeros((2, c.rot_dim), np.float32))
         gsz = gdn_sizes(H, c.lin_kh, c.lin_vh, c.lin_dk, tiles=TILES, shaves=SHAVES, BN1=pack.GEOM["gdn_BN1"], BN2=pack.GEOM["gdn_BN2"])
@@ -91,20 +89,19 @@ class DeviceModel:
         self.gsz, self.asz, self.hsz = gsz, asz, hsz
         # scratch shared by every layer of a kind
         for n, shape, dt in [("G_Y", (1, gsz["YLEN"]), np.float16), ("G_BA", (1, gsz["BA_LEN"]), np.float16), ("G_CV", (1, gsz["CVLEN"]), np.float16),
-                             ("G_O", (1, gsz["OPAD"]), np.float16), ("G_Out", (1, gsz["NOUT_pad"]), np.float16),
+                             ("G_O", (1, gsz["OPAD"]), np.float16), ("G_Mix", (1, gsz["NOUT_pad"]), np.float16),
                              ("A_Y", (1, asz["NQKV"]), np.float16), ("A_QN", (c.n_kv, asz["GQ"], c.head_dim), np.float16),
                              ("A_Part", (c.n_kv, asz["GQ"], TILES, asz["PW"]), np.float32), ("A_O", (1, asz["KO"]), np.float16),
-                             ("A_Out", (1, asz["NOUT_pad"]), np.float16),
-                             ("M_Part", (TILES, H), np.float32), ("M_Out", (1, H), np.float16),
-                             ("H_Hs", (1, H), np.float16), ("H_Logits", (TILES, hsz["CS"], SHAVES * pack.GEOM["head_BN"]), np.float16),
+                             ("A_Mix", (1, asz["NOUT_pad"]), np.float16),
+                             ("M_Part", (TILES, H), np.float32),
+                             ("H_Logits", (TILES, hsz["CS"], SHAVES * pack.GEOM["head_BN"]), np.float16),
                              ("H_Part", (hsz["workers"], 32), np.float32), ("H_Tok", (1, 8), np.int32)]:
             s.alloc(n, int(np.prod(shape)) * np.dtype(dt).itemsize)
-        self.layer_w = []
         for i in range(self.L):
             paths = pack.cached_paths(self.pack_dir, pack.layer_key(i), lambda: pack.pack_layer(self.ck, i), log=self.log)
-            self.layer_w.append({k: np.load(paths[k]) for k in ("in_norm", "post_norm")})
             for k, p in paths.items():
                 if k in ("in_norm", "post_norm"):
+                    s.upload(f"L{i}_{k}", np.load(p).astype(np.float16).reshape(1, H))
                     continue
                 total += s.upload_npy(f"L{i}_{k}", p)
             if c.layer_types[i] == "linear_attention":
@@ -135,49 +132,38 @@ class DeviceModel:
     # ---- one token ----------------------------------------------------------------------------------------------
     def _bufs(self, kind, i):
         """Buffer names in the kernel's device parameter order."""
-        c = self.c
         if kind == "gdn":
-            m = dict(X="X", Res="Zero", WinP=f"L{i}_WinP", Wba=f"L{i}_Wba", ConvW=f"L{i}_ConvW", ALog=f"L{i}_ALog", DtBias=f"L{i}_DtBias",
-                     GNorm=f"L{i}_GNorm", ConvState=f"L{i}_ConvState", Ssm=f"L{i}_Ssm", WoutP=f"L{i}_WoutP", Y="G_Y", BA="G_BA",
-                     CV="G_CV", O="G_O", Out="G_Out")
+            m = dict(Hio="Hio", InNorm=f"L{i}_in_norm", PostNorm=f"L{i}_post_norm", WinP=f"L{i}_WinP", Wba=f"L{i}_Wba", ConvW=f"L{i}_ConvW",
+                     ALog=f"L{i}_ALog", DtBias=f"L{i}_DtBias", GNorm=f"L{i}_GNorm", ConvState=f"L{i}_ConvState", Ssm=f"L{i}_Ssm",
+                     WoutP=f"L{i}_WoutP", Wr=f"L{i}_Wr", WguP=f"L{i}_WguP", WdP=f"L{i}_WdP", Y="G_Y", BA="G_BA", CV="G_CV", O="G_O",
+                     Mix="G_Mix", Logits="M_Logits", PartM="M_Part")
         elif kind == "attn":
-            m = dict(X="X", Res="Zero", WqkvP=f"L{i}_WqkvP", QNormW=f"L{i}_QNormW", KNormW=f"L{i}_KNormW", CosSin="CosSin", Pos="Pos",
-                     Kc=f"L{i}_Kc", Vt=f"L{i}_Vt", WoP=f"L{i}_WoP", Y="A_Y", QN="A_QN", Part="A_Part", O="A_O", Out="A_Out")
-        elif kind == "moe":
-            m = dict(X="X", Wr=f"L{i}_Wr", WguP=f"L{i}_WguP", WdP=f"L{i}_WdP", Res="Zero", Logits="M_Logits", Part="M_Part", Out="M_Out")
+            m = dict(Hio="Hio", InNorm=f"L{i}_in_norm", PostNorm=f"L{i}_post_norm", WqkvP=f"L{i}_WqkvP", QNormW=f"L{i}_QNormW",
+                     KNormW=f"L{i}_KNormW", CosSin="CosSin", Pos="Pos", Kc=f"L{i}_Kc", Vt=f"L{i}_Vt", WoP=f"L{i}_WoP", Wr=f"L{i}_Wr",
+                     WguP=f"L{i}_WguP", WdP=f"L{i}_WdP", Y="A_Y", QN="A_QN", PartA="A_Part", O="A_O", Mix="A_Mix", Logits="M_Logits",
+                     PartM="M_Part")
         else:
-            m = dict(Hs="H_Hs", NormW="H_NormW", WlmP="H_WlmP", Logits="H_Logits", Part="H_Part", Tok="H_Tok")
+            m = dict(Hs="Hio", NormW="H_NormW", WlmP="H_WlmP", Logits="H_Logits", Part="H_Part", Tok="H_Tok")
         return [m[n] for n in self.low[kind].param_names]
 
     def step(self, token: int, trace: list | None = None) -> tuple[int, dict]:
-        """Runs `token` at the current position through every layer and the head; returns (next token, timing)."""
+        """Runs `token` at the current position through every layer and the head; returns (next token, timing).
+        `trace` (slow: a download per layer) collects the residual stream after every layer."""
         c, s = self.c, self.s
         H = c.hidden
         import torch
         h = self.embed[token].to(torch.float32).numpy().copy()
         t0 = time.time()
-        dev_ms = dict(mixer=0.0, moe=0.0, head=0.0)
+        dev_ms = dict(layers=0.0, head=0.0)
+        s.upload("Hio", h.reshape(1, H))
         s.upload("Pos", np.array([[self.pos]], np.int32))
         s.upload("CosSin", rope_cos_sin(self.pos, c.rot_dim, c.rope_theta))
         for i in range(self.L):
-            w = self.layer_w[i]
-            s.upload("X", rmsnorm_zc(h, w["in_norm"], c.eps).reshape(1, H))
-            if c.layer_types[i] == "linear_attention":
-                _, km = s.launch("gdn", *self._bufs("gdn", i))
-                mix = s.download("G_Out", np.float16, (1, self.gsz["NOUT_pad"]))[0, :H].astype(np.float32)
-            else:
-                _, km = s.launch("attn", *self._bufs("attn", i))
-                mix = s.download("A_Out", np.float16, (1, self.asz["NOUT_pad"]))[0, :H].astype(np.float32)
-            dev_ms["mixer"] += km
-            h = h + mix
-            s.upload("X", rmsnorm_zc(h, w["post_norm"], c.eps).reshape(1, H))
-            _, km = s.launch("moe", *self._bufs("moe", i))
-            dev_ms["moe"] += km
-            m = s.download("M_Out", np.float16, (1, H))[0].astype(np.float32)
-            h = h + m
+            kind = "gdn" if c.layer_types[i] == "linear_attention" else "attn"
+            _, km = s.launch(kind, *self._bufs(kind, i))
+            dev_ms["layers"] += km
             if trace is not None:
-                trace.append(dict(layer=i, mix=mix, moe=m, out=h.copy()))
-        s.upload("H_Hs", h.astype(np.float16).reshape(1, H))
+                trace.append(dict(layer=i, out=s.download("Hio", np.float32, (1, H))[0].copy()))
         _, km = s.launch("head", *self._bufs("head", 0))
         dev_ms["head"] += km
         tok = int(s.download("H_Tok", np.int32, (1, 8))[0, 0])
@@ -232,16 +218,13 @@ def main(argv):
             t0 = time.time()
             dev_trace = []
             dev_tok, ms = m.step(ids[0], trace=dev_trace)
-            print("layer-by-layer, first prompt token: max |h_dev - h_ref| / max |h_ref| (mixer contribution, MoE contribution):")
+            print("layer-by-layer, first prompt token: max |h_dev - h_ref| / max |h_ref| after the layer:")
             worst = 0.0
             for i in range(layers):
-                dr = dev_trace[i]
-                ref_out, ref_mix, ref_moe = gold["trace_out"][i], gold["trace_mix"][i], gold["trace_moe"][i]
-                rel_h = np.abs(dr["out"] - ref_out).max() / np.abs(ref_out).max()
-                rel_mix = np.abs(dr["mix"] - ref_mix).max() / max(np.abs(ref_mix).max(), 1e-6)
-                rel_moe = np.abs(dr["moe"] - ref_moe).max() / max(np.abs(ref_moe).max(), 1e-6)
+                ref_out = gold["trace_out"][i]
+                rel_h = np.abs(dev_trace[i]["out"] - ref_out).max() / np.abs(ref_out).max()
                 worst = max(worst, rel_h)
-                print(f"  layer {i:2d} {ck.cfg.layer_types[i][:6]}: h rel {rel_h:.2e}  mixer rel {rel_mix:.2e}  moe rel {rel_moe:.2e}")
+                print(f"  layer {i:2d} {ck.cfg.layer_types[i][:6]}: h rel {rel_h:.2e}")
             print(f"  worst h rel over the layers: {worst:.2e}")
             # the rest of the prompt, then the reference's greedy tokens, teacher-forced
             for t in ids[1:]:
@@ -280,8 +263,8 @@ def main(argv):
             wall = sorted(t["host_wall"] for t in times)
             med = times[len(times) // 2]
             cond = "UNPROFILED, " + ("TURBO" if m.s.turbo else "NO TURBO")
-            print(f"per token: device launches sum median {dev[len(dev) // 2]:.1f} ms (mixer {med['mixer']:.1f} + moe {med['moe']:.1f} + head "
-                  f"{med['head']:.1f} of the median step), host wall median {wall[len(wall) // 2]:.0f} ms [{cond}]")
+            print(f"per token: device launches sum median {dev[len(dev) // 2]:.1f} ms (layers {med['layers']:.1f} + head {med['head']:.1f} "
+                  f"of the median step), host wall median {wall[len(wall) // 2]:.0f} ms = {1000 / wall[len(wall) // 2]:.1f} tok/s [{cond}]")
         return 0
     finally:
         m.close()

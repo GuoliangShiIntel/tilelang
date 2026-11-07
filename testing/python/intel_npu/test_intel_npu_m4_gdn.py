@@ -1,4 +1,4 @@
-﻿"""M4 (plan section 4 / 9): the Gated DeltaNet mixer layer at decode in one launch.
+"""M4 (plan section 4 / 9): the Gated DeltaNet mixer layer at decode in one launch.
 
 `kernels.make_gdn_decode`: in_proj GEMV (chunk blocks, local rings) -> grid barrier -> causal conv1d + SiLU per channel
 block with the conv state carried in place -> grid barrier -> per v-head the two-pass delta rule on fp32 vector lanes
@@ -93,7 +93,7 @@ def test_qwen36_shape_lowers_to_two_local_gemv_rings_and_a_vector_scan():
     # in_proj: 12288 rows = 3 tiles x 32 chunks of 128 (+4 scale rows), two slots per SHAVE, local; b | a: 64 fp16
     # rows dealt 11 per worker as fp32 lane dot products
     assert "ctx.ring_begin((&(w1_cmx[0])), 135168, 4, 32, 0, 0, 2, 0, 1);" in src
-    assert "ctx.dma_load((&(wba_cmx[0])), (&(Wba[((bx * 45056) + (shave * 22528))])), 4096, 11, 4096, 4096);" in src
+    assert "ctx.dma_load((&(wba_cmx[0])), (&(Wba[((tile * 45056) + (shave * 22528))])), 4096, 11, 4096, 4096);" in src
     assert "y1_cmx[r] = ((half)tl_npu_vsum(" in src
     assert "ctx.dpu_matmul_i4g((&(y1_cmx[(sub * 64)])), (&(x_cmx[0])), (&(w1_cmx[((((u & 1) * 270336) + (shave * 135168)) + (sub * 65536))]))" in src
     # out_proj: 2048 rows padded to 2112 = 3 x 11 chunks of 64 (+2 scale rows), K 4096 -> 32 groups, 32-row workloads;
@@ -112,8 +112,8 @@ def test_qwen36_shape_lowers_to_two_local_gemv_rings_and_a_vector_scan():
     assert "__builtin_convertvector(*(half16*)(cs_cmx + ((c0 * 16) + 512)), float16)" in src
     assert src.count("ctx.sync_grid();") == 3
     # the SSM state of one head in and out of DDR (64 KiB fp32 each way), head = worker * 6 + j
-    assert "ctx.dma_load((&(S_cmx[0])), (&(Ssm[(((bx * 196608) + (shave * 98304)) + (j * 16384))])), 512, 128, 512, 512);" in src
-    assert "ctx.dma_store((&(Ssm[(((bx * 196608) + (shave * 98304)) + (j * 16384))])), (&(S_cmx[0])), 512, 128, 512, 512);" in src
+    assert "ctx.dma_load((&(S_cmx[0])), (&(Ssm[(((tile * 196608) + (shave * 98304)) + (j * 16384))])), 512, 128, 512, 512);" in src
+    assert "ctx.dma_store((&(Ssm[(((tile * 196608) + (shave * 98304)) + (j * 16384))])), (&(S_cmx[0])), 512, 128, 512, 512);" in src
 
 
 @needs_cxx

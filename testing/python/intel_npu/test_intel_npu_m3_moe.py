@@ -73,7 +73,7 @@ def test_qwen36_shape_lowers_to_indirect_split_rings_hoisted_over_the_items():
     # the router: 288 padded rows, 6 chunks of 16 per tile, a split (unicast) fp16 ring with submit-ahead, two
     # slots per SHAVE whose fills alternate the ports (2 = use & 1)
     assert "ctx.ring_begin((&(wr_cmx[0])), 65536, 4, 6, 8, 16, 2, 0, 0);" in src
-    assert "x16: tile-invariant resident, 1 row(s) filled by SHAVE 0" in src
+    assert "x_cmx: tile-invariant resident, 1 row(s) filled by SHAVE 0" in src   # x16 is built from it in CMX
     # the expert rings: fills read ids[tile * 3 + j]; hoisted over j with the fill ahead reading the chunk's item
     assert "wq_cmx: SEGMENTED (streamed, each tile fills its own slot)" in src
     assert "ring over n hoisted over j (3 iterations: one begin/end, fills read the iteration)" in src
@@ -85,7 +85,7 @@ def test_qwen36_shape_lowers_to_indirect_split_rings_hoisted_over_the_items():
     assert "ctx.ring_begin((&(wqd_cmx[0])), 67584, 4, 24, 0, 0, 3, 0, 1);" in src
     assert "ring: READY 8..15, FREE 16..23; ring_1: local (no ids); ring_2: local (no ids)" in src
     # the fill two uses ahead: item = chunk / 8 (the next item's expert when it wraps), chunk % 8 within the expert
-    assert re.search(r"ctx\.ring_fill\(ring_1, \(\(\(j \* 4\) \+ u_1\) \+ 2\), \(&\(WguP\[\(\(\(\(int64_t\)ids\[\(\(\(\(\(int64_t\)bx\) \* "
+    assert re.search(r"ctx\.ring_fill\(ring_1, \(\(\(j \* 4\) \+ u_1\) \+ 2\), \(&\(WguP\[\(\(\(\(int64_t\)ids\[\(\(\(\(\(int64_t\)tile\) \* "
                      r"\(int64_t\)3\) \+ \(\(\(\(\(\(int64_t\)u_1\) \* \(int64_t\)2\) \+ \(\(int64_t\)shave\)\) \+ \(int64_t\)4\) >> \(int64_t\)3\)\) "
                      r"\+ \(\(int64_t\)j\)\)\]\) \* \(int64_t\)1081344\)", src)   # expert stride: 8 blocks x 135168 B
     # the workload's scales: column row0 of the group-major block after the 128 weight rows (stride 128), in this
