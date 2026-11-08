@@ -567,14 +567,28 @@ def LowerIntelNpuPipelined():
                 post_order_visit(i, visit)
             return found
 
+        def _let_bound_in(stmt):
+            """Vars a statement binds (`tirx.Bind`): a `T.ddr_view` inside a loop body names that iteration's DDR
+            tensor through such a binding, so a fill reading the view is per-iteration."""
+            found = []
+
+            def visit(node):
+                if isinstance(node, tirx.Bind):
+                    found.append(node.var)
+
+            post_order_visit(stmt, visit)
+            return found
+
         def hoistable(outer):
             """The pipelined loops directly inside a serial loop whose rings can run over all its iterations: a
             fill issued ahead then reads the next iteration's chunk, which is sound when nothing the outer body
-            writes feeds the fill's source index (an index read from a buffer the iteration computes is not)."""
+            writes feeds the fill's source index (an index read from a buffer the iteration computes is not) and
+            the fill's source tensor is not a view bound inside the iteration."""
             if not isinstance(outer, tirx.For) or outer.kind != tirx.ForKind.SERIAL or is_pipelined(outer):
                 return []
             stmts = list(outer.body.seq) if isinstance(outer.body, tirx.SeqStmt) else [outer.body]
             written = _written_in(outer.body)
+            bound = _let_bound_in(outer.body)
             hoisted = []
             for inner in (s for s in stmts if is_pipelined(s)):
                 fills = [s for s in (list(inner.body.seq) if isinstance(inner.body, tirx.SeqStmt) else [inner.body])
@@ -584,6 +598,10 @@ def LowerIntelNpuPipelined():
                 if any(any(w.same_as(b) for w in written) for f in fills for b in _index_reads(f.value.args[1])):
                     notes.append(f"ring over {inner.loop_var.name} not hoisted over {outer.loop_var.name}: a fill's "
                                  f"source index reads a buffer the iteration writes")
+                    continue
+                if any(any(v.same_as(_load_of(f.value.args[1]).buffer.data) for v in bound) for f in fills):
+                    notes.append(f"ring over {inner.loop_var.name} not hoisted over {outer.loop_var.name}: a fill's "
+                                 f"source is a DDR view bound inside the iteration")
                     continue
                 hoisted.append(inner)
             return hoisted

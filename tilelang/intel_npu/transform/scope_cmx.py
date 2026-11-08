@@ -23,6 +23,7 @@ from tvm.tirx.stmt_functor import post_order_visit
 from tvm.tirx.transform import prim_func_pass
 
 LEXICAL_SCOPE = "lexical_alloc_scope"
+NOTES_ATTR = "intel_npu.notes"
 
 
 def _is_sync_grid(stmt) -> bool:
@@ -89,17 +90,49 @@ def _for(s, body):
     return tirx.For(s.loop_var, s.min, s.extent, s.kind, body, s.thread_binding, s.annotations, s.step)
 
 
-def _is_decl(s) -> bool:
-    """An allocation or a DeclBuffer alias of one (LowerOpaqueBlock emits both; they move together)."""
-    return isinstance(s, (tirx.AllocBuffer, tirx.DeclBuffer))
+def _is_ddr_bind(s) -> bool:
+    return (isinstance(s, tirx.Bind) and isinstance(s.value, tirx.Call)
+            and getattr(s.value.op, "name", "") == "tl.intel_npu_ddr_ptr")
+
+
+def _is_view_def(s, items) -> bool:
+    """A `T.ddr_view` definition: the Bind of the pointer, or a DeclBuffer over a pointer bound that way in `items`."""
+    if _is_ddr_bind(s):
+        return True
+    if isinstance(s, tirx.DeclBuffer):
+        return any(_is_ddr_bind(b) and b.var.same_as(s.buffer.data) for b in items)
+    return False
+
+
+def _alloc_keys(stmt) -> set:
+    """Identity keys of the data vars the statement's AllocBuffers define (anywhere inside)."""
+    keys = set()
+
+    def visit(node):
+        if isinstance(node, tirx.AllocBuffer):
+            keys.add(hash(node.buffer.data))
+
+    post_order_visit(stmt, visit)
+    return keys
+
+
+def _is_decl(s, alloc_keys=None) -> bool:
+    """An allocation or a DeclBuffer alias of one (LowerOpaqueBlock emits both; they move together). A DeclBuffer
+    over a pointer defined otherwise (a `T.ddr_view` over a `Bind`) is not movable: it must follow its binding."""
+    if isinstance(s, tirx.AllocBuffer):
+        return True
+    if isinstance(s, tirx.DeclBuffer):
+        return alloc_keys is None or hash(s.buffer.data) in alloc_keys
+    return False
 
 
 def _strip_allocs(stmt):
     """(stmt without its AllocBuffer / DeclBuffer statements (None if nothing is left), those in program order)."""
     allocs = []
+    keys = _alloc_keys(stmt)
 
     def rec(s):
-        if _is_decl(s):
+        if _is_decl(s, keys):
             allocs.append(s)
             return None
         if isinstance(s, tirx.SeqStmt):
@@ -147,9 +180,11 @@ class _Scoper:
         return out
 
     def _block_items(self, stmt):
-        items = []
-        for s in _items(stmt):
-            items.extend(self.flatten(s))
+        items = self._sink(_items(stmt))
+        flat = []
+        for s in items:
+            flat.extend(self.flatten(s))
+        items = flat
         # phases of this block, split by grid barriers
         phases, cur = [], []
         for s in items:
@@ -162,12 +197,21 @@ class _Scoper:
         phases.append(cur)
         if len(phases) == 1:
             return _seq(items) if items else stmt
-        allocs = [s for s in items if _is_decl(s)]
+        # DDR views (`T.ddr_view`: a Bind of a ddr_ptr call and its DeclBuffer) go to the block's head: a phase
+        # becomes its own C++ block, and a view declared inside one would be out of scope for the next. Their
+        # values read only kernel parameters and loop variables, all defined at the block's start.
+        views = [s for s in items if _is_view_def(s, items)]
+        if views:
+            view_ids = {id(s) for s in views}
+            items = [s for s in items if id(s) not in view_ids]
+            phases = [[s for s in ph if id(s) not in view_ids] for ph in phases]
+        keys = {hash(s.buffer.data) for s in items if isinstance(s, tirx.AllocBuffer)}
+        allocs = [s for s in items if _is_decl(s, keys)]
         uses = []
         for ph in phases:
             u = set()
             for s in ph:
-                if not _is_decl(s):
+                if not _is_decl(s, keys):
                     u |= _buffers_used(s)
             uses.append(u)
         home = {}
@@ -179,7 +223,7 @@ class _Scoper:
         out = []
         for i, ph in enumerate(phases):
             moved = [a for a in allocs if home.get(id(a)) == i]
-            body = [s for s in ph if not _is_decl(s)]
+            body = [s for s in ph if not _is_decl(s, keys)]
             if moved:
                 self.moved += sum(isinstance(a, tirx.AllocBuffer) for a in moved)
                 out.append(tirx.AttrStmt(tirx.IntImm("int32", 0), LEXICAL_SCOPE, tirx.IntImm("int32", 1), _seq(moved + body)))
@@ -187,7 +231,75 @@ class _Scoper:
                 out.extend(body)
         # allocations that stay in this block come first, where they were
         kept = [a for a in allocs if id(a) not in home]
-        return _seq(kept + out)
+        return _seq(views + kept + out)
+
+    def _sink(self, items: list) -> list:
+        """3. **Branches and loops.** An allocation of this block used by exactly one statement of it, that statement
+        being a loop or a SHAVE-uniform `if`, moves into that loop body / the one branch that uses it (together with its
+        DeclBuffer aliases), where the phase rule then places it. This is what puts a layer kind's buffers under its
+        `if Kind[li] == 0` branch, so the two kinds of a model loop share CMX instead of adding up."""
+        flat = []
+
+        def expand(s):
+            # a notes wrapper is a comment: keep it as an empty-bodied marker and let its body join this block
+            if isinstance(s, tirx.AttrStmt) and s.attr_key == NOTES_ATTR:
+                flat.append(tirx.AttrStmt(s.node, s.attr_key, s.value, _nop()))
+                for x in _items(s.body):
+                    expand(x)
+            else:
+                flat.extend(_items(s))
+
+        for s in items:
+            expand(s)
+        items = flat
+        keys = {hash(s.buffer.data) for s in items if isinstance(s, tirx.AllocBuffer)}
+        decls = [s for s in items if _is_decl(s, keys)]
+        if not decls:
+            return items
+        by_key = {}
+        for d in decls:
+            by_key.setdefault(hash(d.buffer.data), []).append(d)
+        uses = [None if _is_decl(s, keys) else _buffers_used(s) for s in items]
+        sunk = {}  # id(item) -> {"then": [...], "else": [...], "body": [...]}
+        gone = set()
+        for key, ds in by_key.items():
+            where = [i for i, u in enumerate(uses) if u is not None and key in u]
+            if len(where) != 1:
+                continue
+            tgt = items[where[0]]
+            if isinstance(tgt, tirx.For):
+                slot = "body"
+            elif isinstance(tgt, tirx.IfThenElse) and not (self.shave is not None and _uses_var(tgt.condition, self.shave)):
+                in_then = key in _buffers_used(tgt.then_case)
+                in_else = tgt.else_case is not None and key in _buffers_used(tgt.else_case)
+                if in_then == in_else:
+                    continue
+                slot = "then" if in_then else "else"
+            else:
+                continue
+            sunk.setdefault(id(tgt), {}).setdefault(slot, []).extend(ds)
+            gone.update(id(d) for d in ds)
+        if not gone:
+            return items
+        out = []
+        for s in items:
+            if id(s) in gone:
+                continue
+            mv = sunk.get(id(s))
+            if mv is None:
+                out.append(s)
+                continue
+            n = sum(isinstance(d, tirx.AllocBuffer) for v in mv.values() for d in v)
+            self.moved += n
+            if isinstance(s, tirx.For):
+                out.append(_for(s, _seq(mv["body"] + _items(s.body))))
+            else:
+                then_case = _seq(mv.get("then", []) + _items(s.then_case))
+                else_case = s.else_case
+                if "else" in mv:
+                    else_case = _seq(mv["else"] + _items(s.else_case))
+                out.append(tirx.IfThenElse(s.condition, then_case, else_case))
+        return out
 
     def flatten(self, s) -> list:
         """One statement of a block, with nested blocks rewritten; a SHAVE-dependent `if` gives up its allocations."""
