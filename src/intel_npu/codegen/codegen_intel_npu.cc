@@ -284,6 +284,16 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const BindNode *op) {
              << ";\n";
       return;
     }
+    if (call->op.same_as(tl::intel_npu_ddr_ptr())) {
+      // a DDR tensor at a run-time address (a layer table entry): typed by the second argument
+      const DataType dt = call->args[1].dtype();
+      RegisterHandleType(op->var.get(), dt);
+      PrintIndent();
+      stream << "const npu::Ddr<";
+      PrintType(dt, stream);
+      stream << "> " << AllocVarID(op->var.get()) << "((uint64_t)" << PrintExpr(call->args[0]) << ");\n";
+      return;
+    }
   }
   CodeGenC::VisitStmt_(op);
 }

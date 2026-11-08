@@ -11,8 +11,10 @@ from .memory import *  # noqa: F401,F403  (alloc_shared with scope "shared" over
 from .memory import __all__ as _MEMORY_ALL
 from .quant import *  # noqa: F401,F403
 from .quant import __all__ as _QUANT_ALL
+from .ddr import *  # noqa: F401,F403
+from .ddr import __all__ as _DDR_ALL
 
 __tilelang_dialect__ = "intel_npu"
-__all__ = tuple(dict.fromkeys((*_COMMON_ALL, *_KERNEL_ALL, *_MEMORY_ALL, *_QUANT_ALL)))
+__all__ = tuple(dict.fromkeys((*_COMMON_ALL, *_KERNEL_ALL, *_MEMORY_ALL, *_QUANT_ALL, *_DDR_ALL)))
 
-del _COMMON_ALL, _KERNEL_ALL, _MEMORY_ALL, _QUANT_ALL
+del _COMMON_ALL, _KERNEL_ALL, _MEMORY_ALL, _QUANT_ALL, _DDR_ALL

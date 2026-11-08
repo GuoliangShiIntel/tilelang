@@ -59,6 +59,13 @@ TVM_DLL const Op &intel_npu_dma_copy();
 TVM_DLL const Op &intel_npu_dpu_matmul();
 
 /*!
+ * \brief A DDR tensor at a run-time address: `intel_npu_ddr_ptr(addr_int64, typed_zero)` is a handle a buffer is
+ * declared over (`T.ddr_view`); codegen binds it as `npu::Ddr<T>(addr)` with T from the typed constant. The
+ * layer table of a single-launch model points at each layer's weights and states this way.
+ */
+TVM_DLL const Op &intel_npu_ddr_ptr();
+
+/*!
  * \brief The streamed ping-pong ring (plan Phase 3b; README sections 1-3). A
  * T.Pipelined loop over a DUPLICATED fill becomes:
  *
