@@ -525,16 +525,26 @@ interop; a Python `nl.*`-compatible shim.
 9. **Where SHAVE code is fetched from, and the instruction cache size.** Asked while attributing the (since explained)
    in-model slowdown; still useful: it decides whether a 130-260 KB `.text` has a cost beyond the budget.
 
-10. **`test_chunked_scan_matches_the_recurrence` fails about one run in three, but only inside the full suite
-    (2026-11-08, M6 P3). NOT diagnosed -- parked by `<user>`.** The P3 GDN scan agrees with the recurrence at
-    rel 7e-4 when its own file runs, and once reported rel 0.52 in a whole-suite run. The host-sim library is
-    cached by a hash of the source **and** the runtime headers, so the two runs execute identical machine code;
-    the inputs are seeded. The leading candidate is therefore a read of CMX that the kernel has not written,
-    which is zero when the arena is fresh and garbage when an earlier test file has dirtied it -- the simulator's
-    arena lives inside a DLL that the process loads once. **That candidate is unconfirmed**: running the same
-    kernel three times in one process gave bit-identical output, so the dirtying has not been reproduced on
-    demand. Do not report P3 as clean until this is either explained or shown to be the harness. Next instrument:
-    fill the arena with a poison pattern before the run and see whether the failure becomes deterministic.
+10. **The P3 GDN chunked scan is intermittently wrong on more than one tile (2026-11-08, M6 P3). OPEN.**
+    First seen as a one-in-three host-sim flake; the device made it reproducible. With five independent trials
+    per point (`device/run_gdn_scan_prefill_device.py --trials 5`), at Qwen3.6's GDN shape on **3 x 2**:
+    n=192 C=32 agrees with the recurrence **1/5**, n=128 C=64 **4/5** (worst rel 5.98e-01), n=512 C=64 **4/5**.
+    On **1 x 2** the same n=192 C=32 point is **5/5** at rel 7.10e-04, and 1 x 1 agrees with it bit for bit.
+    **Earlier single-run "device PASS" claims for this kernel are withdrawn** -- they were trials that did not
+    hit it. Established so far:
+    * **It is not the multi-tile infrastructure.** `run_attn_prefill_device.py --n 128` (P1, same 3 x 2, same
+      runtime, DMA and DPU path) returns rel 5.10e-04 on five consecutive runs, identical to three digits.
+    * **It is not the shared identity matrix or the tile barrier.** Giving every SHAVE its own `eye` in
+      `alloc_local` and dropping the `shave == 0` init still failed 3/3. Reverted.
+    * **It is not launch repetition feeding the state back.** `npu_run.cpp` restores every input, `inout`
+      included, before each launch, so repeating only rolls the dice again; the readback is the last launch.
+      An earlier "the state drifts across repeats" reading of this was wrong and is struck.
+    * Failing runs differ from each other (nan, rel 2.45e-01, rel 5.98e-01 at the same shape and binary), which
+      is a race or an unwritten read rather than an algebra error.
+    Next instrument: the one thing P3 does that P1 does not is write **256 B slices of a shared 8192 B DDR row
+    from different tiles at once** (`Out[ci*C, h*DV]`, one v-head per worker). Give each worker a disjoint
+    output region and see whether it goes away. That does not yet explain the state going nan, so it is a
+    hypothesis, not a diagnosis.
 
 ## 9. Model target: Qwen3.8-35B-A3B-Distill, and what it needs (2026-11-06)
 
@@ -548,7 +558,7 @@ device-verified and measured here.
 | Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | **have** (log 2026-11-07 M2): `T.gemm_i4` / `T.gemm_i8` merged-FC DPU path, device PASS, 30 / 41 GB/s of weights (DMA bound ~126) | M2 |
 | Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | `T.vectorized` loops lower to half32/float16 SHAVE vector ops with VAU exp/log/tanh (**have**, log 2026-11-07); the ops themselves not yet written | M1 |
 | Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash prefill phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**, 960x1024x64 vectorised 1.042 ms TURBO; **decode layer have** (log 2026-11-08): qkv GEMV, zero-centred q/k norm, RoPE, cache append, flash-decoding over 1536 positions with GQA 8:1 and the output gate, o_proj, in one launch, device PASS, **0.563 ms** TURBO; prefill GQA / gate / causal mask open | M1 |
-| Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | **decode have** (log 2026-11-08 M4, M5 step 5): one launch at Qwen3.6's shape, device PASS with both states checked, **0.640 ms** TURBO (delta rule at npu_dsl's gdn_scan code quality; its SHAVE section 323 vs npu_dsl's 247 us); **prefill chunked scan lowers and matches the recurrence in the host sim** (rel 7e-4, 11 DPU matmuls per chunk incl. transposes, `make_gdn_scan_prefill`) but is **not device-verified and its suite run is intermittent -- see question 10**; the prefill conv1d is open | M4 |
+| Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | **decode have** (log 2026-11-08 M4, M5 step 5): one launch at Qwen3.6's shape, device PASS with both states checked, **0.640 ms** TURBO (delta rule at npu_dsl's gdn_scan code quality; its SHAVE section 323 vs npu_dsl's 247 us); the prefill chunked scan (`make_gdn_scan_prefill`, 11 DPU matmuls per chunk incl. transposes) is **NOT have**: correct and stable on one tile (5/5 at rel 7.10e-04, ~30-40 us per token) but **intermittently wrong on 3 x 2 -- see question 10**; the prefill conv1d is open | M4 |
 | MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | **have** (log 2026-11-08 M3): one launch at Qwen3.6's shape, device PASS (routing == oracle), **0.560 ms** TURBO = 28 GB/s of the 15.8 MB it reads; expert phase ~0.43 ms at 34 GB/s (DMA-latency bound, see the log's cost split) | M3 |
 | Head | final norm + lm_head (int8 g128) + greedy argmax | **have** (log 2026-11-08): one launch at Qwen3.6's vocabulary, device PASS, **8.78 ms** TURBO = 58.9 GB/s vs npu_dsl's head 9.44 ms same day; both at <50% of the DMA bound | M5 |
 | Compiler | layer table + device-side layer loop with two layer kinds; long-prompt chunk loop; CMX reuse across phases; barrier id reuse; `.text` per kernel | **have** (log 2026-11-08 M5 step 3, unblocked M6): `T.ddr_view` address table, device-side `for li` with `Kind[li]`, scoped CMX across the loop, 40 layers lower and fit (`.text` 127 KB); question 8's device loss is **worked around** -- the KV cache is a kernel parameter, not a table address, so one launch may hold any mix of layers; rings do not yet hoist over the layer loop (cross-layer prefetch, npu_dsl's 14 ms of fusion gain); long-prompt chunk loop open | M5 |
