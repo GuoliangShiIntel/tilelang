@@ -653,6 +653,160 @@ def moe_block(H: int, I: int, E: int, TOPK: int, G: int, tiles: int, shaves: int
     return moe_phases
 
 
+def make_moe_route_prefill(N: int = 128, H: int = 2048, E: int = 256, TOPK: int = 8, BM: int = 64, BNR: int = 16,
+                           tiles: int = 3, shaves: int = 2):
+    """P2a: MoE routing and **grouping by expert** for `N` prompt tokens.
+
+    Decode reads every chosen expert's weights once per token. Prefill must read them once per expert, so the
+    (token, choice) pairs are sorted into expert order first and the FFN then walks one contiguous group per
+    expert. Phases, each closed by a grid barrier:
+
+      A. router GEMM for all N tokens, the padded router rows split over the tiles (`RRT` each), token blocks of
+         `BM` rows so one workload stays inside the DPU's output-point limit -> `Logits[N, RR]`;
+      B. the tokens dealt over the workers: top-k of `E` on fp16 lanes (lowest id on a tie, as decode), the
+         renormalised softmax over the chosen k, and the shared expert's sigmoid gate -> `Ids`, `Wts`;
+      C. worker 0 builds the grouping: `Cnt[e]` tokens per expert (the shared expert E takes every token),
+         `Off` its exclusive prefix sum, and `Slot[s] = t * (TOPK + 1) + k` -- the (token, choice) pair that
+         occupies grouped slot `s`, so slot `s` of expert `e` is `Off[e] .. Off[e + 1]`.
+
+    `Wts[t, TOPK]` is the shared expert's gate. Oracle: `moe_route_prefill_reference`."""
+    FL, HL = 16, 32
+    per_round = tiles * shaves * BNR
+    RR = ((E + 1 + per_round - 1) // per_round) * per_round
+    RRT = RR // tiles
+    workers = tiles * shaves
+    SLOTS = N * (TOPK + 1)
+    assert N % BM == 0 and E % HL == 0 and H % FL == 0 and RR % tiles == 0 and RRT % 16 == 0
+    assert BM * RRT <= 8192, f"router workload {BM} x {RRT} exceeds the DPU's 8192 output points: lower BM"
+    assert TOPK + 1 <= 16, "the per-token choice buffers are one 16-wide vector"
+
+    @T.prim_func
+    def moe_route(X: T.Tensor((N, H), T.float16), Wr: T.Tensor((RR, H), T.float16),
+                  Logits: T.Tensor((N, RR), T.float16), Ids: T.Tensor((N, TOPK), T.int32),
+                  Wts: T.Tensor((N, 16), T.float32), Cnt: T.Tensor((E + 1,), T.int32),
+                  Off: T.Tensor((E + 2,), T.int32), Slot: T.Tensor((SLOTS,), T.int32)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            x_cmx = T.alloc_shared((BM, H), T.float16)
+            wr_cmx = T.alloc_shared((RRT, H), T.float16)
+            yr_cmx = T.alloc_local((BM, RRT), T.float16)
+            lg_cmx = T.alloc_local((1, RR), T.float16)
+            idl = T.alloc_local((1, 16), T.int32)
+            wl = T.alloc_local((1, 16), T.float32)
+            pick = T.alloc_local((16,), T.float32)
+            best = T.alloc_local((4,), T.float32)
+            mx = T.alloc_local((HL,), T.float16)
+            ids_all = T.alloc_local((N, TOPK), T.int32)
+            cnt_cmx = T.alloc_local((E + 1,), T.int32)
+            off_cmx = T.alloc_local((E + 2,), T.int32)
+            cur_cmx = T.alloc_local((E + 1,), T.int32)
+            slot_cmx = T.alloc_local((SLOTS,), T.int32)
+            # --- A. router GEMM over the token blocks ----------------------------------------------------
+            T.copy(Wr[tile * RRT, 0], wr_cmx)
+            for b in T.serial(N // BM):
+                T.copy(X[b * BM, 0], x_cmx)
+                if shave == 0:
+                    T.gemm(x_cmx, wr_cmx, yr_cmx, transpose_B=True, clear_accum=True)
+                    T.copy(yr_cmx, Logits[b * BM, tile * RRT])
+                T.sync_threads()
+            T.sync_grid()
+            # --- B. top-k per token, the tokens dealt over the workers -----------------------------------
+            for it in T.serial(T.ceildiv(N, workers)):
+                t = it * workers + worker
+                if t < N:
+                    T.copy(Logits[t, 0], lg_cmx)
+                    for k in T.serial(TOPK):
+                        for v in T.vectorized(HL):
+                            mx[v] = lg_cmx[0, v]
+                        for e0 in T.serial(1, E // HL):
+                            for v in T.vectorized(HL):
+                                mx[v] = T.max(mx[v], lg_cmx[0, e0 * HL + v])
+                        best[0] = T.cast(T.call_extern(T.float16, "tl_npu_vmax", mx[0:HL]), T.float32)
+                        # argmax on lanes: E - index where the logit equals the max -> the lowest index wins
+                        for v in T.vectorized(HL):
+                            mx[v] = T.if_then_else(lg_cmx[0, v] == T.cast(best[0], T.float16), T.cast(E - v, T.float16), T.float16(0))
+                        for e0 in T.serial(1, E // HL):
+                            for v in T.vectorized(HL):
+                                mx[v] = T.max(mx[v], T.if_then_else(lg_cmx[0, e0 * HL + v] == T.cast(best[0], T.float16),
+                                                                    T.cast(E - (e0 * HL + v), T.float16), T.float16(0)))
+                        best[1] = T.float32(E) - T.cast(T.call_extern(T.float16, "tl_npu_vmax", mx[0:HL]), T.float32)
+                        idl[0, k] = T.cast(best[1], T.int32)
+                        pick[k] = best[0]
+                        lg_cmx[0, idl[0, k]] = T.float16(-65504)
+                    best[1] = T.float32(0)
+                    for k in T.serial(TOPK):
+                        wl[0, k] = T.exp(pick[k] - pick[0])   # pick[0] is the row max
+                        best[1] = best[1] + wl[0, k]
+                    for k in T.serial(TOPK):
+                        wl[0, k] = wl[0, k] / best[1]
+                    wl[0, TOPK] = T.float32(1) / (T.float32(1) + T.exp(T.float32(0) - T.cast(lg_cmx[0, E], T.float32)))
+                    T.copy(idl[0:1, 0:TOPK], Ids[t, 0])
+                    T.copy(wl, Wts[t, 0])
+            T.sync_grid()
+            # --- C. grouping: histogram, exclusive prefix sum, slot table (worker 0) ----------------------
+            if worker == 0:
+                T.copy(Ids[0, 0], ids_all)
+                for e in T.serial(E + 1):
+                    cnt_cmx[e] = 0
+                for t in T.serial(N):
+                    for k in T.serial(TOPK):
+                        cnt_cmx[ids_all[t, k]] = cnt_cmx[ids_all[t, k]] + 1
+                cnt_cmx[E] = N                      # every token also goes to the shared expert
+                off_cmx[0] = 0
+                for e in T.serial(E + 1):
+                    off_cmx[e + 1] = off_cmx[e] + cnt_cmx[e]
+                    cur_cmx[e] = off_cmx[e]
+                for t in T.serial(N):
+                    for k in T.serial(TOPK):
+                        slot_cmx[cur_cmx[ids_all[t, k]]] = t * (TOPK + 1) + k
+                        cur_cmx[ids_all[t, k]] = cur_cmx[ids_all[t, k]] + 1
+                    slot_cmx[cur_cmx[E]] = t * (TOPK + 1) + TOPK
+                    cur_cmx[E] = cur_cmx[E] + 1
+                T.copy(cnt_cmx, Cnt[0])
+                T.copy(off_cmx, Off[0])
+                T.copy(slot_cmx, Slot[0])
+
+    return moe_route
+
+
+def moe_route_prefill_reference(x, wr, E: int, TOPK: int):
+    """numpy oracle of make_moe_route_prefill (fp32): the top-k ids (lowest id on a tie), the renormalised
+    weights with the shared expert's gate last, and the expert grouping (counts, exclusive offsets, slots)."""
+    import numpy as np
+    N = x.shape[0]
+    logits = x.astype(np.float32) @ wr.astype(np.float32).T          # [N, RR]
+    ids = np.zeros((N, TOPK), np.int32)
+    wts = np.zeros((N, 16), np.float32)
+    for t in range(N):
+        row = logits[t, :E].copy()
+        for k in range(TOPK):
+            m = row.max()
+            i = int(np.flatnonzero(row == m)[0])                     # the lowest index among equals
+            ids[t, k] = i
+            row[i] = -65504.0
+        p = np.exp(logits[t, ids[t]] - logits[t, ids[t, 0]])
+        wts[t, :TOPK] = p / p.sum()
+        wts[t, TOPK] = 1.0 / (1.0 + np.exp(-logits[t, E]))
+    cnt = np.zeros(E + 1, np.int32)
+    for t in range(N):
+        for k in range(TOPK):
+            cnt[ids[t, k]] += 1
+    cnt[E] = N
+    off = np.zeros(E + 2, np.int32)
+    off[1:] = np.cumsum(cnt)
+    cur = off[:E + 1].copy()
+    slot = np.zeros(N * (TOPK + 1), np.int32)
+    for t in range(N):
+        for k in range(TOPK):
+            e = int(ids[t, k])
+            slot[cur[e]] = t * (TOPK + 1) + k
+            cur[e] += 1
+        slot[cur[E]] = t * (TOPK + 1) + TOPK
+        cur[E] += 1
+    return dict(logits=logits, ids=ids, wts=wts, cnt=cnt, off=off, slot=slot)
+
+
 def moe_scale_rows(H: int, I: int, G: int, BNG: int, BND: int):
     """Rows of a chunk block that hold the chunk's group-major fp16 scales, for the gate/up and down projections."""
     HG, IG = H // G, I // G
