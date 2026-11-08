@@ -1751,6 +1751,267 @@ def rope_cos_sin(pos: int, ROT: int, theta: float):
     return np.stack([np.cos(emb), np.sin(emb)]).astype(np.float32)
 
 
+GDN_Q_SCALE = 64.0
+"""The chunked scan multiplies q by this before the DPU and divides it out in the gated norm (npu_dsl's
+`kGdnQScale`). The DPU flushes fp16 subnormals, and `q k^T . D` has many entries below 2^-14 in a head that decays
+fast; losing them is visible after the per-head RMSNorm of a small output. A power of two, so it is exact."""
+
+
+def make_gdn_scan_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 128, DV: int = 128, C: int = 64,
+                          tiles: int = 3, shaves: int = 2, eps: float = 1e-6):
+    """P3: the Gated DeltaNet recurrence over `n` prompt tokens in **CHUNKED** form -- the prefill shape of the
+    delta rule that `make_gdn_decode` runs one token at a time. Takes the conv phase's output (q / k l2-normalised
+    fp32, v, and the two gates) and writes the mixer's gated-RMSNorm output.
+
+    The recurrence `S <- S e^g + k (v - e^g S^T k) beta^T`, `o = S^T q` is sequential in t, so a prefill that walks
+    it token by token leaves the DPU idle. The chunked form makes a block of C tokens into matrix products and keeps
+    only the chunk-to-chunk carry sequential. With `gc = cumsum(g)` over the chunk, `gl = gc[C-1]`,
+    `D[i][j] = e^(gc_i - gc_j)` for `j <= i` and 0 above, and S0 the state entering the chunk:
+
+      T     = (I + strictly_lower(beta k k^T . D))^-1        (forward substitution, the one serial step left)
+      U     = T (beta v);  W = T (e^gc beta k);  v_new = U - W S0
+      P     = (q k^T) . D
+      o     = (e^gc q) S0 + P v_new;   S = e^gl S0 + (e^(gl - gc) k)^T v_new
+
+    Eleven DPU matmuls per chunk carry it, including the transposes (`out = a . b^T` with `a = I` transposes `b`
+    exactly); the SHAVE only scales rows, builds D, solves the triangle and keeps the fp32 state. **Two of the
+    eleven -- `dS` and the state transpose, both 128x128 = 16384 output values -- were refused by this backend until
+    `device/run_dpu_points_probe.py` falsified the "8192 output points" reading of dpu.md 13.**
+
+    v-heads are dealt round-robin over the tiles x SHAVEs (32 heads over 6 workers balances 6/6/6/5/5/4, which
+    blocking into 6 would not); chunks within a head stay ordered because the state carries. `Nt[0, 0]` is the live
+    token count, so one kernel serves any prompt up to NP = ceil(N / C) * C; a chunk's rows past it are zeroed and
+    contribute nothing to gc, to the products or to the state. Tensors are head-major so a chunk is one contiguous
+    DMA, except `Out`, which is token-major like npu_dsl's layer output. Oracle: `gdn_scan_prefill_reference`,
+    which runs the RECURRENCE, not this algebra."""
+    assert DK == DV and VH % KH == 0 and C % 32 == 0 and DK % 32 == 0 and DV % 32 == 0
+    assert C % 16 == 0 and DK % 16 == 0, "N and K of every workload are 16-aligned"
+    REP = VH // KH
+    NP = -(-N // C) * C
+    NC = NP // C
+    VC = VH * DV
+    workers = tiles * shaves
+    HL, FL = 32, 16
+    INV = 1.0 / GDN_Q_SCALE
+
+    @T.prim_func
+    def gdn_scan(QK: T.Tensor((KH, NP, 2 * DK), T.float32), V: T.Tensor((VH, NP, DV), T.float16),
+                 Gb: T.Tensor((VH, NP, 2), T.float32), Z: T.Tensor((VH, NP, DV), T.float16),
+                 GNorm: T.Tensor((1, DV), T.float16), Nt: T.Tensor((1, 1), T.int32),
+                 Ssm: T.Tensor((VH, DK, DV), T.float32), Out: T.Tensor((NP, VC), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            eye = T.alloc_shared((DK, DK), T.float16)
+            gn = T.alloc_shared((1, DV), T.float16)
+            nt = T.alloc_shared((1, 1), T.int32)
+            Sf = T.alloc_local((DK, DV), T.float32)
+            S16 = T.alloc_local((DK, DV), T.float16)
+            ST = T.alloc_local((DV, DK), T.float16)
+            qkc = T.alloc_local((C, 2 * DK), T.float32)
+            vin = T.alloc_local((C, DV), T.float16)
+            gbv = T.alloc_local((C, 2), T.float32)
+            zb = T.alloc_local((C, DV), T.float16)
+            kq = T.alloc_local((2 * C, DK), T.float16)
+            khb = T.alloc_local((C, DK), T.float16)
+            qg = T.alloc_local((C, DK), T.float16)
+            kg = T.alloc_local((C, DK), T.float16)
+            kd = T.alloc_local((C, DK), T.float16)
+            vb = T.alloc_local((C, DV), T.float16)
+            dm = T.alloc_local((C, C), T.float16)
+            pm = T.alloc_local((C, C), T.float16)
+            tri = T.alloc_local((C, C), T.float16)
+            ap = T.alloc_local((2 * C, C), T.float16)
+            vbT = T.alloc_local((DK, C), T.float16)
+            kgT = T.alloc_local((DK, C), T.float16)
+            kdT = T.alloc_local((DK, C), T.float16)
+            uT = T.alloc_local((DV, C), T.float16)
+            vpT = T.alloc_local((DV, C), T.float16)
+            vnT = T.alloc_local((DV, C), T.float16)
+            W = T.alloc_local((C, DK), T.float16)
+            qi = T.alloc_local((C, DV), T.float16)
+            o1 = T.alloc_local((C, DV), T.float16)
+            on = T.alloc_local((C, DV), T.float16)
+            dS = T.alloc_local((DK, DV), T.float16)
+            gc = T.alloc_local((C,), T.float32)
+            la = T.alloc_local((C,), T.float32)
+            ac = T.alloc_local((C,), T.float32)
+            xr = T.alloc_local((DV,), T.float32)
+            lq = T.alloc_local((FL,), T.float32)
+            lk = T.alloc_local((FL,), T.float32)
+            ls = T.alloc_local((FL,), T.float32)
+            eh = T.alloc_local((FL,), T.float16)
+            st = T.alloc_local((8,), T.float32)
+            T.copy(GNorm[0, 0], gn)
+            T.copy(Nt[0, 0], nt)
+            if shave == 0:
+                for i, j0 in T.grid(DK, DK // HL):
+                    for v in T.vectorized(HL):
+                        eye[i, j0 * HL + v] = T.float16(0)
+                for i in T.serial(DK):
+                    eye[i, i] = T.float16(1)
+            T.sync_threads()
+            for ht in T.serial(T.ceildiv(VH, workers)):
+                h = ht * workers + worker
+                if h < VH:
+                    T.copy(Ssm[h, 0, 0], Sf)
+                    for d, c0 in T.grid(DK, DV // FL):
+                        for v in T.vectorized(FL):
+                            S16[d, c0 * FL + v] = T.cast(Sf[d, c0 * FL + v], T.float16)
+                    T.gemm(eye, S16, ST, transpose_B=True, clear_accum=True)
+                    for ci in T.serial(NC):
+                        tb = T.max(0, T.min(C, nt[0, 0] - ci * C))
+                        T.copy(QK[h // REP, ci * C, 0], qkc)
+                        T.copy(V[h, ci * C, 0], vin)
+                        T.copy(Gb[h, ci * C, 0], gbv)
+                        T.copy(Z[h, ci * C, 0], zb)
+                        # --- the chunk's row operands: gc, then every row scaled by its gate -----------------
+                        st[0] = T.float32(0)
+                        for t in T.serial(C):
+                            st[0] = st[0] + T.if_then_else(t < tb, gbv[t, 0], T.float32(0))
+                            gc[t] = st[0]
+                        for t in T.serial(C):
+                            if t < tb:
+                                st[2] = gbv[t, 1]                           # beta
+                                st[3] = T.exp(gc[t])
+                                st[4] = T.exp(gc[C - 1] - gc[t])
+                                for d0 in T.serial(DK // FL):
+                                    for v in T.vectorized(FL):
+                                        lq[v] = qkc[t, d0 * FL + v] * T.float32(GDN_Q_SCALE)
+                                        lk[v] = qkc[t, DK + d0 * FL + v]
+                                        kq[C + t, d0 * FL + v] = T.cast(lq[v], T.float16)
+                                        khb[t, d0 * FL + v] = T.cast(lk[v], T.float16)
+                                        kq[t, d0 * FL + v] = T.cast(lk[v] * st[2], T.float16)
+                                        qg[t, d0 * FL + v] = T.cast(lq[v] * st[3], T.float16)
+                                        kg[t, d0 * FL + v] = T.cast(lk[v] * st[2] * st[3], T.float16)
+                                        kd[t, d0 * FL + v] = T.cast(lk[v] * st[4], T.float16)
+                                for d0 in T.serial(DV // FL):
+                                    for v in T.vectorized(FL):
+                                        vb[t, d0 * FL + v] = T.cast(
+                                            T.cast(vin[t, d0 * FL + v], T.float32) * st[2], T.float16)
+                            else:
+                                for d0 in T.serial(DK // HL):
+                                    for v in T.vectorized(HL):
+                                        kq[t, d0 * HL + v] = T.float16(0)
+                                        kq[C + t, d0 * HL + v] = T.float16(0)
+                                        khb[t, d0 * HL + v] = T.float16(0)
+                                        qg[t, d0 * HL + v] = T.float16(0)
+                                        kg[t, d0 * HL + v] = T.float16(0)
+                                        kd[t, d0 * HL + v] = T.float16(0)
+                                for d0 in T.serial(DV // HL):
+                                    for v in T.vectorized(HL):
+                                        vb[t, d0 * HL + v] = T.float16(0)
+                        # D: the whole row vectorised, then the strictly-upper part zeroed. exp overflows to inf
+                        # above the diagonal and is overwritten there; a per-lane select does not vectorise.
+                        for i in T.serial(C):
+                            for j0 in T.serial(C // FL):
+                                for v in T.vectorized(FL):
+                                    dm[i, j0 * FL + v] = T.cast(T.exp(gc[i] - gc[j0 * FL + v]), T.float16)
+                            for j in T.serial(i + 1, C):
+                                dm[i, j] = T.float16(0)
+                        # --- products: [beta k k^T; s q k^T], and the three transposes -----------------------
+                        T.gemm(kq, khb, ap, transpose_B=True, clear_accum=True)
+                        T.gemm(eye, vb, vbT, transpose_B=True, clear_accum=True)
+                        T.gemm(eye, kg, kgT, transpose_B=True, clear_accum=True)
+                        T.gemm(eye, kd, kdT, transpose_B=True, clear_accum=True)
+                        # --- T = (I + strictly_lower(A . D))^-1 by forward substitution ----------------------
+                        for j0 in T.serial(C // HL):
+                            for v in T.vectorized(HL):
+                                tri[0, j0 * HL + v] = T.float16(0)
+                        for i in T.serial(1, C):
+                            for j0 in T.serial(C // FL):
+                                for v in T.vectorized(FL):
+                                    la[j0 * FL + v] = T.float32(0) - (T.cast(ap[i, j0 * FL + v], T.float32)
+                                                                      * T.cast(dm[i, j0 * FL + v], T.float32))
+                            for j in T.serial(i, C):
+                                la[j] = T.float32(0)        # row i is strictly lower; column i on is not its own
+                            for j0 in T.serial(C // FL):
+                                for v in T.vectorized(FL):
+                                    ac[j0 * FL + v] = la[j0 * FL + v]
+                            for m in T.serial(i):
+                                st[5] = la[m]
+                                for j0 in T.serial(C // FL):
+                                    for v in T.vectorized(FL):
+                                        ac[j0 * FL + v] = ac[j0 * FL + v] + T.cast(tri[m, j0 * FL + v],
+                                                                                   T.float32) * st[5]
+                            for j0 in T.serial(C // FL):
+                                for v in T.vectorized(FL):
+                                    tri[i, j0 * FL + v] = T.cast(ac[j0 * FL + v], T.float16)
+                        for i in T.serial(C):
+                            tri[i, i] = T.float16(1)
+                        for i in T.serial(C):
+                            for j0 in T.serial(C // HL):
+                                for v in T.vectorized(HL):
+                                    pm[i, j0 * HL + v] = ap[C + i, j0 * HL + v] * dm[i, j0 * HL + v]
+                        # --- v_new, the output halves and the state increment --------------------------------
+                        T.gemm(vbT, tri, uT, transpose_B=True, clear_accum=True)
+                        T.gemm(tri, kgT, W, transpose_B=True, clear_accum=True)
+                        T.gemm(ST, W, vpT, transpose_B=True, clear_accum=True)
+                        T.gemm(qg, ST, qi, transpose_B=True, clear_accum=True)
+                        for i in T.serial(DV):
+                            for j0 in T.serial(C // HL):
+                                for v in T.vectorized(HL):
+                                    vnT[i, j0 * HL + v] = uT[i, j0 * HL + v] - vpT[i, j0 * HL + v]
+                        T.gemm(pm, vnT, o1, transpose_B=True, clear_accum=True)
+                        T.gemm(kdT, vnT, dS, transpose_B=True, clear_accum=True)
+                        st[6] = T.exp(gc[C - 1])
+                        for d in T.serial(DK):
+                            for c0 in T.serial(DV // FL):
+                                for v in T.vectorized(FL):
+                                    Sf[d, c0 * FL + v] = (Sf[d, c0 * FL + v] * st[6]
+                                                          + T.cast(dS[d, c0 * FL + v], T.float32))
+                                    S16[d, c0 * FL + v] = T.cast(Sf[d, c0 * FL + v], T.float16)
+                        T.gemm(eye, S16, ST, transpose_B=True, clear_accum=True)
+                        # --- gated RMSNorm, with the q pre-scale divided back out ----------------------------
+                        for i in T.serial(C):
+                            for v in T.vectorized(FL):
+                                ls[v] = T.float32(0)
+                            for c0 in T.serial(DV // FL):
+                                for v in T.vectorized(FL):
+                                    xr[c0 * FL + v] = (T.cast(qi[i, c0 * FL + v], T.float32)
+                                                       + T.cast(o1[i, c0 * FL + v], T.float32))
+                                    ls[v] = ls[v] + xr[c0 * FL + v] * xr[c0 * FL + v]
+                            st[7] = T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL])
+                            st[7] = T.float32(INV) / T.sqrt(st[7] * T.float32(INV * INV) / T.float32(DV)
+                                                            + T.float32(eps))
+                            for c0 in T.serial(DV // FL):
+                                for v in T.vectorized(FL):
+                                    eh[v] = T.exp(T.float16(0) - zb[i, c0 * FL + v])
+                                    on[i, c0 * FL + v] = T.cast(
+                                        xr[c0 * FL + v] * st[7] * T.cast(gn[0, c0 * FL + v], T.float32)
+                                        * T.cast(zb[i, c0 * FL + v], T.float32)
+                                        / (T.float32(1) + T.cast(eh[v], T.float32)), T.float16)
+                        T.copy(on, Out[ci * C, h * DV])
+                    T.copy(Sf, Ssm[h, 0, 0])
+
+    return gdn_scan
+
+
+def gdn_scan_prefill_reference(qk, v, gb, z, gnorm, ssm, n: int, eps: float = 1e-6):
+    """numpy oracle of make_gdn_scan_prefill (fp32), as the RECURRENCE rather than the chunked algebra: the kernel's
+    chunking, its triangular inverse and its decay matrix are all claims about this loop, so the oracle must not
+    share them. Returns (out [NP, VH*DV], ssm after the scan)."""
+    import numpy as np
+    KH, NP, _, DK = qk.shape
+    VH, _, DV = v.shape
+    REP = VH // KH
+    out = np.zeros((NP, VH * DV), np.float32)
+    s = ssm.astype(np.float64).copy()
+    for h in range(VH):
+        for t in range(n):
+            q = qk[h // REP, t, 0].astype(np.float64)
+            k = qk[h // REP, t, 1].astype(np.float64)
+            g, beta = float(gb[h, t, 0]), float(gb[h, t, 1])
+            eg = np.exp(g)
+            delta = (v[h, t].astype(np.float64) - eg * (s[h].T @ k)) * beta
+            s[h] = s[h] * eg + np.outer(k, delta)
+            o = s[h].T @ q
+            zt = z[h, t].astype(np.float64)
+            o = o / np.sqrt((o * o).mean() + eps) * gnorm.astype(np.float64).reshape(-1)
+            out[t, h * DV:(h + 1) * DV] = o * zt / (1.0 + np.exp(-zt))
+    return out, s.astype(np.float32)
+
+
 def make_attn_prefill(N: int = 64, NKV: int = 2, GQ: int = 8, D: int = 256, SMAX: int = 1536, TB: int = 4,
                       BKV: int = 128, tiles: int = 3, shaves: int = 2, pipelined: bool = False):
     """P1: the full-attention PREFILL phase -- flash attention over `N` query tokens already normed, roped and
