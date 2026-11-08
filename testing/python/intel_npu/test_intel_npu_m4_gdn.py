@@ -99,7 +99,10 @@ def test_qwen36_shape_lowers_to_two_local_gemv_rings_and_a_vector_scan():
     # out_proj: 2048 rows padded to 2112 = 3 x 11 chunks of 64 (+2 scale rows), K 4096 -> 32 groups, 32-row workloads;
     # one slot per SHAVE (the budget), so the lone depth-1 stream is split in two halves over the ports
     assert "ctx.ring_begin((&(w2_cmx[0])), 135168, 2, 11, 0, 0, -1, 0, 1);" in src
-    assert ", 1, 32, 4096, 128, 64);" in src
+    # the workload itself: M = 1 row, 32 weight rows, K = 4096, group 128, scales 64 rows into the chunk block.
+    # Anchored on the call and left open at the end: a later argument (the deferred-reduction flag) must not break it.
+    assert re.search(r"ctx\.dpu_matmul_i4g\(\(&\(y2_cmx\[[^\]]*\]\)\).*, 1, 32, 4096, 128, 64\b", src)
+    assert not re.search(r"ctx\.dpu_matmul_i4g\(\(&\(y2_cmx\[[^\]]*\]\)\).*, 1, 64, 4096, 128, 64\b", src)   # control
     assert "ring: local (no ids); ring_1: local (no ids)" in src
     # the scan on fp32 lanes (npu_dsl's gdn_scan algebra): pass 1 reads S once for both S^T k and S^T q with four
     # register accumulators and scalar k_d / q_d splats; pass 2 is one read-modify-write of S, a row in eight

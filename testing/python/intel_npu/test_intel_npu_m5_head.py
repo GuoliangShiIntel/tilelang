@@ -72,7 +72,10 @@ def test_qwen36_shape_lowers_to_one_local_int8_ring_with_masked_tail():
     # each SHAVE's 324 chunk rows of 256 B land 512 B apart (the other SHAVE's chunks interleave)
     assert "ctx.dma_store((&(Logits[((tile * 82944) + (shave * 128))])), (&(yl[0])), 256, 324, 512, 256);" in src
     assert src.count("ctx.sync_grid();") == 1
-    assert "ctx.reserve_qg(16384, 1024);" in src
+    # the merged-FC scratch is sized by the kernel's largest quantised gemm; left open at the end so that a later
+    # argument (the deferred-reduction elements) does not break an assertion that is about the first two
+    assert "ctx.reserve_qg(16384, 1024" in src
+    assert "ctx.reserve_qg(16384, 2048" not in src   # control: the pattern still discriminates on the second argument
 
 
 @needs_cxx
