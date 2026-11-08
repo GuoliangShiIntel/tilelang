@@ -739,10 +739,16 @@ def gdn_block(H: int, KH: int, VH: int, DK: int, DV: int, G: int, tiles: int, sh
     skip_conv, skip_scan, skip_gemv = (probe_skip == "conv"), (probe_skip == "scan"), (probe_skip == "gemv")
 
     @T.macro
-    def gdn_head(S_cmx, q_cmx, k_cmx, v_cmx, z_cmx, ba_cmx, al_cmx, db_cmx, gn_cmx, qn, kn, knv, qnv, egv, betav, kv, delta,
-                 o, kr, kr2, dr, sn, sn2, st, ls, ls2, eh, on_cmx, j, h):
-        """One v-head's step: l2-normalised q / k of its k-head, the gates, the two-pass delta rule on S (fp32
-        lanes), the gated RMSNorm into on_cmx[j]. j: the head's index within the worker's block, h: its index."""
+    def gdn_head(S_cmx, q_cmx, k_cmx, v_cmx, z_cmx, ba_cmx, al_cmx, db_cmx, gn_cmx, qn, kn, egv, betav, kv, sq, delta,
+                 o, kr, kr2, qr, qr2, rs, dr, st, ls, ls2, eh, on_cmx, j, h):
+        """One v-head's step: l2-normalised q / k of its k-head, the gates, the delta rule on S (fp32 lanes), the
+        gated RMSNorm into on_cmx[j]. j: the head's index within the worker's block, h: its index.
+        The delta rule as npu_dsl's gdn_scan (kernels_poc/common/fused_ops.hpp): ONE read of S accumulates both
+        kv = S^T k and sq = S^T q, then o = e^g sq + (k . q) delta algebraically (S_new^T q = e^g S^T q + delta (k^T q)),
+        and S = e^g S + k delta^T is one read-modify-write. k_d / q_d are scalar splats (CMU.CP.512.32.R, one op; not a
+        [DK, FL] row expansion that costs a load per FMA). moviCompile does not software-pipeline these loops, so every
+        iteration carries its own parallelism: pass 1 four register accumulators over two column vectors, pass 2 a
+        whole row in eight register vectors loaded before any store (a load after a store to S serialises on it)."""
         for v in T.vectorized(FL):
             ls[v] = T.float32(0)
             ls2[v] = T.float32(0)
@@ -759,16 +765,14 @@ def gdn_block(H: int, KH: int, VH: int, DK: int, DV: int, G: int, tiles: int, sh
             st[1] = st[1] + ls2[v]
         st[0] = T.float32(qscale) / T.sqrt(st[0] + T.float32(1e-6))
         st[1] = T.float32(1) / T.sqrt(st[1] + T.float32(1e-6))
+        for v in T.vectorized(FL):
+            ls[v] = T.float32(0)
         for d0 in T.serial(DK // FL):
             for v in T.vectorized(FL):
                 qn[d0 * FL + v] = T.cast(q_cmx[0, (j // REP) * DK + d0 * FL + v], T.float32) * st[0]
                 kn[d0 * FL + v] = T.cast(k_cmx[0, (j // REP) * DK + d0 * FL + v], T.float32) * st[1]
-        # the per-row scalars as vector rows, built once per head: a scalar splat costs ~16 lane copies on this
-        # SHAVE, a vector load one LSU op, and the scan's inner loops use each row's k and q 8 times
-        for d in T.serial(DK):
-            for v in T.vectorized(FL):
-                knv[d, v] = kn[d]
-                qnv[d, v] = qn[d]
+                ls[v] = ls[v] + qn[d0 * FL + v] * kn[d0 * FL + v]
+        st[4] = T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL])   # k . q
         # gates: beta = sigmoid(b); g = -exp(A_log) softplus(a + dt_bias); e^g
         st[2] = T.float32(1) / (T.float32(1) + T.exp(T.float32(0) - T.cast(ba_cmx[0, j], T.float32)))
         st[3] = T.cast(ba_cmx[1, j], T.float32) + db_cmx[0, h]
@@ -777,44 +781,42 @@ def gdn_block(H: int, KH: int, VH: int, DK: int, DV: int, G: int, tiles: int, sh
         for v in T.vectorized(FL):
             egv[v] = st[3]
             betav[v] = st[2]
-        # pass 1: kv = S^T k (the decay e^g applied once below). Column block outer, rows inner, the block's
-        # accumulators in one-vector register buffers (kr, kr2: two rows per iteration = two independent chains);
-        # the row-outer form with CMX accumulators spent 503 cycles per row pair on their loads and stores.
-        for v0 in T.unroll(DV // FL):
-            for v in T.vectorized(FL):
-                kv[v0 * FL + v] = T.float32(0)
-                o[v0 * FL + v] = T.float32(0)
-        for v0 in T.serial(DV // FL):
+        # pass 1: kv = S^T k and sq = S^T q from one read of S; two adjacent column vectors outer, rows inner
+        for v0 in T.serial(DV // (2 * FL)):
             for v in T.vectorized(FL):
                 kr[v] = T.float32(0)
                 kr2[v] = T.float32(0)
-            for d0 in T.serial(DK // 2):
+                qr[v] = T.float32(0)
+                qr2[v] = T.float32(0)
+            for d in T.serial(DK):
                 for v in T.vectorized(FL):
-                    kr[v] = kr[v] + S_cmx[2 * d0, v0 * FL + v] * knv[2 * d0, v]
-                    kr2[v] = kr2[v] + S_cmx[2 * d0 + 1, v0 * FL + v] * knv[2 * d0 + 1, v]
+                    kr[v] = kr[v] + S_cmx[d, 2 * v0 * FL + v] * kn[d]
+                    qr[v] = qr[v] + S_cmx[d, 2 * v0 * FL + v] * qn[d]
+                    kr2[v] = kr2[v] + S_cmx[d, (2 * v0 + 1) * FL + v] * kn[d]
+                    qr2[v] = qr2[v] + S_cmx[d, (2 * v0 + 1) * FL + v] * qn[d]
             for v in T.vectorized(FL):
-                kv[v0 * FL + v] = kr[v] + kr2[v]
+                kv[2 * v0 * FL + v] = kr[v]
+                sq[2 * v0 * FL + v] = qr[v]
+                kv[(2 * v0 + 1) * FL + v] = kr2[v]
+                sq[(2 * v0 + 1) * FL + v] = qr2[v]
+        # delta = beta (v - e^g kv); o = e^g sq + (k . q) delta
         for v0 in T.unroll(DV // FL):
             for v in T.vectorized(FL):
-                delta[v0 * FL + v] = (T.cast(v_cmx[0, j * DV + v0 * FL + v], T.float32) - egv[v] * kv[v0 * FL + v]) * betav[v]
-        # pass 2: S = S e^g + k delta^T; o = S^T q (same loop order: delta[block] and o[block] stay in registers). The
-        # new row goes through a lane temporary: re-reading S right after its store made moviCompile scalarise the
-        # body (422 lane copies and 147 scalar ops per iteration).
-        for v0 in T.serial(DV // FL):
-            for v in T.vectorized(FL):
-                dr[v] = delta[v0 * FL + v]
-                kr[v] = T.float32(0)
-                kr2[v] = T.float32(0)
-            for d0 in T.serial(DK // 2):
+                dr[v] = (T.cast(v_cmx[0, j * DV + v0 * FL + v], T.float32) - egv[v] * kv[v0 * FL + v]) * betav[v]
+                delta[v0 * FL + v] = dr[v]
+                o[v0 * FL + v] = egv[v] * sq[v0 * FL + v] + dr[v] * st[4]
+        # pass 2: S = e^g S + k delta^T, a row at a time: its DV / FL vectors loaded (rs, registers), computed, then stored
+        for d in T.serial(DK):
+            st[5] = kn[d]
+            for i, r in enumerate(rs):   # Python-level: `range` would become a TIR loop
                 for v in T.vectorized(FL):
-                    sn[v] = S_cmx[2 * d0, v0 * FL + v] * egv[v] + knv[2 * d0, v] * dr[v]
-                    sn2[v] = S_cmx[2 * d0 + 1, v0 * FL + v] * egv[v] + knv[2 * d0 + 1, v] * dr[v]
-                    S_cmx[2 * d0, v0 * FL + v] = sn[v]
-                    S_cmx[2 * d0 + 1, v0 * FL + v] = sn2[v]
-                    kr[v] = kr[v] + sn[v] * qnv[2 * d0, v]
-                    kr2[v] = kr2[v] + sn2[v] * qnv[2 * d0 + 1, v]
-            for v in T.vectorized(FL):
-                o[v0 * FL + v] = kr[v] + kr2[v]
+                    r[v] = S_cmx[d, i * FL + v]
+            for i, r in enumerate(rs):
+                for v in T.vectorized(FL):
+                    r[v] = r[v] * egv[v] + delta[i * FL + v] * st[5]
+            for i, r in enumerate(rs):
+                for v in T.vectorized(FL):
+                    S_cmx[d, i * FL + v] = r[v]
         # gated RMSNorm: o * rsqrt(mean(o^2) + eps) * g_norm * silu(z), on lanes (the exp of -z on half16, VAU.EXP)
         for v in T.vectorized(FL):
             ls[v] = T.float32(0)
@@ -853,23 +855,23 @@ def gdn_block(H: int, KH: int, VH: int, DK: int, DV: int, G: int, tiles: int, sh
             S_cmx = T.alloc_local((DK, DV), T.float32)
             qn = T.alloc_local((DK,), T.float32)
             kn = T.alloc_local((DK,), T.float32)
-            knv = T.alloc_local((DK, FL), T.float32)
-            qnv = T.alloc_local((DK, FL), T.float32)
             egv = T.alloc_local((FL,), T.float32)
             betav = T.alloc_local((FL,), T.float32)
-            sn = T.alloc_local((FL,), T.float32)
-            sn2 = T.alloc_local((FL,), T.float32)
             kv = T.alloc_local((DV,), T.float32)
+            sq = T.alloc_local((DV,), T.float32)
             delta = T.alloc_local((DV,), T.float32)
             o = T.alloc_local((DV,), T.float32)
             kr = T.alloc_local((FL,), T.float32)
             kr2 = T.alloc_local((FL,), T.float32)
+            qr = T.alloc_local((FL,), T.float32)
+            qr2 = T.alloc_local((FL,), T.float32)
+            rs = [T.alloc_local((FL,), T.float32) for _ in range(DV // FL)]   # one S row in registers (pass 2)
             dr = T.alloc_local((FL,), T.float32)
             acc = T.alloc_local((FL,), T.float32)
             ls = T.alloc_local((FL,), T.float32)
             ls2 = T.alloc_local((FL,), T.float32)
             eh = T.alloc_local((FL,), T.float16)
-            st = T.alloc_local((4,), T.float32)
+            st = T.alloc_local((8,), T.float32)
             on_cmx = T.alloc_local((1, HPW * DV), T.float16)
             o_cmx = T.alloc_shared((1, VC), T.float16)
             res_cmx = T.alloc_shared((1, NOUT_pad), T.float16)
@@ -934,8 +936,8 @@ def gdn_block(H: int, KH: int, VH: int, DK: int, DV: int, G: int, tiles: int, sh
                     if skip_scan:
                         on_cmx[0, j * DV] = T.cast(S_cmx[0, 0], T.float16)
                     else:
-                        gdn_head(S_cmx, q_cmx, k_cmx, v_cmx, z_cmx, ba_cmx, al_cmx, db_cmx, gn_cmx, qn, kn, knv, qnv, egv, betav,
-                                 kv, delta, o, kr, kr2, dr, sn, sn2, st, ls, ls2, eh, on_cmx, j, worker * HPW + j)
+                        gdn_head(S_cmx, q_cmx, k_cmx, v_cmx, z_cmx, ba_cmx, al_cmx, db_cmx, gn_cmx, qn, kn, egv, betav,
+                                 kv, sq, delta, o, kr, kr2, qr, qr2, rs, dr, st, ls, ls2, eh, on_cmx, j, worker * HPW + j)
                     T.copy(S_cmx, Ssm[worker * HPW + j, 0, 0])
             T.copy(on_cmx, O[0, worker * HPW * DV])
             T.sync_grid()

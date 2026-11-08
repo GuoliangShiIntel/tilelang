@@ -101,12 +101,15 @@ def test_qwen36_shape_lowers_to_two_local_gemv_rings_and_a_vector_scan():
     assert "ctx.ring_begin((&(w2_cmx[0])), 135168, 2, 11, 0, 0, -1, 0, 1);" in src
     assert ", 1, 32, 4096, 128, 64);" in src
     assert "ring: local (no ids); ring_1: local (no ids)" in src
-    # the scan on fp32 lanes: column block outer, two rows per iteration, the block accumulators and the new row
-    # in one-vector register buffers (kr, kr2, sn, sn2, dr); S is the only CMX round trip per row
+    # the scan on fp32 lanes (npu_dsl's gdn_scan algebra): pass 1 reads S once for both S^T k and S^T q with four
+    # register accumulators and scalar k_d / q_d splats; pass 2 is one read-modify-write of S, a row in eight
+    # register vectors loaded before any store
     assert "float16 kr = {};  // local, one vector: a register" in src
-    assert re.search(r"sn = \(\(\*\(float16\*\)\(S_cmx \+ \(\((d0_\d+) \* 256\) \+ \((v0_\d+) \* 16\)\)\) \* egv\) \+ \(\*\(float16\*\)\(knv \+ \(\1 \* 32\)\) \* dr\)\);", src)
-    assert re.search(r"\*\(float16\*\)\(S_cmx \+ \(\((d0_\d+) \* 256\) \+ \((v0_\d+) \* 16\)\)\) = sn;", src)
-    assert re.search(r"kr = \(kr \+ \(sn \* \*\(float16\*\)\(qnv \+ \((d0_\d+) \* 32\)\)\)\);", src)
+    assert re.search(r"kr = \(kr \+ \(\*\(float16\*\)\(S_cmx \+ \(\((d_?\d*) \* 128\) \+ \((v0_?\d*) \* 32\)\)\) \* \(\(float16\)\(kn\[\1\]\)\)\)\);", src)
+    assert re.search(r"qr = \(qr \+ \(\*\(float16\*\)\(S_cmx \+ \(\((d_?\d*) \* 128\) \+ \((v0_?\d*) \* 32\)\)\) \* \(\(float16\)\(qn\[\1\]\)\)\)\);", src)
+    assert re.search(r"(r_\d+) = \(\(\1 \* egv\) \+ \(\*\(float16\*\)\(delta \+ 112\) \* __builtin_shufflevector\(st, st, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5\)\)\);", src)
+    assert re.search(r"\*\(float16\*\)\(S_cmx \+ \(\((d_\d+) \* 128\) \+ 112\)\) = r_\d+;", src)
+    assert "knv" not in src and "qnv" not in src
     # the conv on time-major state: unit-stride half16 lanes converted to fp32, the SiLU's exp on half16 lanes (VAU.EXP)
     assert re.search(r"eh = tl_npu_hexp\(__builtin_convertvector\(\(\(\(float16\)\(broadcast_var\w*\)\) - acc\), half16\)\);", src)
     assert "__builtin_convertvector(*(half16*)(cs_cmx + ((c0 * 16) + 512)), float16)" in src
