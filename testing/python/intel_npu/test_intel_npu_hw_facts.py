@@ -46,6 +46,8 @@ def test_target_defaults_are_the_facts():
     assert int(t.attrs["barrier_pool_first"]) == hw_facts.fact("barrier_pool_first")
     assert int(t.attrs["dma_ports"]) == hw_facts.fact("dma_ports")
     assert int(t.attrs["dpu_z_align"]) == hw_facts.fact("dpu_z_align")
+    assert int(t.attrs["dpu_max_output_points"]) == hw_facts.fact("dpu_max_output_points") == 8192
+    assert int(t.attrs["dpu_z_align"]) == hw_facts.fact("dpu_z_align")
     # the workspace is the physical CMX minus the runtime's reserved head, not the physical size
     assert hw_facts.fact("cmx_workspace_bytes") < hw_facts.fact("cmx_bytes_per_tile")
 

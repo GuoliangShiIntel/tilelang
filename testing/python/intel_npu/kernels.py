@@ -1453,7 +1453,7 @@ def rope_cos_sin(pos: int, ROT: int, theta: float):
     return np.stack([np.cos(emb), np.sin(emb)]).astype(np.float32)
 
 
-def make_attn_prefill(N: int = 64, NKV: int = 2, GQ: int = 8, D: int = 256, SMAX: int = 1536, TB: int = 8,
+def make_attn_prefill(N: int = 64, NKV: int = 2, GQ: int = 8, D: int = 256, SMAX: int = 1536, TB: int = 4,
                       BKV: int = 128, tiles: int = 3, shaves: int = 2, pipelined: bool = False):
     """P1: the full-attention PREFILL phase -- flash attention over `N` query tokens already normed, roped and
     appended to the cache, with the three things the decode phase does not need: **GQA**, the **causal mask** and
@@ -1472,6 +1472,11 @@ def make_attn_prefill(N: int = 64, NKV: int = 2, GQ: int = 8, D: int = 256, SMAX
     Oracle: `attn_prefill_reference`."""
     assert D % 32 == 0 and BKV % 32 == 0 and SMAX % BKV == 0 and N % TB == 0
     ROWS = TB * GQ
+    # One `T.gemm` is one DPU workload and the DPU takes at most 8192 output points, so the PV product bounds the
+    # query block: TB x GQ x D <= 8192. Splitting that output over D would allow a larger TB, which matters because
+    # a bigger block amortises the K/V re-read -- the next step, not this one.
+    assert ROWS * D <= 8192, f"query block {ROWS} x {D} = {ROWS * D} output points exceeds the DPU's 8192: lower TB"
+    assert ROWS * BKV <= 8192, f"score block {ROWS} x {BKV} exceeds the DPU's 8192 output points: lower TB or BKV"
     HL, FL = 32, 16
     assert BKV % HL == 0 and D % FL == 0
     scale = 1.0 / (D ** 0.5)

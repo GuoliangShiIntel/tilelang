@@ -60,6 +60,12 @@ FACTS: dict[str, Fact] = {
                               measured="npu_dsl's basis (2048 x 2.0454 GHz); IDU durations reach 96.9% of it under turbo",
                               note="question for the knowledge base / hardware owner: the nominal DPU_CLK under NPU_TURBO=YES and without it"),
     "dpu_z_align": Fact(16, "hw/npu5/dpu.md#3 (C mod 16 padding)", note="target dpu_z_align"),
+    "dpu_max_output_points": Fact(8192, "hw/npu5/dpu.md#13 (max output points per op on VPU5 -- 8192 against VPU4's 16384); "
+                                        "hw/npu5/dpu.md#4.6 (a separate limit: every workload dimension <= 8192)",
+                                  note="target dpu_max_output_points. It is the PRODUCT M x N of one workload's output, not a "
+                                       "per-dimension bound: LowerIntelNpuTileOp refuses a gemm whose output tile exceeds it. "
+                                       "dpu.md#1 lists the halving beside the other VPU5 reductions (PPEs 64 -> 32; NTHW/NTK "
+                                       "stencils 16/4 -> 16/2 and 8/8 -> 8/4 and 4/16 -> 4/8) but does not state a cause"),
     # --- SHAVE -------------------------------------------------------------------------------
     "shave_vector_bits": Fact(512, "hw/npu5/shave.md#1 and #2.1 (VRF: 32 x 512-bit)",
                               note="32 fp16 / 16 fp32 lanes; the 128-bit (v8f16, SAU.SUMX.f32) builtins are refused by moviCompile -mcpu=5000xx"),
