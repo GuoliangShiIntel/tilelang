@@ -1,0 +1,39 @@
+// Kernel registry for the TileLang device runner: npu_runtime resolves a kernel by name through
+// npu::getKernelsRegistry(). generic_compute's generate_kernels_registry embeds every ELF of the build
+// directory as a byte array in a generated source (48 MB for 80 kernels: a 15 s CMake hex conversion and
+// a 6 s compile, then a relink of the runner, after EVERY kernel change). This registry reads the same
+// ELFs from the build directory at first use instead, so this source is constant and a kernel change
+// costs its own compile and link only. The build directory is baked in by configure_file (a test
+// harness on the developer's box; the generated kernels are not shipped).
+#include <cstdint>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace npu {
+
+std::unordered_map<std::string, const std::pair<const std::uint8_t*, std::size_t>>& getKernelsRegistry() {
+    static std::deque<std::vector<std::uint8_t>> storage;   // stable addresses for the registry's pointers
+    static std::unordered_map<std::string, const std::pair<const std::uint8_t*, std::size_t>> registry;
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        const std::filesystem::path dir("@CMAKE_BINARY_DIR@");
+        for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+            if (!entry.is_regular_file() || entry.path().extension() != ".elf") continue;
+            std::ifstream in(entry.path(), std::ios::binary);
+            if (!in) continue;
+            storage.emplace_back(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            const auto& bytes = storage.back();
+            registry.emplace(entry.path().stem().string(), std::make_pair(bytes.data(), bytes.size()));
+        }
+    }
+    return registry;
+}
+
+}  // namespace npu

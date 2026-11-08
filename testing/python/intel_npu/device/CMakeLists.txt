@@ -44,4 +44,10 @@ foreach(device ${TL_NPU_DEVICES})
   endforeach()
 endforeach()
 
-generate_kernels_registry()
+# npu_runtime links `generated_kernels_registry` for npu::getKernelsRegistry(). generic_compute's
+# generate_kernels_registry() would embed every ELF of the build directory in a generated source and
+# recompile + relink the runner on every kernel change (~21 s of the ~26 s a one-kernel rebuild took);
+# this registry reads the ELFs from the build directory at first use (host/kernels_registry.cpp.in).
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/host/kernels_registry.cpp.in" "${CMAKE_BINARY_DIR}/generated_kernels_registry.cpp" @ONLY)
+add_library(generated_kernels_registry STATIC "${CMAKE_BINARY_DIR}/generated_kernels_registry.cpp")
+add_dependencies(npu_run build_user_kernels)
