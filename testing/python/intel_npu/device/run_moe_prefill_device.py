@@ -57,37 +57,49 @@ def main(argv):
     wr = np.zeros((RR, H), np.float16)
     wr[:E + 1] = (rng.standard_normal((E + 1, H), np.float32) * 0.05).astype(np.float16)
     ref = moe_route_prefill_reference(x, wr, E=E, TOPK=TOPK)
+    trials = arg(argv, "--trials", 5)
     rc = 0
 
     if phase in ("route", "both"):
         low = lowering.lower(make_moe_route_prefill(N=N, H=H, E=E, TOPK=TOPK, BM=min(N, 64), BNR=BNR,
                                                     tiles=TILES, shaves=SHAVES))
         db = build(low.source, f"tl_moe_route_prefill_n{N}_h{H}_e{E}", argv)
-        out = dict(Logits=np.zeros((N, RR), np.float16), Ids=np.zeros((N, TOPK), np.int32),
-                   Wts=np.zeros((N, 16), np.float32), Cnt=np.zeros(E + 1, np.int32),
-                   Off=np.zeros(E + 2, np.int32), Slot=np.zeros(N * (TOPK + 1), np.int32))
-        arrays = {"X": ("in", x), "Wr": ("in", wr), **{k: ("out", v) for k, v in out.items()}}
-        res = runner.run(db, lowering.order_arrays(low, arrays), TILES, SHAVES, HERE / "run_moe_prefill",
-                         repeat=10, warmup=10, timeout_s=300)
-        runner.check_status(res.status)
-        # the GEMM against fp32, with a tolerance; the grouping against the ranking of the device's OWN fp16
-        # logits, exactly -- in fp16 a near-tie among hundreds of experts ranks differently than in fp32
-        lg_rel = float(np.abs(out["Logits"][:, :E + 1].astype(np.float32) - ref["logits"][:, :E + 1]).max()
+
+        def route_once():
+            out = dict(Logits=np.zeros((N, RR), np.float16), Ids=np.zeros((N, TOPK), np.int32),
+                       Wts=np.zeros((N, 16), np.float32), Cnt=np.zeros(E + 1, np.int32),
+                       Off=np.zeros(E + 2, np.int32), Slot=np.zeros(N * (TOPK + 1), np.int32))
+            arrays = {"X": ("in", x), "Wr": ("in", wr), **{k: ("out", v) for k, v in out.items()}}
+            r = runner.run(db, lowering.order_arrays(low, arrays), TILES, SHAVES, HERE / "run_moe_prefill",
+                           repeat=10, warmup=10, timeout_s=300)
+            runner.check_status(r.status)
+            # the GEMM against fp32, with a tolerance; the grouping against the ranking of the device's OWN fp16
+            # logits, exactly -- in fp16 a near-tie among hundreds of experts ranks differently than in fp32
+            lg = float(np.abs(out["Logits"][:, :E + 1].astype(np.float32) - ref["logits"][:, :E + 1]).max()
                        / np.abs(ref["logits"][:, :E + 1]).max())
-        dev = moe_route_prefill_reference(x, wr, E=E, TOPK=TOPK, logits=out["Logits"])
-        ok = (np.array_equal(out["Ids"], dev["ids"]) and np.array_equal(out["Cnt"], dev["cnt"])
-              and np.array_equal(out["Off"], dev["off"]) and np.array_equal(out["Slot"], dev["slot"])
-              and np.abs(out["Wts"][:, :TOPK + 1] - dev["wts"][:, :TOPK + 1]).max() < 2e-3)
-        perm = np.array_equal(np.sort(out["Slot"]), np.arange(N * (TOPK + 1)))
-        flips = int((out["Ids"] != ref["ids"]).sum())
+            dev = moe_route_prefill_reference(x, wr, E=E, TOPK=TOPK, logits=out["Logits"])
+            exact = (np.array_equal(out["Ids"], dev["ids"]) and np.array_equal(out["Cnt"], dev["cnt"])
+                     and np.array_equal(out["Off"], dev["off"]) and np.array_equal(out["Slot"], dev["slot"])
+                     and np.abs(out["Wts"][:, :TOPK + 1] - dev["wts"][:, :TOPK + 1]).max() < 2e-3)
+            perm = np.array_equal(np.sort(out["Slot"]), np.arange(N * (TOPK + 1)))
+            return out, r, lg, exact and perm and lg < 5e-2
+
+        good, worst_lg, first = 0, 0.0, None
+        for _ in range(trials):
+            out, res, lg, okt = route_once()
+            good += int(okt)
+            worst_lg = max(worst_lg, lg)
+            if first is None:
+                first = out
+        flips = int((first["Ids"] != ref["ids"]).sum())
         kind = runner.condition(res, False)
-        print(f"route: {res.median_kernel_ms:.3f} ms [{kind}] -> {'PASS' if ok and perm and lg_rel < 5e-2 else 'FAIL'}; "
-              f"logits rel {lg_rel:.2e}; grouping exact on the device's own logits: {ok}; "
-              f"slot table is a permutation: {perm}; sha {db.source_sha256[:12]}")
-        print(f"  {N} tokens, {E + 1} experts: {int(out['Cnt'][:E].max())} tokens on the busiest routed expert, "
-              f"{int((out['Cnt'][:E] > 0).sum())} of {E} routed experts used; "
+        print(f"route: {res.median_kernel_ms:.3f} ms [{kind}] -> {'PASS' if good == trials else 'FAIL'}; "
+              f"{good}/{trials} trials exact on the device's own logits; worst logits rel {worst_lg:.2e}; "
+              f"sha {db.source_sha256[:12]}")
+        print(f"  {N} tokens, {E + 1} experts: {int(first['Cnt'][:E].max())} tokens on the busiest routed expert, "
+              f"{int((first['Cnt'][:E] > 0).sum())} of {E} routed experts used; "
               f"{flips} of {N * TOPK} choices differ from the fp32 ranking (fp16 near-ties)")
-        rc |= 0 if (ok and perm and lg_rel < 5e-2) else 1
+        rc |= 0 if good == trials else 1
 
     if phase in ("expert", "both"):
         gu_int = rng.integers(-8, 8, (E + 1, 2 * I, H), dtype=np.int8)
@@ -113,15 +125,19 @@ def main(argv):
         got, res = run(gu_int, d_int)
         oracle = moe_expert_prefill_reference(x, gu_int, gu_s, d_int, d_s, ref["wts"], ref["off"], ref["slot"],
                                               TOPK=TOPK, G=G)
-        rel = float(np.abs(got - oracle).max() / np.abs(oracle).max())
-        verdict = "PASS" if rel < 5e-2 else "FAIL"
+        scale = np.abs(oracle).max()
+        rels = [float(np.abs(got - oracle).max() / scale)]
+        for _ in range(trials - 1):
+            rels.append(float(np.abs(run(gu_int, d_int)[0] - oracle).max() / scale))
+        good = sum(1 for r in rels if r < 5e-2)
+        verdict = "PASS" if good == trials else "FAIL"
         kind = runner.condition(res, False)
         # the kernel skips an expert with no slots, so only the VISITED experts' weights are read
         visited = int((np.diff(ref["off"][:E + 2]) > 0).sum())
         per_expert = (2 * I * H + H * I) // 2
         once, decode_like = visited * per_expert, N * (TOPK + 1) * per_expert
-        print(f"expert: {res.median_kernel_ms:.3f} ms [{kind}]; max |out - ref| rel {rel:.2e} -> {verdict}; "
-              f"sha {db.source_sha256[:12]}")
+        print(f"expert: {res.median_kernel_ms:.3f} ms [{kind}]; {good}/{trials} trials match the oracle, "
+              f"worst rel {max(rels):.2e} -> {verdict}; sha {db.source_sha256[:12]}")
         print(f"  grouped: {visited} of {E + 1} experts visited, {once / 1e6:.0f} MB of int4 read once "
               f"({once / (res.median_kernel_ms * 1e-3) / 1e9:.1f} GB/s); a per-token walk of the same {N} tokens "
               f"would read {decode_like / 1e6:.0f} MB ({decode_like / once:.1f}x)")
