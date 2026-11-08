@@ -49,15 +49,17 @@ public:
   int64_t per_slot_bytes = 0; // scope local: x shaves_per_tile, at the peak
   int64_t shared_bytes = 0;   // scope shared: once per tile, at the peak
   int64_t qg_part_elems = 0, qg_st_elems = 0;   // merged-FC scratch of the largest gemm_i4/i8 (per SHAVE)
+  int64_t qg_defer_elems = 0;                   // ... of the largest DEFERRED one (its part is double-buffered)
   std::vector<std::pair<std::string, int64_t>> buffers;   // every allocation (the report)
   int spt = 1;
 
-  // Mirrors Ctx::reserve_qg: part + sT halves + the 16 KiB weight table, per SHAVE, when the kernel has a
-  // quantised GEMV (codegen emits the reservation from the same calls).
+  // Mirrors Ctx::reserve_qg: the `part` scratch is the larger of the largest shape and two of the largest deferred
+  // shape (the deferred reduction reads one while the DPU writes the other) + sT halves + the 16 KiB weight
+  // table, per SHAVE, when the kernel has a quantised GEMV (codegen emits the reservation from the same calls).
   int64_t qg_bytes_per_slot() const {
     if (qg_part_elems == 0)
       return 0;
-    return AlignUp(2 * qg_part_elems) + AlignUp(2 * qg_st_elems) + 16 * 1024;
+    return AlignUp(2 * std::max(qg_part_elems, 2 * qg_defer_elems)) + AlignUp(2 * qg_st_elems) + 16 * 1024;
   }
 
   void Run(const Stmt &body) {
@@ -87,8 +89,12 @@ private:
         const auto *G = op->args[7].as<IntImmNode>();
         if (M && N && K && G && G->value > 0) {
           const int64_t ng = K->value / G->value;
-          u_->qg_part_elems = std::max(u_->qg_part_elems, M->value * ng * N->value * ng);
+          const int64_t part = M->value * ng * N->value * ng;
+          u_->qg_part_elems = std::max(u_->qg_part_elems, part);
           u_->qg_st_elems = std::max(u_->qg_st_elems, ng * N->value);
+          const auto *defer = op->args.size() > 9 ? op->args[9].as<IntImmNode>() : nullptr;
+          if (defer != nullptr && defer->value != 0)
+            u_->qg_defer_elems = std::max(u_->qg_defer_elems, part);
         }
       }
       StmtExprVisitor::VisitExpr_(op);

@@ -281,25 +281,27 @@ public:
 
   // The device's merged-FC quantised GEMV, with its rounding points: each (row, group) partial product is
   // scaled by 1/16 and rounded to fp16 by the DPU's ODU, the SHAVE sums partial x scale in fp32, x16, fp16.
+  // `defer` is a device scheduling hint (the reduction runs later); the host sim reduces at once.
   void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride = 0) {
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride = 0, bool = false) {
     dpu_matmul_qg(out, a, q, s, M, N, K, G, 4, sStride);
   }
   void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q, const half *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride = 0) {
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride = 0, bool = false) {
     dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), s, M, N, K, G, 8, sStride);
   }
   void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const std::uint8_t *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride) {
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride, bool = false) {
     dpu_matmul_qg(out, a, q, reinterpret_cast<const half *>(s), M, N, K, G, 4, sStride);
   }
   void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q, const std::int8_t *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride) {
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride, bool = false) {
     dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), reinterpret_cast<const half *>(s), M, N, K, G, 8,
                   sStride);
   }
+  void qg_flush() {}
   // sStride 0: s row-major [N, K/G]; > 0: s group-major [K/G, sStride] (the device reads it in place).
-  void reserve_qg(std::uint32_t, std::uint32_t) {}   // the device's merged-FC scratch; nothing to reserve here
+  void reserve_qg(std::uint32_t, std::uint32_t, std::uint32_t = 0) {}   // the device's merged-FC scratch; nothing to reserve here
   void dpu_matmul_qg(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t bits, std::uint32_t sStride) {
     if (!ok_)

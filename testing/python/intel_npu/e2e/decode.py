@@ -56,6 +56,10 @@ class DeviceModel:
         self.chunks = self._chunks() if (single and chunked) else [self.layer_ids]
         G = pack.GEOM
         moe_kw = dict(BNR=G["moe_BNR"], BNG=G["moe_BNG"], BND=G["moe_BND"])
+        if os.environ.get("TL_NPU_MOE_NSG"):   # gate/up ring depth (slots), independent of the down ring's
+            moe_kw["num_stages_g"] = int(os.environ["TL_NPU_MOE_NSG"])
+        if os.environ.get("TL_NPU_MOE_DEFER"):   # defer the gate/up reductions (64 KB more CMX per SHAVE)
+            moe_kw["defer_gu"] = True
         if single:
             base_skip = frozenset(x for x in os.environ.get("TL_NPU_DBG_SKIP", "").split(",") if x)
             r2 = dict(R2=int(os.environ["TL_NPU_DBG_R2"])) if os.environ.get("TL_NPU_DBG_R2") else {}   # out_proj rows (model default 16)

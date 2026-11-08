@@ -82,16 +82,25 @@ def test_qwen36_shape_lowers_to_split_kv_rings_hoisted_over_the_groups():
     # qkv: 9216 rows = 3 tiles x 24 chunks of 128 (no padding), local ring; o_proj 2048 -> 2112, K 4096
     assert "ctx.ring_begin((&(w1_cmx[0])), 135168, 4, 24, 0, 0, 2, 0, 1);" in src
     assert "ctx.ring_begin((&(w2_cmx[0])), 135168, 2, 11, 0, 0, -1, 0, 1);" in src
-    # K and Vt: split streams (the tile's third of 1536 positions, 4 chunks of 128) read by the DPU, hoisted over g
+    # K and Vt: split local streams, with a per-tile chunk count derived from the runtime position.
     assert "k_cmx: SEGMENTED (streamed, each tile fills its own slot)" in src
-    assert "ring over kv hoisted over g (2 iterations: one begin/end, fills read the iteration)" in src
-    assert "ctx.ring_begin((&(k_cmx[0])), 65536, 2, 8, 8, 12, 0, 0, 0);" in src
-    assert "ctx.ring_begin((&(v_cmx[0])), 65536, 2, 8, 16, 20, 1, 0, 0);" in src
+    assert "ring over kv hoisted over g" not in src
+    kv_start = src.index("ring over kv (")
+    kv_note = src[kv_start:kv_start + 300]
+    kv_extent = re.search(r"int32_t kv_extent = (.*);", src)
+    assert "kv_extent" in kv_note and kv_extent and "pos_cmx[0]" in kv_extent.group(1) and "tile" in kv_extent.group(1)
+    begins = re.findall(r"ctx\.ring_begin\(\(&\((\w+)\[0\]\)\), 65536, 2, (.*?), 0, 0, (\d), 0, 1\);", src)
+    assert [(b[0], b[2]) for b in begins] == [("k_cmx", "0"), ("v_cmx", "1")]   # one port each, split, local
+    assert all("kv_extent" in b[1] for b in begins)
     assert "q_cmx: tile-invariant resident in a loop, 8 rows split 4 per SHAVE, tile sync before and after" in src
     # the mask on the chunk that straddles pos, the softmax on half32 lanes with the lane reductions
     assert "= (half)-6.550400e+04f;" in src
     assert "tl_npu_vmax(mx)" in src and "tl_npu_vsum(ls)" in src
-    assert "ctx.ring_dpu_submit(ring_1, ((g * 2) + u_1), (&(s_cmx[0])), (&(q_cmx[0])), ctx.ring_slot<half>(ring_1, ((g * 2) + u_1)), 8, 128, 256, 0, -1);" in src
+    # the QK / PV gemms sit under the position guard, so the slots are SHAVE-acquired around the chunk's work (one
+    # acquire + release per ring per use) and the gemms are synchronous DPU ops on the acquired slot
+    assert src.count("ctx.ring_slot_acquire(ring_1,") == 1 and src.count("ctx.ring_slot_release(ring_1,") == 1
+    assert src.count("ctx.ring_slot_acquire(ring_2,") == 1 and src.count("ctx.ring_slot_release(ring_2,") == 1
+    assert re.search(r"ctx\.dpu_matmul\(\(&\(s_cmx\[0\]\)\), \(&\(q_cmx\[0\]\)\), \(&\(k_cmx\[.*\]\)\), 8, 128, 256, 0, -1\);", src)
     assert src.count("ctx.sync_grid();") == 4
     # the V^T append is a strided DMA store of one column (2 B x 256 rows, 3072 B apart)
     assert re.search(r"ctx\.dma_store\(\(&\(Vt\[.*pos_cmx\[\(int64_t\)0\].*\]\)\), \(&\(vcol\[0\]\)\), 2, 256, 3072, 2\);", src)

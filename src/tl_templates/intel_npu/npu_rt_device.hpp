@@ -342,33 +342,48 @@ public:
   // [ng, sStride] (the packer's layout) and is read in place -- the transpose cost ~70 ns per row when ng % 8
   // != 0 (scalar path), 210 us per SHAVE in the MoE's down GEMVs (M3).
   void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride = 0) {
-    dpu_matmul_qg(out, a, q, s, M, N, K, G, 4, sStride);
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride = 0, bool defer = false) {
+    dpu_matmul_qg(out, a, q, s, M, N, K, G, 4, sStride, defer);
   }
   // int8 weights (one signed byte per value, rows K bytes apart), the DPU's native mixed mode; PPE 1/256.
   void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q, const half *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride = 0) {
-    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), s, M, N, K, G, 8, sStride);
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride = 0, bool defer = false) {
+    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), s, M, N, K, G, 8, sStride, defer);
   }
   // The scales packed after the weight rows of the chunk (gemm_i4's scales_row): addressed as bytes.
   void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const std::uint8_t *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride) {
-    dpu_matmul_qg(out, a, q, reinterpret_cast<const half *>(s), M, N, K, G, 4, sStride);
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride, bool defer = false) {
+    dpu_matmul_qg(out, a, q, reinterpret_cast<const half *>(s), M, N, K, G, 4, sStride, defer);
   }
   void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q, const std::int8_t *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride) {
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride, bool defer = false) {
     dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), reinterpret_cast<const half *>(s), M, N, K, G, 8,
-                  sStride);
+                  sStride, defer);
   }
-  // The merged-FC scratch (part [M x ng, C] fp16, sT [ng, N] fp16, one descriptor set and weight table) for the
+  // `defer` (npu_dsl fused_rt's matmul_qg defer): the SHAVE reduction of this workload is left pending and run by the
+  // NEXT dpu_matmul_qg after it has kicked its own DPU workload, so the reduce overlaps that workload's DPU time. The
+  // scratch `part` is double-buffered for it; `qg_flush()` runs a pending reduction (before any read of `out`: the
+  // codegen emits it where the author's statements read the output, and the sync / finish paths call it).
+  TL_NPU_HW_CALL void qg_flush() {
+    if (i4Pend_.out != nullptr) {
+      q_reduce(i4Pend_.out, i4Pend_.part, i4Pend_.sT, i4Pend_.sRow, i4Pend_.M, i4Pend_.N, i4Pend_.ng, i4Pend_.inv);
+      i4Pend_.out = nullptr;
+    }
+  }
+  // The merged-FC scratch (part [M x ng, C] fp16 -- two of them for the largest DEFERRED shape, whose pending
+  // reduction reads one while the DPU writes the other -- sT [ng, N] fp16, one descriptor set and
+  // weight table) for the
   // largest quantised GEMV shape of the kernel: codegen emits the call from the kernel's gemm_i4/i8 ops, so the
   // CMX budget is exact and the first workload pays no allocation; a larger later shape re-sizes (the old buffers
   // are left behind, which is the case the up-front reservation avoids).
-  TL_NPU_HW_CALL void reserve_qg(std::uint32_t partElems, std::uint32_t stElems) {
+  TL_NPU_HW_CALL void reserve_qg(std::uint32_t partElems, std::uint32_t stElems, std::uint32_t deferElems = 0) {
     if (!ok_)
       return;
-    if (partElems > i4PartElems_) {
-      i4PartElems_ = partElems;
+    if (deferElems > i4DeferElems_)
+      i4DeferElems_ = deferElems;
+    const std::uint32_t need = partElems > 2 * i4DeferElems_ ? partElems : 2 * i4DeferElems_;
+    if (need > i4PartElems_) {
+      i4PartElems_ = need;
       i4Part_ = alloc<half>(i4PartElems_);
     }
     if (stElems > i4STElems_) {
@@ -384,7 +399,8 @@ public:
     }
   }
   TL_NPU_HW_CALL void dpu_matmul_qg(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
-                     std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t bits, std::uint32_t sStride) {
+                     std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t bits, std::uint32_t sStride,
+                     bool defer = false) {
     if (!ok_)
       return;
     const std::uint32_t ng = K / G, C = N * ng;
@@ -392,8 +408,9 @@ public:
       fail(kStatusUnsupported, C);
       return;
     }
-    if (i4Part_ == nullptr || M * ng * C > i4PartElems_ || ng * N > i4STElems_)
-      reserve_qg(M * ng * C, ng * N);
+    const std::uint32_t partElems = M * ng * C;
+    if (i4Part_ == nullptr || partElems > i4PartElems_ || ng * N > i4STElems_ || (defer && partElems > i4DeferElems_))
+      reserve_qg(partElems, ng * N, defer ? partElems : 0);
     if (!ok_)
       return;
     const float partScale = bits == 8 ? kI8PartScale : kI4PartScale;
@@ -422,11 +439,20 @@ public:
     i4Mm_->setProducerBarriers(0, 0);
     const std::uint32_t t0 = perf_ticks();
     ++dpuStarts_;
-    i4Mm_->startMixed(i4Part_, const_cast<half *>(a), reinterpret_cast<std::int8_t *>(const_cast<std::uint8_t *>(q)));
+    half *part = i4Part_;
+    if (partElems <= i4DeferElems_) {
+      part += i4PartHalf_ ? i4DeferElems_ : 0;   // the half the pending reduction is not reading
+      i4PartHalf_ ^= 1u;
+    } else {
+      qg_flush();   // a shape beyond the ping-pong halves takes the whole scratch
+    }
+    i4Mm_->startMixed(part, const_cast<half *>(a), reinterpret_cast<std::int8_t *>(const_cast<std::uint8_t *>(q)));
     TL_NPU_COMPILER_BARRIER();
+    qg_flush();   // the previous workload's deferred reduction, overlapping this one's DPU time
     // s [N, ng] -> sT [ng, N] while the DPU runs: 8x8 vector transposes (npu_dsl's transpose_h) when the
     // shape allows, a scalar loop otherwise (1024 strided scalar copies cost ~9 us at N=64, ng=16).
-    // Group-major s (sStride > 0) needs none of it.
+    // Group-major s (sStride > 0) needs none of it. (Under defer, sT must stay valid until the next call: the
+    // packed group-major scales of a ring slot do, the transposed copy in i4ST_ would not, so defer needs sStride > 0.)
     const half *sT = s;
     std::uint32_t sRow = sStride;
     if (sStride == 0) {
@@ -438,6 +464,7 @@ public:
             i4ST_[g * N + n] = s[n * ng + g];
       sT = i4ST_;
       sRow = N;
+      defer = false;
     }
     const std::uint32_t t1 = perf_ticks();
     i4Mm_->wait();
@@ -446,7 +473,10 @@ public:
     dpuCount_ += 1;
     dpuIduTicks_ += static_cast<volatile const DpuMatMul::DescriptorsBuffer *>(i4Desc_)->hwpStats.idu_workload_duration;
     dpuOduTicks_ += static_cast<volatile const DpuMatMul::DescriptorsBuffer *>(i4Desc_)->hwpStats.odu_workload_duration;
-    q_reduce(out, i4Part_, sT, sRow, M, N, ng, 1.0f / partScale);
+    if (defer)
+      i4Pend_ = {out, part, sT, sRow, M, N, ng, 1.0f / partScale};
+    else
+      q_reduce(out, part, sT, sRow, M, N, ng, 1.0f / partScale);
     const std::uint32_t t3 = perf_ticks();
     ringTicks_[kTickSubmit] += (t1 - t0) + (t3 - t2);   // SHAVE side: start + transpose, reduce
     ringTicks_[kTickDpuWait] += t2 - t1;                // DPU time not hidden behind the transpose
@@ -699,6 +729,7 @@ public:
   // before (use >= 2 x depth).
   TL_NPU_HW_CALL void ring_fill(Ring &r, std::uint32_t use, std::uint64_t src, std::uint32_t width,
                  std::uint32_t rows, std::uint32_t srcStride) {
+    qg_flush();   // the fill may overwrite the slot whose scales a deferred reduction reads
     if (!ok_ || !ring_issuer(r) || use >= r.myUses)
       return;
     DmaDescriptor *d = ring_fill_desc(r, use);
@@ -750,10 +781,14 @@ public:
         DmaDrv::setProducerBarrier(d, ready);
       DmaDrv::setConsumerBarriers(d, 0, 0);
       TL_NPU_COMPILER_BARRIER();
+      const std::uint32_t t2 = perf_ticks();
       dma_.start(d, port);
       TL_NPU_COMPILER_BARRIER();
       lastOnPort_[port] = d;
-      ringTicks_[kTickFillIssue] += perf_ticks() - t1;
+      const std::uint32_t t3 = perf_ticks();
+      if (r.local)
+        ringTicks_[kTickOrder] += t3 - t2;   // local rings have no order wait: the counter holds the toolkit start (chain spin + kick)
+      ringTicks_[kTickFillIssue] += t3 - t1;
       return;
     }
     DmaDrv::initDesc(d + 1);
@@ -850,6 +885,7 @@ public:
     ringTicks_[kTickLive] += perf_ticks() - t0;
   }
   TL_NPU_HW_CALL void ring_slot_release(Ring &r, std::uint32_t use) {
+    qg_flush();   // a deferred reduction may read the slot's scales
     if (!ok_ || !r.armed || use >= r.myUses || r.local)
       return;
     TL_NPU_COMPILER_BARRIER();   // the slot's last reads stay before the release
@@ -911,6 +947,7 @@ public:
   // Barriers. DMA is synchronous in Phase 1-2, so only SHAVE-side writes need
   // publishing: CMX writes to the tile, direct DDR stores out of the data L1.
   TL_NPU_HW_CALL void sync_grid() {
+    qg_flush();
     TL_NPU_COMPILER_BARRIER();
     flushCmxWrites();
     sync::memoryFence();
@@ -922,6 +959,7 @@ public:
     TL_NPU_COMPILER_BARRIER();
   }
   TL_NPU_HW_CALL void sync_tile() {
+    qg_flush();
     TL_NPU_COMPILER_BARRIER();
     flushCmxWrites();
     sync::memoryFence();
@@ -1015,6 +1053,7 @@ public:
   // max(t_finish) - min(t_entry) over the SHAVEs as the kernel-only time. `extra` is a probe's.
   static constexpr std::uint32_t kStatusBytes = 64;
   TL_NPU_HW_CALL void finish(const std::uint32_t *extra = nullptr, std::uint32_t nExtra = 0) {
+    qg_flush();
     if (statusAddr_ == 0)
       return;
     const std::uint64_t a = statusAddr_ + static_cast<std::uint64_t>(kStatusBytes) * worker();
@@ -1233,6 +1272,7 @@ private:
 
   TL_NPU_HW_CALL void dma_store(std::uint64_t dst, const void *src, std::uint32_t width, std::uint32_t rows,
                  std::uint32_t dstStride, std::uint32_t srcStride) {
+    qg_flush();   // the store may read a deferred reduction's output
     if (!ok_ || width == 0 || rows == 0)
       return;
     port_retire(0);
@@ -1309,6 +1349,14 @@ private:
   DpuMatMul::DescriptorsBuffer *i4Desc_{nullptr};
   std::uint32_t *i4Wt_{nullptr};
   half *i4Part_{nullptr}, *i4ST_{nullptr};
+  std::uint32_t i4PartHalf_ = 0;
+  std::uint32_t i4DeferElems_ = 0;   // part elems of the largest deferred shape: the scratch holds two of them
+  struct QgPending {
+    half *out = nullptr, *part = nullptr;
+    const half *sT = nullptr;
+    std::uint32_t sRow = 0, M = 0, N = 0, ng = 0;
+    float inv = 0.f;
+  } i4Pend_;
   std::uint32_t i4PartElems_{0}, i4STElems_{0};
   std::uint64_t i4Key_{~0ull};
   std::uint32_t dpuCount_{0}, dpuIduTicks_{0}, dpuOduTicks_{0};

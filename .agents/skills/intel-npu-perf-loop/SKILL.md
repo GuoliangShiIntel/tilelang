@@ -74,6 +74,8 @@ model that is kept produces the next wasted attempt). A golden failure is a stop
 |---|---|---|
 | decode ring, per chunk (local ring, one 64-132 KB fill): `fill_issue` ~2.3 us + `acquire` ~2.5 us | ~5 us of SHAVE time per chunk, regardless of bytes | status words 10-15 (ring ticks), MoE 2026-11-07 |
 | one `gemm_i4` workload (M=1, 64-256 rows x K 512-4096): submit ~0.85 us + dpu_wait ~2 us | ~2.9 us round trip; a 16-row router ring was 67 us for 6 us of DPU | same |
+| the merged-FC SHAVE reduce (q_reduce, 64 cols x 16 groups) | ~1 us: deferring it into the next workload's DPU time (`gemm_i4(defer=True)`) saved 11 us per MoE layer, not the predicted 70 — the dpu_wait is the DPU's own kick-to-watermark latency (hardware question 7), not the reduce | defer A/B 2026-11-07 |
+| ring geometry at decode (128-row x 2 slots vs 256-row x 1 slot per SHAVE) | fewer, larger fills are WORSE (+170 us): `DmaDrv::start` spins on the port's previous job (one in flight per port), so one slot per SHAVE serialises fill(u+1) behind fill(u). The per-chunk ~5 us is a latency chain, not a byte or job count | geometry A/B 2026-11-07 |
 | fp16 DPU workload M=16, N=96, K=2048 | ~15 us (not the 2.7 us of the M=1 i4 form) | MoE resident router |
 | a vectorised elementwise pass over 1024 fp16/fp32 values on one SHAVE (SwiGLU, axpy) | < 2 us: never the bound | perf regions `swig` / `accm` |
 | a scalar top-k over 256 logits on one SHAVE | 43 us; on 32 lanes 12 us | perf region `topk` |

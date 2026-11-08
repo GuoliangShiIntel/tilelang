@@ -331,11 +331,11 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
     return;
   }
   if (op->op.same_as(tl::intel_npu_dpu_matmul_i4g())) {
-    os << "ctx.dpu_matmul_i4g(" << args(0, 9) << ")";
+    os << "ctx.dpu_matmul_i4g(" << args(0, op->args.size()) << ")";
     return;
   }
   if (op->op.same_as(tl::intel_npu_dpu_matmul_i8g())) {
-    os << "ctx.dpu_matmul_i8g(" << args(0, 9) << ")";
+    os << "ctx.dpu_matmul_i8g(" << args(0, op->args.size()) << ")";
     return;
   }
   if (op->op.same_as(tl::intel_npu_ring_begin())) {
@@ -469,7 +469,7 @@ void CodeGenTileLangIntelNpu::AddFunction(const PrimFunc &f) {
   }
   // The merged-FC scratch (npu_rt_device.hpp dpu_matmul_qg): part [M x ng, N x ng] and sT [ng, N] halves of the
   // largest quantised GEMV, reserved up front in kernel_entry so a kernel with two GEMV shapes pays no re-size.
-  qg_part_elems_ = qg_st_elems_ = 0;
+  qg_part_elems_ = qg_st_elems_ = qg_defer_elems_ = 0;
   // Buffers accessed at a variable lane (indexed by a loop variable) are arrays, not registers: a splat of a
   // variable-lane extract is unselectable on the SHAVE (the flash-decoding o_acc update by corr[i], M1 decode).
   variable_lane_.clear();
@@ -501,8 +501,12 @@ void CodeGenTileLangIntelNpu::AddFunction(const PrimFunc &f) {
     const auto *G = call->args[7].as<IntImmNode>();
     if (M && N && K && G && G->value > 0) {
       const int64_t ng = K->value / G->value;
-      qg_part_elems_ = std::max(qg_part_elems_, M->value * ng * N->value * ng);
+      const int64_t part = M->value * ng * N->value * ng;
+      qg_part_elems_ = std::max(qg_part_elems_, part);
       qg_st_elems_ = std::max(qg_st_elems_, ng * N->value);
+      const auto *defer = call->args.size() > 9 ? call->args[9].as<IntImmNode>() : nullptr;
+      if (defer != nullptr && defer->value != 0)
+        qg_defer_elems_ = std::max(qg_defer_elems_, part);
     }
   });
 
@@ -579,8 +583,8 @@ void CodeGenTileLangIntelNpu::EmitKernelEntry(
   stream << ");\n";
   stream << "  if (!ctx.ok()) { ctx.finish(); return; }\n";
   if (qg_part_elems_ > 0) {
-    stream << "  ctx.reserve_qg(" << qg_part_elems_ << ", " << qg_st_elems_
-           << ");  // merged-FC scratch of the largest gemm_i4/i8 shape\n";
+    stream << "  ctx.reserve_qg(" << qg_part_elems_ << ", " << qg_st_elems_ << ", " << qg_defer_elems_
+           << ");  // merged-FC scratch of the largest gemm_i4/i8 shape (and 2 x the largest deferred one)\n";
     stream << "  if (!ctx.ok()) { ctx.finish(); return; }\n";
   }
   stream << "  " << kernel_name << "(ctx";

@@ -486,7 +486,8 @@ def make_moe_decode(H: int = 2048, I: int = 512, E: int = 256, TOPK: int = 8, G:
 
 
 def moe_block(H: int, I: int, E: int, TOPK: int, G: int, tiles: int, shaves: int, num_stages: int = 4, BNR: int = 16,
-              BNG: int = 128, BND: int = 256, RG: int = 64, RD: int = 256, pipelined: bool = True, probe_skip_dpu: bool = False):
+              BNG: int = 128, BND: int = 256, RG: int = 64, RD: int = 256, pipelined: bool = True, probe_skip_dpu: bool = False,
+              num_stages_g: int | None = None, defer_gu: bool = False):
     """The MoE layer's phases 1-3 as a `T.macro` (make_moe_decode's docstring): `moe_phases(x_cmx, Wr, WguP, WdP,
     Logits, Part, tile, shave)` takes the normed token in tile-shared CMX (`x_cmx` fp16 [1, H]) and leaves every tile's
     fp32 partial of the MoE output in `Part[tile]` behind a grid barrier; the caller combines (the standalone kernel on
@@ -507,6 +508,10 @@ def moe_block(H: int, I: int, E: int, TOPK: int, G: int, tiles: int, shaves: int
     assert (I // shaves) % (2 * FL) == 0 and (H // shaves) % FL == 0 and BNG % (2 * FL) == 0 and BND % (2 * FL) == 0 and H % (2 * FL) == 0
     assert E + 1 <= RR   # the shared expert's gate logit is row E
     topk_lanes = E % (2 * FL) == 0   # the row max on 32 fp16 lanes; a small instance scans scalars
+    NSG = num_stages_g if num_stages_g is not None else num_stages   # resolved here: `or` inside the macro parses as a TIR boolean
+    # (workload, defer its reduction into the next workload's DPU time): all but the last. Measured -11 us/layer for
+    # 2 x RG x H/G x 2 B of CMX (the part double buffer), which the GDN + MoE layer kernel cannot spare: opt-in.
+    GU_SUBS = [(sub, defer_gu and sub < BNG // RG - 1) for sub in range(BNG // RG)]
     SRG, SRD = moe_scale_rows(H, I, G, BNG, BND)
     BG, BD = BNG + SRG, BND + SRD
 
@@ -597,13 +602,14 @@ def moe_block(H: int, I: int, E: int, TOPK: int, G: int, tiles: int, shaves: int
         # --- 3. experts: IPT items per tile -----------------------------------------------------------
         for j in T.serial(IPT):
             perf_begin("gupr")
-            for n in (T.Pipelined(CG, num_stages=num_stages) if pipelined else T.serial(CG)):
+            for n in (T.Pipelined(CG, num_stages=NSG) if pipelined else T.serial(CG)):
                 T.copy(WguP[(ids[tile * IPT + j] * CG + n) * BG, 0], wq_cmx)
                 if probe_skip_dpu:
                     y_cmx[0, 0] = T.cast(wq_cmx[0, 0], T.float16)   # keep the slot read (the ring needs a reader)
                 else:
-                    for sub in T.serial(BNG // RG):
-                        T.gemm_i4(x_cmx, wq_cmx, None, y_cmx, group=G, row0=sub * RG, rows=RG, scales_row=BNG)
+                    for sub, dfr in GU_SUBS:   # Python-level: `defer` is a compile-time flag
+                        # all but the chunk's last workload defer their reduction into the next workload's DPU time
+                        T.gemm_i4(x_cmx, wq_cmx, None, y_cmx, group=G, row0=sub * RG, rows=RG, scales_row=BNG, defer=dfr)
                 for c0 in T.serial(BNG // HL):
                     for v in T.vectorized(HL):
                         gu_cmx[0, n * BNG + c0 * HL + v] = y_cmx[0, c0 * HL + v]
@@ -1184,6 +1190,7 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
     workers = tiles * shaves
     NIT = NH + NKV
     CPT = SMAX // (tiles * BKV)                 # key chunks per tile per group
+    assert CPT % shaves == 0, "the kv ring's runtime chunk count is a multiple of the SHAVEs (hoisted over the groups)"
     HL, FL = 32, 16
     PW = D + FL                                 # partial row: O then m, l
     scale = 1.0 / (D ** 0.5)
@@ -1290,17 +1297,20 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
                 for i in T.serial(GQ):
                     m_i[i] = T.float32(-1e30)
                     l_i[i] = T.float32(0)
-                for kv in (T.Pipelined(CPT, num_stages=kv_stages) if (pipelined and kv_stages > 0) else T.serial(CPT)):
-                    T.copy(Kc[g, (tile * CPT + kv) * BKV, 0], k_cmx)
-                    T.copy(Vt[g, 0, (tile * CPT + kv) * BKV], v_cmx)
-                    if "g" not in stages:
+                # The K/V rings are local, so each tile streams only its own chunks up to pos.
+                kv_extent = T.min(CPT, T.ceildiv(T.max(0, pos_cmx[0, 0] + 1 - tile * BKV), BKV * tiles))
+                for kv in (T.Pipelined(kv_extent, num_stages=kv_stages) if (pipelined and kv_stages > 0) else T.serial(CPT)):
+                    T.copy(Kc[g, (kv * tiles + tile) * BKV, 0], k_cmx)
+                    T.copy(Vt[g, 0, (kv * tiles + tile) * BKV], v_cmx)
+                    if (kv * tiles + tile) * BKV <= pos_cmx[0, 0]:
+                      if "g" not in stages:
                         T.gemm(q_cmx, k_cmx, s_cmx, transpose_B=True, clear_accum=True)
-                    # positions past pos: their scores are 0 (zeroed cache) -> -65504 before the max, so P = 0
-                    if (tile * CPT + kv) * BKV + BKV > pos_cmx[0, 0] + 1:
+                      # positions past pos: their scores are 0 (zeroed cache) -> -65504 before the max, so P = 0
+                      if (kv * tiles + tile) * BKV + BKV > pos_cmx[0, 0] + 1:
                         for i, j in T.grid(GQ, BKV):
-                            if (tile * CPT + kv) * BKV + j > pos_cmx[0, 0]:
+                            if (kv * tiles + tile) * BKV + j > pos_cmx[0, 0]:
                                 s_cmx[i, j] = T.float16(-65504)
-                    for i in T.serial(GQ):
+                      for i in T.serial(GQ):
                         for v in T.vectorized(HL):
                             mx[v] = s_cmx[i, v]
                         for j0 in T.serial(1, BKV // HL):
@@ -1318,9 +1328,9 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
                                 ls[v] = ls[v] + T.cast(s_cmx[i, j0 * FL + v], T.float32)
                         l_i[i] = l_i[i] * corr[i] + T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL])
                         m_i[i] = m_new[i]
-                    if "g" not in stages:
+                      if "g" not in stages:
                         T.gemm(s_cmx, v_cmx, pv_cmx, transpose_B=True, clear_accum=True)
-                    for i in T.serial(GQ):
+                      for i in T.serial(GQ):
                         for d0 in T.serial(D // FL):
                             for v in T.vectorized(FL):
                                 o_acc[i, d0 * FL + v] = o_acc[i, d0 * FL + v] * corr[i] + T.cast(pv_cmx[i, d0 * FL + v], T.float32)
@@ -1978,9 +1988,11 @@ def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int
                 Wr = T.ddr_view(Table[li, col["Wr"]], (RR, H), T.float16)
                 WguP = T.ddr_view(Table[li, col["WguP"]], ((E + 1) * CG * BG, H // 2), T.uint8)
                 WdP = T.ddr_view(Table[li, col["WdP"]], ((E + 1) * CD * BD, I // 2), T.uint8)
+                perf_begin("lhed")
                 T.copy(InNorm[0, 0], nw_cmx)
                 if "norm" not in skip:
                     rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
+                perf_end()
                 if Kind[li, 0] == 0:
                     WinP = T.ddr_view(Table[li, col["W0"]], ((NIN_pad // BN1g) * BR1g, H // 2), T.uint8)
                     Wba = T.ddr_view(Table[li, col["W1"]], (WBA_pad, H), T.float16)
@@ -1993,8 +2005,10 @@ def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int
                     Ssm = T.ddr_view(Table[li, col["S1"]], (VH, DK, DV), T.float32)
                     if "gdn" not in skip:
                         gdn_mixer(x_cmx, WinP, Wba, ConvW, ALog, DtBias, GNorm, ConvState, Ssm, WoutP, Y, BA, CV, O, Mix, Mix, tile, shave)
+                        perf_begin("mixh")
                         T.sync_grid()
                         T.copy(Mix[0:1, 0:H], mix_cmx[0:1, 0:H])
+                        perf_end()
                     else:
                         if shave == 0:
                             for c in T.serial(H):
@@ -2016,14 +2030,18 @@ def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int
                             for c in T.serial(H):
                                 mix_cmx[0, c] = x_cmx[0, c]
                         T.sync_threads()
+                perf_begin("ltal")
                 add_rows(h32, mix_cmx, shave)
                 T.copy(PostNorm[0, 0], nw_cmx)
                 if "norm" not in skip:
                     rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
+                perf_end()
                 if "moe" not in skip:
                     moe_phases(x_cmx, Wr, WguP, WdP, Logits, PartM, tile, shave)
+                    perf_begin("lprt")
                     T.copy(PartM[0, 0], p_cmx)
                     add_parts(h32, p_cmx, tiles, shave)
+                    perf_end()
             # a grid barrier closes the layer loop's CMX phase before the head's ring (the lm_head ring is 1 MB)
             T.sync_grid()
             T.copy(NormW[0, 0], nw_cmx)

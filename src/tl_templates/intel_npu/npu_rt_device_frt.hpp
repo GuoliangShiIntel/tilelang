@@ -125,7 +125,7 @@ public:
       return;
     frt::Ctx::matmul(out, a, bt, M, N, K);   // fused_rt's own M split / stencil (mm_tune)
   }
-  __attribute__((noinline)) void reserve_qg(std::uint32_t partElems, std::uint32_t /*stElems*/) {
+  __attribute__((noinline)) void reserve_qg(std::uint32_t partElems, std::uint32_t /*stElems*/, std::uint32_t = 0) {
     if (!ok_ || partElems <= i4PartElems_)
       return;
     i4PartElems_ = partElems;
@@ -133,22 +133,23 @@ public:
   }
   __attribute__((noinline)) void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const half *s,
                                                 std::uint32_t M, std::uint32_t N, std::uint32_t K, std::uint32_t G,
-                                                std::uint32_t sStride = 0) {
-    qg(out, a, q, s, M, N, K, G, 4, sStride);
+                                                std::uint32_t sStride = 0, bool defer = false) {
+    qg(out, a, q, s, M, N, K, G, 4, sStride, defer);
   }
   __attribute__((noinline)) void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q, const half *s,
                                                 std::uint32_t M, std::uint32_t N, std::uint32_t K, std::uint32_t G,
-                                                std::uint32_t sStride = 0) {
-    qg(out, a, reinterpret_cast<const std::uint8_t *>(q), s, M, N, K, G, 8, sStride);
+                                                std::uint32_t sStride = 0, bool defer = false) {
+    qg(out, a, reinterpret_cast<const std::uint8_t *>(q), s, M, N, K, G, 8, sStride, defer);
   }
   void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const std::uint8_t *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride) {
-    dpu_matmul_i4g(out, a, q, reinterpret_cast<const half *>(s), M, N, K, G, sStride);
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride, bool defer = false) {
+    dpu_matmul_i4g(out, a, q, reinterpret_cast<const half *>(s), M, N, K, G, sStride, defer);
   }
   void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q, const std::int8_t *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride) {
-    dpu_matmul_i8g(out, a, q, reinterpret_cast<const half *>(s), M, N, K, G, sStride);
+                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride, bool defer = false) {
+    dpu_matmul_i8g(out, a, q, reinterpret_cast<const half *>(s), M, N, K, G, sStride, defer);
   }
+  void qg_flush() {}   // frt flushes its own pending reduction at the next matmul_qg / barrier / store
 
   // ---- rings: split streams only; a fill is one descriptor on the second port, one in flight per SHAVE ------
   struct Ring {
@@ -306,7 +307,7 @@ private:
     }
   }
   void qg(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M, std::uint32_t N, std::uint32_t K,
-          std::uint32_t G, std::uint32_t bits, std::uint32_t sStride) {
+          std::uint32_t G, std::uint32_t bits, std::uint32_t sStride, bool defer) {
     if (!ok_)
       return;
     const std::uint32_t ng = K / G;
@@ -314,7 +315,7 @@ private:
       reserve_qg(M * ng * N * ng, ng * N);
     if (!ok_)
       return;
-    frt::Ctx::matmul_qg(out, a, q, s, i4Part_, M, N, K, G, bits, false, sStride, 0);
+    frt::Ctx::matmul_qg(out, a, q, s, i4Part_, M, N, K, G, bits, defer && sStride != 0, sStride, 0);
   }
 
   std::uint64_t statusAddr_ = 0;

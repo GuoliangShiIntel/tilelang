@@ -78,7 +78,7 @@ def test_gemv_streams_split_weight_chunks_the_dpu_reads_in_place():
     assert "ctx.ring_begin((&(wq_cmx[0])), 262144, 2, 8, 0, 0, 0, 0, 1);" in src
     assert "0 gemm(s), 2 slot(s) read by the SHAVE" in src
     assert re.search(r"for \(int32_t sub = 0; sub < 4; \+\+sub\) \{\s*ctx\.dpu_matmul_i4g\(\(&\(y_cmx\[\(sub \* 64\)\]\)\), \(&\(x_cmx\[0\]\)\), "
-                     r"\(&\(wq_cmx\[\(\(tx \* 262144\) \+ \(sub \* 65536\)\)\]\)\), \(&\(s_cmx\[\(\(tx \* 4096\) \+ \(sub \* 1024\)\)\]\)\), 1, 64, 2048, 128, 0\);", src)   # row-major scales (stride 0)
+                     r"\(&\(wq_cmx\[\(\(tx \* 262144\) \+ \(sub \* 65536\)\)\]\)\), \(&\(s_cmx\[\(\(tx \* 4096\) \+ \(sub \* 1024\)\)\]\)\), 1, 64, 2048, 128, 0, 0\);", src)   # row-major scales (stride 0), no defer
     with pytest.raises(AssertionError):
         make_w4a16_gemv(6144, 2048, BN=256, G=G, tiles=TILES, rows_per_workload=128)   # 128 x 16 groups > 1024 channels
 

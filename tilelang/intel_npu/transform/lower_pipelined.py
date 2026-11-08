@@ -91,6 +91,21 @@ def _const(e):
     return int(e.value)
 
 
+def _const_or(e, default):
+    return int(e.value) if isinstance(e, tirx.IntImm) else default
+
+
+def _as_i32(e):
+    return e if e.dtype == "int32" else tirx.Cast("int32", e)
+
+
+def _divisible(e, n) -> bool:
+    """Whether the extent `e` (constant or runtime) is provably a multiple of `n`."""
+    if isinstance(e, tirx.IntImm):
+        return int(e.value) % n == 0
+    return bool(tvm.arith.Analyzer().can_prove_equal(tirx.floormod(e, _i32(n)), _i32(0)))
+
+
 class _Launch:
     """The launch variables and extents of the kernel (thread_extent AttrStmts)."""
 
@@ -305,8 +320,17 @@ class _Pipeline:
         self.loop = loop
         self.outer = outer   # the enclosing serial loop the ring is hoisted over, if any
         self.c = loop.loop_var
-        self.total = _const(loop.extent)
-        self.total_chunks = self.total * (_const(outer.extent) if outer is not None else 1)
+        # The chunk count may be a runtime value (a decode step streams the cache up to its position, not
+        # SMAX): it must be the same on every SHAVE of every tile (the barrier counts are shared), which a
+        # value read from tile-shared CMX is. The runtime ignores fills / uses past it.
+        self.total = _as_i32(loop.extent)
+        outer_n = _const(outer.extent) if outer is not None else 1
+        if isinstance(loop.extent, tirx.IntImm):
+            self.total_chunks = _i32(int(loop.extent.value) * outer_n)
+            self.total_text = str(int(loop.extent.value) * outer_n)
+        else:
+            self.total_chunks = self.total * _i32(outer_n)
+            self.total_text = f"({loop.extent})" + (f" x {outer_n}" if outer is not None else "")
         self.stages = int(loop.annotations["num_stages"])
         if _const(loop.min) != 0:
             raise ValueError("intel_npu: a pipelined loop must start at 0")
@@ -369,15 +393,17 @@ def LowerIntelNpuPipelined():
             return use * spt + tx
 
         def inner_chunk(p, use):
-            # the pipelined loop's own index of global chunk `use * spt + tx` (hoisted: modulo the inner extent)
-            return tirx.floormod(chunk(use), _i32(p.total)) if p.outer is not None else chunk(use)
+            # the pipelined loop's own index of global chunk `use * spt + tx` (hoisted: modulo the inner extent);
+            # truncating division: both operands are non-negative, and a runtime extent would otherwise cost the
+            # SHAVE the signed floordiv fix-up on every fill address
+            return tirx.truncmod(chunk(use), p.total) if p.outer is not None else chunk(use)
 
         def fill(st, use):
             # the source of global chunk `use * spt + tx`: the pipelined index is that chunk modulo the inner extent
             # and (hoisted) the outer index is its quotient, so a fill issued ahead reads the next iteration's rows
             sub = {st.pipe_c: inner_chunk(st.pipe, use)}
             if st.pipe.outer is not None:
-                sub[st.pipe.outer.loop_var] = tirx.floordiv(chunk(use), _i32(st.pipe.total))
+                sub[st.pipe.outer.loop_var] = tirx.floordiv(chunk(use), st.pipe.total)
             src = substitute(st.src, sub)
             return tirx.Evaluate(tirx.Call("handle", _op(RING_FILL),
                                            [st.ring, use, src, _i32(st.width), _i32(st.rows), _i32(st.src_stride)]))
@@ -412,7 +438,7 @@ def LowerIntelNpuPipelined():
             st.local = local
             return tirx.Bind(st.ring, tirx.Call("handle", _op(RING_BEGIN),
                                                 [_address_of(st.slots, [_i32(0)] * len(st.slots.shape)),
-                                                 _i32(st.slot_bytes), _i32(p.stages), _i32(p.total_chunks), _i32(-1),
+                                                 _i32(st.slot_bytes), _i32(p.stages), p.total_chunks, _i32(-1),
                                                  _i32(-1), _i32(st.port), _i32(multicast), _i32(local)]))
 
         def assign_ports(pipes):
@@ -436,10 +462,10 @@ def LowerIntelNpuPipelined():
             load = [0, 0]
             for st in deep:
                 for port in (0, 1):
-                    load[port] += st.pipe.total_chunks * (st.slot_bytes + fixed_bytes) // 2
+                    load[port] += _const_or(st.pipe.total_chunks, 1) * (st.slot_bytes + fixed_bytes) // 2
             for st in sorted(shallow, key=lambda s: -(s.slot_bytes)):
                 st.port = 0 if load[0] <= load[1] else 1
-                load[st.port] += st.pipe.total_chunks * (st.slot_bytes + fixed_bytes)
+                load[st.port] += _const_or(st.pipe.total_chunks, 1) * (st.slot_bytes + fixed_bytes)
 
         def end(st):
             return tirx.Evaluate(tirx.Call("handle", _op(RING_END), [st.ring]))
@@ -448,10 +474,10 @@ def LowerIntelNpuPipelined():
             """This SHAVE's uses: all of them, or (hoisted) those of one outer iteration, as a loop over `u`
             with the body written against the global use `g`."""
             if p.outer is None:
-                uses = tirx.floordiv(_i32(p.total) - tx + _i32(spt - 1), _i32(spt))
+                uses = tirx.floordiv(p.total - tx + _i32(spt - 1), _i32(spt))
                 return tirx.For(u, _i32(0), uses, tirx.ForKind.SERIAL, body(u))
-            per = p.total // spt
-            return tirx.For(u, _i32(0), _i32(per), tirx.ForKind.SERIAL, body(p.outer.loop_var * per + u))
+            per = tirx.truncdiv(p.total, _i32(spt))   # hoisted only when the extent is a multiple of spt
+            return tirx.For(u, _i32(0), per, tirx.ForKind.SERIAL, body(p.outer.loop_var * per + u))
 
         def lower_simple(p: _Pipeline):
             # One stream, its gemm, stores: submit u+1 right after u completes, output double-buffered by parity.
@@ -480,7 +506,7 @@ def LowerIntelNpuPipelined():
                 return tirx.SeqStmt([wait(st, g), submit(st, g + 1, out_addr(tirx.floormod(g + 1, 2))), fill(st, g + p.depth)]
                                     + [store(s, g, tirx.floormod(g, 2)) for s in p.stores])
 
-            notes.append(f"ring over {p.c.name} ({p.total_chunks} chunks of {st.slot_bytes} B into {st.slot_buf.name}"
+            notes.append(f"ring over {p.c.name} ({p.total_text} chunks of {st.slot_bytes} B into {st.slot_buf.name}"
                          f"[{p.stages} slots], SHAVE s owns {p.depth} slot(s), fills {p.depth} use(s) ahead, output "
                          f"{out_buf.name} x2 by use parity, submit-ahead; issuer tile 0, two halves on ports 0/1)")
             prologue = [begin(st, p)] + [fill(st, _i32(k)) for k in range(p.depth)] + [submit(st, _i32(0), out_addr(_i32(0)))]
@@ -519,7 +545,7 @@ def LowerIntelNpuPipelined():
 
             prologue = [begin(st, p) for st in p.streams] + [fill(st, _i32(k)) for k in range(p.depth) for st in p.streams]
             kinds = (f"{len(p.gemms)} gemm(s)" + (f", {len(p.shave_streams)} slot(s) read by the SHAVE" if p.shave_streams else ""))
-            notes.append(f"ring over {p.c.name} ({p.total_chunks} chunks; streams " +
+            notes.append(f"ring over {p.c.name} ({p.total_text} chunks; streams " +
                          ", ".join(f"{st.slot_buf.name}[{p.stages} slots, {st.slot_bytes} B]" for st in p.streams) +
                          f"; SHAVE s owns {p.depth} slot(s), fills {p.depth} use(s) ahead; {kinds} with SHAVE "
                          f"statements between, no submit-ahead)")
@@ -593,7 +619,7 @@ def LowerIntelNpuPipelined():
             for inner in (s for s in stmts if is_pipelined(s)):
                 fills = [s for s in (list(inner.body.seq) if isinstance(inner.body, tirx.SeqStmt) else [inner.body])
                          if _is_call(s, DMA_COPY) and _const(s.value.args[6]) == 1]
-                if not fills or _const(inner.extent) % spt != 0:
+                if not fills or not _divisible(inner.extent, spt):
                     continue  # uses would straddle outer iterations unevenly; one ring per iteration instead
                 if any(any(w.same_as(b) for w in written) for f in fills for b in _index_reads(f.value.args[1])):
                     notes.append(f"ring over {inner.loop_var.name} not hoisted over {outer.loop_var.name}: a fill's "

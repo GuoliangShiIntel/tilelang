@@ -23,7 +23,7 @@ def _addr(buf: Buffer, idx=None):
 
 
 def _gemm_q(op_name: str, bytes_per_k: float, a: Buffer, wq: Buffer, s: Buffer | None, out: Buffer, group: int, row0, rows,
-            scales_major: str | None, scales_row: int | None):
+            scales_major: str | None, scales_row: int | None, defer: bool = False):
     M, K = (int(v) for v in a.shape)
     ng = K // group
     row_bytes = int(K * bytes_per_k)
@@ -63,22 +63,28 @@ def _gemm_q(op_name: str, bytes_per_k: float, a: Buffer, wq: Buffer, s: Buffer |
         s_addr, s_stride = _addr(s, [row0, 0]), 0
     else:
         s_addr, s_stride = _addr(s, [0, row0]), N_all
+    if defer and scales_row is None and scales_major == "row":
+        raise ValueError(f"intel_npu: {op_name}: defer needs group-major scales read in place (the transposed copy does not outlive the call)")
     return tirx.call_intrin("handle", tirx.op.Op.get(f"tl.intel_npu_dpu_matmul_{op_name}"),
-                            _addr(out, [0, row0]), _addr(a), _addr(wq, [row0, 0]), s_addr, M, N, K, group, s_stride)
+                            _addr(out, [0, row0]), _addr(a), _addr(wq, [row0, 0]), s_addr, M, N, K, group, s_stride, 1 if defer else 0)
 
 
 def gemm_i4(a: Buffer, wq: Buffer, s: Buffer | None, out: Buffer, group: int = 128, row0=0, rows: int | None = None,
-            scales_major: str | None = None, scales_row: int | None = None):
+            scales_major: str | None = None, scales_row: int | None = None, defer: bool = False):
     """`row0`/`rows`: the block of weight rows (and output columns) this workload covers, so one streamed chunk
     of many rows is consumed by several workloads under the channel limit (rows x K / group <= 1024).
     `scales_major`: 'row' ([N, K/group]) or 'group' ([K/group, N]); inferred from the shape when unambiguous.
     `scales_row`: the scales ride in `wq` itself (s=None): N = scales_row weight rows, then the group-major fp16
     scales [K/group, N] packed in whole rows -- one DMA per chunk instead of two (the engine's fixed cost per
-    job, ~2.5 us, was 180 us per port in the MoE's 72 scale fills; M3)."""
-    return _gemm_q("i4g", 0.5, a, wq, s, out, group, row0, rows, scales_major, scales_row)
+    job, ~2.5 us, was 180 us per port in the MoE's 72 scale fills; M3).
+    `defer`: the SHAVE's group reduction of this workload runs during the NEXT quantised gemm's DPU time instead of
+    right after this one's (npu_dsl fused_rt's defer); legal when nothing reads `out[:, row0:row0+rows]` before that
+    next gemm (the runtime also flushes a pending reduction at a store, a sync, a ring release or fill, and at the
+    end). The pattern: all but the last of the workloads that consume one streamed chunk."""
+    return _gemm_q("i4g", 0.5, a, wq, s, out, group, row0, rows, scales_major, scales_row, defer)
 
 
 def gemm_i8(a: Buffer, wq: Buffer, s: Buffer | None, out: Buffer, group: int = 128, row0=0, rows: int | None = None,
-            scales_major: str | None = None, scales_row: int | None = None):
+            scales_major: str | None = None, scales_row: int | None = None, defer: bool = False):
     """gemm_i4 with int8 weights (`wq` int8 [N, K], one byte per value); the lm_head's format."""
-    return _gemm_q("i8g", 1.0, a, wq, s, out, group, row0, rows, scales_major, scales_row)
+    return _gemm_q("i8g", 1.0, a, wq, s, out, group, row0, rows, scales_major, scales_row, defer)
