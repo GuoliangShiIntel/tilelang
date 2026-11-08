@@ -17,6 +17,8 @@
 
 #if defined(NPU_RT_HOST_SIM)
 #include "npu_rt_host.hpp"
+#elif defined(TL_NPU_RUNTIME_FRT)
+#include "npu_rt_device_frt.hpp"   // the same surface over npu_dsl's fused_rt.hpp (its DMA / DPU disciplines)
 #else
 #include "npu_rt_device.hpp"
 #endif

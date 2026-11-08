@@ -11,9 +11,21 @@
 //    row at the address given to its constructor;
 //  * a SHAVE's direct DDR store (DdrAccessor) sits in its data L1 until flushed:
 //    without npu::sync::memoryFence() the store can be lost when the SHAVE
-//    halts (seen as an unwritten status record in ~1 of 25 launches).
+//    halts (seen as an unwritten status record in ~1 of 25 launches);
+//  * the toolkit kicks the DMA and the DPU with volatile register stores and flushes
+//    CMX with an `asm volatile` that has NO "memory" clobber, so neither orders the
+//    kernel's ordinary stores (a buffer just written, a descriptor just configured)
+//    before the kick, nor its loads after a watermark wait. In a large kernel at -O3
+//    the VLIW scheduler does move them (M5: a whole-model kernel finished on every SHAVE
+//    and the device was then lost -- a DPU/DMA started on a half-written descriptor;
+//    the same kernel with the runtime compiled unoptimised ran). Every method here that
+//    touches hardware is therefore a real call (TL_NPU_HW_CALL) with compiler barriers
+//    around its kick and its wait.
 #ifndef TL_TEMPLATES_INTEL_NPU_NPU_RT_DEVICE_HPP_
 #define TL_TEMPLATES_INTEL_NPU_NPU_RT_DEVICE_HPP_
+
+#define TL_NPU_HW_CALL __attribute__((noinline))
+#define TL_NPU_COMPILER_BARRIER() __asm volatile("" ::: "memory")
 
 #include <shave/kernel/include/kernel.hpp>
 
@@ -183,6 +195,7 @@ template <class T> struct Ddr {
   }
 };
 
+#ifndef TL_NPU_RUNTIME_FRT   // the fused_rt shim (npu_rt_device_frt.hpp) provides its own npu::Ctx over this surface
 class Ctx {
 public:
   static constexpr std::uint32_t kAlign = 64;
@@ -208,6 +221,8 @@ public:
     }
     cmxFree0_ = cmx_.getAvailableSize();
     desc_ = alloc_hw<DmaDescriptor>(2);
+    ringOrder_ = alloc_shared<std::uint32_t>(16 * kRingPool);
+    ringFill_ = alloc_hw<DmaDescriptor>(2 * kRingMaxDepth * kRingPool);
     for (std::uint32_t i = 0; i < kDpuSets; ++i) {
       dpu_[i].desc = alloc_hw<DpuMatMul::DescriptorsBuffer>(1);
       dpu_[i].wt = alloc<std::uint32_t>(4 * kMaxDpuN);
@@ -227,7 +242,7 @@ public:
   std::int32_t shaves_per_tile() const { return spt_; }
 
   // Worker-private CMX: one allocation of spt_ slots, this SHAVE takes slot shave_.
-  template <class T> T *alloc(std::uint32_t count) {
+  template <class T> TL_NPU_HW_CALL T *alloc(std::uint32_t count) {
     const std::uint32_t bytes = alignUp(count * sizeof(T), kAlign);
     auto *base = reinterpret_cast<std::uint8_t *>(cmx_.alloc<kAlign>(bytes * spt_));
     if (base == nullptr) {
@@ -239,7 +254,7 @@ public:
   // Tile-shared CMX: one allocation, the same address on every SHAVE of the tile
   // (identical allocation sequences) and the same offset on every tile, which is
   // what a multicast fill needs.
-  template <class T> T *alloc_shared(std::uint32_t count) {
+  template <class T> TL_NPU_HW_CALL T *alloc_shared(std::uint32_t count) {
     const std::uint32_t bytes = alignUp(count * sizeof(T), kAlign);
     auto *base = cmx_.alloc<kAlign>(bytes);
     if (base == nullptr) {
@@ -253,8 +268,13 @@ public:
   // Every SHAVE runs the same sequence (allocations never sit under a SHAVE-dependent branch: the compiler
   // hoists them), so shared buffers keep one address per tile and one offset across tiles.
   using CmxMark = LinearAllocator;
-  CmxMark cmx_mark() const { return cmx_; }
-  void cmx_restore(const CmxMark &m) { cmx_ = m; }
+  // Real calls, not inlined: with the mark / restore / alloc sequence inlined into a large kernel at -O3,
+  // moviCompile 22.1.1 produced a kernel whose SHAVEs all finished and whose device was then lost (M5: the
+  // single-launch model with an attention layer inside the layer loop; the same kernel with cmx_restore
+  // out of line ran). The allocator's state is the one thing every buffer address derives from, so it is
+  // kept behind call boundaries.
+  TL_NPU_HW_CALL CmxMark cmx_mark() const { return cmx_; }
+  TL_NPU_HW_CALL void cmx_restore(const CmxMark &m) { cmx_ = m; }
   class CmxScope {
   public:
     explicit CmxScope(Ctx &c) : c_(c), m_(c.cmx_mark()) {}
@@ -286,7 +306,7 @@ public:
   // spatialX 0 keeps DpuMatMul::init's M split; mpe -1 keeps its stencil, else
   // 0/1/2 = CUBOID_4x16/8x16/16x16 as (nthw_ntk, odu_nthw) pairs. The ODU nthw
   // must change with nthw_ntk or output rows come back permuted (npu_dsl Round 705).
-  void dpu_matmul(half *out, const half *a, const half *bt, std::uint32_t M,
+  TL_NPU_HW_CALL void dpu_matmul(half *out, const half *a, const half *bt, std::uint32_t M,
                   std::uint32_t N, std::uint32_t K, std::uint32_t spatialX = 0,
                   std::int32_t mpe = -1) {
     if (!dpu_prepare(M, N, K, spatialX, mpe))
@@ -294,7 +314,9 @@ public:
     // No barriers on a synchronous workload (a ring use may have set them).
     mm_->setConsumerBarriers(0, 0);
     mm_->setProducerBarriers(0, 0);
+    ++dpuStarts_;
     mm_->run(out, const_cast<half *>(a), const_cast<half *>(bt));
+    TL_NPU_COMPILER_BARRIER();
     dpu_account();
   }
 
@@ -332,7 +354,7 @@ public:
   // largest quantised GEMV shape of the kernel: codegen emits the call from the kernel's gemm_i4/i8 ops, so the
   // CMX budget is exact and the first workload pays no allocation; a larger later shape re-sizes (the old buffers
   // are left behind, which is the case the up-front reservation avoids).
-  void reserve_qg(std::uint32_t partElems, std::uint32_t stElems) {
+  TL_NPU_HW_CALL void reserve_qg(std::uint32_t partElems, std::uint32_t stElems) {
     if (!ok_)
       return;
     if (partElems > i4PartElems_) {
@@ -351,7 +373,7 @@ public:
       i4Mm_ = new (i4Store_) DpuMatMul(env_.getDpuDrv(), i4Desc_, i4Wt_);
     }
   }
-  void dpu_matmul_qg(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
+  TL_NPU_HW_CALL void dpu_matmul_qg(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t bits, std::uint32_t sStride) {
     if (!ok_)
       return;
@@ -389,7 +411,9 @@ public:
     i4Mm_->setConsumerBarriers(0, 0);
     i4Mm_->setProducerBarriers(0, 0);
     const std::uint32_t t0 = perf_ticks();
+    ++dpuStarts_;
     i4Mm_->startMixed(i4Part_, const_cast<half *>(a), reinterpret_cast<std::int8_t *>(const_cast<std::uint8_t *>(q)));
+    TL_NPU_COMPILER_BARRIER();
     // s [N, ng] -> sT [ng, N] while the DPU runs: 8x8 vector transposes (npu_dsl's transpose_h) when the
     // shape allows, a scalar loop otherwise (1024 strided scalar copies cost ~9 us at N=64, ng=16).
     // Group-major s (sStride > 0) needs none of it.
@@ -407,6 +431,7 @@ public:
     }
     const std::uint32_t t1 = perf_ticks();
     i4Mm_->wait();
+    TL_NPU_COMPILER_BARRIER();
     const std::uint32_t t2 = perf_ticks();
     dpuCount_ += 1;
     dpuIduTicks_ += static_cast<volatile const DpuMatMul::DescriptorsBuffer *>(i4Desc_)->hwpStats.idu_workload_duration;
@@ -559,7 +584,7 @@ public:
   // 2 x depth uses on tile 0 (every (slot, parity) once); one grid rendezvous so
   // every config is live before any gate. `readyBase`/`freeBase` come from the
   // compiler's barrier assignment (2 x slots ids each).
-  Ring ring_begin(void *slotBase, std::uint32_t slotBytes, std::uint32_t slots, std::uint32_t total,
+  TL_NPU_HW_CALL Ring ring_begin(void *slotBase, std::uint32_t slotBytes, std::uint32_t slots, std::uint32_t total,
                   std::uint32_t readyBase, std::uint32_t freeBase, std::int32_t port = -1, bool multicast = true,
                   bool local = false) {
     Ring r{};
@@ -583,8 +608,15 @@ public:
       fail(kStatusRingRefused, kRingOneTile);
       return r;
     }
-    r.order = alloc_shared<std::uint32_t>(16); // 64 B: one line, two words used
-    r.fill = alloc_hw<DmaDescriptor>(2 * r.depth);
+    if (r.depth > kRingMaxDepth) {
+      fail(kStatusRingRefused, kRingSlotsNeShaves);
+      return r;
+    }
+    // Control memory from the root pool (npu_dsl's static form): a scope-allocated descriptor is released
+    // and overwritten by the next phase's buffers while the link agent may still reference it.
+    const std::uint32_t slot = ringSeq_++ % kRingPool;
+    r.order = ringOrder_ + 16 * slot;
+    r.fill = ringFill_ + 2 * kRingMaxDepth * slot;
     if (!ok_)
       return r;
     r.myUses = total > static_cast<std::uint32_t>(shave_)
@@ -622,6 +654,15 @@ public:
   std::uint8_t ring_consumers(const Ring &) const { return static_cast<std::uint8_t>(tiles_); }
   std::uint8_t ring_free_consumers(const Ring &r) const { return static_cast<std::uint8_t>(r.multicast ? 1 : tiles_); }
   void ring_config(const Ring &r, std::uint32_t use) {
+    // Barrier safety is the runtime's job (hw_barriers.md: the hardware does not check that an id's previous
+    // config has retired before a new one is pushed). A push behind a live config queues in the id's FIFO and
+    // a produce / consume in that window hits the OLD config; so the push waits until the id reads (0, 0):
+    // nothing live, nothing queued (a queued config goes live the moment the previous one retires).
+    // Reached across tiles: a split ring's FREE(use - 2 depth) is consumed by EVERY tile's fill(use - depth),
+    // and tile 0 (the armer) cannot know its peers got there; a ring re-begun on ids a previous ring used
+    // (a layer loop) likewise.
+    if (!barrier_wait_retired(ring_ready(r, use)) || !barrier_wait_retired(ring_free(r, use)))
+      return;
     barrier_config(ring_ready(r, use), ring_ready_producers(r), ring_consumers(r), false);
     barrier_config(ring_free(r, use), ring_consumers(r), ring_free_consumers(r), false);
   }
@@ -646,7 +687,7 @@ public:
   // use >= depth it first waits until every tile's DPU has produced FREE[use - depth]
   // (the slot's previous occupant), then re-arms this use's ids when they were used
   // before (use >= 2 x depth).
-  void ring_fill(Ring &r, std::uint32_t use, std::uint64_t src, std::uint32_t width,
+  TL_NPU_HW_CALL void ring_fill(Ring &r, std::uint32_t use, std::uint64_t src, std::uint32_t width,
                  std::uint32_t rows, std::uint32_t srcStride) {
     if (!ok_ || !ring_issuer(r) || use >= r.myUses)
       return;
@@ -698,7 +739,9 @@ public:
       if (!r.local)
         DmaDrv::setProducerBarrier(d, ready);
       DmaDrv::setConsumerBarriers(d, 0, 0);
+      TL_NPU_COMPILER_BARRIER();
       dma_.start(d, port);
+      TL_NPU_COMPILER_BARRIER();
       lastOnPort_[port] = d;
       ringTicks_[kTickFillIssue] += perf_ticks() - t1;
       return;
@@ -720,8 +763,10 @@ public:
     }
     DmaDrv::setConsumerBarriers(d, 0, 0);
     DmaDrv::setConsumerBarriers(d + 1, 0, 0);
+    TL_NPU_COMPILER_BARRIER();
     dma_.start(d, 0);
     dma_.start(d + 1, 1);
+    TL_NPU_COMPILER_BARRIER();
     lastOnPort_[0] = d;
     lastOnPort_[1] = d + 1;
     ringTicks_[kTickFillIssue] += perf_ticks() - t1;
@@ -740,7 +785,7 @@ public:
   // while a SHAVE does its own work; that needs the output buffer double-buffered
   // by use parity. The ids of a use are armed by ring_arm at its fill or its
   // submit, whichever the program reaches first.
-  void ring_dpu_submit(Ring &r, std::uint32_t use, half *out, const half *a, const half *bt,
+  TL_NPU_HW_CALL void ring_dpu_submit(Ring &r, std::uint32_t use, half *out, const half *a, const half *bt,
                        std::uint32_t M, std::uint32_t N, std::uint32_t K,
                        std::uint32_t spatialX = 0, std::int32_t mpe = -1) {
     if (!ok_ || !r.armed || use >= r.myUses)
@@ -763,7 +808,9 @@ public:
       return;
     mm_->setConsumerBarrier(ready);
     mm_->setProducerBarrier(freeId);
+    ++dpuStarts_;
     mm_->start(out, const_cast<half *>(a), const_cast<half *>(bt));
+    TL_NPU_COMPILER_BARRIER();
     r.desc[use & 1u] = dpuDesc_;
     r.order[shave_] = use + 1;
     flushCmxWrites();
@@ -771,7 +818,7 @@ public:
   }
   // A slot read by the SHAVE instead of the DPU (a dequant, a norm): the SHAVE is the
   // READY consumer and the FREE producer, one per tile per slot, so the same counts hold.
-  void ring_slot_acquire(Ring &r, std::uint32_t use) {
+  TL_NPU_HW_CALL void ring_slot_acquire(Ring &r, std::uint32_t use) {
     if (!ok_ || !r.armed || use >= r.myUses)
       return;
     const std::uint32_t t0 = perf_ticks();
@@ -787,17 +834,19 @@ public:
         return;
       barrier_consume(ready);
     }
+    TL_NPU_COMPILER_BARRIER();   // the slot's loads stay after the wait
     // the acquire wait (the fill landing) is counted with the submit path's barrier-live wait (counter 0), apart
     // from the DPU wait (counter 3), so a SHAVE-read ring's DMA and DPU waits are told apart in the status words
     ringTicks_[kTickLive] += perf_ticks() - t0;
   }
-  void ring_slot_release(Ring &r, std::uint32_t use) {
+  TL_NPU_HW_CALL void ring_slot_release(Ring &r, std::uint32_t use) {
     if (!ok_ || !r.armed || use >= r.myUses || r.local)
       return;
+    TL_NPU_COMPILER_BARRIER();   // the slot's last reads stay before the release
     barrier_produce(ring_free(r, use));
   }
 
-  void ring_dpu_wait(Ring &r, std::uint32_t use) {
+  TL_NPU_HW_CALL void ring_dpu_wait(Ring &r, std::uint32_t use) {
     if (!ok_ || !r.armed || use >= r.myUses)
       return;
     // The driver's wait spins forever on a workload whose READY gate never opens; the
@@ -808,6 +857,7 @@ public:
     const std::uint32_t t0 = perf_ticks();
     for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
       if (*watermark == expected) {
+        TL_NPU_COMPILER_BARRIER();   // the output's loads stay after the wait
         ringTicks_[kTickDpuWait] += perf_ticks() - t0;
         dpu_account(desc);
         return;
@@ -826,7 +876,7 @@ public:
   // Issuer: the last fills must be retired on their chains before the kernel ends,
   // and the last FREE of every owned slot consumed so every id is quiescent (a
   // later ring may reuse the ids).
-  void ring_end(Ring &r) {
+  TL_NPU_HW_CALL void ring_end(Ring &r) {
     if (!ok_ || !ring_issuer(r) || r.myUses == 0)
       return;
     for (std::uint32_t k = 0; k < r.depth && k < r.myUses; ++k) {
@@ -850,7 +900,8 @@ public:
 
   // Barriers. DMA is synchronous in Phase 1-2, so only SHAVE-side writes need
   // publishing: CMX writes to the tile, direct DDR stores out of the data L1.
-  void sync_grid() {
+  TL_NPU_HW_CALL void sync_grid() {
+    TL_NPU_COMPILER_BARRIER();
     flushCmxWrites();
     sync::memoryFence();
     if (syncBase_ == kNoHwSync) {
@@ -858,11 +909,14 @@ public:
     } else {
       hw_sync_grid();
     }
+    TL_NPU_COMPILER_BARRIER();
   }
-  void sync_tile() {
+  TL_NPU_HW_CALL void sync_tile() {
+    TL_NPU_COMPILER_BARRIER();
     flushCmxWrites();
     sync::memoryFence();
     sync_.waitLocal();
+    TL_NPU_COMPILER_BARRIER();
   }
 
   // Hardware barrier primitives (NCE barrier registers; ids from the job's pool).
@@ -920,6 +974,17 @@ public:
     fail(kStatusBarrierTimeout, id);
     return false;
   }
+  // Both counts zero: the previous config retired and nothing is queued (see ring_config).
+  bool barrier_wait_retired(std::uint32_t id) {
+    std::uint8_t p = 1, c = 1;
+    for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
+      hw::nce::barriers::hgl::getCounters(id, &p, &c);
+      if (p == 0 && c == 0)
+        return true;
+    }
+    fail(kStatusBarrierTimeout, id | 0x100u);
+    return false;
+  }
   // A config is live once its consumer count is non-zero (a dead barrier reads
   // (0, 0)); the exact counts are not checked because producers may already have
   // arrived.
@@ -939,7 +1004,7 @@ public:
   // are the NCE_TIME free-running counter (19.2 MHz perf clock on this box): the host takes
   // max(t_finish) - min(t_entry) over the SHAVEs as the kernel-only time. `extra` is a probe's.
   static constexpr std::uint32_t kStatusBytes = 64;
-  void finish(const std::uint32_t *extra = nullptr, std::uint32_t nExtra = 0) {
+  TL_NPU_HW_CALL void finish(const std::uint32_t *extra = nullptr, std::uint32_t nExtra = 0) {
     if (statusAddr_ == 0)
       return;
     const std::uint64_t a = statusAddr_ + static_cast<std::uint64_t>(kStatusBytes) * worker();
@@ -952,7 +1017,7 @@ public:
     s4 = dpuCount_;
     s5 = dpuIduTicks_;
     s6 = dpuOduTicks_;
-    s7 = 0;
+    s7 = dpuStarts_;   // DPU workloads started; s4 counts the ones waited for (equal unless one was orphaned)
     s8 = tStart_;
     s9 = perf_ticks();
     if (extra == nullptr) {
@@ -1024,11 +1089,12 @@ private:
     }
   }
 
-  void port_retire(int port) {
+  TL_NPU_HW_CALL void port_retire(int port) {
     if (lastOnPort_[port] != nullptr) {
       dma_wait(lastOnPort_[port], 5 + port);
       lastOnPort_[port] = nullptr;
     }
+    TL_NPU_COMPILER_BARRIER();
   }
 
   // The driver's wait (DmaDrvBase::wait) spins on the tail descriptor's watermark without a
@@ -1036,8 +1102,10 @@ private:
   // 1/2 ring_fill previous halves, 3/4 ring_end, 5/6 port_retire.
   bool dma_wait(volatile DmaDescriptor *tail, std::uint32_t where) {
     for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
-      if (tail->watermark != 0)
+      if (tail->watermark != 0) {
+        TL_NPU_COMPILER_BARRIER();   // the landed slot's loads stay after the wait
         return true;
+      }
     }
     fail(kStatusDmaTimeout, where);
     return false;
@@ -1135,7 +1203,7 @@ private:
     return nullptr;
   }
 
-  void dma_load(void *dst, std::uint64_t src, std::uint32_t width, std::uint32_t rows,
+  TL_NPU_HW_CALL void dma_load(void *dst, std::uint64_t src, std::uint32_t width, std::uint32_t rows,
                 std::uint32_t dstStride, std::uint32_t srcStride) {
     if (!ok_ || width == 0 || rows == 0)
       return;
@@ -1148,10 +1216,12 @@ private:
       return;
     DmaDrv::initDesc(desc_);
     config_copy(desc_, reinterpret_cast<std::uint32_t>(dst), src, width, rows, dstStride, srcStride);
+    TL_NPU_COMPILER_BARRIER();
     dma_.run(desc_);
+    TL_NPU_COMPILER_BARRIER();
   }
 
-  void dma_store(std::uint64_t dst, const void *src, std::uint32_t width, std::uint32_t rows,
+  TL_NPU_HW_CALL void dma_store(std::uint64_t dst, const void *src, std::uint32_t width, std::uint32_t rows,
                  std::uint32_t dstStride, std::uint32_t srcStride) {
     if (!ok_ || width == 0 || rows == 0)
       return;
@@ -1159,10 +1229,13 @@ private:
     port_retire(1);
     if (!ok_)
       return;
+    TL_NPU_COMPILER_BARRIER();
     flushCmxWrites();
     DmaDrv::initDesc(desc_ + 1);
     config_copy(desc_ + 1, dst, reinterpret_cast<std::uint32_t>(src), width, rows, dstStride, srcStride);
+    TL_NPU_COMPILER_BARRIER();
     dma_.run(desc_ + 1);
+    TL_NPU_COMPILER_BARRIER();
   }
 
   // The fewest dimensions that describe the copy: rows that are contiguous on both sides are ONE 1-D
@@ -1196,6 +1269,11 @@ private:
 
   DmaDescriptor *desc_{nullptr};
   DmaDescriptor *lastOnPort_[2]{nullptr, nullptr};
+  // Ring control pool: kRingPool rings' order words (shared) and fill descriptors (per SHAVE), cycled.
+  static constexpr std::uint32_t kRingPool = 8, kRingMaxDepth = 2;
+  std::uint32_t *ringOrder_ = nullptr;
+  DmaDescriptor *ringFill_ = nullptr;
+  std::uint32_t ringSeq_ = 0;
   // DPU descriptor sets, one per recently used workload shape (CheckIntelNpuBudgets
   // reserves their CMX: kDpuSets x (descriptors + 16 KiB weight table) per SHAVE).
   static constexpr std::uint32_t kDpuSets = 2;
@@ -1210,6 +1288,7 @@ private:
   };
   DpuSet dpu_[kDpuSets];
   std::uint32_t dpuStamp_{0};
+  std::uint32_t dpuStarts_{0};
   DpuMatMul *mm_{nullptr};                           // the set of the last prepared shape
   DpuMatMul::DescriptorsBuffer *dpuDesc_{nullptr};
   // Mixed-mode (fp16 x int4 weights) set for dpu_matmul_i4g, allocated on first use.
@@ -1228,6 +1307,7 @@ private:
   enum { kTickLive = 0, kTickOrder = 1, kTickSubmit = 2, kTickDpuWait = 3, kTickFreeWait = 4, kTickFillIssue = 5 };
   std::uint32_t ringTicks_[6]{0, 0, 0, 0, 0, 0};
 };
+#endif // TL_NPU_RUNTIME_FRT
 
 } // namespace npu
 
