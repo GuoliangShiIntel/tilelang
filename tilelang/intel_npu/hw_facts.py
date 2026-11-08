@@ -60,12 +60,17 @@ FACTS: dict[str, Fact] = {
                               measured="npu_dsl's basis (2048 x 2.0454 GHz); IDU durations reach 96.9% of it under turbo",
                               note="question for the knowledge base / hardware owner: the nominal DPU_CLK under NPU_TURBO=YES and without it"),
     "dpu_z_align": Fact(16, "hw/npu5/dpu.md#3 (C mod 16 padding)", note="target dpu_z_align"),
-    "dpu_max_output_points": Fact(8192, "hw/npu5/dpu.md#13 (max output points per op on VPU5 -- 8192 against VPU4's 16384); "
-                                        "hw/npu5/dpu.md#4.6 (a separate limit: every workload dimension <= 8192)",
-                                  note="target dpu_max_output_points. It is the PRODUCT M x N of one workload's output, not a "
-                                       "per-dimension bound: LowerIntelNpuTileOp refuses a gemm whose output tile exceeds it. "
-                                       "dpu.md#1 lists the halving beside the other VPU5 reductions (PPEs 64 -> 32; NTHW/NTK "
-                                       "stencils 16/4 -> 16/2 and 8/8 -> 8/4 and 4/16 -> 4/8) but does not state a cause"),
+    "dpu_max_workload_dim": Fact(8192, "hw/npu5/dpu.md#4.6 (every workload dimension <= 8192)",
+                                 measured="single fp16 gemms of 64x128, 128x128, 256x64, 64x256 and 128x512 output "
+                                          "values are all exact on PTL (device/run_dpu_points_probe.py 2026-11-08, "
+                                          "one ctx.dpu_matmul and one DpuMatMul::run each, rel <= 4.13e-4)",
+                                 note="target dpu_max_workload_dim. **dpu.md#13's 'max output points per operation "
+                                      "8192 on VPU5' is NOT the output tile's M x N product.** It was recorded that "
+                                      "way and LowerIntelNpuTileOp refused M*N > 8192 until the probe above showed "
+                                      "65536-value matmuls computing correctly, 8x the supposed cap. What #13 counts "
+                                      "is an open question for the hardware owner -- candidates are spatial output "
+                                      "points with channels excluded, or an operation class other than the matmul. "
+                                      "Until it is answered, only the per-dimension bound is enforced"),
     # --- SHAVE -------------------------------------------------------------------------------
     "shave_vector_bits": Fact(512, "hw/npu5/shave.md#1 and #2.1 (VRF: 32 x 512-bit)",
                               note="32 fp16 / 16 fp32 lanes; the 128-bit (v8f16, SAU.SUMX.f32) builtins are refused by moviCompile -mcpu=5000xx"),

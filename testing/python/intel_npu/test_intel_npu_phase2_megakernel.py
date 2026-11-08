@@ -217,7 +217,9 @@ def test_sync_grid_under_uniform_condition_is_allowed():
 
 
 def test_budget_refuses_oversized_kernel():
-    func = make_gemm(64, 64, 32768, BM=64, BN=64, tiles=1, shaves=2)  # A tile 64 x 32768 fp16 = 4 MiB per SHAVE
+    # 4 MiB of A per SHAVE through the ROWS: K stays within the DPU's 8192 per-dimension bound, so the
+    # budget is what refuses this and not the workload legality check.
+    func = make_gemm(256, 64, 8192, BM=256, BN=64, tiles=1, shaves=2)  # A tile 256 x 8192 fp16 = 4 MiB per SHAVE
     with pytest.raises(ValueError, match=r"(?s)CMX budget exceeded.*A_cmx: 4194304 B"):
         tilelang.lower(func, target="intel_npu")
 

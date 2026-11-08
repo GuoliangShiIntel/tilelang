@@ -677,7 +677,7 @@ def make_moe_route_prefill(N: int = 128, H: int = 2048, E: int = 256, TOPK: int 
     workers = tiles * shaves
     SLOTS = N * (TOPK + 1)
     assert N % BM == 0 and E % HL == 0 and H % FL == 0 and RR % tiles == 0 and RRT % 16 == 0
-    assert BM * RRT <= 8192, f"router workload {BM} x {RRT} exceeds the DPU's 8192 output points: lower BM"
+    assert BM <= 8192 and RRT <= 8192, f"router workload {BM} x {RRT} has a dimension above the DPU's 8192"
     assert TOPK + 1 <= 16, "the per-token choice buffers are one 16-wide vector"
 
     @T.prim_func
@@ -1770,11 +1770,10 @@ def make_attn_prefill(N: int = 64, NKV: int = 2, GQ: int = 8, D: int = 256, SMAX
     Oracle: `attn_prefill_reference`."""
     assert D % 32 == 0 and BKV % 32 == 0 and SMAX % BKV == 0 and N % TB == 0
     ROWS = TB * GQ
-    # One `T.gemm` is one DPU workload and the DPU takes at most 8192 output points, so the PV product bounds the
-    # query block: TB x GQ x D <= 8192. Splitting that output over D would allow a larger TB, which matters because
-    # a bigger block amortises the K/V re-read -- the next step, not this one.
-    assert ROWS * D <= 8192, f"query block {ROWS} x {D} = {ROWS * D} output points exceeds the DPU's 8192: lower TB"
-    assert ROWS * BKV <= 8192, f"score block {ROWS} x {BKV} exceeds the DPU's 8192 output points: lower TB or BKV"
+    # One `T.gemm` is one DPU workload. Only each DIMENSION is bounded (8192, dpu.md 4.6) -- the output tile's
+    # M x N product is not, which device/run_dpu_points_probe.py established after an earlier reading of dpu.md 13
+    # had capped TB at 4 here for nothing.
+    assert ROWS <= 8192 and D <= 8192 and BKV <= 8192, f"query block {ROWS} x {D} / score block {ROWS} x {BKV}"
     HL, FL = 32, 16
     assert BKV % HL == 0 and D % FL == 0
     scale = 1.0 / (D ** 0.5)

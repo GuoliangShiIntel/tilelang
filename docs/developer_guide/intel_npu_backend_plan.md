@@ -189,7 +189,7 @@ they are cited here by file and section, not copied. What changes in this plan b
 | Distribution | VPUX names: `SEGMENTED` (disjoint slice per tile), `DUPLICATED` (full copy on every tile, one DMA), `OVERLAPPED`, `MULTICASTED`; a distributed DMA consumes **all DMA ports** (`workload-management.md` §8, §10). Multicast is one DDR read at unicast throughput (`dma-controller.md` §3). A DUPLICATED operand sits at the **same CMX offset on every tile** | `PlanDistribution` emits these modes by name; a DUPLICATED fill is one multicast DMA (same offset everywhere: our allocator's identical per-tile sequence guarantees it), split in two halves over the two ports |
 | Remote CMX | DPU and SHAVE can **write** a remote tile's CMX (ITI) but never read it; remote reads fault (`nce-subsystem.md` §2.1, §9) | Scope `shared` means "the two SHAVEs of one tile"; cross-tile data moves only by DMA multicast. The dialect never offers a cross-tile read |
 | CMX | 1536 KiB physical per tile on PTL; the compiler-usable workspace is **1439 KiB** after the runtime's reserved regions (`platform-resources.md` §3). Our kernels observe exactly 1473536 B free at entry. Accesses 32 B aligned; VPUX allocates at 64 B; a tiling heuristic keeps ~10% slack for fragmentation (`FRAGMENTATION_AVOID_RATIO`) | `cmx_bytes` default becomes the **workspace** 1473536, not the physical size; `CheckBudgets` compares against it; allocations stay 64 B aligned |
-| DPU workload legality | Output and input Z (N, K) multiples of 16; any workload dimension <= 8192; max output points per operation 8192 on VPU5 (`dpu.md` §4.6, §13). Stencils 16/2, 8/4, 4/8 with reduced activation reuse vs VPU4 (§4.5); IC-split secondary accumulator exists but is only enabled for a grouped 1x1 pattern (§4.7) | `LowerIntelNpuTileOp` refuses N % 16, K % 16 and M*N > `dpu_max_output_points` (target attribute 8192) with the reason; stencil selection (`setSpatial`/`setStencil` in the prior art) is a Phase 3 performance item driven by M, N |
+| DPU workload legality | Output and input Z (N, K) multiples of 16; any workload dimension <= 8192 (`dpu.md` §4.6). §13's "max output points per operation 8192 on VPU5" was read as the output tile's M x N PRODUCT and that reading is **falsified**: `device/run_dpu_points_probe.py` computes single fp16 matmuls of 16384 and 65536 output values exactly on PTL. What §13 counts is an open hardware question. Stencils 16/2, 8/4, 4/8 with reduced activation reuse vs VPU4 (§4.5); IC-split secondary accumulator exists but is only enabled for a grouped 1x1 pattern (§4.7) | `LowerIntelNpuTileOp` refuses N % 16, K % 16 and any of M, N, K above `dpu_max_workload_dim` (target attribute 8192) with the reason; stencil selection (`setSpatial`/`setStencil` in the prior art) is a Phase 3 performance item driven by M, N |
 | DPU FIFO | One workload FIFO per tile, 256 entries (`nce-subsystem.md` §4.2) | Two SHAVEs enqueue on one DPU without a sync between them, as the flow assumes |
 | SHAVE and DDR | A SHAVE reaching DDR through its cache gets < 10% of DMA bandwidth (12 vs 256 outstanding) (`nce-subsystem.md` §7, §8) | Scalar `Ddr<T>` element access is for status words and the odd scalar, never a data path; a pass flagging scalar DDR access inside a loop is a Phase 4 item. Per-SHAVE SW-kernel inputs 32 B aligned (`multi-shave.md` §8.1) |
 | Scheduling | VPUX list-schedules with per-op cycle costs (VPUNN) over executor FIFOs, prefetch window 35 levels, loop ping-pong with two banks freed every second iteration, loop regions allocated first (`memory-scheduler.md` §8, §10; `workload-management.md` §3, §7) | Phase 3 keeps the author's explicit `T.Pipelined(num_stages=2)`; a cost-driven scheduler is a later item, and when it comes it is this model, not npu_dsl's six-coefficient fit |
@@ -549,6 +549,25 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 
 ## 8. Log
 
+* 2026-11-08: **The DPU's "8192 output points" was a misreading, it cost real time, and a device probe killed it.**
+  `dpu.md` §13 says "max output points per operation 8192 on VPU5"; this plan and `hw_facts.py` recorded that as the
+  output tile's **M x N product**, and `LowerIntelNpuTileOp` refused any gemm above it. P3 exposed the contradiction:
+  npu_dsl's device-verified prefill GDN layer issues `ctx.matmul(dS, kdT, vnT, 128, 128, 64)` as ONE workload, 16384
+  output values. **`device/run_dpu_points_probe.py` settles it**: single fp16 matmuls of 8192, 16384 (as 128x128,
+  256x64 and 64x256) and **65536** output values are all exact on PTL (rel <= 4.13e-4, zero outputs off), each one a
+  single `ctx.dpu_matmul` reaching a single `DpuMatMul::run` -- verified in the generated `.cpp` and in the runtime, so
+  nothing split them behind the probe's back. The bound is now **per dimension** (`dpu_max_workload_dim`, which is what
+  §4.6 actually states), and `dpu_max_output_points` is gone.
+  **It was not a harmless over-restriction.** It had capped the prefill attention block at TB = 4 (`TB x GQ x D <=
+  8192`). At TB = 16 the same kernel is **2.452 ms against 2.691 ms** at 128 tokens / pos0 512, same rel 1.32e-3 --
+  **8.9% faster**, using a 128x256 workload the old check refused outright.
+  Two lessons. A relayed constant must be checked against its **first-party consumer**: a working kernel from the
+  neighbouring project contradicted this one for as long as it stood, and nobody looked. And a legality check that
+  only ever **refuses** is as unfalsifiable as a gate that only ever passes -- its refusals were never once tested
+  against the hardware.
+  **Open for the hardware owner:** what does §13's "output points per operation" count, if not M x N? Candidates are
+  spatial output points with channels excluded, or an operation class other than the fp16 matmul. The per-dimension
+  bound is what is enforced until that is answered.
 * 2026-11-08: **Prefill P2 is on the device, and a routing golden must rank the device's OWN logits.** The MoE
   routing (P2a, `tl_moe_route_prefill_n64_h2048_e256` `7d5b65ee0104`, **0.331 ms**) and the grouped expert FFN
   (P2b, `tl_moe_expert_prefill_n64_h2048_i512_e256_mb16` `d430e5021d85`, **53.8 ms** rel 5.49e-4) both pass at

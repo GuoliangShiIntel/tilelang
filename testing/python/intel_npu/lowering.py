@@ -19,8 +19,8 @@ class Lowered:
     param_names: list[str]  # device kernel order; each is the prim_func buffer name
 
 
-def lower(func) -> Lowered:
-    artifact = tilelang.lower(func, target="intel_npu")
+def lower(func, target=None) -> Lowered:
+    artifact = tilelang.lower(func, target=target or "intel_npu")
     funcs = [f for _, f in artifact.device_mod.functions.items() if isinstance(f, tirx.PrimFunc)]
     assert len(funcs) == 1, f"expected one device function, got {len(funcs)}"
     dev = funcs[0]

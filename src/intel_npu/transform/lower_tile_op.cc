@@ -107,9 +107,9 @@ PrimExpr AddressOf(const RegionInfo &r) {
 
 class IntelNpuTileOpLowerer : public StmtExprMutator {
 public:
-  IntelNpuTileOpLowerer(int64_t dpu_z_align, int64_t dpu_max_output_points, int64_t spatial_x,
+  IntelNpuTileOpLowerer(int64_t dpu_z_align, int64_t dpu_max_workload_dim, int64_t spatial_x,
                         int64_t mpe)
-      : dpu_z_align_(dpu_z_align), dpu_max_output_points_(dpu_max_output_points),
+      : dpu_z_align_(dpu_z_align), dpu_max_workload_dim_(dpu_max_workload_dim),
         spatial_x_(spatial_x), mpe_(mpe) {}
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
@@ -240,11 +240,11 @@ private:
           << "intel_npu: gemm N=" << N << ", K=" << K << " must be multiples of " << dpu_z_align_
           << ": the DPU's output and input channel extents are " << dpu_z_align_ << "-aligned";
     }
-    if (M * N > dpu_max_output_points_) {
+    if (M > dpu_max_workload_dim_ || N > dpu_max_workload_dim_ || K > dpu_max_workload_dim_) {
       TVM_FFI_THROW(ValueError)
-          << "intel_npu: gemm output tile " << M << "x" << N << " = " << M * N
-          << " points exceeds the DPU's " << dpu_max_output_points_
-          << " output points per workload; split the output tile";
+          << "intel_npu: gemm " << M << "x" << N << "x" << K
+          << " has a dimension above the DPU's " << dpu_max_workload_dim_
+          << " per workload dimension; split the tile";
     }
     if (spatial_x_ < 0 || (spatial_x_ > 0 && M % spatial_x_ != 0)) {
       TVM_FFI_THROW(ValueError) << "intel_npu: " << kIntelNpuDpuSpatialX << "=" << spatial_x_
@@ -262,7 +262,7 @@ private:
   }
 
   int64_t dpu_z_align_;
-  int64_t dpu_max_output_points_;
+  int64_t dpu_max_workload_dim_;
   int64_t spatial_x_;
   int64_t mpe_;
 };
@@ -274,16 +274,16 @@ namespace transform {
 tvm::transform::Pass LowerIntelNpuTileOp() {
   auto pass_func = [](PrimFunc func, const IRModule &mod,
                       const tvm::transform::PassContext &ctx) -> PrimFunc {
-    int64_t z_align = 16, max_points = 8192;
+    int64_t z_align = 16, max_dim = 8192;
     if (auto target = func->GetAttr<Target>(tvm::attr::kTarget)) {
       z_align = target.value()->GetAttr<Integer>("dpu_z_align").value_or(Integer(16)).IntValue();
-      max_points =
-          target.value()->GetAttr<Integer>("dpu_max_output_points").value_or(Integer(8192)).IntValue();
+      max_dim =
+          target.value()->GetAttr<Integer>("dpu_max_workload_dim").value_or(Integer(8192)).IntValue();
     }
     const int64_t spatial_x =
         ctx->GetConfig<Integer>(kIntelNpuDpuSpatialX, Integer(0)).value().IntValue();
     const int64_t mpe = ctx->GetConfig<Integer>(kIntelNpuDpuMpe, Integer(-1)).value().IntValue();
-    IntelNpuTileOpLowerer lowerer(z_align, max_points, spatial_x, mpe);
+    IntelNpuTileOpLowerer lowerer(z_align, max_dim, spatial_x, mpe);
     func.CopyOnWrite()->body = lowerer(func->body);
     return func;
   };

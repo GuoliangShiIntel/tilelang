@@ -74,13 +74,13 @@ def test_lowers_with_a_router_workload_inside_the_dpu_limit():
     # accumulator is a register or a CMX buffer is the register-promotion pass's choice, not this phase's decision.
     assert "tl_npu_vmax(" in src
     assert "tl_npu_vmax_not_a_real_symbol(" not in src   # control: the needle still discriminates
-    assert BM * (RR // TILES) <= 8192
+    assert BM <= 8192 and RR // TILES <= 8192
 
 
 def test_an_oversized_router_block_is_refused():
-    """The DPU output-point limit is a refusal, not a silent slowdown."""
-    with pytest.raises(AssertionError, match="8192 output points"):
-        make_moe_route_prefill(N=N, H=H, E=E, TOPK=TOPK, BM=N, BNR=256, tiles=TILES, shaves=SHAVES)
+    """The DPU's per-dimension limit is a refusal, not a silent slowdown."""
+    with pytest.raises(AssertionError, match="above the DPU's 8192"):
+        make_moe_route_prefill(N=N, H=H, E=16384, TOPK=TOPK, BM=BM, BNR=BNR, tiles=1, shaves=1)
 
 
 @needs_cxx

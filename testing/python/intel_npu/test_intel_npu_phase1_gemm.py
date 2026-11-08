@@ -94,12 +94,14 @@ def test_ksplit_refused_by_name():
         _source(make_gemm_ksplit(64, 64, 256))
 
 
-def test_dpu_output_points_limit_refused():
-    # 128 x 128 = 16384 output points: over the NPU5 DPU's 8192 per workload.
-    with pytest.raises(ValueError, match="16384 points exceeds the DPU's 8192"):
-        _source(make_gemm(128, 128, 256, BM=128, BN=128, tiles=1, shaves=1))
-    # 64 x 128 = 8192 is the limit and is accepted.
-    assert "ctx.dpu_matmul(" in _source(make_gemm(64, 128, 256, BM=64, BN=128, tiles=1, shaves=1))
+def test_dpu_workload_dim_limit_refused():
+    # A dimension above 8192 is refused (dpu.md 4.6); the output tile's M x N PRODUCT is not bounded.
+    # dpu.md 13's "max output points per operation 8192" was read as that product until
+    # device/run_dpu_points_probe.py ran 16384- and 65536-value matmuls correctly on PTL.
+    with pytest.raises(ValueError, match="has a dimension above the DPU's 8192"):
+        _source(make_gemm(16384, 64, 256, BM=16384, BN=64, tiles=1, shaves=1))
+    # the shape that used to be refused, and the one npu_dsl's prefill scan issues
+    assert "ctx.dpu_matmul(" in _source(make_gemm(128, 128, 256, BM=128, BN=128, tiles=1, shaves=1))
 
 
 def test_dpu_z_alignment_refused():
@@ -115,12 +117,12 @@ def test_cmx_exhaustion_reported_in_status():
     # target that claims 64 MiB of CMX so the RUNTIME allocator is the one that reports the failure.
     from tvm.target import Target
 
-    func = make_gemm(64, 64, 32768, BM=64, BN=64, tiles=1, shaves=2)  # A tile 64 x 32768 fp16 = 4 MiB per SHAVE
+    func = make_gemm(256, 64, 8192, BM=256, BN=64, tiles=1, shaves=2)  # A tile 256 x 8192 fp16 = 4 MiB per SHAVE
     big = Target({"kind": "intel_npu", "arch": "npu5", "cmx_bytes": 64 * 1024 * 1024})
     lib = host_sim.build(tilelang.lower(func, target=big).kernel_source, "gemm_too_big")
-    a = np.zeros((64, 32768), np.float16)
-    b = np.zeros((64, 32768), np.float16)
-    c = np.zeros((64, 64), np.float16)
+    a = np.zeros((256, 8192), np.float16)
+    b = np.zeros((64, 8192), np.float16)
+    c = np.zeros((256, 64), np.float16)
     status = host_sim.run(lib, [a, b, c], tiles=1, shaves=2)
     with pytest.raises(RuntimeError, match="CMX_EXHAUSTED"):
         host_sim.check_status(status)

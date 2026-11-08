@@ -37,10 +37,14 @@ TVM_REGISTER_TARGET_KIND("intel_npu", kDLExtDev)
     // 7 is the toolkit mutex). An id at or above the job's range hangs the run.
     .add_attr_option<int64_t>("barrier_pool_first", refl::DefaultValue(8))
     .add_attr_option<int64_t>("barriers_per_tile", refl::DefaultValue(16))
-    // DPU workload legality (NPU5): Z extents multiples of 16, at most this
-    // many output points per workload.
+    // DPU workload legality (NPU5): Z extents multiples of 16, and no
+    // workload dimension above this (dpu.md 4.6). There is deliberately NO
+    // bound on the output tile's M*N product: dpu.md 13's "max output points
+    // per operation" was read that way and a device probe falsified it --
+    // single fp16 matmuls of 16384 and 65536 output values are exact on PTL
+    // (device/run_dpu_points_probe.py).
     .add_attr_option<int64_t>("dpu_z_align", refl::DefaultValue(16))
-    .add_attr_option<int64_t>("dpu_max_output_points", refl::DefaultValue(8192))
+    .add_attr_option<int64_t>("dpu_max_workload_dim", refl::DefaultValue(8192))
     // SHAVE .text budget per kernel, bytes.
     .add_attr_option<int64_t>("text_limit_bytes", refl::DefaultValue(262272))
     // kernel_entry returns void; status travels through a parameter.
