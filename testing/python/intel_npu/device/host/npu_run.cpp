@@ -14,8 +14,10 @@
 #include <npu_runtime.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -211,6 +213,7 @@ int run(int argc, char **argv) {
 //   alloc NAME BYTES              shared device buffer, zeroed
 //   load NAME FILE [OFFSET [FILEOFF [SIZE]]]   FILE (DIR-relative, or absolute) from FILEOFF, SIZE bytes (0: to its end) -> buffer at OFFSET
 //   zero NAME
+//   addr NAME                     -> "ok <address>" the buffer's device address (what the kernel sees as a parameter)
 //   save NAME FILE [OFFSET BYTES] buffer -> DIR/FILE
 //   kernel ALIAS ELFNAME [profile]
 //   launch ALIAS NAME...          -> "ok ms <host> kernel_ms <k>" or "error <why>"
@@ -316,6 +319,16 @@ int session(const std::string &dir, int tiles, int shaves) {
         }
         std::memset(it->second.dev, 0, it->second.bytes);
         reply("ok");
+      } else if (cmd == "addr") {
+        std::string name;
+        ls >> name;
+        auto it = bufs.find(name);
+        if (it == bufs.end()) {
+          reply("error no buffer " + name);
+          continue;
+        }
+        // the kernel sees the device view of the host allocation (what submit() puts in params[]), not the host pointer
+        reply("ok " + std::to_string(reinterpret_cast<std::uint64_t>(device.getDeviceView(it->second.dev))));
       } else if (cmd == "kernel") {
         std::string alias, elf, opt;
         ls >> alias >> elf >> opt;
@@ -360,7 +373,43 @@ int session(const std::string &dir, int tiles, int shaves) {
         std::memset(status, 0xFF, statusBytes);
         auto t0 = std::chrono::steady_clock::now();
         it->second->submit(params, stream);
-        stream.wait();
+        {
+          // Watchdog: a SHAVE that failed (status != 0xFFFFFFFF, != OK) skips its tile peer's sync_tile, which waits
+          // unbounded, so the launch never returns. Dump every worker's status words after 20 s and give up.
+          std::atomic<bool> done{false};
+          std::thread waiter([&] { stream.wait(); done = true; });
+          while (!done) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (sec > 20.0 && !done) {
+              std::cerr << "WATCHDOG: launch " << alias << " not finished after " << sec << " s; per-SHAVE status words:\n";
+              for (std::uint32_t w = 0; w < workers; ++w) {
+                std::cerr << "  shave " << w << ":";
+                for (std::uint32_t k = 0; k < kStatusWords; ++k)
+                  std::cerr << " " << status[w * kStatusWords + k];
+                std::cerr << "\n";
+              }
+              std::cerr.flush();
+              std::string health;
+              const bool healthy = device.isHealthy(&health);
+              std::cerr << "WATCHDOG: device " << (healthy ? "healthy" : "UNHEALTHY") << ": " << health << "\n";
+              std::cerr.flush();
+              if (const char *tracePath = std::getenv("TL_NPU_WATCHDOG_TRACE")) {
+                try {
+                  std::ofstream f(tracePath);
+                  it->second->saveProfilingJson(f);
+                  std::cerr << "WATCHDOG: profiling trace saved to " << tracePath << "\n";
+                } catch (const std::exception &e) {
+                  std::cerr << "WATCHDOG: trace save failed: " << e.what() << "\n";
+                }
+                std::cerr.flush();
+              }
+              std::cout << "fatal watchdog " << alias << std::endl;
+              std::_Exit(3);
+            }
+          }
+          waiter.join();
+        }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::string health;
         if (!device.isHealthy(&health)) {
@@ -393,6 +442,12 @@ int session(const std::string &dir, int tiles, int shaves) {
           spanTicks = std::max(spanTicks, status[w * kStatusWords + kStampEnd] - start0);
         std::ostringstream os;
         os << "ok ms " << ms << " kernel_ms " << spanTicks / kPerfClkMHz / 1000.0;
+        if (std::getenv("TL_NPU_DUMP_STATUS")) {
+          os << " status";
+          for (std::uint32_t w = 0; w < workers; ++w)
+            for (std::uint32_t k = 0; k < kStatusWords; ++k)
+              os << " " << status[w * kStatusWords + k];
+        }
         reply(os.str());
       } else {
         reply("error unknown command " + cmd);

@@ -265,7 +265,14 @@ class Session:
         if not r:
             raise RuntimeError(f"session died on {line!r}: {self.proc.stderr.read()[-3000:]}")
         if r.startswith("error") or r.startswith("fatal"):
-            raise RuntimeError(f"session {line.split()[0]} {line.split()[1] if len(line.split()) > 1 else ''}: {r}")
+            tail = ""
+            if r.startswith("fatal"):   # the process is exiting: its stderr carries the watchdog / health dump
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+                tail = "\n" + self.proc.stderr.read()[-4000:]
+            raise RuntimeError(f"session {line.split()[0]} {line.split()[1] if len(line.split()) > 1 else ''}: {r}{tail}")
         return r
 
     def alloc(self, name: str, nbytes: int) -> None:
@@ -305,6 +312,10 @@ class Session:
     def zero(self, name: str) -> None:
         self._cmd(f"zero {name}")
 
+    def address(self, name: str) -> int:
+        """The buffer's device address: what a kernel parameter carries, so a layer table can name it."""
+        return int(self._cmd(f"addr {name}").split()[1])
+
     def kernel(self, alias: str, elf_name: str, profile: bool = False) -> None:
         self._cmd(f"kernel {alias} {elf_name}" + (" profile" if profile else ""))
 
@@ -312,6 +323,8 @@ class Session:
         r = self._cmd(f"launch {alias} " + " ".join(buffers))
         parts = r.split()
         host_ms, kernel_ms = float(parts[2]), float(parts[4])
+        if "status" in parts:   # TL_NPU_DUMP_STATUS: the 16 status words of every SHAVE, kept for the caller
+            self.last_status = [int(x) for x in parts[parts.index("status") + 1:]]
         self.launches.append((alias, host_ms, kernel_ms))
         return host_ms, kernel_ms
 

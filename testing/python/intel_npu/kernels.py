@@ -1095,7 +1095,8 @@ def make_attn_decode(H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, RO
 
 def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, tiles: int, shaves: int, BN1: int = 128,
                R1: int = 64, BN2: int = 64, R2: int = 32, BKV: int = 128, num_stages: int = 4, num_stages2: int = 2,
-               kv_stages: int = 2, eps: float = 1e-6, pipelined: bool = True, res_add: bool = True):
+               kv_stages: int = 2, eps: float = 1e-6, pipelined: bool = True, res_add: bool = True, stages: str = "ABCDE",
+               gemv_pipelined: bool = True):
     """The full-attention mixer as a `T.macro` (make_attn_decode's docstring): `attn_mixer(x_cmx, WqkvP, QNormW, KNormW,
     CosSin, Pos, Kc, Vt, WoP, Y, QN, Part, O, Res, Out, tile, shave)` takes the normed token in tile-shared CMX and writes
     the mixer output (+ Res when `res_add`) to Out, every tile its third of the rows. Returns (macro, sizes)."""
@@ -1158,7 +1159,8 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
             w2_cmx = T.alloc_shared((BR2, KO // 2), T.uint8)
             y2_cmx = T.alloc_local((1, BN2), T.float16)
             # --- A. qkv GEMV -----------------------------------------------------------------------------------------
-            for n in (T.Pipelined(C1, num_stages=num_stages) if pipelined else T.serial(C1)):
+            if "A" in stages:
+              for n in (T.Pipelined(C1, num_stages=num_stages) if (pipelined and gemv_pipelined) else T.serial(C1)):
                 T.copy(WqkvP[(tile * C1 + n) * BR1, 0], w1_cmx)
                 for sub in T.serial(BN1 // R1):
                     T.gemm_i4(x_cmx, w1_cmx, None, y1_cmx, group=G, row0=sub * R1, rows=R1, scales_row=BN1)
@@ -1169,7 +1171,8 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
             T.copy(CosSin[0, 0], cs_cmx)
             T.copy(QNormW[0, 0], qw_cmx)
             T.copy(KNormW[0, 0], kw_cmx)
-            for it in T.serial(T.ceildiv(NIT, workers)):
+            if "B" in stages:
+              for it in T.serial(T.ceildiv(NIT, workers)):
                 item = it * workers + worker
                 if item < NIT:
                     if item < NH:
@@ -1206,10 +1209,12 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
                         T.copy(Y[0, VOFF + (item - NH) * D], row)
                         for d in T.serial(D):
                             vcol[d, 0] = row[0, d]
-                        T.copy(vcol, Vt[item - NH, 0, pos_cmx[0, 0]])
+                        if "v" not in stages:   # diagnostic 'v': skip the 2-byte-wide strided V^T column store
+                            T.copy(vcol, Vt[item - NH, 0, pos_cmx[0, 0]])
             T.sync_grid()
             # --- C. flash-decoding over this tile's third of the positions, per kv group -----------------------------
-            for g in T.serial(NKV):
+            if "C" in stages:
+              for g in T.serial(NKV):
                 T.copy(QN[g, 0, 0], q_cmx)
                 for i, d0 in T.grid(GQ, D // FL):
                     for v in T.vectorized(FL):
@@ -1217,10 +1222,11 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
                 for i in T.serial(GQ):
                     m_i[i] = T.float32(-1e30)
                     l_i[i] = T.float32(0)
-                for kv in (T.Pipelined(CPT, num_stages=kv_stages) if pipelined else T.serial(CPT)):
+                for kv in (T.Pipelined(CPT, num_stages=kv_stages) if (pipelined and kv_stages > 0) else T.serial(CPT)):
                     T.copy(Kc[g, (tile * CPT + kv) * BKV, 0], k_cmx)
                     T.copy(Vt[g, 0, (tile * CPT + kv) * BKV], v_cmx)
-                    T.gemm(q_cmx, k_cmx, s_cmx, transpose_B=True, clear_accum=True)
+                    if "g" not in stages:
+                        T.gemm(q_cmx, k_cmx, s_cmx, transpose_B=True, clear_accum=True)
                     # positions past pos: their scores are 0 (zeroed cache) -> -65504 before the max, so P = 0
                     if (tile * CPT + kv) * BKV + BKV > pos_cmx[0, 0] + 1:
                         for i, j in T.grid(GQ, BKV):
@@ -1244,7 +1250,8 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
                                 ls[v] = ls[v] + T.cast(s_cmx[i, j0 * FL + v], T.float32)
                         l_i[i] = l_i[i] * corr[i] + T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL])
                         m_i[i] = m_new[i]
-                    T.gemm(s_cmx, v_cmx, pv_cmx, transpose_B=True, clear_accum=True)
+                    if "g" not in stages:
+                        T.gemm(s_cmx, v_cmx, pv_cmx, transpose_B=True, clear_accum=True)
                     for i in T.serial(GQ):
                         for d0 in T.serial(D // FL):
                             for v in T.vectorized(FL):
@@ -1272,29 +1279,37 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
                 T.sync_threads()
             T.sync_grid()
             # --- D. merge the tiles per head, apply the gate -> O ------------------------------------------------------
-            for it in T.serial(T.ceildiv(NH, workers)):
+            if "D" in stages or "d" in stages:
+              for it in T.serial(T.ceildiv(NH, workers)):
                 h = it * workers + worker
                 if h < NH:
                     T.copy(Part[h // GQ, h % GQ, 0, 0], p3)
                     T.copy(Y[0, h * 2 * D + D], gate)
-                    st[0] = p3[0, D]
-                    for t in T.serial(1, tiles):
+                    if "D" in stages:
+                      st[0] = p3[0, D]
+                      for t in T.serial(1, tiles):
                         st[0] = T.max(st[0], p3[t, D])
-                    st[1] = T.float32(0)
-                    for t in T.serial(tiles):
-                        p3[t, D] = T.exp(p3[t, D] - st[0])     # the tile's weight
+                      st[1] = T.float32(0)
+                      for t in T.serial(tiles):
+                        if "x" in stages:
+                            p3[t, D] = p3[t, D] - st[0]
+                        else:
+                            p3[t, D] = T.exp(p3[t, D] - st[0])     # the tile's weight
                         st[1] = st[1] + p3[t, D] * p3[t, D + 1]
-                    st[1] = T.float32(1) / st[1]
-                    for d0 in T.serial(D // FL):
+                      st[1] = T.float32(1) / st[1]
+                      for d0 in T.serial(D // FL):
                         for v in T.vectorized(FL):
                             rowf[d0 * FL + v] = T.float32(0)
-                    for t in T.serial(tiles):
+                      for t in T.serial(tiles):
                         for d0 in T.serial(D // FL):
                             for v in T.vectorized(FL):
                                 rowf[d0 * FL + v] = rowf[d0 * FL + v] + p3[t, d0 * FL + v] * p3[t, D]
-                    for d0 in T.serial(D // FL):
+                      for d0 in T.serial(D // FL):
                         for v in T.vectorized(FL):
-                            gh[v] = T.exp(T.float16(0) - gate[0, d0 * FL + v])
+                            if "x" in stages:
+                                gh[v] = T.float16(0) - gate[0, d0 * FL + v]
+                            else:
+                                gh[v] = T.exp(T.float16(0) - gate[0, d0 * FL + v])
                             oh[0, d0 * FL + v] = T.cast(rowf[d0 * FL + v] * st[1] / (T.float32(1) + T.cast(gh[v], T.float32)), T.float16)
                     T.copy(oh, O[0, h * D])
             T.sync_grid()
@@ -1305,7 +1320,8 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
                         res_cmx[0, H + c] = T.float16(0)
                 T.copy(Res[0:1, 0:H], res_cmx[0:1, 0:H])
             T.copy(O[0, 0], o_cmx)
-            for n in (T.Pipelined(C2, num_stages=num_stages2) if pipelined else T.serial(C2)):
+            if "E" in stages:
+              for n in (T.Pipelined(C2, num_stages=num_stages2) if (pipelined and gemv_pipelined) else T.serial(C2)):
                 T.copy(WoP[(tile * C2 + n) * BR2, 0], w2_cmx)
                 for sub in T.serial(BN2 // R2):
                     T.gemm_i4(o_cmx, w2_cmx, None, y2_cmx, group=G, row0=sub * R2, rows=R2, scales_row=BN2)
@@ -1393,7 +1409,7 @@ def pack_int4(w_int: "np.ndarray") -> "np.ndarray":
 
 
 def make_head(H: int = 2048, V: int = 248320, G: int = 128, tiles: int = 3, shaves: int = 2, BN: int = 128, R: int = 64,
-              num_stages: int = 4, eps: float = 1e-6, pipelined: bool = True, h_dtype=T.float16):
+              num_stages: int = 4, eps: float = 1e-6, pipelined: bool = True, h_dtype=T.float16, as_block: bool = False):
     """M5 decode head in ONE launch: logits = rmsnorm_zc(h) . dequant_i8(Wlm)^T over the vocabulary, greedy argmax.
 
       x = h rsqrt(mean h^2 + eps) (1 + w)                 (every tile, SHAVE 0; the final norm)
@@ -1443,6 +1459,56 @@ def make_head(H: int = 2048, V: int = 248320, G: int = 128, tiles: int = 3, shav
             for v in T.vectorized(HL):
                 yl[n // shaves, j0 * HL + v] = y_cmx[0, j0 * HL + v]
 
+    @T.macro
+    def head_phases(x_cmx, WlmP, Logits, Part, Tok, tile, shave):
+        """Phases B and C over the normed token `x_cmx` (shared fp16 [1, H]): the vocabulary GEMV with the running
+        argmax, the partials, the grid barrier, worker 0's pick into Tok."""
+        worker = tile * shaves + shave
+        w_cmx = T.alloc_shared((BR, H), T.int8)
+        y_cmx = T.alloc_local((1, BN), T.float16)
+        yl = T.alloc_local((CS, BN), T.float16)
+        st = T.alloc_local((4,), T.float32)
+        bi = T.alloc_local((4,), T.int32)
+        mx = T.alloc_local((HL,), T.float16)
+        pw = T.alloc_local((1, PW), T.float32)
+        pall = T.alloc_local((workers, PW), T.float32)
+        tok_cmx = T.alloc_local((1, 8), T.int32)
+        # chunk n belongs to SHAVE n % shaves (the ring's dealing; the serial form deals it by hand)
+        st[0] = T.float32(-3e38)
+        bi[0] = 0
+        if pipelined:
+            for n in T.Pipelined(C, num_stages=num_stages):
+                T.copy(WlmP[(tile * C + n) * BR, 0], w_cmx)
+                consume(x_cmx, w_cmx, y_cmx, yl, mx, st, bi, tile, n)
+        else:
+            for n in T.serial(C):
+                T.copy(WlmP[(tile * C + n) * BR, 0], w_cmx)
+                if n % shaves == shave:
+                    consume(x_cmx, w_cmx, y_cmx, yl, mx, st, bi, tile, n)
+        T.copy(yl, Logits[tile, 0, shave * BN])
+        for c in T.serial(PW):
+            pw[0, c] = T.float32(0)
+        pw[0, 0] = st[0]
+        pw[0, 1] = T.cast(bi[0], T.float32)
+        T.copy(pw, Part[worker, 0])
+        T.sync_grid()
+        # worker 0: the lowest index among the partials sharing the max
+        if worker == 0:
+            T.copy(Part[0, 0], pall)
+            st[0] = pall[0, 0]
+            bi[0] = T.cast(pall[0, 1], T.int32)
+            for w in T.serial(1, workers):
+                if pall[w, 0] > st[0] or (pall[w, 0] == st[0] and T.cast(pall[w, 1], T.int32) < bi[0]):
+                    st[0] = pall[w, 0]
+                    bi[0] = T.cast(pall[w, 1], T.int32)
+            for c in T.serial(8):
+                tok_cmx[0, c] = 0
+            tok_cmx[0, 0] = bi[0]
+            T.copy(tok_cmx, Tok[0, 0])
+
+    if as_block:
+        return head_phases, dict(V_pad=V_pad, C=C, CS=CS, BR=BR, workers=workers, PW=PW)
+
     @T.prim_func
     def head(Hs: T.Tensor((1, H), h_dtype), NormW: T.Tensor((1, H), T.float16),
              WlmP: T.Tensor(((V_pad // BN) * BR, H), T.int8),
@@ -1450,20 +1516,11 @@ def make_head(H: int = 2048, V: int = 248320, G: int = 128, tiles: int = 3, shav
              Tok: T.Tensor((1, 8), T.int32)):
         with T.Kernel(tiles, threads=shaves) as tile:
             shave = T.get_thread_binding()
-            worker = tile * shaves + shave
             h_cmx = T.alloc_shared((1, H), h_dtype)
             nw_cmx = T.alloc_shared((1, H), T.float16)
             x_cmx = T.alloc_shared((1, H), T.float16)
-            w_cmx = T.alloc_shared((BR, H), T.int8)
-            y_cmx = T.alloc_local((1, BN), T.float16)
-            yl = T.alloc_local((CS, BN), T.float16)
             ls = T.alloc_local((FL,), T.float32)
             st = T.alloc_local((4,), T.float32)
-            bi = T.alloc_local((4,), T.int32)
-            mx = T.alloc_local((HL,), T.float16)
-            pw = T.alloc_local((1, PW), T.float32)
-            pall = T.alloc_local((workers, PW), T.float32)
-            tok_cmx = T.alloc_local((1, 8), T.int32)
             # --- A. final norm (zero-centred) on SHAVE 0 of every tile -----------------------------------------------
             T.copy(Hs[0, 0], h_cmx)
             T.copy(NormW[0, 0], nw_cmx)
@@ -1479,39 +1536,7 @@ def make_head(H: int = 2048, V: int = 248320, G: int = 128, tiles: int = 3, shav
                         x_cmx[0, d0 * FL + v] = T.cast(T.cast(h_cmx[0, d0 * FL + v], T.float32) * st[0]
                                                        * (T.float32(1) + T.cast(nw_cmx[0, d0 * FL + v], T.float32)), T.float16)
             T.sync_threads()
-            # --- B. lm_head GEMV over this tile's third of the rows, argmax on the fly ---------------------------------
-            # chunk n belongs to SHAVE n % shaves (the ring's dealing; the serial form deals it by hand)
-            st[0] = T.float32(-3e38)
-            bi[0] = 0
-            if pipelined:
-                for n in T.Pipelined(C, num_stages=num_stages):
-                    T.copy(WlmP[(tile * C + n) * BR, 0], w_cmx)
-                    consume(x_cmx, w_cmx, y_cmx, yl, mx, st, bi, tile, n)
-            else:
-                for n in T.serial(C):
-                    T.copy(WlmP[(tile * C + n) * BR, 0], w_cmx)
-                    if n % shaves == shave:
-                        consume(x_cmx, w_cmx, y_cmx, yl, mx, st, bi, tile, n)
-            T.copy(yl, Logits[tile, 0, shave * BN])
-            for c in T.serial(PW):
-                pw[0, c] = T.float32(0)
-            pw[0, 0] = st[0]
-            pw[0, 1] = T.cast(bi[0], T.float32)
-            T.copy(pw, Part[worker, 0])
-            T.sync_grid()
-            # --- C. worker 0: the lowest index among the partials sharing the max --------------------------------------
-            if worker == 0:
-                T.copy(Part[0, 0], pall)
-                st[0] = pall[0, 0]
-                bi[0] = T.cast(pall[0, 1], T.int32)
-                for w in T.serial(1, workers):
-                    if pall[w, 0] > st[0] or (pall[w, 0] == st[0] and T.cast(pall[w, 1], T.int32) < bi[0]):
-                        st[0] = pall[w, 0]
-                        bi[0] = T.cast(pall[w, 1], T.int32)
-                for c in T.serial(8):
-                    tok_cmx[0, c] = 0
-                tok_cmx[0, 0] = bi[0]
-                T.copy(tok_cmx, Tok[0, 0])
+            head_phases(x_cmx, WlmP, Logits, Part, Tok, tile, shave)
 
     return head
 
@@ -1806,3 +1831,139 @@ def make_attn_layer(H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, ROT
                     T.copy(h32, Hio[0, 0])
 
     return attn_layer
+
+
+# Layer table columns (`make_decode_model`): one int64 device address per column, filled by the host from
+# `Session.address`; a column a layer kind does not use holds 0.
+TABLE_COLS = ["InNorm", "PostNorm", "W0", "W1", "W2", "W3", "W4", "W5", "W6", "W7", "Wr", "WguP", "WdP", "S0", "S1", "pad"]
+GDN_TABLE = dict(W0="WinP", W1="Wba", W2="ConvW", W3="ALog", W4="DtBias", W5="GNorm", W6="WoutP", S0="ConvState", S1="Ssm")
+ATTN_TABLE = dict(W0="WqkvP", W1="QNormW", W2="KNormW", W3="WoP", S0="Kc", S1="Vt")
+
+
+def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV: int = 128, NH: int = 16, NKV: int = 2,
+                      D: int = 256, ROT: int = 64, SMAX: int = 1536, I: int = 512, E: int = 256, TOPK: int = 8, V: int = 248320,
+                      G: int = 128, tiles: int = 3, shaves: int = 2, eps: float = 1e-6, pipelined: bool = True,
+                      gdn_kw: dict | None = None, attn_kw: dict | None = None, moe_kw: dict | None = None, head_kw: dict | None = None,
+                      skip: frozenset = frozenset()):
+    """M5: the whole decode step in ONE launch: a device-side loop over the L layers (`Kind[li]` 0 = Gated DeltaNet,
+    1 = full attention), each layer's weights and states reached through `Table[li, :]` (device addresses,
+    `T.ddr_view`, columns `TABLE_COLS`), the residual stream fp32 in CMX for the whole step (written back to Hio at the
+    end), then the final norm and the lm_head with the greedy argmax into Tok. The host uploads the embedding row into
+    Hio, Pos and CosSin, launches once, reads Tok. The two layer kinds' phases share CMX (scoped), the
+    `if Kind == 0` branches are uniform across the SHAVEs, and every ring stays inside its layer (LowerIntelNpuPipelined
+    refuses to hoist a ring whose fill source is a view bound inside the loop). The out_proj gemms submit
+    R2 = 16 rows (not 32): the runtime's merged-FC scratch is sized by the largest quantised gemm of the whole kernel
+    (M x ng^2 x N, K = 4096 -> ng = 32) and is not scoped, so at R2 = 32 it costs 64 KiB more than the head alone
+    and the 1 MB lm_head ring no longer fits next to it (CheckIntelNpuBudgets refuses by 16 KiB). `skip` (diagnostic
+    only) leaves out whole stages: any of "gdn", "attn", "moe", "head"."""
+    gk = dict(R2=16)
+    gk.update(gdn_kw or {})
+    ak = dict(R2=16)
+    ak.update(attn_kw or {})
+    ak.setdefault("pipelined", pipelined)
+    gdn_mixer, gs = gdn_block(H=H, KH=KH, VH=VH, DK=DK, DV=DV, G=G, tiles=tiles, shaves=shaves, eps=eps, pipelined=pipelined,
+                              res_add=False, **gk)
+    attn_mixer, asz = attn_block(H=H, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX, G=G, tiles=tiles, shaves=shaves, eps=eps,
+                                 res_add=False, **ak)
+    mk = dict(num_stages=4, BNR=16, BNG=128, BND=256)
+    mk.update(moe_kw or {})
+    moe_phases = moe_block(H=H, I=I, E=E, TOPK=TOPK, G=G, tiles=tiles, shaves=shaves, pipelined=pipelined, **mk)
+    head_phases, hs = make_head(H=H, V=V, G=G, tiles=tiles, shaves=shaves, eps=eps, pipelined=pipelined, as_block=True, **(head_kw or {}))
+    rmsnorm_zc, add_rows, add_parts = norm_block(H, shaves, eps)
+    BN1g, BN2g = (gdn_kw or {}).get("BN1", 128), (gdn_kw or {}).get("BN2", 64)
+    BN1a, BN2a = (attn_kw or {}).get("BN1", 128), (attn_kw or {}).get("BN2", 64)
+    BNh = (head_kw or {}).get("BN", 128)
+    CONV, NIN_pad, NOUTg, BR1g, BR2g, VC = gs["CONV"], gs["NIN_pad"], gs["NOUT_pad"], gs["BR1"], gs["BR2"], gs["VC"]
+    WBA_pad, YLEN, BA_LEN, CVLEN, OPADg = gs["WBA_pad"], gs["YLEN"], gs["BA_LEN"], gs["CVLEN"], gs["OPAD"]
+    NQKV, NOUTa, BR1a, BR2a, KO, GQ, PWa = asz["NQKV"], asz["NOUT_pad"], asz["BR1"], asz["BR2"], asz["KO"], asz["GQ"], asz["PW"]
+    per_round = tiles * shaves * mk["BNR"]
+    RR = -(-(E + 1) // per_round) * per_round
+    CG, CD = (2 * I) // mk["BNG"], H // mk["BND"]
+    SRG, SRD = moe_scale_rows(H, I, G, mk["BNG"], mk["BND"])
+    BG, BD = mk["BNG"] + SRG, mk["BND"] + SRD
+    MR = 16
+    NCOL = len(TABLE_COLS)
+    col = {n: i for i, n in enumerate(TABLE_COLS)}
+
+    @T.prim_func
+    def model(Hio: T.Tensor((1, H), T.float32), Pos: T.Tensor((1, 1), T.int32), CosSin: T.Tensor((2, ROT), T.float32),
+              Kind: T.Tensor((L, 4), T.int32), Table: T.Tensor((L, NCOL), T.int64),
+              Y: T.Tensor((1, YLEN), T.float16), BA: T.Tensor((1, BA_LEN), T.float16), CV: T.Tensor((1, CVLEN), T.float16),
+              O: T.Tensor((1, OPADg), T.float16), Mix: T.Tensor((1, NOUTg), T.float16),
+              YA: T.Tensor((1, NQKV), T.float16), QN: T.Tensor((NKV, GQ, D), T.float16),
+              PartA: T.Tensor((NKV, GQ, tiles, PWa), T.float32), OA: T.Tensor((1, KO), T.float16), MixA: T.Tensor((1, NOUTa), T.float16),
+              Logits: T.Tensor((MR, RR), T.float16), PartM: T.Tensor((tiles, H), T.float32),
+              NormW: T.Tensor((1, H), T.float16), WlmP: T.Tensor(((hs["V_pad"] // BNh) * hs["BR"], H), T.int8),
+              HLogits: T.Tensor((tiles, hs["CS"], shaves * BNh), T.float16), HPart: T.Tensor((hs["workers"], hs["PW"]), T.float32),
+              Tok: T.Tensor((1, 8), T.int32)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            h32 = T.alloc_shared((1, H), T.float32)
+            x_cmx = T.alloc_shared((1, H), T.float16)
+            nw_cmx = T.alloc_shared((1, H), T.float16)
+            mix_cmx = T.alloc_shared((1, H), T.float16)
+            p_cmx = T.alloc_shared((tiles, H), T.float32)
+            T.copy(Hio[0, 0], h32)
+            for li in T.serial(L):
+                InNorm = T.ddr_view(Table[li, col["InNorm"]], (1, H), T.float16)
+                PostNorm = T.ddr_view(Table[li, col["PostNorm"]], (1, H), T.float16)
+                Wr = T.ddr_view(Table[li, col["Wr"]], (RR, H), T.float16)
+                WguP = T.ddr_view(Table[li, col["WguP"]], ((E + 1) * CG * BG, H // 2), T.uint8)
+                WdP = T.ddr_view(Table[li, col["WdP"]], ((E + 1) * CD * BD, I // 2), T.uint8)
+                T.copy(InNorm[0, 0], nw_cmx)
+                if "norm" not in skip:
+                    rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
+                if Kind[li, 0] == 0:
+                    WinP = T.ddr_view(Table[li, col["W0"]], ((NIN_pad // BN1g) * BR1g, H // 2), T.uint8)
+                    Wba = T.ddr_view(Table[li, col["W1"]], (WBA_pad, H), T.float16)
+                    ConvW = T.ddr_view(Table[li, col["W2"]], (4, CONV), T.float16)
+                    ALog = T.ddr_view(Table[li, col["W3"]], (1, VH), T.float32)
+                    DtBias = T.ddr_view(Table[li, col["W4"]], (1, VH), T.float32)
+                    GNorm = T.ddr_view(Table[li, col["W5"]], (1, DV), T.float16)
+                    WoutP = T.ddr_view(Table[li, col["W6"]], ((NOUTg // BN2g) * BR2g, VC // 2), T.uint8)
+                    ConvState = T.ddr_view(Table[li, col["S0"]], (3, CONV), T.float16)
+                    Ssm = T.ddr_view(Table[li, col["S1"]], (VH, DK, DV), T.float32)
+                    if "gdn" not in skip:
+                        gdn_mixer(x_cmx, WinP, Wba, ConvW, ALog, DtBias, GNorm, ConvState, Ssm, WoutP, Y, BA, CV, O, Mix, Mix, tile, shave)
+                        T.sync_grid()
+                        T.copy(Mix[0:1, 0:H], mix_cmx[0:1, 0:H])
+                    else:
+                        if shave == 0:
+                            for c in T.serial(H):
+                                mix_cmx[0, c] = x_cmx[0, c]
+                        T.sync_threads()
+                else:
+                    WqkvP = T.ddr_view(Table[li, col["W0"]], ((NQKV // BN1a) * BR1a, H // 2), T.uint8)
+                    QNormW = T.ddr_view(Table[li, col["W1"]], (1, D), T.float16)
+                    KNormW = T.ddr_view(Table[li, col["W2"]], (1, D), T.float16)
+                    WoP = T.ddr_view(Table[li, col["W3"]], ((NOUTa // BN2a) * BR2a, KO // 2), T.uint8)
+                    Kc = T.ddr_view(Table[li, col["S0"]], (NKV, SMAX, D), T.float16)
+                    Vt = T.ddr_view(Table[li, col["S1"]], (NKV, D, SMAX), T.float16)
+                    if "attn" not in skip:
+                        attn_mixer(x_cmx, WqkvP, QNormW, KNormW, CosSin, Pos, Kc, Vt, WoP, YA, QN, PartA, OA, MixA, MixA, tile, shave)
+                        T.sync_grid()
+                        T.copy(MixA[0:1, 0:H], mix_cmx[0:1, 0:H])
+                    else:
+                        if shave == 0:
+                            for c in T.serial(H):
+                                mix_cmx[0, c] = x_cmx[0, c]
+                        T.sync_threads()
+                add_rows(h32, mix_cmx, shave)
+                T.copy(PostNorm[0, 0], nw_cmx)
+                if "norm" not in skip:
+                    rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
+                if "moe" not in skip:
+                    moe_phases(x_cmx, Wr, WguP, WdP, Logits, PartM, tile, shave)
+                    T.copy(PartM[0, 0], p_cmx)
+                    add_parts(h32, p_cmx, tiles, shave)
+            # a grid barrier closes the layer loop's CMX phase before the head's ring (the lm_head ring is 1 MB)
+            T.sync_grid()
+            T.copy(NormW[0, 0], nw_cmx)
+            rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
+            if "head" not in skip:
+                head_phases(x_cmx, WlmP, HLogits, HPart, Tok, tile, shave)
+            if tile == 0:
+                if shave == 0:
+                    T.copy(h32, Hio[0, 0])
+
+    return model

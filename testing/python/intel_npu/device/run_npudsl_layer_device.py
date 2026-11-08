@@ -165,7 +165,13 @@ def main(argv):
         ours_ms = "0.563 (attention) + 0.560 (MoE) = 1.12"
     wbytes = sum(x.nbytes for m, x in arrays if m == "in") - h_in.nbytes
     print(f"layer {layer} ({kind}) weights {wbytes / 1e6:.0f} MB prepared in {time.time() - t0:.0f} s")
-    res = runner.run(db, arrays, TILES, SHAVES, HERE / "run_npudsl_layer", repeat=10, warmup=10, timeout_s=900)
+    profile = None
+    if "--profile" in argv:   # observability run (toolkit timeline of the DMA / DPU drivers fused_rt uses), not a timing
+        (HERE / "evidence").mkdir(exist_ok=True)
+        profile = HERE / "evidence" / f"{kernel}_trace.json"
+    res = runner.run(db, arrays, TILES, SHAVES, HERE / "run_npudsl_layer", repeat=10, warmup=10, timeout_s=900, profile_json=profile)
+    if profile is not None:
+        print(f"trace: {profile}")
     print(f"status per SHAVE (code, detail): {res.status[:, :2].tolist()}")
     runner.check_status(res.status)
     h_out = arrays[2][1]
