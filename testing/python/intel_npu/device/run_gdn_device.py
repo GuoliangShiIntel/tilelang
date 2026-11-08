@@ -66,7 +66,7 @@ def main(argv):
     arrays = gdn_arrays(p, packed, **cfg)
     # npu_run re-uploads every input (inout included) before each launch, so the in-place states restart every
     # launch and the one-step oracle is the golden (verified: the 20-step iteration disagrees, the one-step agrees)
-    WARMUP, REPEAT = 10, 10
+    WARMUP, REPEAT = (0, 1) if "--cold" in argv else (10, 10)   # --cold: one launch on an idle device (the e2e step's condition)
     ref_p = gdn_problem(0, **cfg)   # the UNPERTURBED problem, so the negative must fail
     ref, ref_cs, ref_ssm = gdn_reference(ref_p["x"], ref_p["res"], ref_p["win_int"], ref_p["win_scales"], ref_p["wout_int"],
                                          ref_p["wout_scales"], ref_p["conv_w"], ref_p["a_log"], ref_p["dt_bias"], ref_p["g_norm"],

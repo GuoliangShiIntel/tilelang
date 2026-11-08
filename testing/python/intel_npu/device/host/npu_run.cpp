@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +24,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -376,12 +378,25 @@ int session(const std::string &dir, int tiles, int shaves) {
         {
           // Watchdog: a SHAVE that failed (status != 0xFFFFFFFF, != OK) skips its tile peer's sync_tile, which waits
           // unbounded, so the launch never returns. Dump every worker's status words after 20 s and give up.
-          std::atomic<bool> done{false};
-          std::thread waiter([&] { stream.wait(); done = true; });
-          while (!done) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          // The waiter signals a condition variable: the launch returns the moment the stream completes (a 50 ms
+          // poll here once cost every 1 ms launch 54 ms of host time and left the device idle, i.e. cold).
+          std::mutex mtx;
+          std::condition_variable cv;
+          bool done = false;
+          std::thread waiter([&] {
+            stream.wait();
+            std::lock_guard<std::mutex> lk(mtx);
+            done = true;
+            cv.notify_all();
+          });
+          bool finished;
+          {
+            std::unique_lock<std::mutex> lk(mtx);
+            finished = cv.wait_for(lk, std::chrono::seconds(20), [&] { return done; });
+          }
+          if (!finished) {
             const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            if (sec > 20.0 && !done) {
+            {
               std::cerr << "WATCHDOG: launch " << alias << " not finished after " << sec << " s; per-SHAVE status words:\n";
               for (std::uint32_t w = 0; w < workers; ++w) {
                 std::cerr << "  shave " << w << ":";

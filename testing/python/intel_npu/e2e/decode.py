@@ -250,17 +250,24 @@ class DeviceModel:
         c, s = self.c, self.s
         H = c.hidden
         import torch
+        tt = time.perf_counter()
         h = self.embed[token].to(torch.float32).numpy().copy()
         t0 = time.perf_counter()
         dev_ms = dict(layers=0.0, head=0.0)
         s.upload("Hio", h.reshape(1, H))
         s.upload("Pos", np.array([[self.pos]], np.int32))
         s.upload("CosSin", rope_cos_sin(self.pos, c.rot_dim, c.rope_theta))
+        t1 = time.perf_counter()
         if self.single:
             dev_ms = dict(model=0.0)
             for ci in range(len(self.chunks)):
-                _, km = s.launch(self._chunk_kernel(ci), *self._model_bufs(ci))
+                if os.environ.get("TL_NPU_DBG_WARM_LAUNCH") == "1":   # diagnostic: a throwaway launch right before the timed one (clock ramp)
+                    s.launch(self._chunk_kernel(ci), *self._model_bufs(ci))
+                hm, km = s.launch(self._chunk_kernel(ci), *self._model_bufs(ci))
                 dev_ms["model"] += km
+            if os.environ.get("TL_NPU_DBG_STEP_TIMING") == "1":
+                print(f"step timing: embed {1e3 * (t0 - tt):.1f} ms, uploads {1e3 * (t1 - t0):.1f} ms, launch round trip "
+                      f"{1e3 * (time.perf_counter() - t1):.1f} ms (runner host {hm:.1f} ms, kernel {km:.1f} ms)", file=sys.stderr)
             if getattr(s, "last_status", None):
                 ws = s.last_status
                 for w in range(len(ws) // 16):
