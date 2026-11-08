@@ -1453,6 +1453,135 @@ def rope_cos_sin(pos: int, ROT: int, theta: float):
     return np.stack([np.cos(emb), np.sin(emb)]).astype(np.float32)
 
 
+def make_attn_prefill(N: int = 64, NKV: int = 2, GQ: int = 8, D: int = 256, SMAX: int = 1536, TB: int = 8,
+                      BKV: int = 128, tiles: int = 3, shaves: int = 2, pipelined: bool = False):
+    """P1: the full-attention PREFILL phase -- flash attention over `N` query tokens already normed, roped and
+    appended to the cache, with the three things the decode phase does not need: **GQA**, the **causal mask** and
+    the **output gate**.
+
+      out[g, t, hh, :] = softmax_j(q[g, t, hh] . Kc[g, j] / sqrt(D))[j <= pos0 + t] . Vt[g, :, j]^T
+                         * sigmoid(gate[g, t, hh, :])
+
+    Work items are (kv head, token block of TB tokens) dealt round-robin over the tiles x SHAVEs; one worker owns a
+    block end to end, so there is no cross-worker merge (the decode phase splits the positions instead, because at
+    one token there is nothing else to split). The DPU operand is the block's `TB x GQ` query rows: Q is laid out
+    `[NKV, N, GQ, D]` so one block is one contiguous DMA. Only the chunks a block can see are read (`ck` below), and
+    only the chunk that straddles the diagonal is masked.
+
+    `Pos[0, 0]` is the absolute position of token 0 of this call, so a prompt is prefilled in chunks of `N` tokens.
+    Oracle: `attn_prefill_reference`."""
+    assert D % 32 == 0 and BKV % 32 == 0 and SMAX % BKV == 0 and N % TB == 0
+    ROWS = TB * GQ
+    HL, FL = 32, 16
+    assert BKV % HL == 0 and D % FL == 0
+    scale = 1.0 / (D ** 0.5)
+    workers = tiles * shaves
+    NIT = NKV * (N // TB)
+    CMAX = SMAX // BKV
+
+    @T.prim_func
+    def attn_prefill(Q: T.Tensor((NKV, N, GQ, D), T.float16), Kc: T.Tensor((NKV, SMAX, D), T.float16),
+                     Vt: T.Tensor((NKV, D, SMAX), T.float16), Gate: T.Tensor((NKV, N, GQ, D), T.float16),
+                     Pos: T.Tensor((1, 1), T.int32), O: T.Tensor((NKV, N, GQ, D), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            pos_cmx = T.alloc_shared((1, 1), T.int32)
+            q_cmx = T.alloc_local((ROWS, D), T.float16)
+            k_cmx = T.alloc_local((BKV, D), T.float16)
+            v_cmx = T.alloc_local((D, BKV), T.float16)
+            s_cmx = T.alloc_local((ROWS, BKV), T.float16)
+            pv_cmx = T.alloc_local((ROWS, D), T.float16)
+            o_acc = T.alloc_local((ROWS, D), T.float32)
+            gt_cmx = T.alloc_local((ROWS, D), T.float16)
+            m_i = T.alloc_local((ROWS,), T.float32)
+            l_i = T.alloc_local((ROWS,), T.float32)
+            m_new = T.alloc_local((ROWS,), T.float32)
+            corr = T.alloc_local((ROWS,), T.float32)
+            mx = T.alloc_local((HL,), T.float16)
+            ls = T.alloc_local((FL,), T.float32)
+            gh = T.alloc_local((FL,), T.float16)
+            T.copy(Pos[0, 0], pos_cmx)
+            for it in T.serial(T.ceildiv(NIT, workers)):
+                item = it * workers + worker
+                if item < NIT:
+                    g = item // (N // TB)
+                    t0 = (item % (N // TB)) * TB
+                    T.copy(Q[g, t0, 0, 0], q_cmx)
+                    for i, d0 in T.grid(ROWS, D // FL):
+                        for v in T.vectorized(FL):
+                            o_acc[i, d0 * FL + v] = T.float32(0)
+                    for i in T.serial(ROWS):
+                        m_i[i] = T.float32(-1e30)
+                        l_i[i] = T.float32(0)
+                    # the block's last query is at pos0 + t0 + TB - 1, so it sees chunks 0 .. that // BKV
+                    ck = T.min(CMAX, T.ceildiv(pos_cmx[0, 0] + t0 + TB, BKV))
+                    for kv in (T.Pipelined(ck, num_stages=2) if pipelined else T.serial(ck)):
+                        T.copy(Kc[g, kv * BKV, 0], k_cmx)
+                        T.copy(Vt[g, 0, kv * BKV], v_cmx)
+                        T.gemm(q_cmx, k_cmx, s_cmx, transpose_B=True, clear_accum=True)
+                        # causal: row i is token t0 + i // GQ at position pos0 + t0 + i // GQ
+                        if kv * BKV + BKV > pos_cmx[0, 0] + t0:
+                            for i, j in T.grid(ROWS, BKV):
+                                if kv * BKV + j > pos_cmx[0, 0] + t0 + i // GQ:
+                                    s_cmx[i, j] = T.float16(-65504)
+                        for i in T.serial(ROWS):
+                            for v in T.vectorized(HL):
+                                mx[v] = s_cmx[i, v]
+                            for j0 in T.serial(1, BKV // HL):
+                                for v in T.vectorized(HL):
+                                    mx[v] = T.max(mx[v], s_cmx[i, j0 * HL + v])
+                            m_new[i] = T.max(m_i[i], T.cast(T.call_extern(T.float16, "tl_npu_vmax", mx[0:HL]), T.float32) * scale)
+                            corr[i] = T.exp(m_i[i] - m_new[i])
+                            for j0 in T.serial(BKV // HL):
+                                for v in T.vectorized(HL):
+                                    s_cmx[i, j0 * HL + v] = T.exp(s_cmx[i, j0 * HL + v] * T.float16(scale) - T.cast(m_new[i], T.float16))
+                            for v in T.vectorized(FL):
+                                ls[v] = T.cast(s_cmx[i, v], T.float32)
+                            for j0 in T.serial(1, BKV // FL):
+                                for v in T.vectorized(FL):
+                                    ls[v] = ls[v] + T.cast(s_cmx[i, j0 * FL + v], T.float32)
+                            l_i[i] = l_i[i] * corr[i] + T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL])
+                            m_i[i] = m_new[i]
+                        T.gemm(s_cmx, v_cmx, pv_cmx, transpose_B=True, clear_accum=True)
+                        for i in T.serial(ROWS):
+                            for d0 in T.serial(D // FL):
+                                for v in T.vectorized(FL):
+                                    o_acc[i, d0 * FL + v] = o_acc[i, d0 * FL + v] * corr[i] + T.cast(pv_cmx[i, d0 * FL + v], T.float32)
+                    # normalise and apply the per-head output gate
+                    T.copy(Gate[g, t0, 0, 0], gt_cmx)
+                    for i in T.serial(ROWS):
+                        corr[i] = T.float32(1) / l_i[i]
+                        for d0 in T.serial(D // FL):
+                            for v in T.vectorized(FL):
+                                gh[v] = T.exp(T.float16(0) - gt_cmx[i, d0 * FL + v])
+                                pv_cmx[i, d0 * FL + v] = T.cast(o_acc[i, d0 * FL + v] * corr[i]
+                                                                / (T.float32(1) + T.cast(gh[v], T.float32)), T.float16)
+                    T.copy(pv_cmx, O[g, t0, 0, 0])
+
+    return attn_prefill
+
+
+def attn_prefill_reference(q, kc, vt, gate, pos0: int, eps: float = 0.0):
+    """numpy oracle of make_attn_prefill (fp32). q / gate / out are [NKV, N, GQ, D], kc [NKV, SMAX, D],
+    vt [NKV, D, SMAX]; query token t of the call is at absolute position pos0 + t and sees keys 0 .. pos0 + t."""
+    import numpy as np
+    NKV, N, GQ, D = q.shape
+    out = np.zeros((NKV, N, GQ, D), np.float32)
+    for g in range(NKV):
+        for t in range(N):
+            p = pos0 + t
+            k = kc[g, :p + 1].astype(np.float32)        # [p + 1, D]
+            v = vt[g, :, :p + 1].astype(np.float32)     # [D, p + 1]
+            for hh in range(GQ):
+                s = k @ q[g, t, hh].astype(np.float32) / np.sqrt(D)
+                pr = np.exp(s - s.max())
+                pr /= pr.sum()
+                gt = gate[g, t, hh].astype(np.float32)
+                out[g, t, hh] = (v @ pr) / (1.0 + np.exp(-gt))
+    return out
+
+
 def attn_reference(x, res, wqkv_int, wqkv_scales, wo_int, wo_scales, qnorm_w, knorm_w, cos_sin, pos, kc, vt,
                    NH: int, NKV: int, D: int, ROT: int, G: int, eps: float = 1e-6):
     """numpy oracle of make_attn_decode (fp32): returns out [H], the K cache and transposed V cache after the append."""
