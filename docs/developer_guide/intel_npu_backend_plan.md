@@ -549,6 +549,22 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 
 ## 8. Log
 
+* 2026-11-08: **Prefill P2 is on the device, and a routing golden must rank the device's OWN logits.** The MoE
+  routing (P2a, `tl_moe_route_prefill_n64_h2048_e256` `7d5b65ee0104`, **0.331 ms**) and the grouped expert FFN
+  (P2b, `tl_moe_expert_prefill_n64_h2048_i512_e256_mb16` `d430e5021d85`, **53.8 ms** rel 5.49e-4) both pass at
+  Qwen3.8's shape for 64 prompt tokens (`device/run_moe_prefill_device.py --n 64 --phase both --negative`).
+  **Routing FAILed on its first device run and the kernel was innocent.** The device stores its logits in fp16 and
+  ranks those; the oracle ranked fp32 logits. Among 257 experts a near-tie ranks differently in the two, so **3 of
+  512 choices** flipped -- and because a flipped choice changes the expert, every downstream array (`Ids`, `Cnt`,
+  `Off`, `Slot`) disagreed at once, which reads like a broken kernel rather than a 3-in-512 tie. The rule, and it
+  generalises to any top-k on a quantised score: **check the GEMM against fp32 with a tolerance, then re-derive the
+  grouping from the values the device actually ranked and compare THAT exactly.** The check stays strict -- the slot
+  table must still be a permutation of `0..N*(TOPK+1)-1`, and the negative control (perturb one expert's weights,
+  and exactly the tokens routed to it may move) bit precisely: 7 moved, 7 expected.
+  **The grouping's win is tokens-per-expert, and at N=64 it is only 2.6x.** 64 tokens x 9 choices scatter over 222
+  of 257 experts, so the kernel reads 349 MB of int4 once against the 906 MB a per-token walk would read. The ratio
+  is `N*(TOPK+1) / experts_visited`; it is near 1 for small N and saturates once N exceeds the expert count. A
+  prefill chunk size chosen for MoE should be read off that curve, not assumed.
 * 2026-11-08: **The KV cache is sized by attention layers, not by layer slots: 126 MB -> 32 MB.** The entry below
   left `KcAll` / `VtAll` indexed by the layer slot `li`, so a 40-layer launch reserved 40 caches for its 10
   full-attention layers. `make_decode_model` now takes `KVL` (the launch's attention-layer count) as their leading

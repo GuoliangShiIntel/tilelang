@@ -770,12 +770,15 @@ def make_moe_route_prefill(N: int = 128, H: int = 2048, E: int = 256, TOPK: int 
     return moe_route
 
 
-def moe_route_prefill_reference(x, wr, E: int, TOPK: int):
+def moe_route_prefill_reference(x, wr, E: int, TOPK: int, logits=None):
     """numpy oracle of make_moe_route_prefill (fp32): the top-k ids (lowest id on a tie), the renormalised
-    weights with the shared expert's gate last, and the expert grouping (counts, exclusive offsets, slots)."""
+    weights with the shared expert's gate last, and the expert grouping (counts, exclusive offsets, slots).
+    `logits`: rank THESE instead of recomputing them. The device stores its logits in fp16, and with hundreds of
+    experts a near-tie ranks differently in fp16 than in fp32, so a device golden passes its own logits back in
+    and the grouping is then compared exactly -- the GEMM is checked separately, against a tolerance."""
     import numpy as np
     N = x.shape[0]
-    logits = x.astype(np.float32) @ wr.astype(np.float32).T          # [N, RR]
+    logits = (x.astype(np.float32) @ wr.astype(np.float32).T) if logits is None else logits.astype(np.float32)
     ids = np.zeros((N, TOPK), np.int32)
     wts = np.zeros((N, 16), np.float32)
     for t in range(N):
