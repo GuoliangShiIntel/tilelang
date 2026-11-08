@@ -541,13 +541,43 @@ device-verified and measured here.
 | MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | **have** (log 2026-11-08 M3): one launch at Qwen3.6's shape, device PASS (routing == oracle), **0.560 ms** TURBO = 28 GB/s of the 15.8 MB it reads; expert phase ~0.43 ms at 34 GB/s (DMA-latency bound, see the log's cost split) | M3 |
 | Head | final norm + lm_head (int8 g128) + greedy argmax | **have** (log 2026-11-08): one launch at Qwen3.6's vocabulary, device PASS, **8.78 ms** TURBO = 58.9 GB/s vs npu_dsl's head 9.44 ms same day; both at <50% of the DMA bound | M5 |
 | Compiler | layer table + device-side layer loop with two layer kinds; long-prompt chunk loop; CMX reuse across phases; barrier id reuse; `.text` per kernel | **have** (log 2026-11-08 M5 step 3, unblocked M6): `T.ddr_view` address table, device-side `for li` with `Kind[li]`, scoped CMX across the loop, 40 layers lower and fit (`.text` 127 KB); question 8's device loss is **worked around** -- the KV cache is a kernel parameter, not a table address, so one launch may hold any mix of layers; rings do not yet hoist over the layer loop (cross-layer prefetch, npu_dsl's 14 ms of fusion gain); long-prompt chunk loop open | M5 |
-| e2e | pack, export, fp32 reference on the quantised weights, golden, `longseq` | **decode have** (log 2026-11-08 M6): 40 layers through the model kernel in **ONE launch**, golden 16/16, **47.0 ms of device time per token, 51 ms host wall = 19.6 tok/s** (`<user>`'s measure) vs npu_dsl's 40 ms = 25 tok/s; the `--chunked` 20-launch form is kept as the A/B baseline; prefill forms, `longseq` open (the KV cache is reserved at `SMAX` and over-reserves 4x today -- see the M6 log entry) | M6 |
+| e2e | pack, export, fp32 reference on the quantised weights, golden, `longseq` | **decode have** (log 2026-11-08 M6): 40 layers through the model kernel in **ONE launch**, golden 16/16, **47.0 ms of device time per token, 51 ms host wall = 19.6 tok/s** (`<user>`'s measure) vs npu_dsl's 40 ms = 25 tok/s; the `--chunked` 20-launch form is kept as the A/B baseline; prefill forms, `longseq` open (the KV cache is still reserved at `SMAX`, now one per attention layer: 32 MB at smax 1536, 671 MB at 32768 -- paged KV is costed in the log entry of the same date) | M6 |
 | Measurement | kernel-only time, traces, flow check, VPUNN-planned workloads, DMA model | **have** | - |
 
 Baseline to beat: npu_dsl's Qwen3.6-35B-A3B numbers (`qwen36_e2e`, its `docs/design/fused_compiler_log.md`),
 re-measured on the same day as ours, since the box's DPU rate has changed since October (section 7 question 5).
 
 ## 8. Log
+
+* 2026-11-08: **The KV cache is sized by attention layers, not by layer slots: 126 MB -> 32 MB.** The entry below
+  left `KcAll` / `VtAll` indexed by the layer slot `li`, so a 40-layer launch reserved 40 caches for its 10
+  full-attention layers. `make_decode_model` now takes `KVL` (the launch's attention-layer count) as their leading
+  extent and indexes with the KV slot the host writes into the previously unused `Kind[li, 1]` column;
+  `decode.py` sizes the buffers by `_kv_slots(ci)` and puts the slot count in the chunked kernel key, so two chunks
+  of equal length but different layer kinds cannot share a kernel. K + V at smax 1536, 40 layers: **126 -> 32 MB**;
+  at smax 32768 it would be 2.7 GB -> 671 MB, which is what makes long context affordable at all. Golden **16/16**
+  unchanged, layer-39 residual rel 7.59e-4, **47.0 ms** device per token (kernel `311717e82ff2`); the 3-D path is
+  untouched (`run_attn_device.py --pos 1000` PASS rel 6.30e-3).
+  **Dialect limit found on the way, and it costs a build cycle to rediscover: a `T.macro` parameter must be a
+  variable or a constant.** Passing `Kind[li, 1]` (a `BufferLoad`) emitted `kvl` as an undeclared identifier at six
+  sites; `li` (a Var) and the literal `0` had both worked, which is why the earlier form did not expose it. The slot
+  now arrives as a buffer and an index (`KvSlot`, `kvi`) and is loaded inside the macro, which is also how
+  `moe_block` reads `ids`.
+  **Paged / blocked KV looks cheap from here, and nothing in the compiler is missing.** The allocation policy already
+  lives entirely in `decode.py`, so a page allocator and a free list never reach the kernel. Three things make it
+  easy: (1) the address shape is already `kernel parameter + runtime index x stride + runtime offset`, which is the
+  cell question 8 proves safe -- paging only renames the index; (2) **a ring whose fill source reads a runtime index
+  out of CMX is already device-verified**: `moe_block`'s expert stream does exactly that (`WguP[(ids[...] * CG + n) *
+  BG, 0]`), so a page-table lookup needs no new pass; (3) with a page of **`BKV` positions** both caches stay
+  contiguous per page -- a K page is `[NKV, BKV, D]` and a V^T page `[NKV, D, BKV]`, so the chunk reads keep their
+  present DMA shapes and the V^T column append's stride drops from `SMAX * 2` = 3072 to `BKV * 2` = 256, i.e. the
+  whole column lands in one page. npu_dsl's `vt_block` (`npu_dsl/lib/kv_cache.py`) is precisely this blocked V^T, so
+  the layout has a precedent. What is actual work: the attention extent and mask math stops being affine in `pos`
+  and becomes a page-table lookup (the table loaded into CMX once per layer, as `ids` is), and `SMAX` stays a
+  compile-time bound -- paging does not remove the reservation, it changes what is reserved from `max_seq` per layer
+  to a shared pool of pages. Order if it is taken up: K first (contiguous, simplest), then the blocked V^T, then the
+  host allocator, and **validate on `--layer-ids 3,7` before 40 layers** -- question 8's mechanism is still unknown,
+  so a two-layer launch is the cheap canary.
 
 * 2026-11-08: **M6: the whole decode step in ONE launch. The KV cache became a kernel parameter, which unblocked
   question 8.** The device loss that forced `--chunked` since M5 step 3 is gone, and the per-token cost went from 20
