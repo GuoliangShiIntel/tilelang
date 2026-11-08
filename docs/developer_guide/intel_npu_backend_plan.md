@@ -471,6 +471,19 @@ interop; a Python `nl.*`-compatible shim.
    and between the ODU finishing and the producer barrier decrementing / the watermark landing. What are those
    two hardware latencies on NPU5? They bound how far "submit ahead and never wait per workload" can go, and
    whether tiny workloads (decode, M = 1) should be batched into one DPU task list the way VPUX does.
+8. **Device lost after a completed kernel (2026-11-08, M5 step 3).** A single launch holding an attention layer and any
+   other layer ends with every SHAVE finished (status records and the toolkit wrapper's post-kernel markers written),
+   then the job never completes and the driver reports `ZE_RESULT_ERROR_DEVICE_LOST`; attention + MoE + head alone, GDN x3,
+   and the same program under npu_dsl's `fused_rt.hpp` all behave the same way (pass / lost respectively), so the runtime
+   is excluded. Within attention the trigger needs the K / QN / V^T cache stores (a 2-byte-wide, 256-row, stride-3072
+   column store among them) followed by DPU work in the same launch, on the second execution. Questions: can the firmware
+   or driver fault log of a `DEVICE_LOST` be retrieved on this box (the MMU / DPU / DMA fault reason), which is the one
+   instrument the SHAVE side cannot provide? Does the job-end path read the DPU's last descriptor or the DMA link agents'
+   state in a way a kernel can leave inconsistent after it has completed? Is a 2-byte-wide strided DMA store to DDR
+   subject to an alignment or width rule? A ~100-line probe (K row store + V^T column store -> one fp16 M = 8 DPU gemm,
+   twice in one launch) is the planned minimal reproduction.
+9. **Where SHAVE code is fetched from, and the instruction cache size.** Asked while attributing the (since explained)
+   in-model slowdown; still useful: it decides whether a 130-260 KB `.text` has a cost beyond the budget.
 
 ## 9. Model target: Qwen3.8-35B-A3B-Distill, and what it needs (2026-11-06)
 
@@ -484,11 +497,11 @@ device-verified and measured here.
 | Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | **have** (log 2026-11-07 M2): `T.gemm_i4` / `T.gemm_i8` merged-FC DPU path, device PASS, 30 / 41 GB/s of weights (DMA bound ~126) | M2 |
 | Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | `T.vectorized` loops lower to half32/float16 SHAVE vector ops with VAU exp/log/tanh (**have**, log 2026-11-07); the ops themselves not yet written | M1 |
 | Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash prefill phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**, 960x1024x64 vectorised 1.042 ms TURBO; **decode layer have** (log 2026-11-08): qkv GEMV, zero-centred q/k norm, RoPE, cache append, flash-decoding over 1536 positions with GQA 8:1 and the output gate, o_proj, in one launch, device PASS, **0.563 ms** TURBO; prefill GQA / gate / causal mask open | M1 |
-| Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | **decode have** (log 2026-11-08 M4): one launch at Qwen3.6's shape, device PASS with both states checked, **0.750 ms** TURBO; the chunked prefill scan open | M4 |
+| Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | **decode have** (log 2026-11-08 M4, M5 step 5): one launch at Qwen3.6's shape, device PASS with both states checked, **0.640 ms** TURBO (delta rule at npu_dsl's gdn_scan code quality; its SHAVE section 323 vs npu_dsl's 247 us); the chunked prefill scan open | M4 |
 | MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | **have** (log 2026-11-08 M3): one launch at Qwen3.6's shape, device PASS (routing == oracle), **0.560 ms** TURBO = 28 GB/s of the 15.8 MB it reads; expert phase ~0.43 ms at 34 GB/s (DMA-latency bound, see the log's cost split) | M3 |
 | Head | final norm + lm_head (int8 g128) + greedy argmax | **have** (log 2026-11-08): one launch at Qwen3.6's vocabulary, device PASS, **8.78 ms** TURBO = 58.9 GB/s vs npu_dsl's head 9.44 ms same day; both at <50% of the DMA bound | M5 |
-| Compiler | layer table + device-side layer loop with two layer kinds; long-prompt chunk loop; CMX reuse across phases; barrier id reuse; `.text` per kernel | phases + derived `sync_grid`, budgets as sums (**have**); PlanCmx and id reuse open | M5 |
-| e2e | pack, export, fp32 reference on the quantised weights, golden, `longseq` | **decode have** (log 2026-11-08): the real checkpoint packed and resident, 40 layers through the session runner, golden 16/16 vs the reference, 57 ms of device time per token (185 ms host wall); prefill forms, `longseq`, the npu_dsl A/B open | M6 |
+| Compiler | layer table + device-side layer loop with two layer kinds; long-prompt chunk loop; CMX reuse across phases; barrier id reuse; `.text` per kernel | **have** (log 2026-11-08 M5 step 3): `T.ddr_view` address table, device-side `for li` with `Kind[li]`, scoped CMX across the loop, 40 layers lower and fit (`.text` 171 KB); **blocked on the device by the loss of question 8** for any launch holding an attention layer and another layer; rings do not yet hoist over the layer loop (cross-layer prefetch, npu_dsl's 14 ms of fusion gain); long-prompt chunk loop open | M5 |
+| e2e | pack, export, fp32 reference on the quantised weights, golden, `longseq` | **decode have** (log 2026-11-08 M5 step 5): 40 layers through the model kernel in 20 chunked launches, golden 16/16, **52 ms of device time per token, 64 ms host wall = 15.7 tok/s** (`<user>`'s measure, `--new 32`) vs npu_dsl's 40 ms = 25 tok/s same day; prefill forms, `longseq` open | M6 |
 | Measurement | kernel-only time, traces, flow check, VPUNN-planned workloads, DMA model | **have** | - |
 
 Baseline to beat: npu_dsl's Qwen3.6-35B-A3B numbers (`qwen36_e2e`, its `docs/design/fused_compiler_log.md`),
@@ -496,6 +509,68 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 
 ## 8. Log
 
+* 2026-11-08: **M5 step 5: GDN delta rule at npu_dsl's code quality; the runner's 50 ms poll; 52 ms of device time per
+  token.** (1) `gdn_head` rewritten on npu_dsl's `gdn_scan` algebra (`kernels_poc/common/fused_ops.hpp:350`, named per the
+  section 0 amendment): one read of S accumulates both S^T k and S^T q into four register accumulators with **scalar
+  k_d / q_d splats** (`CMU.CP.512.32.R` is one instruction; the earlier note that a splat costs ~16 lane copies was wrong,
+  and the `[DK, 16]` row expansions it motivated cost a load per FMA), `o = e^g sq + (k . q) delta` algebraically, and
+  `S = e^g S + k delta^T` as one read-modify-write with the row in `DV / 16` register vectors loaded before any store
+  (moviCompile does not software-pipeline these loops: the first form, eight independent RMWs each load -> NOP 7 -> mul ->
+  mul -> add -> store, ran at 16 cycles per vector because a load after a store to S serialises on it). Checked against
+  npu_dsl's own `gdn_scan` compiled with the same moviCompile (`D:\tmp\npudsl_scan.s`): pass 1 ~28 vs ~30 instructions per
+  two rows, pass 2 ~53 vs ~45 per row, i.e. parity. Standalone mixer **0.781 -> 0.640 ms**, golden unchanged (rel 7.84e-4),
+  SHAVE section 461 -> 323 us (npu_dsl 247). Pass 2 is generic over DV (the DV = 64 host-sim instance caught the first
+  hard-coded form). (2) **The "model kernel is 0.25 ms per layer slower than the standalone kernel" finding (step 4) was the
+  runner.** `npu_run`'s launch watchdog waited for the stream on a thread and **polled it every 50 ms**, so every launch
+  cost >= 50 ms of host time (a 1 ms kernel reported 54 ms) and the device sat idle between launches: the model kernel was
+  measured cold, the standalone kernel warm (warmup 10, back to back). `run_gdn_device.py --cold` (one launch on an idle
+  device) gives 1.00 ms = the in-model number. Now a condition variable: host round trip 54 -> 1.2 ms. The in-model item is
+  struck from the list. (3) Device build: generic_compute's `generate_kernels_registry` embeds every ELF of the build
+  directory as a hex array through a CMake regex (48 MB source, 15 s + a 6 s compile + a runner relink per kernel
+  change); the device project now provides the same `generated_kernels_registry` target from a constant source that reads
+  the ELFs at first use (`device/host/kernels_registry.cpp.in`); 65 stale sweep kernels moved out of the glob. A
+  `run_gdn_device.py` iteration: 41 -> 13 s. (4) **40 layers, chunked (20 launches): device 52 ms per token (was 80), host
+  wall 64 ms = 15.7 tok/s by `<user>`'s measure (`--new 32`), golden 16/16**; npu_dsl 40 ms = 25 tok/s. Remaining, in
+  order: MoE (~8 ms, the top-k gap 128 vs 35 us and the expert stream), norm / RoPE / layer tail (~4 ms), the attention
+  flash fixed cost (every step scans all 1536 positions masked; npu_dsl stops at pos: ~1.5 ms), the GDN SHAVE section's
+  last 76 us per layer (S state double-buffered, the per-head scalar tail), and the single launch (11 ms of host round
+  trips plus npu_dsl's measured 14 ms of fusion gain) behind the device loss below. Commits `81d5ce51`, `133a44a3`,
+  `9ac24960`; INDEX row.
+* 2026-11-08: **M5 step 4: same-day A/B per section against npu_dsl's layer kernels (`run_npudsl_layer_device.py
+  --profile`, traces segmented at DPU idle gaps, cluster 0, pos 0, us).** GDN layer: in_proj stream 248 (ours standalone)
+  vs 332; conv + delta rule (SHAVE only, DPU and DMA idle) **461 vs 247**; out_proj 92 vs 91; MoE **560 vs ~390**; layer
+  tail ~70 vs ~30; whole layer + MoE 1.77 (per-layer kernel) vs **1.144**. Attention layer: qkv 220 vs 213; norm + RoPE +
+  cache store 158 vs 86; flash at pos 0 **160 vs 9** (ours scans the whole window); o_proj 137 vs 93; MoE ~520 vs ~410;
+  whole 1.6 vs **1.024**. Head 8.9 vs 9.44. **The DPU weight streams are at parity: the gap is SHAVE code and algorithm
+  choices**, which is what the ring / pipelining passes cannot see. npu_dsl's standalone layer kernels sum to 54 ms per
+  token while its fused single launch is 40: fusion is worth 14 ms there (cross-layer prefetch, no per-launch ramp).
+  Tools: `D:\tmp\trace_segments.py` (segments one cluster's DPU track at idle gaps and sums the SHAVE waits inside each),
+  `trace_window.py`; INDEX row with the table.
+* 2026-11-08: **M5 step 3: the decode step as ONE kernel, and a device loss that stops it at two layers.** (1) Compiler:
+  `T.ddr_view(Table[li, col], shape, dtype)` binds a typed DDR view to an address read from a device-side int64 table
+  (builtin, codegen, test); `make_decode_model` is the whole step: a device-side `for li` over the layers with
+  `Kind[li]` selecting the GDN or the attention block and `Table[li, :]` (`TABLE_COLS`) giving every layer's weights and
+  states, the residual fp32 in CMX, the head at the end; `ScopeIntelNpuCmx` sinks allocations used by one loop or one
+  branch of a uniform `if`, keeps view definitions at the head of the block that binds them; `LowerIntelNpuPipelined`
+  refuses to hoist a ring over the layer loop when a fill's source is a view bound inside the iteration (noted in the
+  source). It lowers, fits the budget (40 layers: `.text` 171 KB of 262) and the host side is a layer table built from
+  `Session.address`. (2) **Device: every SHAVE finishes normally (status records written, the toolkit wrapper's own
+  post-kernel markers reached), then the job never completes and the driver reports `ZE_RESULT_ERROR_DEVICE_LOST`.**
+  Bisection over two days (`skip` stages, attention stage flags A-E, serial vs rings, R2, kDpuSets, planner, scoped CMX,
+  hardware sync, 16 MB of mapped slack after the caches, address checks, low-CMX checksums at entry and exit): GDN x3
+  passes, attention x1 passes, attention + MoE + head in one launch passes, **a launch holding an attention layer and any
+  other layer is lost**; within attention, B's K / QN / V^T cache stores followed by DPU work in the same launch, on the
+  second execution. (3) **The runtime is excluded as the cause**: npu_dsl's `fused_rt.hpp` copied verbatim
+  (`src/tl_templates/intel_npu/fused_rt.hpp`, `private:` -> `protected:` the only edit) under a 300-line shim
+  (`npu_rt_device_frt.hpp`, `TL_NPU_RUNTIME_FRT`) runs our generated code and reproduces the loss unchanged, and the
+  all-serial attention is lost too. The native runtime was hardened on the way (every hardware method a real call with
+  compiler barriers; the toolkit's `flushCmxWrites` and register writes got `"memory"` clobbers, recorded in npu_dsl's
+  `process/generic_compute_changes.md` rows 22-24); none of it changed the outcome, and the falsified diagnostics were
+  removed before committing. Open hardware questions 8-9 below. (4) Until it is found, `decode.py --chunked` runs the model
+  kernel over runs of 3 GDN layers and single attention layers (the head in the last chunk): 20 launches per token,
+  golden 16/16 at 80 ms per token (then; see step 5). Four commits `a6530956`, `3dca43e5`, `eb4cfc74`, `9f5cccc5`.
+  Finding re-hit: a function-local `static constexpr` array reads as zeros under this SHAVE build (the Phase 3b Step 0
+  note); fused_rt's `mm_tune_on` table is such an array, so its M >= 16 stencil path is suspect in our build.
 * 2026-11-08: **M5 step 2: scoped CMX, and one launch per decoder layer: 5.4 -> 13.7 tok/s by `<user>`'s measure.** (1)
   **Scoped CMX** (the PlanCmx item, as scopes rather than live-range packing): `PlanAndUpdateBufferAllocationLocation`
   sinks allocations into the loops that use them, `ScopeIntelNpuCmx` gives the phases between grid barriers their own
