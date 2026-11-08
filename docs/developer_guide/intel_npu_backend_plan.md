@@ -378,6 +378,15 @@ Rules carried into M1-M6:
   number in this plan dated before 2026-11-07 is NO TURBO (log entry of that date).
 * Evidence (traces, logs, generated `.cpp` with sha256 prefix) goes under
   `testing/python/intel_npu/device/evidence/` with an `INDEX.md` row per device session.
+* **Read the per-SHAVE status words before blaming the device** (2026-11-08, question 8). `npu_rt_device.hpp`'s
+  `finish()` writes 16 words per SHAVE and `npu_run`'s watchdog dumps them even on a timeout:
+  `{code, detail, cmx_free_at_entry, cmx_used, dpu_waited, dpu_idu_ticks, dpu_odu_ticks, dpu_started, t_entry,
+  t_finish, ring[0..5]}`. So a `DEVICE_LOST` dump already says whether the kernel ran: `word0 == kStatusOk (1)`
+  means the body returned and wrote its record, `word7 == word4` means no DPU workload was orphaned, and
+  `(word9 - word8) / 19.2e6` is the kernel's own duration in seconds. A watchdog whose words read `1 0 ... ` with
+  a normal duration is **not** a device hang: the kernel finished and the host never saw the completion event, so
+  the fault is in what the launch left behind, not in the kernel body. Question 8 chased the wrong half of the
+  system for several rounds before these words were decoded.
 * **Hardware facts are looked up before they are measured and before they are asked** (`<user>`, 2026-11-07):
   the VPUX knowledge base (`knowledges/hw/npu5/*.md`, `knowledges/compiler/platform-resources.md`; the
   `intel-npu-hardware` skill) is the first stop; a measurement confirms a sourced fact or exposes a
@@ -471,17 +480,48 @@ interop; a Python `nl.*`-compatible shim.
    and between the ODU finishing and the producer barrier decrementing / the watermark landing. What are those
    two hardware latencies on NPU5? They bound how far "submit ahead and never wait per workload" can go, and
    whether tiny workloads (decode, M = 1) should be batched into one DPU task list the way VPUX does.
-8. **Device lost after a completed kernel (2026-11-08, M5 step 3).** A single launch holding an attention layer and any
-   other layer ends with every SHAVE finished (status records and the toolkit wrapper's post-kernel markers written),
-   then the job never completes and the driver reports `ZE_RESULT_ERROR_DEVICE_LOST`; attention + MoE + head alone, GDN x3,
-   and the same program under npu_dsl's `fused_rt.hpp` all behave the same way (pass / lost respectively), so the runtime
-   is excluded. Within attention the trigger needs the K / QN / V^T cache stores (a 2-byte-wide, 256-row, stride-3072
-   column store among them) followed by DPU work in the same launch, on the second execution. Questions: can the firmware
-   or driver fault log of a `DEVICE_LOST` be retrieved on this box (the MMU / DPU / DMA fault reason), which is the one
-   instrument the SHAVE side cannot provide? Does the job-end path read the DPU's last descriptor or the DMA link agents'
-   state in a way a kernel can leave inconsistent after it has completed? Is a 2-byte-wide strided DMA store to DDR
-   subject to an alignment or width rule? A ~100-line probe (K row store + V^T column store -> one fp16 M = 8 DPU gemm,
-   twice in one launch) is the planned minimal reproduction.
+8. **Device lost after a completed kernel (2026-11-08, M5 step 3). WORKED AROUND 2026-11-08; the mechanism is still
+   open.** A single launch holding an attention layer and any other layer ends with every SHAVE finished, then the job
+   never completes and the driver reports `ZE_RESULT_ERROR_DEVICE_LOST`.
+   **The kernel never hung.** All six SHAVEs report `kStatusOk`, `dpu_started == dpu_waited`, and
+   `word9 - word8` = 10.7-11.3 ms -- the same duration as the runs that pass. `stream.wait()`
+   (`zeEventHostSynchronize`, 1 h timeout) never returns and the 20 s watchdog fires first, so `DEVICE_LOST` is the
+   consequence, not the cause.
+   **Trigger, by bisection on `e2e/decode.py --layer-ids 3,7 --ids 1 --raw --new 1`.** One DDR store is enough, and it
+   needs both halves of its address to be runtime values:
+
+   | store base | store offset | result |
+   |---|---|---|
+   | kernel parameter (`YA`) | runtime (`pos_cmx[0, 0]`) | pass, 10.7 ms |
+   | `T.ddr_view(Table[li, ...])` | compile-time constant | pass, 10.9 ms |
+   | kernel parameter | constant | pass (the other 19 stores of the kernel) |
+   | **`T.ddr_view(Table[li, ...])`** | **runtime** | **lost** |
+
+   Only the KV-cache appends were in the failing cell, which is why no other kernel reaches it: the remaining 19 DMA
+   stores index affinely in `tile` / `shave` / loop variables. Pinning the append position to a literal made the run
+   pass while writing byte-identical data to a byte-identical address at `pos = 0`, so the *value* is not the issue.
+   Either append alone triggers it, and their descriptors differ completely (1-D 512 B versus 2-D width 2 x 256 rows at
+   stride 3072), so the descriptor shape is not the issue either.
+   **Falsified, each on the device:** mixing layer kinds (attention + attention also lost); `q_cmx` shared versus
+   SHAVE-private; hardware barriers in the rings (all nine are `local`, no ids); a zero-length K/V ring at `pos = 0`
+   (`TL_NPU_ATTN_SERIAL=1` removes the ring and still loses); ring control-memory reuse (`kRingPool` 8 -> 32 took
+   effect, `cmx_used` 184576 -> 222976, still loses); a descriptor-field store racing the engine kick (a second
+   `flushCmxWrites()` between `config_copy` and `dma_.run` does not help, and hoisting the position read into a
+   SHAVE-private local does not either); the descriptor variant (forcing every copy through `configDmaCopy2D`, the
+   only form npu_dsl emits, still loses); the trap-window placement in `alloc_hw`; `lastOnPort_` indexing
+   (`ring_fill_port` only ever returns 0 or 1).
+   **Workaround (log 2026-11-08):** the KV cache became a kernel parameter -- `KcAll (L, NKV, SMAX, D)` and
+   `VtAll (L, NKV, D, SMAX)` indexed by the layer -- instead of two table addresses. 40 layers now run in one launch,
+   golden 16/16.
+   **Why the mechanism is still open:** npu_dsl reaches its own KV cache the same way. `qwen3_fused.py`'s
+   `layer_table` documents that the cache tensors "are not kernel parameters ... so their addresses are runtime
+   values", and it appends at a runtime `pos` without trouble. So "a table base plus a runtime offset" is legal on
+   this hardware and the defect is in this backend. One structural difference is left to test: npu_dsl **DMAs the
+   table row into CMX and binds from there** (`nl.dma.load(row, LTab[layer, :])`, `FTable.bind`), while this backend
+   reads `Table[li * NCOL + k]` with a scalar `DdrAccessor` DDR load and feeds that straight into the descriptor.
+   **Still worth asking the hardware owner:** can the firmware or driver fault log of a `DEVICE_LOST` be retrieved on
+   this box (the MMU / DPU / DMA fault reason)? It is the one instrument the SHAVE side cannot provide, and with it
+   this would have been a one-round question instead of a dozen.
 9. **Where SHAVE code is fetched from, and the instruction cache size.** Asked while attributing the (since explained)
    in-model slowdown; still useful: it decides whether a 130-260 KB `.text` has a cost beyond the budget.
 
@@ -500,8 +540,8 @@ device-verified and measured here.
 | Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | **decode have** (log 2026-11-08 M4, M5 step 5): one launch at Qwen3.6's shape, device PASS with both states checked, **0.640 ms** TURBO (delta rule at npu_dsl's gdn_scan code quality; its SHAVE section 323 vs npu_dsl's 247 us); the chunked prefill scan open | M4 |
 | MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | **have** (log 2026-11-08 M3): one launch at Qwen3.6's shape, device PASS (routing == oracle), **0.560 ms** TURBO = 28 GB/s of the 15.8 MB it reads; expert phase ~0.43 ms at 34 GB/s (DMA-latency bound, see the log's cost split) | M3 |
 | Head | final norm + lm_head (int8 g128) + greedy argmax | **have** (log 2026-11-08): one launch at Qwen3.6's vocabulary, device PASS, **8.78 ms** TURBO = 58.9 GB/s vs npu_dsl's head 9.44 ms same day; both at <50% of the DMA bound | M5 |
-| Compiler | layer table + device-side layer loop with two layer kinds; long-prompt chunk loop; CMX reuse across phases; barrier id reuse; `.text` per kernel | **have** (log 2026-11-08 M5 step 3): `T.ddr_view` address table, device-side `for li` with `Kind[li]`, scoped CMX across the loop, 40 layers lower and fit (`.text` 171 KB); **blocked on the device by the loss of question 8** for any launch holding an attention layer and another layer; rings do not yet hoist over the layer loop (cross-layer prefetch, npu_dsl's 14 ms of fusion gain); long-prompt chunk loop open | M5 |
-| e2e | pack, export, fp32 reference on the quantised weights, golden, `longseq` | **decode have** (log 2026-11-08 M5 step 5): 40 layers through the model kernel in 20 chunked launches, golden 16/16, **52 ms of device time per token, 64 ms host wall = 15.7 tok/s** (`<user>`'s measure, `--new 32`) vs npu_dsl's 40 ms = 25 tok/s same day; prefill forms, `longseq` open | M6 |
+| Compiler | layer table + device-side layer loop with two layer kinds; long-prompt chunk loop; CMX reuse across phases; barrier id reuse; `.text` per kernel | **have** (log 2026-11-08 M5 step 3, unblocked M6): `T.ddr_view` address table, device-side `for li` with `Kind[li]`, scoped CMX across the loop, 40 layers lower and fit (`.text` 127 KB); question 8's device loss is **worked around** -- the KV cache is a kernel parameter, not a table address, so one launch may hold any mix of layers; rings do not yet hoist over the layer loop (cross-layer prefetch, npu_dsl's 14 ms of fusion gain); long-prompt chunk loop open | M5 |
+| e2e | pack, export, fp32 reference on the quantised weights, golden, `longseq` | **decode have** (log 2026-11-08 M6): 40 layers through the model kernel in **ONE launch**, golden 16/16, **47.0 ms of device time per token, 51 ms host wall = 19.6 tok/s** (`<user>`'s measure) vs npu_dsl's 40 ms = 25 tok/s; the `--chunked` 20-launch form is kept as the A/B baseline; prefill forms, `longseq` open (the KV cache is reserved at `SMAX` and over-reserves 4x today -- see the M6 log entry) | M6 |
 | Measurement | kernel-only time, traces, flow check, VPUNN-planned workloads, DMA model | **have** | - |
 
 Baseline to beat: npu_dsl's Qwen3.6-35B-A3B numbers (`qwen36_e2e`, its `docs/design/fused_compiler_log.md`),
@@ -509,7 +549,51 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 
 ## 8. Log
 
-* 2026-11-08: **Same-checkpoint Qwen3.8 A/B and short-context KV DMA fix.** Exported the existing `D:\models\qwen38-w4a16` checkpoint into npu_dsl's ABI in a separate directory and ran both projects on the same PTL device/TURBO condition. npu_dsl (`9ebbd7e7`, `qwen36_run --single`) loaded all 40 layers and measured 31 decode steps in 1176.88 ms, median step 37.8 ms = 26.45 tok/s; TileLang's 40-layer `--chunked` run measured 32 outputs in 1.95 s = 16.5 tok/s (49.4 ms device / 61 ms median host wall, 20 launches per step). Token accounting differs by one: npu_dsl produces its first token during prefill; TileLang times the final prompt-token forward. Both host-wall measurements include submission/wait; they are not pure device-time A/Bs. Golden: 16/16, layer-39 residual rel 7.59e-4. **Flash finding:** the prior runtime bound used the same minimum two-SHAVE group count on every tile, so at pos=22 tiles with no valid keys still issued K/V ring fills; DPU/softmax guards did not guard DMA. The local rings need no cross-tile barrier, so `attn_block` now computes a tile-dependent `kv_extent`; device A/B: pos 22 0.523 -> 0.514 ms, pos 1000 0.558 -> 0.546 ms (TURBO, UNPROFILED, warmup 10/repeat 10), golden passed; the lowering regression passes. End-to-end moved 16.1 -> 16.5 tok/s, a modest gain, leaving a 26.45 vs 16.5 tok/s gap. PROFILED traces are `testing/python/intel_npu/device/evidence/trace_model_l3.json`, `trace_model_l1_head.json`, and `tl_npudsl_attn_layer_h2048_trace.json`; each is below the event cap and is for attribution only. The npu_dsl layer profile includes attention+MoE while TileLang's `model_l1_head` trace also includes the head, so their total spans must not be directly compared. Next: per-stage unprofiled A/B and cross-layer launch/fusion work after the existing multi-layer attention `DEVICE_LOST` blocker is resolved.
+* 2026-11-08: **M6: the whole decode step in ONE launch. The KV cache became a kernel parameter, which unblocked
+  question 8.** The device loss that forced `--chunked` since M5 step 3 is gone, and the per-token cost went from 20
+  launches to 1.
+  **The fix.** `make_decode_model` reached each attention layer's cache through `T.ddr_view(Table[li, col["S0"/"S1"]])`,
+  so a cache append formed its DDR address from two runtime values: a base read out of the layer table and the position
+  read out of `pos_cmx`. That combination -- and only that combination, see question 8's table -- loses the device.
+  `attn_block` now takes `kv4`: with it the cache carries a leading layer axis indexed by `kvl`, and
+  `make_decode_model` passes **`KcAll (L, NKV, SMAX, D)` and `VtAll (L, NKV, D, SMAX)` as kernel parameters** with
+  `kvl = li`. `ATTN_TABLE` loses its `S0` / `S1` columns; `decode.py` allocates one `KcAll{ci}` / `VtAll{ci}` per launch
+  unit instead of a pair per layer. `make_attn_decode` and `make_attn_layer` keep the 3-D form (`kv4=False`) and are
+  unchanged on the device.
+  **Measured (UNPROFILED, TURBO).** Qwen3.8, 40/40 layers, smax=1536, one launch per token, kernel
+  `tl_e2e_model_h2048_s1536` sha `35a307262a37`, `.text` 127232 B (48.5%), weights 17.91 GB uploaded in 20 s:
+  **golden 16/16** teacher-forced, residual after layer 39 rel 7.59e-4, **47.0 ms of device kernel time per token,
+  51 ms host wall** = 19.6 tok/s by `<user>`'s measure. The `--chunked` baseline of the same day was 20 launches,
+  49.4-52 ms device, 61-64 ms host wall = 15.7-16.5 tok/s, so collapsing 20 launches into 1 is worth about
+  **10-13 ms of host wall per token** and the device time is unchanged, which matches the 0.31 ms/launch submit/wait
+  measured in the entry below. The two previously lost bisection cases now pass: `--layer-ids 2,3` 11.1 ms and
+  `--layer-ids 3,7` 11.2 ms (sha `0ecbfe5b4bb8`). Regression on the untouched 3-D path:
+  `run_attn_device.py --pos 1000` PASS rel 6.30e-3, 0.551 ms, sha `046b2d358f30`.
+  **What this does not explain.** The mechanism is still open and npu_dsl is a counterexample to the obvious reading --
+  see question 8. The fix is a workaround that happens to also be the better layout.
+  **New problem it exposes: the KV cache is reserved at its maximum, and this one over-reserves 4x.** `SMAX` is a
+  compile-time tensor dimension, and `VtAll` is transposed so its row stride *is* `SMAX`: the cache cannot grow, and a
+  different context length means regenerating the kernel (`SMAX` must stay a multiple of `tiles * BKV * shaves` = 768).
+  Worse, `KcAll` / `VtAll` are indexed by the **layer slot** `li`, so 40 slots are allocated where only the 10 attention
+  layers use one. K + V, 40 layers, NKV=2, D=256, fp16:
+
+  | SMAX | indexed by layer slot (today) | indexed by KV slot (proposed) |
+  |---|---|---|
+  | 1536 | 126 MB | 32 MB |
+  | 32768 | 2.7 GB | 671 MB |
+  | 65536 | 5.4 GB | 1.34 GB |
+
+  `Kind[li, 1]` is already allocated and unused: the host can write each attention layer's ordinal there and the kernel
+  can index with it instead of `li`, which costs nothing and removes the 4x before any long-context work. npu_dsl has
+  the same compile-time reservation (`max_seq` is a config field -- qwen3 40960, gemma4 32768, qwen36 65792 -- the host
+  allocates `np.zeros((n_kv, max_seq, head_dim))` up front, V is transposed, and `--max-seq` regenerates the kernel),
+  but it allocates per real layer and has two savings this backend does not: a **ring layout** for sliding-window layers
+  (`slots = window + max_tokens`, position `p` in slot `p % R`, the first M slots mirrored after `R - 1` so any read or
+  append of <= M positions is one contiguous span) and a **blocked V^T** (`[slots / VB * D, VB]`, so a decode chunk of
+  VB positions is one contiguous DMA) -- `npu_dsl/lib/kv_cache.py`. The new layout here is one pool plus a runtime
+  index, which is the shape a paged cache needs, so paging does not require another relayout.
+
+* 2026-11-08: **Same-checkpoint Qwen3.8 A/B, short-context KV fix, and launch-overhead attribution.** Exported `D:\models\qwen38-w4a16` into npu_dsl's ABI separately and ran both projects on the same PTL/TURBO system. npu_dsl (`9ebbd7e7`, `qwen36_run --single`) measured 31 decode steps in 1176.88 ms, median 37.8 ms = 26.45 tok/s; TileLang `--chunked` measured 32 outputs in 1.95 s = 16.5 tok/s (49.4 ms device / 61 ms median step wall, 20 launches/step). Counts differ by one output: npu_dsl's first token comes from prefill; TileLang times the final prompt-token forward. Both step-wall values include submit/wait and are not device-only A/Bs. An 8-token instrumentation run measured 20 launch calls per step at 56.3 ms summed host time versus 50.0 ms summed NCE_TIME kernels: launch submit/wait contributes **6.3 ms/step (~0.31 ms/launch)**, about one quarter of the 23-25 ms host-wall gap; another ~6.7 ms is upload/Python overhead. Thus launch count is material but not the majority; kernel execution is also substantially slower in aggregate (TileLang device stamps 50 ms versus npu_dsl's 37.8 ms host step, a conservative comparison). Golden remains 16/16, layer-39 residual rel 7.59e-4. **Flash finding:** the original position bound still issued K/V ring fills on tiles with no valid keys because all tiles shared a minimum two-SHAVE extent. `attn_block` now uses a tile-dependent local-ring `kv_extent`; pos 22 attention improved 0.523 -> 0.514 ms and pos 1000 0.558 -> 0.546 ms (UNPROFILED TURBO, warmup 10/repeat 10), but full-model throughput only moved 16.1 -> 16.5 tok/s. The profile traces in `testing/python/intel_npu/device/evidence/` are for attribution only; `trace_model_l1_head` includes the head and must not be directly compared with npu_dsl's attention+MoE total. Next optimization priority: reduce per-layer device work (especially GDN/MoE paths) and safely collapse GDN-only chunks where the measured launch-cost savings justify it; merging attention with another layer remains blocked by the known device-lost trigger.
 
 * 2026-11-08: **M5 step 5: GDN delta rule at npu_dsl's code quality; the runner's 50 ms poll; 52 ms of device time per
   token.** (1) `gdn_head` rewritten on npu_dsl's `gdn_scan` algebra (`kernels_poc/common/fused_ops.hpp:350`, named per the

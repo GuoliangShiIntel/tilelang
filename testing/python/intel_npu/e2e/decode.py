@@ -180,10 +180,17 @@ class DeviceModel:
             if c.layer_types[i] == "linear_attention":
                 s.alloc(f"L{i}_ConvState", 3 * c.conv_dim * 2)
                 s.alloc(f"L{i}_Ssm", c.lin_vh * c.lin_dk * c.lin_dv * 4)
-            else:
+            elif not self.single:
                 s.alloc(f"L{i}_Kc", c.n_kv * self.smax * c.head_dim * 2)
                 s.alloc(f"L{i}_Vt", c.n_kv * self.smax * c.head_dim * 2)
             # the MoE router logits scratch is per kernel, not per layer
+        if self.single:
+            # one KV cache per launch unit, a kernel parameter indexed by (layer, head, position): a DDR store whose
+            # base is a table address AND whose offset is a runtime value loses the device (watchdog, DEVICE_LOST)
+            kv = c.n_kv * self.smax * c.head_dim * 2
+            for ci, chunk in enumerate(self.chunks):
+                s.alloc(f"KcAll{ci}", len(chunk) * kv)
+                s.alloc(f"VtAll{ci}", len(chunk) * kv)
         s.alloc("M_Logits", 16 * self._router_rows() * 2)
         head = pack.cached_paths(self.pack_dir, pack.head_key(), lambda: pack.pack_head_weights(self.ck), log=self.log)
         self.final_norm = np.load(head["final_norm"])
@@ -221,8 +228,16 @@ class DeviceModel:
 
     def reset_state(self):
         for i in self.layer_ids:
-            for k in (("ConvState", "Ssm") if self.c.layer_types[i] == "linear_attention" else ("Kc", "Vt")):
-                self.s.zero(f"L{i}_{k}")
+            if self.c.layer_types[i] == "linear_attention":
+                for k in ("ConvState", "Ssm"):
+                    self.s.zero(f"L{i}_{k}")
+            elif not self.single:
+                for k in ("Kc", "Vt"):
+                    self.s.zero(f"L{i}_{k}")
+        if self.single:
+            for ci in range(len(self.chunks)):
+                self.s.zero(f"KcAll{ci}")
+                self.s.zero(f"VtAll{ci}")
         self.pos = 0
 
     # ---- one token ----------------------------------------------------------------------------------------------
@@ -243,7 +258,8 @@ class DeviceModel:
         return [m[n] for n in self.low[kind].param_names]
 
     def _model_bufs(self, ci: int = 0):
-        m = dict(Hio="Hio", Pos="Pos", CosSin="CosSin", Kind=f"Kind{ci}", Table=f"Table{ci}", Y="G_Y", BA="G_BA", CV="G_CV", O="G_O", Mix="G_Mix",
+        m = dict(Hio="Hio", Pos="Pos", CosSin="CosSin", Kind=f"Kind{ci}", Table=f"Table{ci}", KcAll=f"KcAll{ci}", VtAll=f"VtAll{ci}",
+                 Y="G_Y", BA="G_BA", CV="G_CV", O="G_O", Mix="G_Mix",
                  YA="A_Y", QN="A_QN", PartA="A_Part", OA="A_O", MixA="A_Mix", Logits="M_Logits", PartM="M_Part", NormW="H_NormW",
                  WlmP="H_WlmP", HLogits="H_Logits", HPart="H_Part", Tok="H_Tok")
         return [m[n] for n in self.low[self._chunk_kernel(ci)].param_names]
@@ -313,8 +329,8 @@ def main(argv):
     ap.add_argument("--per-layer", action="store_true", help="one launch per layer + head (the A/B baseline) instead of one per token")
     ap.add_argument("--layer-ids", default=None, help="run only these checkpoint layers, in order (e.g. 3 or 0,1,3): device bisection")
     ap.add_argument("--chunked", action="store_true",
-                    help="one launch per run of up to 3 GDN layers and per attention layer (head in the last): the device is lost "
-                         "after a launch holding an attention layer and another layer")
+                    help="one launch per run of up to 3 GDN layers and per attention layer (head in the last): the A/B "
+                         "baseline for the single-launch model")
     a = ap.parse_args(argv)
     if not a.ckpt or not a.pack_dir:
         print("--ckpt and --pack-dir (or TL_NPU_CKPT / TL_NPU_PACK_DIR) are required")

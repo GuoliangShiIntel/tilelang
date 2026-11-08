@@ -1162,7 +1162,7 @@ def make_attn_decode(H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, RO
             shave = T.get_thread_binding()
             x_cmx = T.alloc_shared((1, H), T.float16)
             T.copy(X[0, 0], x_cmx)
-            attn_mixer(x_cmx, WqkvP, QNormW, KNormW, CosSin, Pos, Kc, Vt, WoP, Y, QN, Part, O, Res, Out, tile, shave)
+            attn_mixer(x_cmx, WqkvP, QNormW, KNormW, CosSin, Pos, Kc, Vt, WoP, Y, QN, Part, O, Res, Out, tile, shave, 0)
 
     return attn
 
@@ -1170,10 +1170,13 @@ def make_attn_decode(H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, RO
 def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, tiles: int, shaves: int, BN1: int = 128,
                R1: int = 64, BN2: int = 64, R2: int = 32, BKV: int = 128, num_stages: int = 4, num_stages2: int = 2,
                kv_stages: int = 2, eps: float = 1e-6, pipelined: bool = True, res_add: bool = True, stages: str = "ABCDE",
-               gemv_pipelined: bool = True):
+               gemv_pipelined: bool = True, kv4: bool = False):
     """The full-attention mixer as a `T.macro` (make_attn_decode's docstring): `attn_mixer(x_cmx, WqkvP, QNormW, KNormW,
-    CosSin, Pos, Kc, Vt, WoP, Y, QN, Part, O, Res, Out, tile, shave)` takes the normed token in tile-shared CMX and writes
-    the mixer output (+ Res when `res_add`) to Out, every tile its third of the rows. Returns (macro, sizes)."""
+    CosSin, Pos, Kc, Vt, WoP, Y, QN, Part, O, Res, Out, tile, shave, kvl)` takes the normed token in tile-shared CMX and writes
+    the mixer output (+ Res when `res_add`) to Out, every tile its third of the rows. `kv4`: Kc / Vt carry a leading layer
+    axis indexed by `kvl` -- one cache for every layer of the launch, reached as a kernel parameter rather than through a
+    table address (a DDR store whose base is a `T.ddr_view` AND whose offset is a runtime value loses the device).
+    Returns (macro, sizes)."""
     assert NH % NKV == 0 and D % 32 == 0 and ROT % 2 == 0 and SMAX % (tiles * BKV) == 0 and BKV % 32 == 0
     GQ = NH // NKV
     NQKV = NH * 2 * D + 2 * NKV * D
@@ -1198,7 +1201,7 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
     sizes = dict(NQKV=NQKV, NOUT_pad=NOUT_pad, BR1=BR1, BR2=BR2, KO=KO, GQ=GQ, PW=PW)
 
     @T.macro
-    def attn_mixer(x_cmx, WqkvP, QNormW, KNormW, CosSin, Pos, Kc, Vt, WoP, Y, QN, Part, O, Res, Out, tile, shave):
+    def attn_mixer(x_cmx, WqkvP, QNormW, KNormW, CosSin, Pos, Kc, Vt, WoP, Y, QN, Part, O, Res, Out, tile, shave, kvl):
             worker = tile * shaves + shave
             w1_cmx = T.alloc_shared((BR1, H // 2), T.uint8)
             y1_cmx = T.alloc_local((1, BN1), T.float16)
@@ -1280,12 +1283,18 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
                     if item < NH:
                         T.copy(rown, QN[item // GQ, item % GQ, 0])
                     else:
-                        T.copy(rown, Kc[item - NH, pos_cmx[0, 0], 0])
+                        if kv4:
+                            T.copy(rown, Kc[kvl, item - NH, pos_cmx[0, 0], 0])
+                        else:
+                            T.copy(rown, Kc[item - NH, pos_cmx[0, 0], 0])
                         T.copy(Y[0, VOFF + (item - NH) * D], row)
                         for d in T.serial(D):
                             vcol[d, 0] = row[0, d]
                         if "v" not in stages:   # diagnostic 'v': skip the 2-byte-wide strided V^T column store
-                            T.copy(vcol, Vt[item - NH, 0, pos_cmx[0, 0]])
+                            if kv4:
+                                T.copy(vcol, Vt[kvl, item - NH, 0, pos_cmx[0, 0]])
+                            else:
+                                T.copy(vcol, Vt[item - NH, 0, pos_cmx[0, 0]])
             T.sync_grid()
             # --- C. flash-decoding over this tile's third of the positions, per kv group -----------------------------
             if "C" in stages:
@@ -1300,8 +1309,12 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
                 # The K/V rings are local, so each tile streams only its own chunks up to pos.
                 kv_extent = T.min(CPT, T.ceildiv(T.max(0, pos_cmx[0, 0] + 1 - tile * BKV), BKV * tiles))
                 for kv in (T.Pipelined(kv_extent, num_stages=kv_stages) if (pipelined and kv_stages > 0) else T.serial(CPT)):
-                    T.copy(Kc[g, (kv * tiles + tile) * BKV, 0], k_cmx)
-                    T.copy(Vt[g, 0, (kv * tiles + tile) * BKV], v_cmx)
+                    if kv4:
+                        T.copy(Kc[kvl, g, (kv * tiles + tile) * BKV, 0], k_cmx)
+                        T.copy(Vt[kvl, g, 0, (kv * tiles + tile) * BKV], v_cmx)
+                    else:
+                        T.copy(Kc[g, (kv * tiles + tile) * BKV, 0], k_cmx)
+                        T.copy(Vt[g, 0, (kv * tiles + tile) * BKV], v_cmx)
                     if (kv * tiles + tile) * BKV <= pos_cmx[0, 0]:
                       if "g" not in stages:
                         T.gemm(q_cmx, k_cmx, s_cmx, transpose_B=True, clear_accum=True)
@@ -1895,7 +1908,7 @@ def make_attn_layer(H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, ROT
             T.copy(Hio[0, 0], h32)
             T.copy(InNorm[0, 0], nw_cmx)
             rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
-            attn_mixer(x_cmx, WqkvP, QNormW, KNormW, CosSin, Pos, Kc, Vt, WoP, Y, QN, PartA, O, Mix, Mix, tile, shave)
+            attn_mixer(x_cmx, WqkvP, QNormW, KNormW, CosSin, Pos, Kc, Vt, WoP, Y, QN, PartA, O, Mix, Mix, tile, shave, 0)
             T.sync_grid()
             T.copy(Mix[0:1, 0:H], mix_cmx[0:1, 0:H])
             add_rows(h32, mix_cmx, shave)
@@ -1915,7 +1928,8 @@ def make_attn_layer(H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, ROT
 # `Session.address`; a column a layer kind does not use holds 0.
 TABLE_COLS = ["InNorm", "PostNorm", "W0", "W1", "W2", "W3", "W4", "W5", "W6", "W7", "Wr", "WguP", "WdP", "S0", "S1", "pad"]
 GDN_TABLE = dict(W0="WinP", W1="Wba", W2="ConvW", W3="ALog", W4="DtBias", W5="GNorm", W6="WoutP", S0="ConvState", S1="Ssm")
-ATTN_TABLE = dict(W0="WqkvP", W1="QNormW", W2="KNormW", W3="WoP", S0="Kc", S1="Vt")
+# The attention KV cache is a kernel parameter (`KcAll` / `VtAll`), not a table address: see `attn_block`'s `kv4`.
+ATTN_TABLE = dict(W0="WqkvP", W1="QNormW", W2="KNormW", W3="WoP")
 
 
 def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV: int = 128, NH: int = 16, NKV: int = 2,
@@ -1942,7 +1956,7 @@ def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int
     gdn_mixer, gs = gdn_block(H=H, KH=KH, VH=VH, DK=DK, DV=DV, G=G, tiles=tiles, shaves=shaves, eps=eps, pipelined=pipelined,
                               res_add=False, **gk)
     attn_mixer, asz = attn_block(H=H, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX, G=G, tiles=tiles, shaves=shaves, eps=eps,
-                                 res_add=False, **ak)
+                                 res_add=False, kv4=True, **ak)
     mk = dict(num_stages=4, BNR=16, BNG=128, BND=256)
     mk.update(moe_kw or {})
     moe_phases = moe_block(H=H, I=I, E=E, TOPK=TOPK, G=G, tiles=tiles, shaves=shaves, pipelined=pipelined, **mk)
@@ -1966,6 +1980,7 @@ def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int
     @T.prim_func
     def model(Hio: T.Tensor((1, H), T.float32), Pos: T.Tensor((1, 1), T.int32), CosSin: T.Tensor((2, ROT), T.float32),
               Kind: T.Tensor((L, 4), T.int32), Table: T.Tensor((L, NCOL), T.int64),
+              KcAll: T.Tensor((L, NKV, SMAX, D), T.float16), VtAll: T.Tensor((L, NKV, D, SMAX), T.float16),
               Y: T.Tensor((1, YLEN), T.float16), BA: T.Tensor((1, BA_LEN), T.float16), CV: T.Tensor((1, CVLEN), T.float16),
               O: T.Tensor((1, OPADg), T.float16), Mix: T.Tensor((1, NOUTg), T.float16),
               YA: T.Tensor((1, NQKV), T.float16), QN: T.Tensor((NKV, GQ, D), T.float16),
@@ -2019,10 +2034,9 @@ def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int
                     QNormW = T.ddr_view(Table[li, col["W1"]], (1, D), T.float16)
                     KNormW = T.ddr_view(Table[li, col["W2"]], (1, D), T.float16)
                     WoP = T.ddr_view(Table[li, col["W3"]], ((NOUTa // BN2a) * BR2a, KO // 2), T.uint8)
-                    Kc = T.ddr_view(Table[li, col["S0"]], (NKV, SMAX, D), T.float16)
-                    Vt = T.ddr_view(Table[li, col["S1"]], (NKV, D, SMAX), T.float16)
                     if "attn" not in skip:
-                        attn_mixer(x_cmx, WqkvP, QNormW, KNormW, CosSin, Pos, Kc, Vt, WoP, YA, QN, PartA, OA, MixA, MixA, tile, shave)
+                        attn_mixer(x_cmx, WqkvP, QNormW, KNormW, CosSin, Pos, KcAll, VtAll, WoP, YA, QN, PartA, OA, MixA, MixA,
+                                   tile, shave, li)
                         T.sync_grid()
                         T.copy(MixA[0:1, 0:H], mix_cmx[0:1, 0:H])
                     else:
