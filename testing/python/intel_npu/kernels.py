@@ -8,7 +8,25 @@ No `from __future__ import annotations`: T.prim_func evaluates the tensor
 annotations against the factory's locals.
 """
 
+import os
+
 import tilelang.intel_npu.language as T
+
+PERF_REGIONS = os.environ.get("TL_NPU_PERF_REGIONS") == "1"   # named SHAVE compute spans in the profiler trace (perf_attr.py)
+
+
+@T.macro
+def perf_begin(name: str):
+    """Opens a named SHAVE region on the profiler track (4-char label; a no-op unless TL_NPU_PERF_REGIONS=1). A macro:
+    a bare extern call inside a plain helper is evaluated and dropped by the eager builder."""
+    if PERF_REGIONS:
+        T.call_extern("handle", "tl_npu_perf_begin", name)
+
+
+@T.macro
+def perf_end():
+    if PERF_REGIONS:
+        T.call_extern("handle", "tl_npu_perf_end")
 
 
 def make_gemm(M: int, N: int, K: int, BM: int = 64, BN: int = 64, tiles: int = 2, shaves: int = 2):
@@ -481,21 +499,28 @@ def moe_block(H: int, I: int, E: int, TOPK: int, G: int, tiles: int, shaves: int
     per_round = tiles * shaves * BNR
     RR = ((E + 1 + per_round - 1) // per_round) * per_round
     CR = RR // (tiles * BNR)
+    assert RR % tiles == 0 and (RR // tiles) % 16 == 0
+    RRT = RR // tiles   # router rows per tile: resident, one DPU workload (a ring of 16-row chunks cost 67 us: ~5 us per chunk of protocol)
     CG, CD = (2 * I) // BNG, H // BND
     MR = 16
+    FL = 16   # fp32 lanes
+    assert (I // shaves) % (2 * FL) == 0 and (H // shaves) % FL == 0 and BNG % (2 * FL) == 0 and BND % (2 * FL) == 0 and H % (2 * FL) == 0
+    assert E + 1 <= RR   # the shared expert's gate logit is row E
+    topk_lanes = E % (2 * FL) == 0   # the row max on 32 fp16 lanes; a small instance scans scalars
     SRG, SRD = moe_scale_rows(H, I, G, BNG, BND)
     BG, BD = BNG + SRG, BND + SRD
 
     @T.macro
     def moe_phases(x_cmx, Wr, WguP, WdP, Logits, Part, tile, shave):
         x16 = T.alloc_shared((MR, H), T.float16)
-        wr_cmx = T.alloc_shared((BNR, H), T.float16)
-        yr_cmx = T.alloc_local((MR, BNR), T.float16)
+        wr_cmx = T.alloc_shared((RRT, H), T.float16)
+        yr_cmx = T.alloc_local((MR, RRT), T.float16)
         lg_cmx = T.alloc_shared((1, RR), T.float16)
         ids = T.alloc_shared((16,), T.int32)
         wts = T.alloc_shared((16,), T.float32)
         pick = T.alloc_local((16,), T.float32)
         best = T.alloc_local((2,), T.float32)
+        mx = T.alloc_local((2 * FL,), T.float16)
         wq_cmx = T.alloc_shared((BG, H // 2), T.uint8)
         y_cmx = T.alloc_local((1, BNG), T.float16)
         gu_cmx = T.alloc_shared((1, 2 * I), T.float16)
@@ -504,32 +529,58 @@ def moe_block(H: int, I: int, E: int, TOPK: int, G: int, tiles: int, shaves: int
         yd_cmx = T.alloc_local((1, BND), T.float16)
         ye_cmx = T.alloc_shared((1, H), T.float16)
         acc = T.alloc_shared((1, H), T.float32)
+        HL = 2 * FL   # fp16 lanes
         # --- 1. router -------------------------------------------------------------------------------
+        perf_begin("x16i")
         for r in T.serial(MR):
             if r % shaves == shave:
-                for c in T.serial(H):
-                    if r == 0:
-                        x16[0, c] = x_cmx[0, c]
-                    else:
-                        x16[r, c] = T.float16(0)
-        for c in T.serial(H // shaves):
-            acc[0, shave * (H // shaves) + c] = T.float32(0)
+                for c0 in T.serial(H // HL):
+                    for v in T.vectorized(HL):
+                        if r == 0:
+                            x16[0, c0 * HL + v] = x_cmx[0, c0 * HL + v]
+                        else:
+                            x16[r, c0 * HL + v] = T.float16(0)
+        for c0 in T.serial(H // shaves // FL):
+            for v in T.vectorized(FL):
+                acc[0, shave * (H // shaves) + c0 * FL + v] = T.float32(0)
+        perf_end()
         T.sync_threads()
-        for n in (T.Pipelined(CR, num_stages=num_stages) if pipelined else T.serial(CR)):
-            T.copy(Wr[(tile * CR + n) * BNR, 0], wr_cmx)
+        perf_begin("rout")
+        T.copy(Wr[tile * RRT, 0], wr_cmx)
+        if shave == 0:
             T.gemm(x16, wr_cmx, yr_cmx, transpose_B=True, clear_accum=True)
-            T.copy(yr_cmx, Logits[0, (tile * CR + n) * BNR])
+            T.copy(yr_cmx, Logits[0, tile * RRT])
+        perf_end()
         T.sync_grid()
         # --- 2. routing (every tile, SHAVE 0) ---------------------------------------------------------
         T.copy(Logits[0, 0], lg_cmx)
+        perf_begin("topk")
         if shave == 0:
             for k in T.serial(TOPK):
-                best[0] = T.float32(-3.0e38)
-                best[1] = T.float32(0)
-                for e in T.serial(E):
-                    if T.cast(lg_cmx[0, e], T.float32) > best[0]:
-                        best[0] = T.cast(lg_cmx[0, e], T.float32)
-                        best[1] = T.cast(e, T.float32)
+                # the row max, then the first index holding it (the lowest id on a tie)
+                if topk_lanes:
+                    for v in T.vectorized(HL):
+                        mx[v] = lg_cmx[0, v]
+                    for e0 in T.serial(1, E // HL):
+                        for v in T.vectorized(HL):
+                            mx[v] = T.max(mx[v], lg_cmx[0, e0 * HL + v])
+                    best[0] = T.cast(T.call_extern(T.float16, "tl_npu_vmax", mx[0:HL]), T.float32)
+                    # argmax on lanes: E - index where the logit equals the max (0 elsewhere), lane max -> E - lowest index
+                    for v in T.vectorized(HL):
+                        mx[v] = T.if_then_else(lg_cmx[0, v] == T.cast(best[0], T.float16), T.cast(E - v, T.float16), T.float16(0))
+                    for e0 in T.serial(1, E // HL):
+                        for v in T.vectorized(HL):
+                            mx[v] = T.max(mx[v], T.if_then_else(lg_cmx[0, e0 * HL + v] == T.cast(best[0], T.float16),
+                                                                T.cast(E - (e0 * HL + v), T.float16), T.float16(0)))
+                    best[1] = T.float32(E) - T.cast(T.call_extern(T.float16, "tl_npu_vmax", mx[0:HL]), T.float32)
+                else:
+                    best[0] = T.float32(-3.0e38)
+                    for e in T.serial(E):
+                        best[0] = T.max(best[0], T.cast(lg_cmx[0, e], T.float32))
+                    best[1] = T.float32(E)
+                    for e in T.serial(E):
+                        if T.cast(lg_cmx[0, e], T.float32) == best[0]:
+                            best[1] = T.min(best[1], T.cast(e, T.float32))
                 ids[k] = T.cast(best[1], T.int32)
                 pick[k] = best[0]
                 lg_cmx[0, ids[k]] = T.float16(-65504)
@@ -541,9 +592,11 @@ def moe_block(H: int, I: int, E: int, TOPK: int, G: int, tiles: int, shaves: int
                 wts[k] = wts[k] / best[1]
             ids[TOPK] = E
             wts[TOPK] = T.float32(1) / (T.float32(1) + T.exp(T.float32(0) - T.cast(lg_cmx[0, E], T.float32)))
+        perf_end()
         T.sync_threads()
         # --- 3. experts: IPT items per tile -----------------------------------------------------------
         for j in T.serial(IPT):
+            perf_begin("gupr")
             for n in (T.Pipelined(CG, num_stages=num_stages) if pipelined else T.serial(CG)):
                 T.copy(WguP[(ids[tile * IPT + j] * CG + n) * BG, 0], wq_cmx)
                 if probe_skip_dpu:
@@ -551,15 +604,22 @@ def moe_block(H: int, I: int, E: int, TOPK: int, G: int, tiles: int, shaves: int
                 else:
                     for sub in T.serial(BNG // RG):
                         T.gemm_i4(x_cmx, wq_cmx, None, y_cmx, group=G, row0=sub * RG, rows=RG, scales_row=BNG)
-                for c in T.serial(BNG):
-                    gu_cmx[0, n * BNG + c] = y_cmx[0, c]
+                for c0 in T.serial(BNG // HL):
+                    for v in T.vectorized(HL):
+                        gu_cmx[0, n * BNG + c0 * HL + v] = y_cmx[0, c0 * HL + v]
+            perf_end()
             T.sync_threads()
-            for c in T.serial(I // shaves):
-                h_cmx[0, shave * (I // shaves) + c] = T.cast(
-                    T.cast(gu_cmx[0, shave * (I // shaves) + c], T.float32)
-                    / (T.float32(1) + T.exp(T.float32(0) - T.cast(gu_cmx[0, shave * (I // shaves) + c], T.float32)))
-                    * T.cast(gu_cmx[0, I + shave * (I // shaves) + c], T.float32), T.float16)
+            # SwiGLU on 32 fp16 lanes (VAU sigmoid), as npu_dsl's silu_h / mul_h: h = gate * sigmoid(gate) * up
+            perf_begin("swig")
+            for c0 in T.serial(I // shaves // HL):
+                for v in T.vectorized(HL):
+                    h_cmx[0, shave * (I // shaves) + c0 * HL + v] = (
+                        gu_cmx[0, shave * (I // shaves) + c0 * HL + v]
+                        * T.sigmoid(gu_cmx[0, shave * (I // shaves) + c0 * HL + v])
+                        * gu_cmx[0, I + shave * (I // shaves) + c0 * HL + v])
+            perf_end()
             T.sync_threads()
+            perf_begin("down")
             for n in (T.Pipelined(CD, num_stages=num_stages) if pipelined else T.serial(CD)):
                 T.copy(WdP[(ids[tile * IPT + j] * CD + n) * BD, 0], wqd_cmx)
                 if probe_skip_dpu:
@@ -567,12 +627,18 @@ def moe_block(H: int, I: int, E: int, TOPK: int, G: int, tiles: int, shaves: int
                 else:
                     for sub in T.serial(BND // RD):
                         T.gemm_i4(h_cmx, wqd_cmx, None, yd_cmx, group=G, row0=sub * RD, rows=RD, scales_row=BND)
-                for c in T.serial(BND):
-                    ye_cmx[0, n * BND + c] = yd_cmx[0, c]   # idempotent: the serial form runs every chunk on both SHAVEs
+                for c0 in T.serial(BND // HL):
+                    for v in T.vectorized(HL):
+                        ye_cmx[0, n * BND + c0 * HL + v] = yd_cmx[0, c0 * HL + v]   # idempotent: the serial form runs every chunk on both SHAVEs
+            perf_end()
             T.sync_threads()
-            for c in T.serial(H // shaves):
-                acc[0, shave * (H // shaves) + c] = (acc[0, shave * (H // shaves) + c]
-                                                     + wts[tile * IPT + j] * T.cast(ye_cmx[0, shave * (H // shaves) + c], T.float32))
+            perf_begin("accm")
+            for c0 in T.serial(H // shaves // FL):
+                for v in T.vectorized(FL):
+                    acc[0, shave * (H // shaves) + c0 * FL + v] = (
+                        acc[0, shave * (H // shaves) + c0 * FL + v]
+                        + wts[tile * IPT + j] * T.cast(ye_cmx[0, shave * (H // shaves) + c0 * FL + v], T.float32))
+            perf_end()
             T.sync_threads()   # h and ye are rewritten by the next item
         if shave == 0:
             T.copy(acc, Part[tile, 0])

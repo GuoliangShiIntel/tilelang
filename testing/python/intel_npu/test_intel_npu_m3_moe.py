@@ -69,29 +69,21 @@ def _run(low, lib, x, packed, res, H, tiles=TILES):
 
 
 def test_qwen36_shape_lowers_to_indirect_split_rings_hoisted_over_the_items():
+    """Compiler PROPERTIES of the lowered MoE, read from the generated source's `// intel_npu:` notes, never from
+    the C++ text itself (the kernel changes; a verbatim line pins the output, not its correctness: the host-sim
+    golden below does that)."""
     src = _lower(make_moe_decode()).source   # H 2048, I 512, E 256, top-8 + shared: 9 items, 3 per tile
-    # the router: 288 padded rows, 6 chunks of 16 per tile, a split (unicast) fp16 ring with submit-ahead, two
-    # slots per SHAVE whose fills alternate the ports (2 = use & 1)
-    assert "ctx.ring_begin((&(wr_cmx[0])), 65536, 4, 6, 8, 16, 2, 0, 0);" in src
+    # the router rows are RESIDENT (a SEGMENTED fill split over the SHAVEs), not a ring
+    assert "ring_begin((&(wr_cmx[0]))" not in src
+    assert "wr_cmx: SEGMENTED resident" in src
     assert "x_cmx: tile-invariant resident, 1 row(s) filled by SHAVE 0" in src   # x16 is built from it in CMX
-    # the expert rings: fills read ids[tile * 3 + j]; hoisted over j with the fill ahead reading the chunk's item
+    # the two expert rings: tile-split streams the SHAVE reads (LOCAL: no barrier ids), each hoisted over the item
+    # loop with the fill ahead reading the chunk's own item
     assert "wq_cmx: SEGMENTED (streamed, each tile fills its own slot)" in src
-    assert "ring over n hoisted over j (3 iterations: one begin/end, fills read the iteration)" in src
-    assert src.count("hoisted over j") == 2
-    # one chunk block per fill (128 weight rows + 4 rows of group-major scales = 132 KiB; 256 + 8 rows = 66 KiB),
-    # 8 chunks x 3 items per tile, two slots per SHAVE; split + SHAVE-read = LOCAL rings (no barrier ids), their
-    # fills on alternating ports in opposite phases (2 / 3)
-    assert "ctx.ring_begin((&(wq_cmx[0])), 135168, 4, 24, 0, 0, 2, 0, 1);" in src
-    assert "ctx.ring_begin((&(wqd_cmx[0])), 67584, 4, 24, 0, 0, 3, 0, 1);" in src
-    assert "ring: READY 8..15, FREE 16..23; ring_1: local (no ids); ring_2: local (no ids)" in src
-    # the fill two uses ahead: item = chunk / 8 (the next item's expert when it wraps), chunk % 8 within the expert
-    assert re.search(r"ctx\.ring_fill\(ring_1, \(\(\(j \* 4\) \+ u_1\) \+ 2\), \(&\(WguP\[\(\(\(\(int64_t\)ids\[\(\(\(\(\(int64_t\)tile\) \* "
-                     r"\(int64_t\)3\) \+ \(\(\(\(\(\(int64_t\)u_1\) \* \(int64_t\)2\) \+ \(\(int64_t\)shave\)\) \+ \(int64_t\)4\) >> \(int64_t\)3\)\) "
-                     r"\+ \(\(int64_t\)j\)\)\]\) \* \(int64_t\)1081344\)", src)   # expert stride: 8 blocks x 135168 B
-    # the workload's scales: column row0 of the group-major block after the 128 weight rows (stride 128), in this
-    # SHAVE's slot of the use (slot = shave + 2 x (use & 1))
-    assert "ctx.dpu_matmul_i4g((&(y_cmx[(sub * 64)])), (&(x_cmx[0])), (&(wq_cmx[((((u_1 & 1) * 270336) + (shave * 135168)) + (sub * 65536))])), (&(wq_cmx[(((((u_1 & 1) * 270336) + (shave * 135168)) + (sub * 128)) + 131072)])), 1, 64, 2048, 128, 128);" in src
-    assert "ctx.dpu_matmul_i4g((&(yd_cmx[0])), (&(h_cmx[0])), (&(wqd_cmx[(((u_2 & 1) * 135168) + (shave * 67584))])), (&(wqd_cmx[((((u_2 & 1) * 135168) + (shave * 67584)) + 65536)])), 1, 256, 512, 128, 256);" in src
+    assert "wqd_cmx: SEGMENTED (streamed, each tile fills its own slot)" in src
+    assert src.count("ring over n hoisted over j (3 iterations: one begin/end, fills read the iteration)") == 2
+    assert "ring: local (no ids); ring_1: local (no ids)" in src
+    assert src.count("ctx.ring_begin(") == 2
     assert src.count("ctx.sync_grid();") == 2
 
 

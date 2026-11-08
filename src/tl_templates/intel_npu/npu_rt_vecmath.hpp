@@ -35,6 +35,9 @@ TL_NPU_VEC_F16(log)
 #ifndef TL_NPU_VEC_HAS_VAU_TANH
 TL_NPU_VEC_F16(tanh)
 #endif
+#ifndef TL_NPU_VEC_HAS_VAU_SIGMOID
+TL_NPU_VEC_F16(sigmoid)
+#endif
 TL_NPU_VEC_F16(exp2)
 TL_NPU_VEC_F16(log2)
 TL_NPU_VEC_F16(sqrt)
@@ -53,6 +56,9 @@ TL_NPU_LANEWISE(tl_npu_rsqrtf, float4, 1.0f / sqrtf(v))
 TL_NPU_LANEWISE(tl_npu_rsqrtf, float8, 1.0f / sqrtf(v))
 TL_NPU_LANEWISE(tl_npu_rsqrtf, float16, 1.0f / sqrtf(v))
 TL_NPU_VEC_F32(tanh)
+TL_NPU_LANEWISE(tl_npu_sigmoidf, float4, 1.0f / (1.0f + expf(-v)))
+TL_NPU_LANEWISE(tl_npu_sigmoidf, float8, 1.0f / (1.0f + expf(-v)))
+TL_NPU_LANEWISE(tl_npu_sigmoidf, float16, 1.0f / (1.0f + expf(-v)))
 TL_NPU_VEC_F32(fabs)
 TL_NPU_VEC_F32(floor)
 TL_NPU_VEC_F32(ceil)
