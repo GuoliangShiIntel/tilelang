@@ -49,6 +49,8 @@ static inline half tl_npu_hlog2(half x) { return (half)log2f((float)x); }
 static inline half tl_npu_hsqrt(half x) { return (half)sqrtf((float)x); }
 static inline half tl_npu_hrsqrt(half x) { return (half)(1.0f / sqrtf((float)x)); }
 static inline half tl_npu_htanh(half x) { return (half)tanhf((float)x); }
+static inline half tl_npu_hsigmoid(half x) { return (half)(1.0f / (1.0f + expf(-(float)x))); }
+static inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }   // the scalar fp32 tirx.sigmoid (not in libm)
 static inline half tl_npu_hfabs(half x) { return (half)fabsf((float)x); }
 static inline half tl_npu_hfloor(half x) { return (half)floorf((float)x); }
 static inline half tl_npu_hceil(half x) { return (half)ceilf((float)x); }
@@ -76,10 +78,12 @@ template <class T> static inline T min(T a, T b) { return a < b ? a : b; }
 TL_NPU_VAU_F16(exp, __builtin_shave_vau_exp_r_half32)
 TL_NPU_VAU_F16(log, __builtin_shave_vau_log_r_half32)
 TL_NPU_VAU_F16(tanh, __builtin_shave_vau_tanh_r_half32)
+TL_NPU_VAU_F16(sigmoid, __builtin_shave_vau_sigm_r_half32)
 #undef TL_NPU_VAU_F16
 #define TL_NPU_VEC_HAS_VAU_EXP 1
 #define TL_NPU_VEC_HAS_VAU_LOG 1
 #define TL_NPU_VEC_HAS_VAU_TANH 1
+#define TL_NPU_VEC_HAS_VAU_SIGMOID 1
 #include "npu_rt_vecmath.hpp"
 
 // Whole-vector reductions (the DSL's T.call_extern("tl_npu_vmax" / "tl_npu_vsum", buf[0:N])):
@@ -115,6 +119,12 @@ static inline half tl_npu_vsum(half32 v) {
   v = v + __builtin_shave_cmu_alignvec_rri_half32(v, v, 2);
   return v[0];
 }
+
+// Named SHAVE compute regions on the profiler's SHAVE track (the DSL's `T.call_extern("tl_npu_perf_begin", "name")` /
+// `tl_npu_perf_end`): a VEC_COMPUTE span with a 4-char label and the instruction counter, so a section's SHAVE time
+// is measured rather than inferred by subtracting waits. Each pair is two profiler events of the 1984 per SHAVE.
+static inline void tl_npu_perf_begin(const char *name) { npu::vecComputeStart(npu::packName4(name)); }
+static inline void tl_npu_perf_end() { npu::vecComputeEnd(); }
 
 // Packed signed int4 (two per byte, LOW nibble first, symmetric: value = (n ^ 8) - 8) to fp16:
 // the LSU converts in the load (`LSU.LD512.i4.i8`: 32 bytes -> 64 int8), lo = values 0..31,

@@ -20,6 +20,12 @@ from checkpoint import Checkpoint, layer_prefix  # noqa: E402
 TILES, SHAVES = 3, 2
 GEOM = dict(gdn_BN1=128, gdn_BN2=64, attn_BN1=128, attn_BN2=64, moe_BNR=16, moe_BNG=128, moe_BND=256, head_BN=128)
 GEOM_TAG = "g1"
+if __import__("os").environ.get("TL_NPU_GEOM"):   # sweeps: "moe_BNG=256,moe_BND=512"; the cache key follows the geometry
+    for _kv in __import__("os").environ["TL_NPU_GEOM"].split(","):
+        _k, _v = _kv.split("=")
+        assert _k in GEOM, _k
+        GEOM[_k] = int(_v)
+    GEOM_TAG = "g_" + "_".join(f"{k[:1]}{k.split('_')[1]}{v}" for k, v in sorted(GEOM.items()))
 
 
 def pack_gdn_layer(ck: Checkpoint, i: int) -> dict:

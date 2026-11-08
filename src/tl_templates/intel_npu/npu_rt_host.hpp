@@ -28,6 +28,8 @@ static inline half tl_npu_hlog2(half x) { return (half)log2f((float)x); }
 static inline half tl_npu_hsqrt(half x) { return (half)sqrtf((float)x); }
 static inline half tl_npu_hrsqrt(half x) { return (half)(1.0f / sqrtf((float)x)); }
 static inline half tl_npu_htanh(half x) { return (half)tanhf((float)x); }
+static inline half tl_npu_hsigmoid(half x) { return (half)(1.0f / (1.0f + expf(-(float)x))); }
+static inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
 static inline half tl_npu_hfabs(half x) { return (half)fabsf((float)x); }
 static inline half tl_npu_hfloor(half x) { return (half)floorf((float)x); }
 static inline half tl_npu_hceil(half x) { return (half)ceilf((float)x); }
@@ -71,6 +73,10 @@ TL_NPU_HOST_REDUCE(float16, float, 16)
 TL_NPU_HOST_REDUCE(float8, float, 8)
 TL_NPU_HOST_REDUCE(float4, float, 4)
 #undef TL_NPU_HOST_REDUCE
+
+// Perf regions (device: profiler VEC_COMPUTE spans) are no-ops in the host simulation.
+static inline void tl_npu_perf_begin(const char *) {}
+static inline void tl_npu_perf_end() {}
 
 // Packed signed int4 (two per byte, low nibble first, value = (n ^ 8) - 8) to fp16, 64 values
 // from 32 bytes as two half32 halves (the device's LSU convert-load).
