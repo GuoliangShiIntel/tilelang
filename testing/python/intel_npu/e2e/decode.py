@@ -69,7 +69,8 @@ class DeviceModel:
                 if key in kernels:
                     continue
                 skip = base_skip if ci == len(self.chunks) - 1 else base_skip | {"head"}
-                kernels[key] = make_decode_model(L=len(chunk), H=c.hidden, KH=c.lin_kh, VH=c.lin_vh, DK=c.lin_dk, DV=c.lin_dv, NH=c.n_heads,
+                kernels[key] = make_decode_model(L=len(chunk), KVL=self._kv_slots(ci), H=c.hidden, KH=c.lin_kh, VH=c.lin_vh, DK=c.lin_dk,
+                                                 DV=c.lin_dv, NH=c.n_heads,
                                                  NKV=c.n_kv, D=c.head_dim, ROT=c.rot_dim, SMAX=smax, I=c.moe_inter, E=c.n_experts,
                                                  TOPK=c.top_k, V=c.vocab, G=ck.group, tiles=TILES, shaves=SHAVES, eps=c.eps,
                                                  pipelined=os.environ.get("TL_NPU_PIPELINED", "1") != "0",
@@ -141,11 +142,15 @@ class DeviceModel:
             out.append(run)
         return out
 
+    def _kv_slots(self, ci: int) -> int:
+        """KV cache slots of chunk ci: one per full-attention layer (at least one, so the parameter is never empty)."""
+        return max(1, sum(1 for i in self.chunks[ci] if self.c.layer_types[i] != "linear_attention"))
+
     def _chunk_kernel(self, ci: int) -> str:
-        """Kernel key of chunk ci: its layer count, and whether the head runs in it (the last chunk)."""
+        """Kernel key of chunk ci: its layer count, its KV slot count, and whether the head runs in it (the last chunk)."""
         if len(self.chunks) == 1:
             return "model"
-        return f"model_l{len(self.chunks[ci])}" + ("_head" if ci == len(self.chunks) - 1 else "")
+        return f"model_l{len(self.chunks[ci])}k{self._kv_slots(ci)}" + ("_head" if ci == len(self.chunks) - 1 else "")
 
     # ---- buffers ------------------------------------------------------------------------------------------------
     def _upload_all(self):
@@ -185,12 +190,12 @@ class DeviceModel:
                 s.alloc(f"L{i}_Vt", c.n_kv * self.smax * c.head_dim * 2)
             # the MoE router logits scratch is per kernel, not per layer
         if self.single:
-            # one KV cache per launch unit, a kernel parameter indexed by (layer, head, position): a DDR store whose
+            # one KV cache per launch unit, a kernel parameter indexed by (kv slot, head, position): a DDR store whose
             # base is a table address AND whose offset is a runtime value loses the device (watchdog, DEVICE_LOST)
             kv = c.n_kv * self.smax * c.head_dim * 2
-            for ci, chunk in enumerate(self.chunks):
-                s.alloc(f"KcAll{ci}", len(chunk) * kv)
-                s.alloc(f"VtAll{ci}", len(chunk) * kv)
+            for ci in range(len(self.chunks)):
+                s.alloc(f"KcAll{ci}", self._kv_slots(ci) * kv)
+                s.alloc(f"VtAll{ci}", self._kv_slots(ci) * kv)
         s.alloc("M_Logits", 16 * self._router_rows() * 2)
         head = pack.cached_paths(self.pack_dir, pack.head_key(), lambda: pack.pack_head_weights(self.ck), log=self.log)
         self.final_norm = np.load(head["final_norm"])
@@ -208,9 +213,13 @@ class DeviceModel:
         for ci, chunk in enumerate(self.chunks):
             kind = np.zeros((len(chunk), 4), np.int32)
             table = np.zeros((len(chunk), len(TABLE_COLS)), np.int64)
+            kv_slot = 0
             for r, i in enumerate(chunk):
                 gdn = c.layer_types[i] == "linear_attention"
                 kind[r, 0] = 0 if gdn else 1
+                if not gdn:
+                    kind[r, 1] = kv_slot   # the layer's slot in KcAll / VtAll
+                    kv_slot += 1
                 names = dict(InNorm=f"L{i}_in_norm", PostNorm=f"L{i}_post_norm", Wr=f"L{i}_Wr", WguP=f"L{i}_WguP", WdP=f"L{i}_WdP")
                 for k, v in (GDN_TABLE if gdn else ATTN_TABLE).items():
                     names[k] = f"L{i}_{v}"
