@@ -807,6 +807,147 @@ def moe_route_prefill_reference(x, wr, E: int, TOPK: int):
     return dict(logits=logits, ids=ids, wts=wts, cnt=cnt, off=off, slot=slot)
 
 
+def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16, TOPK: int = 4, G: int = 128,
+                            MB: int = 16, BNG: int = 64, BND: int = 64, tiles: int = 3, shaves: int = 2):
+    """P2b: the grouped expert FFN for `N` prompt tokens, over P2a's grouping.
+
+    Each worker owns whole experts, so **an expert's weights are read once per launch** instead of once per
+    (token, choice) as decode does -- the point of prefill. An expert's slots `Off[e] .. Off[e + 1]` are walked in
+    chunks of `MB` tokens: the chunk's rows are gathered out of `X` by `Slot`, the gate/up and down projections run
+    as **SHAVE dequant into fp16 then an fp16 DPU gemm** (`make_w4a16_flow`'s path, not decode's merged-FC: the
+    merged-FC scratch grows with M and is sized for M = 1, while the dequant's cost does not grow with M at all and
+    so amortises over the chunk), SwiGLU between them.
+
+    A token's TOPK + 1 choices land on different experts and therefore on different workers, so the weighted
+    scatter-add would race. Each worker accumulates into its own `Part[worker]` and a combine phase behind a grid
+    barrier sums them, the tokens dealt over the workers. That costs `workers x N x H` fp32 of DDR; a slot-major
+    output plus the inverse of `Slot` would cost `N x (TOPK + 1) x H` fp16 instead and is the next form.
+
+    Oracle: `moe_expert_prefill_reference`.
+
+    The weights arrive as `make_w4a16_flow`'s pair -- packed values and **row-major** scales -- not as decode's
+    chunk blocks: those carry the scales group-major so the DPU can read them in place, which is the one layout the
+    SHAVE row dequant cannot use. The int4 bytes are the same either way and scales are 1/64 of them at G = 128,
+    so a model that runs both paths carries one extra scale layout, not one extra weight tensor."""
+    FL, HL = 16, 32
+    workers = tiles * shaves
+    SLOTS = N * (TOPK + 1)
+    CG, CD = (2 * I) // BNG, H // BND
+    KGH, KGI = H // G, I // G
+    assert H % G == 0 and I % G == 0 and (2 * I) % BNG == 0 and H % BND == 0
+    assert H % HL == 0 and I % HL == 0 and MB * BNG <= 8192 and MB * BND <= 8192
+    EPW = -(-(E + 1) // workers)          # experts per worker
+
+    @T.prim_func
+    def moe_expert(X: T.Tensor((N, H), T.float16),
+                   WguQ: T.Tensor(((E + 1) * 2 * I, H // 2), T.uint8), WguS: T.Tensor(((E + 1) * 2 * I, KGH), T.float16),
+                   WdQ: T.Tensor(((E + 1) * H, I // 2), T.uint8), WdS: T.Tensor(((E + 1) * H, KGI), T.float16),
+                   Wts: T.Tensor((N, 16), T.float32), Off: T.Tensor((E + 2,), T.int32),
+                   Slot: T.Tensor((SLOTS,), T.int32), Part: T.Tensor((workers, N, H), T.float32),
+                   Out: T.Tensor((N, H), T.float32)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            off_cmx = T.alloc_local((E + 2,), T.int32)
+            slot_cmx = T.alloc_local((SLOTS,), T.int32)
+            wts_cmx = T.alloc_local((N, 16), T.float32)
+            x_cmx = T.alloc_local((MB, H), T.float16)
+            wq_cmx = T.alloc_local((BNG, H // 2), T.uint8)
+            ws_cmx = T.alloc_local((BNG, KGH), T.float16)
+            wg_cmx = T.alloc_local((BNG, H), T.float16)
+            y_cmx = T.alloc_local((MB, BNG), T.float16)
+            gu_cmx = T.alloc_local((MB, 2 * I), T.float16)
+            h_cmx = T.alloc_local((MB, I), T.float16)
+            wqd_cmx = T.alloc_local((BND, I // 2), T.uint8)
+            wsd_cmx = T.alloc_local((BND, KGI), T.float16)
+            wd_cmx = T.alloc_local((BND, I), T.float16)
+            yd_cmx = T.alloc_local((MB, BND), T.float16)
+            pw = T.alloc_local((1, H), T.float32)
+            pa = T.alloc_local((1, H), T.float32)
+            T.copy(Off[0], off_cmx)
+            T.copy(Slot[0], slot_cmx)
+            T.copy(Wts[0, 0], wts_cmx)
+            for t in T.serial(N):             # this worker's partial starts at zero
+                for c0 in T.serial(H // FL):
+                    for v in T.vectorized(FL):
+                        pw[0, c0 * FL + v] = T.float32(0)
+                T.copy(pw, Part[worker, t, 0])
+            for ei in T.serial(EPW):
+                e = ei * workers + worker
+                if e < E + 1:
+                    for c in T.serial(T.ceildiv(off_cmx[e + 1] - off_cmx[e], MB)):
+                        # gather the chunk's token rows; a short tail keeps the last row, whose result is dropped
+                        for i in T.serial(MB):
+                            T.copy(X[slot_cmx[T.min(off_cmx[e] + c * MB + i, off_cmx[e + 1] - 1)] // (TOPK + 1), 0],
+                                   x_cmx[i:i + 1, 0:H])
+                        for n in T.serial(CG):
+                            T.copy(WguQ[e * 2 * I + n * BNG, 0], wq_cmx)
+                            T.copy(WguS[e * 2 * I + n * BNG, 0], ws_cmx)
+                            for r in T.serial(BNG):
+                                T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wg_cmx[r, 0]),
+                                              T.address_of(wq_cmx[r, 0]), T.address_of(ws_cmx[r, 0]), H, G)
+                            T.gemm(x_cmx, wg_cmx, y_cmx, transpose_B=True, clear_accum=True)
+                            for i, c0 in T.grid(MB, BNG // HL):
+                                for v in T.vectorized(HL):
+                                    gu_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
+                        for i, c0 in T.grid(MB, I // HL):
+                            for v in T.vectorized(HL):
+                                h_cmx[i, c0 * HL + v] = (gu_cmx[i, c0 * HL + v] * T.sigmoid(gu_cmx[i, c0 * HL + v])
+                                                         * gu_cmx[i, I + c0 * HL + v])
+                        for n in T.serial(CD):
+                            T.copy(WdQ[e * H + n * BND, 0], wqd_cmx)
+                            T.copy(WdS[e * H + n * BND, 0], wsd_cmx)
+                            for r in T.serial(BND):
+                                T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wd_cmx[r, 0]),
+                                              T.address_of(wqd_cmx[r, 0]), T.address_of(wsd_cmx[r, 0]), I, G)
+                            T.gemm(h_cmx, wd_cmx, yd_cmx, transpose_B=True, clear_accum=True)
+                            for i in T.serial(MB):
+                                if off_cmx[e] + c * MB + i < off_cmx[e + 1]:
+                                    T.copy(Part[worker, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), n * BND], pw[0:1, 0:BND])
+                                    for c0 in T.serial(BND // FL):
+                                        for v in T.vectorized(FL):
+                                            pw[0, c0 * FL + v] = (pw[0, c0 * FL + v]
+                                                                  + wts_cmx[slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1),
+                                                                            slot_cmx[off_cmx[e] + c * MB + i] % (TOPK + 1)]
+                                                                  * T.cast(yd_cmx[i, c0 * FL + v], T.float32))
+                                    T.copy(pw[0:1, 0:BND], Part[worker, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), n * BND])
+            T.sync_grid()
+            # --- combine: the tokens dealt over the workers, the six partials summed ----------------------
+            for it in T.serial(T.ceildiv(N, workers)):
+                t = it * workers + worker
+                if t < N:
+                    for c0 in T.serial(H // FL):
+                        for v in T.vectorized(FL):
+                            pw[0, c0 * FL + v] = T.float32(0)
+                    for w in T.serial(workers):
+                        T.copy(Part[w, t, 0], pa)     # a DDR row is a DMA into CMX, never a vector load
+                        for c0 in T.serial(H // FL):
+                            for v in T.vectorized(FL):
+                                pw[0, c0 * FL + v] = pw[0, c0 * FL + v] + pa[0, c0 * FL + v]
+                    T.copy(pw, Out[t, 0])
+
+    return moe_expert
+
+
+def moe_expert_prefill_reference(x, gu_int, gu_scales, d_int, d_scales, wts, off, slot, TOPK: int, G: int):
+    """numpy oracle of make_moe_expert_prefill (fp32): every (token, choice) pair's expert FFN, weighted and summed
+    per token. Walks the SAME grouping the kernel walks, so a wrong slot table shows up as a wrong result."""
+    import numpy as np
+    N, H = x.shape
+    E = gu_int.shape[0] - 1
+    out = np.zeros((N, H), np.float32)
+    for e in range(E + 1):
+        gu = gu_int[e].astype(np.float32) * np.repeat(gu_scales[e].astype(np.float32), G, axis=1)
+        dw = d_int[e].astype(np.float32) * np.repeat(d_scales[e].astype(np.float32), G, axis=1)
+        for s in range(int(off[e]), int(off[e + 1])):
+            t, k = int(slot[s]) // (TOPK + 1), int(slot[s]) % (TOPK + 1)
+            y = gu @ x[t].astype(np.float32)
+            g, u = y[: y.size // 2], y[y.size // 2:]
+            h = g / (1 + np.exp(-g)) * u
+            out[t] += float(wts[t, k]) * (dw @ h)
+    return out
+
+
 def moe_scale_rows(H: int, I: int, G: int, BNG: int, BND: int):
     """Rows of a chunk block that hold the chunk's group-major fp16 scales, for the gate/up and down projections."""
     HG, IG = H // G, I // G
