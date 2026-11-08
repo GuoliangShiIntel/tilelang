@@ -525,26 +525,50 @@ interop; a Python `nl.*`-compatible shim.
 9. **Where SHAVE code is fetched from, and the instruction cache size.** Asked while attributing the (since explained)
    in-model slowdown; still useful: it decides whether a 130-260 KB `.text` has a cost beyond the budget.
 
-10. **The P3 GDN chunked scan is intermittently wrong on more than one tile (2026-11-08, M6 P3). OPEN.**
-    First seen as a one-in-three host-sim flake; the device made it reproducible. With five independent trials
-    per point (`device/run_gdn_scan_prefill_device.py --trials 5`), at Qwen3.6's GDN shape on **3 x 2**:
-    n=192 C=32 agrees with the recurrence **1/5**, n=128 C=64 **4/5** (worst rel 5.98e-01), n=512 C=64 **4/5**.
-    On **1 x 2** the same n=192 C=32 point is **5/5** at rel 7.10e-04, and 1 x 1 agrees with it bit for bit.
-    **Earlier single-run "device PASS" claims for this kernel are withdrawn** -- they were trials that did not
-    hit it. Established so far:
-    * **It is not the multi-tile infrastructure.** `run_attn_prefill_device.py --n 128` (P1, same 3 x 2, same
-      runtime, DMA and DPU path) returns rel 5.10e-04 on five consecutive runs, identical to three digits.
-    * **It is not the shared identity matrix or the tile barrier.** Giving every SHAVE its own `eye` in
-      `alloc_local` and dropping the `shave == 0` init still failed 3/3. Reverted.
-    * **It is not launch repetition feeding the state back.** `npu_run.cpp` restores every input, `inout`
-      included, before each launch, so repeating only rolls the dice again; the readback is the last launch.
-      An earlier "the state drifts across repeats" reading of this was wrong and is struck.
-    * Failing runs differ from each other (nan, rel 2.45e-01, rel 5.98e-01 at the same shape and binary), which
-      is a race or an unwritten read rather than an algebra error.
-    Next instrument: the one thing P3 does that P1 does not is write **256 B slices of a shared 8192 B DDR row
-    from different tiles at once** (`Out[ci*C, h*DV]`, one v-head per worker). Give each worker a disjoint
-    output region and see whether it goes away. That does not yet explain the state going nan, so it is a
-    hypothesis, not a diagnosis.
+10. **The P3 GDN chunked scan is intermittently wrong on more than one tile, and it is the per-head state LOAD
+    (2026-11-08, M6 P3). OPEN, narrowed to one statement.** Reproducer, 12 independent trials each, every
+    binary freshly built, `n=192 C=32 VH=32` at Qwen3.6's GDN shape:
+
+    | config | heads per worker | clean |
+    |---|---|---|
+    | 1 x 1 | 32 | **12/12** |
+    | 1 x 2 | 16 | **12/12** |
+    | 2 x 2 | 8 | 7/12 |
+    | 3 x 2 | 5-6 | 4/12 |
+
+    **It needs concurrency AND repetition, and the repetition that counts is the HEAD boundary, not the work.**
+    At 3 x 2 with the work per worker held at ~340 DPU workloads: 1 head x 32 chunks is **12/12**, 5 heads x 6
+    chunks is **3/12**. Heads per worker at a fixed n: 1 -> 12/12, 2 -> 11/12, 5 -> 0/12. The corruption lands on
+    the LATE heads, hits both `Out` and the state, and every SHAVE still reports `kStatusOk` with exactly the
+    expected DPU workload count (402 for the six-head workers, 335 for the five-head ones, i.e. 67 per head).
+    **Removing the per-head `T.copy(Ssm[h, 0, 0], Sf)` -- a 64 KB DDR -> CMX load -- and starting each head from
+    a CMX zero-fill makes it 12/12 at 3 x 2.** Keeping that load and dropping only the matching store is still
+    4/12, so the load alone is sufficient.
+
+    Falsified, each by an experiment, each reverted:
+    * the shared identity matrix and the tile barrier (per-SHAVE `eye` in `alloc_local`: still fails);
+    * the `Out` write pattern (head-major contiguous instead of 256 B slices of a shared 8192 B row: still fails);
+    * `Ssm` being `inout` (split into a read-only `Ssm` and a write-only `SsmO`: still fails);
+    * CMX scope churn at the head boundary (first-use widened the scopes from the head loop to the whole kernel,
+      confirmed in the emitted source: still fails);
+    * total work per worker (matched DPU counts, above);
+    * the 64 KB transfer size (split into two 32 KB loads: still fails);
+    * a missing publish before the outgoing DMA -- `dma_store` already calls `flushCmxWrites()`
+      (`npu_rt_device.hpp:1283`).
+
+    A grid barrier after the head loop is **not** a fix and is informative: 2 x 2 went 7/12 -> 12/12 while
+    3 x 2 went 4/12 -> 0/12, so the defect is strongly timing sensitive.
+
+    **Method note, because it cost real time:** `runner.write_kernel` plus a hand-built `DeviceBuild` runs
+    whatever ELF is already registered under that name, which is not necessarily the source just written. Two
+    rounds of observations taken that way ("1 x 2 fails 6/8", "the state is correct and only the output is
+    sparse-wrong") were artifacts and are struck. Every number above comes from `runner.build`.
+
+    **Question for the hardware owner:** is there a per-job resource behind a DDR -> CMX `dma_load` that is
+    shared between tiles and must not be re-entered -- or an ordering requirement between a tile's DMA into a
+    CMX buffer that the SHAVE has been writing, when other tiles are issuing DMAs at the same time? Nothing in
+    the kernel is shared across tiles: each worker owns whole v-heads, so its `Ssm` block, its `Out` columns and
+    its CMX are disjoint from every other worker's.
 
 ## 9. Model target: Qwen3.8-35B-A3B-Distill, and what it needs (2026-11-06)
 
