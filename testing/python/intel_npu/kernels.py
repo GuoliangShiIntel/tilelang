@@ -916,9 +916,8 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
                             T.copy(WguS[e * 2 * I + n * BNG, 0], ws_cmx)
                             perf_begin("gdeq")
                             if not skip_dequant:
-                                for r in T.serial(BNG):
-                                    T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wg_cmx[r, 0]),
-                                                  T.address_of(wq_cmx[r, 0]), T.address_of(ws_cmx[r, 0]), H, G)
+                                T.call_extern("handle", "tl_npu_dequant_i4_block", T.address_of(wg_cmx[0, 0]),
+                                              T.address_of(wq_cmx[0, 0]), T.address_of(ws_cmx[0, 0]), BNG, H, G)
                             perf_end()
                             perf_begin("ggem")
                             T.gemm(x_cmx, wg_cmx, y_cmx, transpose_B=True, clear_accum=True)
@@ -943,10 +942,9 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
                             T.copy(WdQ[e * H + n * BND, 0], wqd_cmx)
                             perf_begin("ddeq")
                             if not skip_dequant:
-                                for r in T.serial(BND):
-                                    T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wd_cmx[r, 0]),
-                                                  T.address_of(wqd_cmx[r, 0]), T.address_of(wsd_all[n * BND + r, 0]),
-                                                  I, G)
+                                T.call_extern("handle", "tl_npu_dequant_i4_block", T.address_of(wd_cmx[0, 0]),
+                                              T.address_of(wqd_cmx[0, 0]), T.address_of(wsd_all[n * BND, 0]),
+                                              BND, I, G)
                             perf_end()
                             perf_begin("dgem")
                             T.gemm(h_cmx, wd_cmx, yd_cmx, transpose_B=True, clear_accum=True)
@@ -2383,9 +2381,8 @@ def make_proj_prefill(NP: int = 128, M: int = 1024, K: int = 2048, BN: int = 64,
             if n < NCH:
                 T.copy(Wq[n * BN, 0], wq_cmx)
                 T.copy(S[n * BN, 0], s_cmx)
-                for r in T.serial(BN):
-                    T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(w_cmx[r, 0]),
-                                  T.address_of(wq_cmx[r, 0]), T.address_of(s_cmx[r, 0]), K, G)
+                T.call_extern("handle", "tl_npu_dequant_i4_block", T.address_of(w_cmx[0, 0]),
+                              T.address_of(wq_cmx[0, 0]), T.address_of(s_cmx[0, 0]), BN, K, G)
                 for b in T.serial(NTB):
                     T.copy(X[b * MB, 0], x_cmx)
                     T.gemm(x_cmx, w_cmx, y_cmx, transpose_B=True, clear_accum=True)

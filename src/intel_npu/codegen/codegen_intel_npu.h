@@ -63,7 +63,7 @@ private:
   // accumulator lives in a register: moviCompile keeps a CMX buffer in CMX and reloads it after every store
   // (the GDN scan spent 60% of its cycles in NOPs around such round trips, M4).
   std::unordered_map<const VarNode *, int> register_lanes_;
-  std::unordered_set<const VarNode *> variable_lane_;   // buffers read or written at a non-constant lane: stay in CMX
+  std::unordered_set<const VarNode *> needs_memory_;    // buffers that cannot be a register: see the scan in Init
   bool IsRegisterBuffer(const VarNode *v) const { return register_lanes_.count(v) != 0; }
 };
 

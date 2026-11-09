@@ -202,7 +202,7 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const AllocBufferNode *op) {
   const bool shared = scope != "local";
   const DataType dt = op->buffer->dtype;
   const bool one_vector = !shared && dt.lanes() == 1 && dt.is_float() &&
-                          variable_lane_.count(op->buffer->data.get()) == 0 &&
+                          needs_memory_.count(op->buffer->data.get()) == 0 &&
                           ((dt.bits() == 16 && (count == 8 || count == 16 || count == 32)) ||
                            (dt.bits() == 32 && (count == 4 || count == 8 || count == 16)));
   if (one_vector) {
@@ -470,11 +470,19 @@ void CodeGenTileLangIntelNpu::AddFunction(const PrimFunc &f) {
   // The merged-FC scratch (npu_rt_device.hpp dpu_matmul_qg): part [M x ng, N x ng] and sT [ng, N] halves of the
   // largest quantised GEMV, reserved up front in kernel_entry so a kernel with two GEMV shapes pays no re-size.
   qg_part_elems_ = qg_st_elems_ = qg_defer_elems_ = 0;
-  // Buffers accessed at a variable lane (indexed by a loop variable) are arrays, not registers: a splat of a
-  // variable-lane extract is unselectable on the SHAVE (the flash-decoding o_acc update by corr[i], M1 decode).
-  variable_lane_.clear();
+  // A buffer stays in CMX rather than becoming a vector register when either disqualifies it:
+  //   * it is accessed at a variable lane (indexed by a loop variable) -- a splat of a variable-lane extract is
+  //     unselectable on the SHAVE (the flash-decoding o_acc update by corr[i], M1 decode);
+  //   * its address is taken -- a register has none, and a DMA or an extern call needs one.
+  needs_memory_.clear();
   register_lanes_.clear();
   tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &n) {
+    if (const auto *call = n.as<CallNode>()) {
+      if (call->op.same_as(builtin::address_of()))
+        if (const auto *ld = call->args[0].as<BufferLoadNode>())
+          needs_memory_.insert(ld->buffer->data.get());
+      return;
+    }
     const BufferNode *buf = nullptr;
     PrimExpr index;
     int lanes = 1;
@@ -488,7 +496,7 @@ void CodeGenTileLangIntelNpu::AddFunction(const PrimFunc &f) {
       lanes = st->value.dtype().lanes();
     }
     if (buf != nullptr && lanes == 1 && !index.as<IntImmNode>())
-      variable_lane_.insert(buf->data.get());
+      needs_memory_.insert(buf->data.get());
   });
   tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &n) {
     const auto *call = n.as<CallNode>();

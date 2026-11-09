@@ -110,6 +110,11 @@ static inline void tl_npu_dequant_i4_row(half *dst, const unsigned char *src, co
     dst[k] = (half)((float)((n ^ 8) - 8) * (float)scales[k / group]);
   }
 }
+static inline void tl_npu_dequant_i4_block(half *dst, const unsigned char *src, const half *scales, unsigned rows,
+                                           unsigned width, unsigned group) {
+  for (unsigned r = 0; r < rows; ++r)
+    tl_npu_dequant_i4_row(dst + r * width, src + r * (width / 2), scales + r * (width / group), width, group);
+}
 
 #if defined(_WIN32)
 #define NPU_SIM_EXPORT extern "C" __declspec(dllexport)

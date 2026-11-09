@@ -89,6 +89,41 @@ def test_allocation_under_a_shave_branch_is_hoisted():
     assert s_pos < body.index("for (int32_t it") < if_shave, "out of the SHAVE-dependent branch and its loop"
 
 
+def test_a_one_vector_buffer_whose_address_is_taken_stays_in_cmx():
+    """A local buffer of exactly one vector is promoted to a vector register. A register has no address, so a
+    buffer handed to a DMA or an extern call must be disqualified -- the promotion rule used to look only at
+    variable-lane access, so `s` below became a register and taking its address was refused outright."""
+
+    @T.prim_func
+    def k(A: T.Tensor((32,), T.float16), Y: T.Tensor((TILES * SHAVES, 32), T.float16)):
+        with T.Kernel(TILES, threads=SHAVES) as tile:
+            shave = T.get_thread_binding()
+            s = T.alloc_local((32,), T.float16)
+            for v in T.vectorized(32):
+                s[v] = A[v]
+            T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(s[0]), T.address_of(s[0]),
+                          T.address_of(s[0]), 32, 128)
+            T.copy(s, Y[tile * SHAVES + shave, 0])
+
+    body = _lower(k).source.split("kernel_entry")[0]
+    assert "half* __restrict s = ctx.alloc<half>(32);" in body     # CMX, addressable
+    assert "half32 s = {};" not in body                            # ... not the register form
+
+    @T.prim_func                                                   # positive control: s's address is never taken
+    def reg(A: T.Tensor((32,), T.float16), Y: T.Tensor((TILES * SHAVES, 64), T.float16)):
+        with T.Kernel(TILES, threads=SHAVES) as tile:
+            shave = T.get_thread_binding()
+            s = T.alloc_local((32,), T.float16)
+            o = T.alloc_local((64,), T.float16)
+            for v in T.vectorized(32):
+                s[v] = A[v]
+            for v in T.vectorized(32):
+                o[v] = s[v]
+            T.copy(o, Y[tile * SHAVES + shave, 0])
+
+    assert "half32 s = {};  // local, one vector: a register" in _lower(reg).source
+
+
 def test_a_loop_invariant_allocation_bubbles_out_of_every_enclosing_loop():
     """A buffer sunk into a loop body is re-marked and re-allocated every iteration for an address that never
     changes, and that made the GDN prefill scan intermittently wrong on 2+ tiles (4/12 trials clean at 3 x 2).

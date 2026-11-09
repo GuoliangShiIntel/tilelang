@@ -165,6 +165,31 @@ static inline void tl_npu_dequant_i4_row(half *__restrict dst, const unsigned ch
   }
 }
 
+// VPUX's hand-scheduled int4 -> fp16 loop (asm/dequant_dynamic_i4_v0.asm, assembled into every kernel ELF by
+// device/CMakeLists.txt): 0.043 static cycles per element against tl_npu_dequant_i4_row's 0.091. `n` is the
+// number of CONTIGUOUS 128-element groups and `scl` carries one fp16 per group in the same order -- the case the
+// production kernel dispatches here (vpux-plugin sw_runtime_kernels/kernels/src/dynamic_dequantize.cpp:493).
+extern "C" void asm_dequant_dynamic_i4_f16_v0(const void *inp, const half *scl, half *out, int n);
+
+// A whole [rows, width] block of int4 g`group` weights -> fp16 (`T.call_extern("handle", "tl_npu_dequant_i4_block",
+// dst, src, scales, rows, width, group)`). Row-major values and row-major scales make the block one flat run of
+// width / group groups per row, so it is ONE asm call, not one per row -- which is also what keeps the scale
+// pointer aligned when a row carries an odd number of groups.
+//
+// The asm prefetches one unroll ahead, so it reads up to 128 bytes past `src` and 4 past `scales`; both are CMX
+// buffers here and the reads are discarded, which is the same bargain the production kernel takes.
+static inline void tl_npu_dequant_i4_block(half *__restrict dst, const unsigned char *__restrict src,
+                                           const half *__restrict scales, std::uint32_t rows, std::uint32_t width,
+                                           std::uint32_t group) {
+  const std::uint32_t n = rows * (width / group);
+  if (group == 128 && width % 128 == 0 && n >= 2) {
+    asm_dequant_dynamic_i4_f16_v0(src, scales, dst, (int)n); // n = 1 corrupts elements 64..127 (VPUX)
+    return;
+  }
+  for (std::uint32_t r = 0; r < rows; ++r)
+    tl_npu_dequant_i4_row(dst + r * width, src + r * (width / 2), scales + r * (width / group), width, group);
+}
+
 namespace npu {
 
 // Status word 0 per SHAVE, read by the host runner; word 1 is the detail.

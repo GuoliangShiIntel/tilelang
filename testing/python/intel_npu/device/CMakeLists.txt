@@ -34,10 +34,13 @@ get_filename_component(TILELANG_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../../../../src
 include(${GENERIC_COMPUTE_ROOT}/scripts/kernels_build.cmake)
 set(TL_NPU_DEVICES "5010" CACHE STRING "NPU generations to build the kernels for")
 file(GLOB TL_NPU_KERNELS "${CMAKE_CURRENT_SOURCE_DIR}/generated/*.cpp")
+# Hand-written SHAVE assembly the templates declare extern "C"; linked into every kernel ELF (~200 B of .text each)
+file(GLOB TL_NPU_ASM "${TILELANG_SRC}/tl_templates/intel_npu/asm/*.asm")
 foreach(device ${TL_NPU_DEVICES})
   foreach(src ${TL_NPU_KERNELS})
     add_kernels(
       SOURCES "${src}"
+      ASM_SOURCES "${TL_NPU_ASM}"
       INCLUDEDIRS "${TILELANG_SRC}"
       DEVICE "${device}"
     )

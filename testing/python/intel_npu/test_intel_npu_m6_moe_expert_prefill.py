@@ -82,7 +82,8 @@ def _sim(p):
 def test_lowers_with_a_dequant_per_weight_chunk_and_no_merged_fc():
     src = _lower(make_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MB, BNG=BNG, BND=BND,
                                          tiles=TILES, shaves=SHAVES)).source
-    assert "tl_npu_dequant_i4_row" in src          # the prefill path dequantises
+    assert "tl_npu_dequant_i4_block" in src        # the prefill path dequantises a whole chunk per call
+    assert "tl_npu_dequant_i4_row(" not in src     # ... never a call per row
     assert "dpu_matmul_i4g" not in src             # ... and does not use decode's merged-FC
     assert "ctx.sync_grid();" in src               # the combine sits behind a grid barrier
     assert "tl_npu_dequant_i8_row" not in src      # control: the needle still discriminates
