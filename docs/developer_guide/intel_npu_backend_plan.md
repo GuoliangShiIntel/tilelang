@@ -561,6 +561,17 @@ interop; a Python `nl.*`-compatible shim.
     A grid barrier after the head loop is **not** a fix and is informative: 2 x 2 went 7/12 -> 12/12 while
     3 x 2 went 4/12 -> 0/12, so the defect is strongly timing sensitive.
 
+    **The runtime is excluded: the same kernel on npu_dsl's `fused_rt` is 3/12 at 3 x 2, against our 4/12.**
+    The generated source is unchanged; only `TL_NPU_RUNTIME_FRT` is defined, which swaps the whole `npu::Ctx`
+    surface onto npu_dsl's runtime through `npu_rt_device_frt.hpp` -- a runtime with different disciplines
+    throughout (one synchronous load descriptor and one store descriptor, every DPU workload waited for by the
+    SHAVE that issued it, grid sync by the toolkit's software rendezvous). Two independent runtimes fail at the
+    same rate, so the mechanism is below both. **Repairing the shim to get this answer**: it had bit-rotted,
+    reaching `frt::Ctx` members (`ok_`, `tile_`, `shave_`, `tiles_`, `spt_`, `cmx_`, `desc_`, `dma_`) that
+    `fused_rt.hpp` has since made private. The run above opened the single `private:` label in a **local copy**
+    of that header, in our generated directory; npu_dsl's tree was not touched, and access control is
+    compile-time only, so the measurement stands. The shim needs a real repair before it can be used again.
+
     **npu_dsl does the same thing, and cannot be used to exonerate the hardware.** Its prefill GDN
     (`kernels_poc/qwen36_dsl_poc/generated/qwen36_prefill_gdn_layer.cpp:449-472`) distributes v-heads over the
     same 3 x 2 workers and loads the state with the identical per-head 1-D 65536 B DMA
