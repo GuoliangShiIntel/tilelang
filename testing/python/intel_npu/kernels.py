@@ -2640,6 +2640,7 @@ def make_gdn_moe_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: in
             norm_tokens(Hio, PostNorm, Xs, nw, hrow, xrow, ls, st, worker)
             T.sync_grid()
             route_phase(Xs, Wr, Logits, Ids, Wts, Cnt, Off, Slot, tile, shave)
+            T.sync_grid()      # worker 0's grouping is read back by everyone (derived at top level; written here)
             expert_phase(Xs, WguQ, WguS, WdQ, WdS, Wts, Off, Slot, PartE, MoeOut, tile, shave)
             T.sync_grid()
             for it in T.serial(NP // workers):     # h += the MoE output
@@ -2675,7 +2676,7 @@ def gdn_moe_layer_prefill_reference(h, in_norm, post_norm, win_int, win_scales, 
 
 def make_attn_prefill(N: int = 64, NKV: int = 2, GQ: int = 8, D: int = 256, SMAX: int = 1536, TB: int = 4,
                       BKV: int = 128, tiles: int = 3, shaves: int = 2, pipelined: bool = False,
-                      as_block: bool = False):
+                      as_block: bool = False, kv4: bool = False):
     """P1: the full-attention PREFILL phase -- flash attention over `N` query tokens already normed, roped and
     appended to the cache, with the three things the decode phase does not need: **GQA**, the **causal mask** and
     the **output gate**.
@@ -2695,7 +2696,8 @@ def make_attn_prefill(N: int = 64, NKV: int = 2, GQ: int = 8, D: int = 256, SMAX
     out of the same CMX buffer. Only the query has a reason to stay head-major: it is a DPU operand.
 
     `Pos[0, 0]` is the absolute position of token 0 of this call, so a prompt is prefilled in chunks of `N` tokens.
-    Oracle: `attn_prefill_reference`."""
+    `kv4`: Kc / Vt carry a leading layer axis indexed by `KvSlot[kvi, 1]`, one cache per attention layer of the
+    launch, as `attn_block` does for decode -- the model kernel's form. Oracle: `attn_prefill_reference`."""
     assert D % 32 == 0 and BKV % 32 == 0 and SMAX % BKV == 0 and N % TB == 0
     ROWS = TB * GQ
     KO = NKV * GQ * D
@@ -2711,7 +2713,7 @@ def make_attn_prefill(N: int = 64, NKV: int = 2, GQ: int = 8, D: int = 256, SMAX
     CMAX = SMAX // BKV
 
     @T.macro
-    def flash_phase(Q, Kc, Vt, Gate, Pos, O, tile, shave):
+    def flash_phase(Q, Kc, Vt, Gate, Pos, O, tile, shave, KvSlot, kvi):
         worker = tile * shaves + shave
         pos_cmx = T.alloc_shared((1, 1), T.int32)
         q_cmx = T.alloc_local((ROWS, D), T.float16)
@@ -2744,8 +2746,12 @@ def make_attn_prefill(N: int = 64, NKV: int = 2, GQ: int = 8, D: int = 256, SMAX
                 # the block's last query is at pos0 + t0 + TB - 1, so it sees chunks 0 .. that // BKV
                 ck = T.min(CMAX, T.ceildiv(pos_cmx[0, 0] + t0 + TB, BKV))
                 for kv in (T.Pipelined(ck, num_stages=2) if pipelined else T.serial(ck)):
-                    T.copy(Kc[g, kv * BKV, 0], k_cmx)
-                    T.copy(Vt[g, 0, kv * BKV], v_cmx)
+                    if kv4:
+                        T.copy(Kc[KvSlot[kvi, 1], g, kv * BKV, 0], k_cmx)
+                        T.copy(Vt[KvSlot[kvi, 1], g, 0, kv * BKV], v_cmx)
+                    else:
+                        T.copy(Kc[g, kv * BKV, 0], k_cmx)
+                        T.copy(Vt[g, 0, kv * BKV], v_cmx)
                     T.gemm(q_cmx, k_cmx, s_cmx, transpose_B=True, clear_accum=True)
                     # causal: row i is token t0 + i // GQ at position pos0 + t0 + i // GQ
                     if kv * BKV + BKV > pos_cmx[0, 0] + t0:
@@ -2795,7 +2801,7 @@ def make_attn_prefill(N: int = 64, NKV: int = 2, GQ: int = 8, D: int = 256, SMAX
                      Vt: T.Tensor((NKV, D, SMAX), T.float16), Gate: T.Tensor((N, KO), T.float16),
                      Pos: T.Tensor((1, 1), T.int32), O: T.Tensor((N, KO), T.float16)):
         with T.Kernel(tiles, threads=shaves) as tile:
-            flash_phase(Q, Kc, Vt, Gate, Pos, O, tile, T.get_thread_binding())
+            flash_phase(Q, Kc, Vt, Gate, Pos, O, tile, T.get_thread_binding(), Pos, 0)
 
     return attn_prefill
 
@@ -2824,7 +2830,7 @@ def attn_prefill_reference(q, kc, vt, gate, pos0: int, eps: float = 0.0):
 
 def make_attn_qkv_prefill(N: int = 64, H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, ROT: int = 64,
                           SMAX: int = 1536, TB: int = 8, tiles: int = 3, shaves: int = 2, eps: float = 1e-6,
-                          as_block: bool = False):
+                          as_block: bool = False, kv4: bool = False):
     """P1b: the attention layer's PREFILL phase between the qkv projection and the flash phase -- what
     `attn_block`'s stage B does for ONE token, over `N` of them.
 
@@ -2842,7 +2848,8 @@ def make_attn_qkv_prefill(N: int = 64, H: int = 2048, NH: int = 16, NKV: int = 2
     shape the per-job cost punishes hardest.
 
     `Nt[0, 0]` is the live token count: a row past it is written as ZERO, because `make_attn_prefill` relies on
-    unseen cache positions holding zeros rather than masking them. Oracle: `attn_qkv_prefill_reference`."""
+    unseen cache positions holding zeros rather than masking them. `kv4` is `make_attn_prefill`'s: the caches carry
+    a leading layer axis indexed by `KvSlot[kvi, 1]`. Oracle: `attn_qkv_prefill_reference`."""
     GQ = NH // NKV
     NQKV = NH * 2 * D + 2 * NKV * D
     KOFF, VOFF = NH * 2 * D, NH * 2 * D + NKV * D
@@ -2854,7 +2861,7 @@ def make_attn_qkv_prefill(N: int = 64, H: int = 2048, NH: int = 16, NKV: int = 2
     assert NH % NKV == 0 and D % HL == 0 and ROT % 2 == 0 and ROT <= D
 
     @T.macro
-    def qkv_phase(Ys, QNormW, KNormW, CosSin, Pos, Nt, Q, Gate, Kc, Vt, tile, shave):
+    def qkv_phase(Ys, QNormW, KNormW, CosSin, Pos, Nt, Q, Gate, Kc, Vt, tile, shave, KvSlot, kvi):
         """The phase as a macro so the attention layer can call it; `make_attn_qkv_prefill` is the wrapper."""
         worker = tile * shaves + shave
         qw = T.alloc_shared((1, D), T.float16)
@@ -2934,14 +2941,20 @@ def make_attn_qkv_prefill(N: int = 64, H: int = 2048, NH: int = 16, NKV: int = 2
                     for d0 in T.serial(D // FL):
                         for v in T.vectorized(FL):
                             kb[r, d0 * FL + v] = T.cast(rowf[d0 * FL + v] * st[3], T.float16)
-                T.copy(kb, Kc[g, pos[0, 0] + b * TB, 0])
+                if kv4:
+                    T.copy(kb, Kc[KvSlot[kvi, 1], g, pos[0, 0] + b * TB, 0])
+                else:
+                    T.copy(kb, Kc[g, pos[0, 0] + b * TB, 0])
                 # --- the group's value, transposed once per block into the cache's column layout ---------
                 T.copy(Ys[b * TB, VOFF + g * D], vb)
                 for r in T.serial(TB):
                     st[3] = T.if_then_else(b * TB + r < nt[0, 0], T.float32(1), T.float32(0))
                     for d in T.serial(D):
                         vt[d, r] = T.cast(T.cast(vb[r, d], T.float32) * st[3], T.float16)
-                T.copy(vt, Vt[g, 0, pos[0, 0] + b * TB])
+                if kv4:
+                    T.copy(vt, Vt[KvSlot[kvi, 1], g, 0, pos[0, 0] + b * TB])
+                else:
+                    T.copy(vt, Vt[g, 0, pos[0, 0] + b * TB])
 
     if as_block:
         return qkv_phase, dict(NP=NP, NB=NB, NQKV=NQKV, GQ=GQ, KOFF=KOFF, VOFF=VOFF)
@@ -2953,7 +2966,7 @@ def make_attn_qkv_prefill(N: int = 64, H: int = 2048, NH: int = 16, NKV: int = 2
                  Q: T.Tensor((NKV, NP, GQ, D), T.float16), Gate: T.Tensor((NP, NH * D), T.float16),
                  Kc: T.Tensor((NKV, SMAX, D), T.float16), Vt: T.Tensor((NKV, D, SMAX), T.float16)):
         with T.Kernel(tiles, threads=shaves) as tile:
-            qkv_phase(Ys, QNormW, KNormW, CosSin, Pos, Nt, Q, Gate, Kc, Vt, tile, T.get_thread_binding())
+            qkv_phase(Ys, QNormW, KNormW, CosSin, Pos, Nt, Q, Gate, Kc, Vt, tile, T.get_thread_binding(), Pos, 0)
 
     return attn_qkv
 
@@ -3069,9 +3082,9 @@ def make_attn_layer_prefill(N: int = 64, H: int = 2048, NH: int = 16, NKV: int =
             T.sync_grid()
             qkv_proj(Xs, WqkvQ, WqkvS, Ys, tile, shave)
             T.sync_grid()
-            qkv_phase(Ys, QNormW, KNormW, CosSin, Pos, Nt, Q, Gate, Kc, Vt, tile, shave)
+            qkv_phase(Ys, QNormW, KNormW, CosSin, Pos, Nt, Q, Gate, Kc, Vt, tile, shave, Pos, 0)
             T.sync_grid()
-            flash_phase(Q, Kc, Vt, Gate, Pos, Os, tile, shave)
+            flash_phase(Q, Kc, Vt, Gate, Pos, Os, tile, shave, Pos, 0)
             T.sync_grid()
             o_proj(Os, WoQ, WoS, Mix, tile, shave)
             T.sync_grid()
@@ -3189,9 +3202,9 @@ def make_attn_moe_layer_prefill(N: int = 64, H: int = 2048, NH: int = 16, NKV: i
             T.sync_grid()
             qkv_proj(Xs, WqkvQ, WqkvS, Ys, tile, shave)
             T.sync_grid()
-            qkv_phase(Ys, QNormW, KNormW, CosSin, Pos, Nt, Q, Gate, Kc, Vt, tile, shave)
+            qkv_phase(Ys, QNormW, KNormW, CosSin, Pos, Nt, Q, Gate, Kc, Vt, tile, shave, Pos, 0)
             T.sync_grid()
-            flash_phase(Q, Kc, Vt, Gate, Pos, Os, tile, shave)
+            flash_phase(Q, Kc, Vt, Gate, Pos, Os, tile, shave, Pos, 0)
             T.sync_grid()
             o_proj(Os, WoQ, WoS, Mix, tile, shave)
             T.sync_grid()
@@ -3208,6 +3221,7 @@ def make_attn_moe_layer_prefill(N: int = 64, H: int = 2048, NH: int = 16, NKV: i
             norm_tokens(Hio, PostNorm, Xs, nw, hrow, xrow, ls, st, worker)
             T.sync_grid()
             route_phase(Xs, Wr, Logits, Ids, Wts, Cnt, Off, Slot, tile, shave)
+            T.sync_grid()      # worker 0's grouping is read back by everyone (derived at top level; written here)
             expert_phase(Xs, WguQ, WguS, WdQ, WdS, Wts, Off, Slot, PartE, MoeOut, tile, shave)
             T.sync_grid()
             for it in T.serial(NP // workers):     # h += the MoE output, live tokens only
@@ -3858,3 +3872,229 @@ def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int
                     T.copy(h32, Hio[0, 0])
 
     return model
+
+
+# Layer table columns for `make_prefill_model`. Prefill's projections are `make_proj_prefill`'s -- raw packed int4
+# plus ROW-MAJOR scales, two addresses each -- not decode's chunk blocks, so the table is not decode's.
+PREFILL_TABLE_COLS = ["InNorm", "PostNorm", "W0", "W1", "W2", "W3", "W4", "W5", "W6", "W7",
+                      "Wr", "WguQ", "WguS", "WdQ", "WdS", "S0", "S1", "pad"]
+GDN_PREFILL_TABLE = dict(W0="WinQ", W1="WinS", W2="ConvW", W3="ALog", W4="DtBias", W5="GNorm", W6="WoutQ",
+                         W7="WoutS", S0="ConvState", S1="Ssm")
+# As in decode, the KV cache is a kernel parameter (`KcAll` / `VtAll`) and NOT a table address (question 8);
+# `Kind[li]` is (kind, kv_slot, 0, 0).
+ATTN_PREFILL_TABLE = dict(W0="WqkvQ", W1="WqkvS", W2="QNormW", W3="KNormW", W4="WoQ", W5="WoS")
+
+
+def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128,
+                       DV: int = 128, NH: int = 16, NKV: int = 2, D: int = 256, ROT: int = 64, SMAX: int = 1536,
+                       I: int = 512, E: int = 256, TOPK: int = 8, G: int = 128, TB: int = 32, C: int = 64,
+                       TBq: int = 8, TBF: int = 16, BKV: int = 128, BN1: int = 32, BN2: int = 32, MB: int = 16,
+                       BM: int = 64, BNR: int = 16, MBe: int = 16, BNG: int = 64, BND: int = 64, tiles: int = 3,
+                       shaves: int = 2, eps: float = 1e-6, KVL: int | None = None, skip: frozenset = frozenset()):
+    """P5: a whole PREFILL chunk of `N` prompt tokens through `L` layers in ONE launch -- the prefill counterpart
+    of `make_decode_model`. A device-side loop over the layers, `Kind[li, 0]` selecting the Gated DeltaNet or the
+    full-attention mixer, every layer's weights reached through `Table[li, :]` (`PREFILL_TABLE_COLS`), the residual
+    stream fp32 in DDR (`Hio[NP, H]`: at `N` tokens it does not fit CMX, which is the one structural difference
+    from the decode kernel), and the DDR scratch shared by every layer and both kinds.
+
+    `Ys` and `Os` are sized for the WIDER of the two kinds and each phase indexes within its own extent -- a 2-D
+    DDR copy takes its row stride from the buffer, so a narrower phase reading a wider buffer is correct by
+    construction (the same mechanism the attention layer already relies on for its padded `Ys`).
+
+    The GDN conv state is updated IN PLACE: `Table[li, "S0"]` is passed as both the phase's input state and its
+    output. Within one work item the read of a channel slice precedes the write of the same slice, and items own
+    disjoint slices, so no barrier is owed.
+
+    The head is NOT here: it is wanted on the last token of the last chunk only, so the driver launches the
+    standalone `make_head` kernel on `Hio[nt - 1]` instead of this kernel carrying 8.8 ms of lm_head per chunk.
+
+    `skip` (diagnostic only) leaves out whole stages: any of "gdn", "attn", "moe", "norm"."""
+    GQ, KO = NH // NKV, NH * D
+    QK, VC = KH * DK, VH * DV
+    CONV = 2 * QK + VC
+    NIN = CONV + VC + 2 * VH
+    workers = tiles * shaves
+    step = 1
+    for k in (TB, C, TBq, TBF, workers, BM):
+        step = step * k // math.gcd(step, k)
+    NP = -(-N // step) * step
+    conv_phase, _ = make_gdn_conv_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, TB=TB, tiles=tiles, shaves=shaves,
+                                          as_block=True)
+    scan_phase, _ = make_gdn_scan_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, C=C, tiles=tiles, shaves=shaves,
+                                          eps=eps, as_block=True)
+    qkv_phase, qs = make_attn_qkv_prefill(N=NP, H=H, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX, TB=TBq, tiles=tiles,
+                                          shaves=shaves, eps=eps, as_block=True, kv4=True)
+    flash_phase, _ = make_attn_prefill(N=NP, NKV=NKV, GQ=GQ, D=D, SMAX=SMAX, TB=TBF, BKV=BKV, tiles=tiles,
+                                       shaves=shaves, as_block=True, kv4=True)
+    NIN_pad = -(-NIN // BN1) * BN1
+    NQKV_pad = -(-qs["NQKV"] // BN1) * BN1
+    YW, OW = max(NIN_pad, NQKV_pad), max(VC, KO)
+    in_proj, _ = make_proj_prefill(NP=NP, M=NIN_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves,
+                                   as_block=True)
+    gdn_out_proj, _ = make_proj_prefill(NP=NP, M=H, K=VC, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves,
+                                        as_block=True)
+    qkv_proj, _ = make_proj_prefill(NP=NP, M=NQKV_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves,
+                                    as_block=True)
+    o_proj, _ = make_proj_prefill(NP=NP, M=H, K=KO, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True)
+    route_phase, rs = make_moe_route_prefill(N=NP, H=H, E=E, TOPK=TOPK, BM=BM, BNR=BNR, tiles=tiles,
+                                             shaves=shaves, as_block=True)
+    expert_phase, _ = make_moe_expert_prefill(N=NP, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MBe, BNG=BNG, BND=BND,
+                                              tiles=tiles, shaves=shaves, as_block=True)
+    RR, SLOTS = rs["RR"], rs["SLOTS"]
+    KGH, KGI = H // G, I // G
+    FL = 16
+    assert H % FL == 0 and NP % workers == 0
+    norm_tokens = prefill_norm_block(H, NP, workers, eps, FL)
+    NCOL = len(PREFILL_TABLE_COLS)
+    col = {n: i for i, n in enumerate(PREFILL_TABLE_COLS)}
+    KVL = L if KVL is None else KVL
+
+    @T.macro
+    def add_mix(Hio, Src, hrow, mrow, nt, worker):
+        """h += the mixer output, live tokens only: past Nt a zero query gives a uniform softmax, not a zero."""
+        for it in T.serial(NP // workers):
+            t = it * workers + worker
+            if t < nt[0, 0]:
+                T.copy(Hio[t, 0], hrow)
+                T.copy(Src[t, 0], mrow)
+                for d0 in T.serial(H // FL):
+                    for v in T.vectorized(FL):
+                        hrow[0, d0 * FL + v] = hrow[0, d0 * FL + v] + T.cast(mrow[0, d0 * FL + v], T.float32)
+                T.copy(hrow, Hio[t, 0])
+
+    @T.prim_func
+    def prefill_model(Hio: T.Tensor((NP, H), T.float32), Pos: T.Tensor((1, 1), T.int32),
+                      Nt: T.Tensor((1, 1), T.int32), CosSin: T.Tensor((NP, 2 * ROT), T.float32),
+                      Kind: T.Tensor((L, 4), T.int32), Table: T.Tensor((L, NCOL), T.int64),
+                      KcAll: T.Tensor((KVL, NKV, SMAX, D), T.float16),
+                      VtAll: T.Tensor((KVL, NKV, D, SMAX), T.float16),
+                      Xs: T.Tensor((NP, H), T.float16), Ys: T.Tensor((NP, YW), T.float16),
+                      QKs: T.Tensor((KH, NP, 2 * DK), T.float32), Vs: T.Tensor((VH, NP, DV), T.float16),
+                      Gbs: T.Tensor((VH, NP, 2), T.float32), Zs: T.Tensor((VH, NP, DV), T.float16),
+                      Q: T.Tensor((NKV, NP, GQ, D), T.float16), Gate: T.Tensor((NP, KO), T.float16),
+                      Os: T.Tensor((NP, OW), T.float16), Mix: T.Tensor((NP, H), T.float16),
+                      Logits: T.Tensor((NP, RR), T.float16), Ids: T.Tensor((NP, TOPK), T.int32),
+                      Wts: T.Tensor((NP, 16), T.float32), Cnt: T.Tensor((E + 1,), T.int32),
+                      Off: T.Tensor((E + 2,), T.int32), Slot: T.Tensor((SLOTS,), T.int32),
+                      PartE: T.Tensor((tiles, NP, H), T.float32), MoeOut: T.Tensor((NP, H), T.float32)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            nw = T.alloc_shared((1, H), T.float16)
+            nt = T.alloc_shared((1, 1), T.int32)
+            hrow = T.alloc_local((1, H), T.float32)
+            xrow = T.alloc_local((1, H), T.float16)
+            mrow = T.alloc_local((1, H), T.float16)
+            erow = T.alloc_local((1, H), T.float32)
+            ls = T.alloc_local((FL,), T.float32)
+            st = T.alloc_local((4,), T.float32)
+            hrow[0, 0] = T.float32(0)     # pins the scope at kernel level (question 10)
+            xrow[0, 0] = T.float16(0)
+            mrow[0, 0] = T.float16(0)
+            erow[0, 0] = T.float32(0)
+            ls[0] = T.float32(0)
+            st[0] = T.float32(0)
+            T.copy(Nt[0, 0], nt)
+            for li in T.serial(L):
+                InNorm = T.ddr_view(Table[li, col["InNorm"]], (1, H), T.float16)
+                PostNorm = T.ddr_view(Table[li, col["PostNorm"]], (1, H), T.float16)
+                Wr = T.ddr_view(Table[li, col["Wr"]], (RR, H), T.float16)
+                WguQ = T.ddr_view(Table[li, col["WguQ"]], ((E + 1) * 2 * I, H // 2), T.uint8)
+                WguS = T.ddr_view(Table[li, col["WguS"]], ((E + 1) * 2 * I, KGH), T.float16)
+                WdQ = T.ddr_view(Table[li, col["WdQ"]], ((E + 1) * H, I // 2), T.uint8)
+                WdS = T.ddr_view(Table[li, col["WdS"]], ((E + 1) * H, KGI), T.float16)
+                if "norm" not in skip:
+                    norm_tokens(Hio, InNorm, Xs, nw, hrow, xrow, ls, st, worker)
+                T.sync_grid()
+                if Kind[li, 0] == 0:
+                    WinQ = T.ddr_view(Table[li, col["W0"]], (NIN_pad, H // 2), T.uint8)
+                    WinS = T.ddr_view(Table[li, col["W1"]], (NIN_pad, H // G), T.float16)
+                    ConvW = T.ddr_view(Table[li, col["W2"]], (4, CONV), T.float16)
+                    ALog = T.ddr_view(Table[li, col["W3"]], (1, VH), T.float32)
+                    DtBias = T.ddr_view(Table[li, col["W4"]], (1, VH), T.float32)
+                    GNorm = T.ddr_view(Table[li, col["W5"]], (1, DV), T.float16)
+                    WoutQ = T.ddr_view(Table[li, col["W6"]], (H, VC // 2), T.uint8)
+                    WoutS = T.ddr_view(Table[li, col["W7"]], (H, VC // G), T.float16)
+                    ConvState = T.ddr_view(Table[li, col["S0"]], (3, CONV), T.float16)
+                    Ssm = T.ddr_view(Table[li, col["S1"]], (VH, DK, DV), T.float32)
+                    if "gdn" not in skip:
+                        in_proj(Xs, WinQ, WinS, Ys, tile, shave)
+                        T.sync_grid()
+                        conv_phase(Ys, ConvW, ConvState, ALog, DtBias, Nt, QKs, Vs, Gbs, Zs, ConvState, tile, shave)
+                        T.sync_grid()
+                        scan_phase(QKs, Vs, Gbs, Zs, GNorm, Nt, Ssm, Os, tile, shave)
+                        T.sync_grid()
+                        gdn_out_proj(Os, WoutQ, WoutS, Mix, tile, shave)
+                        T.sync_grid()
+                        add_mix(Hio, Mix, hrow, mrow, nt, worker)
+                else:
+                    WqkvQ = T.ddr_view(Table[li, col["W0"]], (NQKV_pad, H // 2), T.uint8)
+                    WqkvS = T.ddr_view(Table[li, col["W1"]], (NQKV_pad, H // G), T.float16)
+                    QNormW = T.ddr_view(Table[li, col["W2"]], (1, D), T.float16)
+                    KNormW = T.ddr_view(Table[li, col["W3"]], (1, D), T.float16)
+                    WoQ = T.ddr_view(Table[li, col["W4"]], (H, KO // 2), T.uint8)
+                    WoS = T.ddr_view(Table[li, col["W5"]], (H, KO // G), T.float16)
+                    if "attn" not in skip:
+                        qkv_proj(Xs, WqkvQ, WqkvS, Ys, tile, shave)
+                        T.sync_grid()
+                        qkv_phase(Ys, QNormW, KNormW, CosSin, Pos, Nt, Q, Gate, KcAll, VtAll, tile, shave, Kind, li)
+                        T.sync_grid()
+                        flash_phase(Q, KcAll, VtAll, Gate, Pos, Os, tile, shave, Kind, li)
+                        T.sync_grid()
+                        o_proj(Os, WoQ, WoS, Mix, tile, shave)
+                        T.sync_grid()
+                        add_mix(Hio, Mix, hrow, mrow, nt, worker)
+                T.sync_grid()
+                if "norm" not in skip:
+                    norm_tokens(Hio, PostNorm, Xs, nw, hrow, xrow, ls, st, worker)
+                T.sync_grid()
+                if "moe" not in skip:
+                    route_phase(Xs, Wr, Logits, Ids, Wts, Cnt, Off, Slot, tile, shave)
+                    # the grouping is worker 0's alone and the expert phase's first act is to read it back;
+                    # DeriveIntelNpuGlobalSync only sees the TOP-LEVEL phase sequence, so inside the layer loop
+                    # this barrier has to be written (without it the expert loop bounds are a race)
+                    T.sync_grid()
+                    expert_phase(Xs, WguQ, WguS, WdQ, WdS, Wts, Off, Slot, PartE, MoeOut, tile, shave)
+                    T.sync_grid()
+                    for it in T.serial(NP // workers):     # h += the MoE output, live tokens only
+                        t = it * workers + worker
+                        if t < nt[0, 0]:
+                            T.copy(Hio[t, 0], hrow)
+                            T.copy(MoeOut[t, 0], erow)
+                            for d0 in T.serial(H // FL):
+                                for v in T.vectorized(FL):
+                                    hrow[0, d0 * FL + v] = hrow[0, d0 * FL + v] + erow[0, d0 * FL + v]
+                            T.copy(hrow, Hio[t, 0])
+                    T.sync_grid()
+
+    return prefill_model
+
+
+def prefill_model_reference(layers: list, h, cos_sin, pos0: int, n: int, NH: int, NKV: int, D: int, ROT: int,
+                            KH: int, VH: int, DK: int, DV: int, E: int, TOPK: int, G: int, kc=None, vt=None,
+                            eps: float = 1e-6):
+    """numpy oracle of make_prefill_model (fp32): the per-layer oracles chained, which is what the model kernel
+    claims. `layers` is one dict per layer in run order with `kind` ("gdn" / "attn"), the layer's weights, and for
+    attention a `kv` index into the `kc` / `vt` cache lists. The GDN layer oracle adds the MoE output to the dead
+    rows too (its kernel does); the model kernel guards both halves of both kinds, so the dead rows are restored
+    here -- they cannot influence a live token, which is why the two kernels may differ there at all."""
+    import numpy as np
+    out = h.astype(np.float32)
+    kc = [] if kc is None else kc
+    vt = [] if vt is None else vt
+    for p in layers:
+        dead = out[n:].copy()
+        if p["kind"] == "gdn":
+            out, p["conv_state"], p["ssm"] = gdn_moe_layer_prefill_reference(
+                out, p["in_norm"], p["post_norm"], p["win_int"], p["win_s"], p["conv_w"], p["conv_state"],
+                p["a_log"], p["dt_bias"], p["gnorm"], p["wout_int"], p["wout_s"], p["ssm"], p["wr"],
+                p["gu_int"], p["gu_s"], p["d_int"], p["d_s"], n=n, KH=KH, VH=VH, DK=DK, DV=DV, E=E, TOPK=TOPK,
+                G=G, eps=eps)
+        else:
+            k = p["kv"]
+            out, kc[k], vt[k] = attn_moe_layer_prefill_reference(
+                out, p["in_norm"], p["post_norm"], p["wqkv_int"], p["wqkv_s"], p["qnorm"], p["knorm"], cos_sin,
+                p["wo_int"], p["wo_s"], kc[k], vt[k], p["wr"], p["gu_int"], p["gu_s"], p["d_int"], p["d_s"],
+                pos0=pos0, n=n, NH=NH, NKV=NKV, D=D, ROT=ROT, E=E, TOPK=TOPK, G=G, eps=eps)
+        out[n:] = dead
+    return out, kc, vt

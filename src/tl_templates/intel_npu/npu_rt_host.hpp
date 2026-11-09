@@ -11,6 +11,8 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -131,25 +133,51 @@ void kernel_entry(int numParams, uint64_t *params, const npu::Environment &env);
 namespace npu {
 
 // Reusable rendezvous for a fixed party count (C++17; std::barrier is C++20).
+// A stuck barrier REPORTS rather than hanging, as the device runtime's waits do: the per-worker arrival
+// counts say which worker never got there and how many barriers it had passed, which is what turns a
+// 10-minute "the sim is slow" into a line number. TL_NPU_HOST_BARRIER_TIMEOUT_S overrides the 120 s bound.
 class Barrier {
 public:
-  explicit Barrier(unsigned parties) : parties_(parties) {}
-  void wait() {
+  explicit Barrier(unsigned parties) : parties_(parties), arrived_(parties, 0) {}
+  void wait(unsigned who = 0u, const char *what = "barrier") {
     std::unique_lock<std::mutex> lk(m_);
     const unsigned gen = gen_;
+    if (who < arrived_.size())
+      ++arrived_[who];
+    if (trace())
+      std::fprintf(stderr, "w%u %s #%u\n", who, what, who < arrived_.size() ? arrived_[who] : 0u);
     if (++count_ == parties_) {
       count_ = 0;
       ++gen_;
       cv_.notify_all();
       return;
     }
-    cv_.wait(lk, [&] { return gen != gen_; });
+    if (!cv_.wait_for(lk, std::chrono::seconds(timeout_s()), [&] { return gen != gen_; })) {
+      std::fprintf(stderr, "npu host sim: %s STUCK at generation %u -- %u of %u arrived\n", what, gen, count_,
+                   parties_);
+      std::fprintf(stderr, "  barriers passed per party:");
+      for (std::size_t i = 0; i < arrived_.size(); ++i)
+        std::fprintf(stderr, " [%zu]=%u", i, arrived_[i]);
+      std::fprintf(stderr, "\n  the party with the LOWEST count is the one still running; its count is the"
+                           " index of the %s it never reached\n", what);
+      std::fflush(stderr);
+      std::abort();
+    }
   }
 
 private:
+  static long timeout_s() {
+    const char *v = std::getenv("TL_NPU_HOST_BARRIER_TIMEOUT_S");
+    return v ? std::strtol(v, nullptr, 10) : 120;
+  }
+  static bool trace() {
+    static const bool on = std::getenv("TL_NPU_HOST_TRACE") != nullptr;
+    return on;
+  }
   std::mutex m_;
   std::condition_variable cv_;
   unsigned parties_, count_{0}, gen_{0};
+  std::vector<unsigned> arrived_;
 };
 
 enum : std::uint32_t {
@@ -341,8 +369,8 @@ public:
       }
   }
 
-  void sync_grid() { env_.grid->wait(); }
-  void sync_tile() { env_.tileBarrier->wait(); }
+  void sync_grid() { env_.grid->wait(env_.tile * env_.spt + env_.shave, "grid barrier"); }
+  void sync_tile() { env_.tileBarrier->wait(env_.shave, "tile barrier"); }
 
   void finish() {
     if (statusAddr_ == 0)
