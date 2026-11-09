@@ -2052,6 +2052,198 @@ def gdn_scan_prefill_reference(qk, v, gb, z, gnorm, ssm, n: int, eps: float = 1e
     return out, s.astype(np.float32)
 
 
+def gdn_conv_prefill_reference(y, conv_w, conv_state, a_log, dt_bias, n: int, KH: int, VH: int, DK: int, DV: int):
+    """numpy oracle of make_gdn_conv_prefill (fp32): the GDN prefill phase BETWEEN the input projection and the
+    chunked scan. Returns exactly what `make_gdn_scan_prefill` consumes -- (qk, v, gb, z, new conv_state) -- so the
+    two compose. Semantics are `gdn_reference`'s, run over `n` tokens instead of one: a causal conv1d of width 4 with
+    SiLU over the CONV channels (the state is the 3 tokens before this chunk, time-major, oldest first), then q and k
+    l2-normalised per k-head with q carrying the `1/sqrt(DK)` of attention, beta = sigmoid(b) and
+    g = -exp(a_log) softplus(a + dt_bias) per v-head, and z passed through unconvolved."""
+    import numpy as np
+    QK, VC = KH * DK, VH * DV
+    CONV = 2 * QK + VC
+    NP = y.shape[0]
+    mixed = y[:, :CONV].astype(np.float32)
+    seq = np.concatenate([conv_state.astype(np.float32), mixed], axis=0)      # [3 + NP, CONV], oldest first
+    w = conv_w.astype(np.float32)
+    conv = sum(seq[j:j + NP] * w[j] for j in range(4))                        # token t sees rows t-3 .. t
+    conv = conv / (1.0 + np.exp(-conv))
+    q = conv[:, :QK].reshape(NP, KH, DK)
+    k = conv[:, QK:2 * QK].reshape(NP, KH, DK)
+    q = q / (np.sqrt((q * q).sum(-1, keepdims=True) + 1e-6) * np.sqrt(DK))
+    k = k / np.sqrt((k * k).sum(-1, keepdims=True) + 1e-6)
+    qk = np.zeros((KH, NP, 2, DK), np.float32)
+    qk[:, :, 0], qk[:, :, 1] = q.transpose(1, 0, 2), k.transpose(1, 0, 2)
+    v = conv[:, 2 * QK:].reshape(NP, VH, DV).transpose(1, 0, 2).astype(np.float16)
+    z = y[:, CONV:CONV + VC].astype(np.float32).reshape(NP, VH, DV).transpose(1, 0, 2).astype(np.float16)
+    b = y[:, CONV + VC:CONV + VC + VH].astype(np.float32)
+    a = y[:, CONV + VC + VH:CONV + VC + 2 * VH].astype(np.float32)
+    gb = np.zeros((VH, NP, 2), np.float32)
+    gb[:, :, 0] = (-np.exp(a_log.astype(np.float32).reshape(1, VH)) * np.logaddexp(0, a + dt_bias.astype(np.float32).reshape(1, VH))).T
+    gb[:, :, 1] = (1.0 / (1.0 + np.exp(-b))).T
+    # rows past the live tokens contribute nothing downstream; the state is the last three LIVE rows
+    qk[:, n:], v[:, n:], z[:, n:], gb[:, n:] = 0, 0, 0, 0
+    new_cs = seq[n:n + 3].astype(np.float16)
+    return qk, v, gb, z, new_cs
+
+
+def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 128, DV: int = 128, TB: int = 32,
+                          tiles: int = 3, shaves: int = 2):
+    """P3b: the Gated DeltaNet PREFILL phase between the input projection and the chunked scan -- a causal conv1d of
+    width 4 with SiLU, then the per-head normalisations -- producing exactly what `make_gdn_scan_prefill` consumes.
+
+    The conv is causal in t and independent per channel, so the work splits on **heads**: item `hb < KH` owns k-head
+    `hb` and does its q and k channels, item `hb >= KH` owns v-head `hb - KH` and does its v channels plus that
+    head's z, beta and g. One head's DK channels stay in one worker, which is what lets the l2 norm be a local
+    reduction; the conv state of those channels is then also private, so no worker touches another's.
+
+    Tokens are walked in blocks of TB with the 3-token window carried in CMX across blocks, so a block is one 2-D
+    DMA (TB rows of DK out of a row of NIN) rather than TB small ones. `Nt[0, 0]` is the live token count: rows past
+    it are zeroed, and the conv state handed on is the last three LIVE rows.
+
+    Every buffer is touched before the loops. That is not style: the compiler otherwise sinks an allocation into a
+    loop body, which is intermittently wrong on 2+ tiles (plan question 10), and
+    `test_intel_npu_scoped_cmx.allocations_inside_loops` is how a kernel is checked for it.
+
+    Oracle: `gdn_conv_prefill_reference`."""
+    assert DK == DV and VH % KH == 0 and DK % 32 == 0 and TB % 16 == 0
+    QK, VC = KH * DK, VH * DV
+    CONV = 2 * QK + VC
+    NIN = CONV + VC + 2 * VH
+    NP = -(-N // TB) * TB
+    NT = NP // TB
+    ITEMS = KH + VH
+    workers = tiles * shaves
+    FL, HL = 16, 32
+
+    @T.prim_func
+    def gdn_conv(Y: T.Tensor((NP, NIN), T.float16), ConvW: T.Tensor((4, CONV), T.float16),
+                 ConvState: T.Tensor((3, CONV), T.float16), ALog: T.Tensor((1, VH), T.float32),
+                 DtBias: T.Tensor((1, VH), T.float32), Nt: T.Tensor((1, 1), T.int32),
+                 QKo: T.Tensor((KH, NP, 2 * DK), T.float32), Vo: T.Tensor((VH, NP, DV), T.float16),
+                 Gb: T.Tensor((VH, NP, 2), T.float32), Zo: T.Tensor((VH, NP, DV), T.float16),
+                 CsOut: T.Tensor((3, CONV), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            nt = T.alloc_shared((1, 1), T.int32)
+            al = T.alloc_shared((1, VH), T.float32)
+            db = T.alloc_shared((1, VH), T.float32)
+            win = T.alloc_local((3, DK), T.float16)      # the 3 tokens before the current row, per channel
+            keep = T.alloc_local((3, DK), T.float16)     # that window as it stood after the last LIVE token
+            cw = T.alloc_local((4, DK), T.float16)
+            xb = T.alloc_local((TB, DK), T.float16)      # one block of tokens for this head's channels
+            cv = T.alloc_local((TB, DK), T.float32)      # conv + SiLU
+            ob = T.alloc_local((TB, DK), T.float32)
+            zb = T.alloc_local((TB, DV), T.float16)
+            bb = T.alloc_local((TB, 1), T.float16)       # b and a are VH columns apart in the projection row
+            aa = T.alloc_local((TB, 1), T.float16)
+            gbb = T.alloc_local((TB, 2), T.float32)
+            acc = T.alloc_local((FL,), T.float32)
+            eh = T.alloc_local((FL,), T.float16)
+            ls = T.alloc_local((FL,), T.float32)
+            st = T.alloc_local((8,), T.float32)
+            # first use here keeps every CMX scope at kernel level (question 10)
+            win[0, 0] = T.float16(0)
+            keep[0, 0] = T.float16(0)
+            cw[0, 0] = T.float16(0)
+            xb[0, 0] = T.float16(0)
+            cv[0, 0] = T.float32(0)
+            ob[0, 0] = T.float32(0)
+            zb[0, 0] = T.float16(0)
+            bb[0, 0] = T.float16(0)
+            aa[0, 0] = T.float16(0)
+            gbb[0, 0] = T.float32(0)
+            acc[0] = T.float32(0)
+            ls[0] = T.float32(0)
+            eh[0] = T.float16(0)
+            st[0] = T.float32(0)
+            T.copy(Nt[0, 0], nt)
+            T.copy(ALog[0, 0], al)
+            T.copy(DtBias[0, 0], db)
+            T.sync_threads()
+            for it in T.serial(T.ceildiv(ITEMS, workers)):
+                hb = it * workers + worker
+                if hb < ITEMS:
+                    # channel base of this item: k-heads take q then k, v-heads take their v slice
+                    for part in T.serial(2):
+                        if hb >= KH and part == 1:
+                            st[0] = T.float32(0)        # a v-head has one channel slice, not two
+                        else:
+                            st[1] = T.float32(0)
+                            cb = T.if_then_else(hb < KH, hb * DK + part * QK, 2 * QK + (hb - KH) * DV)
+                            T.copy(ConvState[0, cb], win)
+                            T.copy(ConvW[0, cb], cw)
+                            for tb in T.serial(NT):
+                                T.copy(Y[tb * TB, cb], xb)
+                                for r in T.serial(TB):
+                                    for c0 in T.serial(DK // FL):
+                                        for v in T.vectorized(FL):
+                                            acc[v] = (T.cast(win[0, c0 * FL + v], T.float32) * T.cast(cw[0, c0 * FL + v], T.float32)
+                                                      + T.cast(win[1, c0 * FL + v], T.float32) * T.cast(cw[1, c0 * FL + v], T.float32)
+                                                      + T.cast(win[2, c0 * FL + v], T.float32) * T.cast(cw[2, c0 * FL + v], T.float32)
+                                                      + T.cast(xb[r, c0 * FL + v], T.float32) * T.cast(cw[3, c0 * FL + v], T.float32))
+                                            eh[v] = T.exp(T.cast(T.float32(0) - acc[v], T.float16))
+                                            cv[r, c0 * FL + v] = acc[v] / (T.float32(1) + T.cast(eh[v], T.float32))
+                                            win[0, c0 * FL + v] = win[1, c0 * FL + v]
+                                            win[1, c0 * FL + v] = win[2, c0 * FL + v]
+                                            win[2, c0 * FL + v] = xb[r, c0 * FL + v]
+                                    if tb * TB + r == nt[0, 0] - 1:
+                                        for c0 in T.serial(DK // HL):
+                                            for v in T.vectorized(HL):
+                                                keep[0, c0 * HL + v] = win[0, c0 * HL + v]
+                                                keep[1, c0 * HL + v] = win[1, c0 * HL + v]
+                                                keep[2, c0 * HL + v] = win[2, c0 * HL + v]
+                                # l2 norm per token, then the slice's destination
+                                for r in T.serial(TB):
+                                    for v in T.vectorized(FL):
+                                        ls[v] = T.float32(0)
+                                    for c0 in T.serial(DK // FL):
+                                        for v in T.vectorized(FL):
+                                            ls[v] = ls[v] + cv[r, c0 * FL + v] * cv[r, c0 * FL + v]
+                                    st[2] = T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL])
+                                    st[3] = T.float32(1) / T.sqrt(st[2] + T.float32(1e-6))
+                                    if hb < KH and part == 0:
+                                        st[3] = st[3] * T.float32(1.0 / (DK ** 0.5))
+                                    st[4] = T.if_then_else(tb * TB + r < nt[0, 0], T.float32(1), T.float32(0))
+                                    for c0 in T.serial(DK // FL):
+                                        for v in T.vectorized(FL):
+                                            ob[r, c0 * FL + v] = T.if_then_else(
+                                                hb < KH, cv[r, c0 * FL + v] * st[3], cv[r, c0 * FL + v]) * st[4]
+                                if hb < KH:
+                                    T.copy(ob, QKo[hb, tb * TB, part * DK])
+                                else:
+                                    for r in T.serial(TB):
+                                        for c0 in T.serial(DV // FL):
+                                            for v in T.vectorized(FL):
+                                                zb[r, c0 * FL + v] = T.cast(ob[r, c0 * FL + v], T.float16)
+                                    T.copy(zb, Vo[hb - KH, tb * TB, 0])
+                            T.copy(keep, CsOut[0, cb])
+            T.sync_grid()
+            # z, beta and g: one v-head per item, read straight out of the projection row
+            for it in T.serial(T.ceildiv(VH, workers)):
+                h = it * workers + worker
+                if h < VH:
+                    for tb in T.serial(NT):
+                        T.copy(Y[tb * TB, CONV + h * DV], zb)
+                        for r in T.serial(TB):
+                            st[5] = T.if_then_else(tb * TB + r < nt[0, 0], T.float32(1), T.float32(0))
+                            for c0 in T.serial(DV // FL):
+                                for v in T.vectorized(FL):
+                                    zb[r, c0 * FL + v] = T.cast(T.cast(zb[r, c0 * FL + v], T.float32) * st[5], T.float16)
+                        T.copy(zb, Zo[h, tb * TB, 0])
+                        T.copy(Y[tb * TB, CONV + VC + h], bb)
+                        T.copy(Y[tb * TB, CONV + VC + VH + h], aa)
+                        for r in T.serial(TB):
+                            st[6] = T.if_then_else(tb * TB + r < nt[0, 0], T.float32(1), T.float32(0))
+                            gbb[r, 1] = st[6] / (T.float32(1) + T.exp(T.float32(0) - T.cast(bb[r, 0], T.float32)))
+                            st[7] = T.cast(aa[r, 0], T.float32) + db[0, h]
+                            gbb[r, 0] = (T.float32(0) - T.exp(al[0, h])) * T.log(T.float32(1) + T.exp(st[7])) * st[6]
+                        T.copy(gbb, Gb[h, tb * TB, 0])
+
+    return gdn_conv
+
+
 def make_attn_prefill(N: int = 64, NKV: int = 2, GQ: int = 8, D: int = 256, SMAX: int = 1536, TB: int = 4,
                       BKV: int = 128, tiles: int = 3, shaves: int = 2, pipelined: bool = False):
     """P1: the full-attention PREFILL phase -- flash attention over `N` query tokens already normed, roped and
