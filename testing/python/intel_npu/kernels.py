@@ -867,6 +867,7 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
         wsd_cmx = T.alloc_local((BND, KGI), T.float16)
         wd_cmx = T.alloc_local((BND, I), T.float16)
         yd_cmx = T.alloc_local((MB, BND), T.float16)
+        yo = T.alloc_local((MB, H), T.float16)      # the chunk's whole down output, so Part is touched once per token
         pw = T.alloc_local((1, H), T.float32)
         pa = T.alloc_local((1, H), T.float32)
         T.copy(Off[0], off_cmx)
@@ -906,16 +907,21 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
                             T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wd_cmx[r, 0]),
                                           T.address_of(wqd_cmx[r, 0]), T.address_of(wsd_cmx[r, 0]), I, G)
                         T.gemm(h_cmx, wd_cmx, yd_cmx, transpose_B=True, clear_accum=True)
-                        for i in T.serial(MB):
-                            if off_cmx[e] + c * MB + i < off_cmx[e + 1]:
-                                T.copy(Part[worker, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), n * BND], pw[0:1, 0:BND])
-                                for c0 in T.serial(BND // FL):
-                                    for v in T.vectorized(FL):
-                                        pw[0, c0 * FL + v] = (pw[0, c0 * FL + v]
-                                                              + wts_cmx[slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1),
-                                                                        slot_cmx[off_cmx[e] + c * MB + i] % (TOPK + 1)]
-                                                              * T.cast(yd_cmx[i, c0 * FL + v], T.float32))
-                                T.copy(pw[0:1, 0:BND], Part[worker, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), n * BND])
+                        for i, c0 in T.grid(MB, BND // HL):
+                            for v in T.vectorized(HL):
+                                yo[i, n * BND + c0 * HL + v] = yd_cmx[i, c0 * HL + v]
+                    # one read-modify-write of the whole row per live token: the chunk-wise form cost CD of
+                    # them, and at BND = 64 those are 256-byte DDR jobs whose count dominated the phase
+                    for i in T.serial(MB):
+                        if off_cmx[e] + c * MB + i < off_cmx[e + 1]:
+                            T.copy(Part[worker, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), 0], pw)
+                            for c0 in T.serial(H // FL):
+                                for v in T.vectorized(FL):
+                                    pw[0, c0 * FL + v] = (pw[0, c0 * FL + v]
+                                                          + wts_cmx[slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1),
+                                                                    slot_cmx[off_cmx[e] + c * MB + i] % (TOPK + 1)]
+                                                          * T.cast(yo[i, c0 * FL + v], T.float32))
+                            T.copy(pw, Part[worker, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), 0])
         T.sync_grid()
         # --- combine: the tokens dealt over the workers, the six partials summed ----------------------
         for it in T.serial(T.ceildiv(N, workers)):

@@ -110,15 +110,19 @@ def main(argv):
                                                      BNG=64, BND=64, tiles=TILES, shaves=SHAVES))
         db = build(low.source, f"tl_moe_expert_prefill_n{N}_h{H}_i{I}_e{E}_mb{MB}", argv)
 
-        def run(gu, dw):
+        def run(gu, dw, profile=False):
             out = np.zeros((N, H), np.float32)
             arrays = {"X": ("in", x), "WguQ": ("in", pack_int4(gu.reshape(-1, H))),
                       "WguS": ("in", gu_s.reshape(-1, H // G)), "WdQ": ("in", pack_int4(dw.reshape(-1, I))),
                       "WdS": ("in", d_s.reshape(-1, I // G)), "Wts": ("in", ref["wts"].astype(np.float32)),
                       "Off": ("in", ref["off"].astype(np.int32)), "Slot": ("in", ref["slot"].astype(np.int32)),
                       "Part": ("out", np.zeros((WORKERS, N, H), np.float32)), "Out": ("out", out)}
+            trace = HERE / "evidence" / f"tl_moe_expert_prefill_n{N}_trace.json" if profile else None
+            if trace is not None:
+                trace.parent.mkdir(parents=True, exist_ok=True)
             r = runner.run(db, lowering.order_arrays(low, arrays), TILES, SHAVES, HERE / "run_moe_prefill",
-                           repeat=3, warmup=3, timeout_s=600)
+                           repeat=1 if profile else 3, warmup=0 if profile else 3, timeout_s=600,
+                           profile_json=trace)
             runner.check_status(r.status)
             return out, r
 
@@ -144,6 +148,12 @@ def main(argv):
         print(f"  the win IS tokens-per-expert: {N * (TOPK + 1) / visited:.1f} here, and it grows with N -- "
               f"at this N the tokens still scatter over most of the {E} experts")
         rc |= 0 if verdict == "PASS" else 1
+
+        if "--profile" in argv:
+            # an observability run, never a latency claim: the timing above is the unprofiled one
+            _, pr = run(gu_int, d_int, profile=True)
+            print(f"  trace [{runner.condition(pr, True)}]: "
+                  f"{HERE / 'evidence' / f'tl_moe_expert_prefill_n{N}_trace.json'}")
 
         if "--negative" in argv:
             victim = int(np.argmax(np.diff(ref["off"][:E + 1])))
