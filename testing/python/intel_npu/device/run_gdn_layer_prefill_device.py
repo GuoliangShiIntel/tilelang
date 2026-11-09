@@ -26,13 +26,12 @@ from kernels import gdn_layer_prefill_reference, make_gdn_layer_prefill, pack_in
 
 TILES, SHAVES = 3, 2
 H, KH, VH, DK, DV, G = 2048, 16, 32, 128, 128, 128
-# BN/MB are what the CMX budget allows once every phase's buffers are hoisted to kernel scope (question
-# 10's workaround): the phases no longer share bytes, so BN1 = BN2 = 64 overruns by 494 KB per SHAVE.
-TB, C, BN1, BN2, MB = 32, 64, 16, 16, 16
+# BN=64 overruns at 813120 B per SHAVE, and that is one projection phase's own buffers, not phases failing
+# to share: the number is byte-identical with and without question 10's hoist. `--bn` sweeps what does fit.
+TB, C, MB = 32, 64, 16
 QK, VC = KH * DK, VH * DV
 CONV = 2 * QK + VC
 NIN = CONV + VC + 2 * VH
-NIN_pad = -(-NIN // BN1) * BN1
 
 
 def arg(argv, name, default):
@@ -42,11 +41,13 @@ def arg(argv, name, default):
 def main(argv):
     n = arg(argv, "--n", 192)
     trials = arg(argv, "--trials", 12)
+    BN1 = BN2 = arg(argv, "--bn", 32)   # 32 is 120.3 us per token against 16's 152.3; 64 does not fit
+    NIN_pad = -(-NIN // BN1) * BN1
     NP = -(-n // (TB * C // np.gcd(TB, C))) * (TB * C // np.gcd(TB, C))
 
     low = lowering.lower(make_gdn_layer_prefill(N=NP, H=H, KH=KH, VH=VH, DK=DK, DV=DV, G=G, TB=TB, C=C,
                                                 BN1=BN1, BN2=BN2, MB=MB, tiles=TILES, shaves=SHAVES))
-    name = f"tl_gdn_layer_prefill_n{NP}_h{H}"
+    name = f"tl_gdn_layer_prefill_n{NP}_h{H}_bn{BN1}"
     if "--no-build" in argv:
         _, sha = runner.write_kernel(low.source, name)
         db = runner.DeviceBuild(build_dir=HERE / "build", exe=HERE / "build" / "Release" / "npu_run.exe",
