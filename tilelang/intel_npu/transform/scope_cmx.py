@@ -13,6 +13,14 @@ Runs after LowerOpaqueBlock, on flat `AllocBuffer` statements. Two moves:
    uniform block: every SHAVE of a tile must run the same allocation sequence, or shared buffers get different
    addresses on the two SHAVEs (the ring slots, the x row). Tile-dependent conditions are fine: a tile's SHAVEs
    agree, and the per-tile offsets stay equal because every tile runs the same program.
+3. **Loops.** An allocation whose extents do not depend on a loop variable leaves that loop's body and bubbles
+   out through every enclosing loop. Inside one loop it buys nothing -- the buffer is live in every iteration, so
+   the peak over that loop is the same either way -- while the runtime re-runs mark / alloc / restore once per
+   iteration for an address that never changes. That cost correctness, not just time: the GDN prefill scan had
+   one 512 B scratch buffer sunk into a per-row loop (1152 allocations per worker) and was intermittently wrong
+   on 2+ tiles, 4/12 trials clean at 3 x 2, 12/12 once it stayed put (plan question 10). The price is that two
+   SIBLING loops with different buffers no longer share those bytes, so the peak becomes their sum;
+   CheckIntelNpuBudgets prices the result and refuses a kernel that stops fitting.
 """
 
 from __future__ import annotations
@@ -301,6 +309,22 @@ class _Scoper:
                 out.append(tirx.IfThenElse(s.condition, then_case, else_case))
         return out
 
+    def _hoist_from_loop(self, s, body) -> list:
+        """Loop-invariant allocations at the top of `body` move in front of the loop, so the runtime allocates them
+        once instead of once per iteration. Nesting these calls hoists through every enclosing loop in turn."""
+        items = _items(body)
+        keys = _alloc_keys(body)
+        lead, rest = [], []
+        for x in items:
+            if _is_decl(x, keys) and not _uses_var(x, s.loop_var):
+                lead.append(x)
+            else:
+                rest.append(x)
+        if not lead or not rest:
+            return [_for(s, body)]
+        self.hoisted += sum(isinstance(a, tirx.AllocBuffer) for a in lead)
+        return lead + [_for(s, _seq(rest))]
+
     def flatten(self, s) -> list:
         """One statement of a block, with nested blocks rewritten; a SHAVE-dependent `if` gives up its allocations."""
         if isinstance(s, tirx.SeqStmt):
@@ -309,7 +333,7 @@ class _Scoper:
                 out.extend(self.flatten(x))
             return out
         if isinstance(s, tirx.For):
-            return [_for(s, self.block(s.body))]
+            return self._hoist_from_loop(s, self.block(s.body))
         if isinstance(s, tirx.While):
             return [tirx.While(s.condition, self.block(s.body))]
         if isinstance(s, tirx.IfThenElse):
