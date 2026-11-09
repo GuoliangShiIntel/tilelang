@@ -175,12 +175,15 @@ def PlanIntelNpuDistribution():
         notes = []
         pipelined_depth = [0]
         loop_depth = [0]
+        shave_branch = []   # one flag per enclosing SHAVE-dependent branch: did it fill a shared buffer?
 
         def pre(stmt):
             if isinstance(stmt, tirx.For):
                 loop_depth[0] += 1
                 if int(stmt.annotations.get("num_stages", 0)) > 0:
                     pipelined_depth[0] += 1
+            elif isinstance(stmt, tirx.IfThenElse) and _uses(stmt.condition, launch.shave_var):
+                shave_branch.append(False)
             return None
 
         def post(stmt):
@@ -188,6 +191,12 @@ def PlanIntelNpuDistribution():
                 loop_depth[0] -= 1
                 if int(stmt.annotations.get("num_stages", 0)) > 0:
                     pipelined_depth[0] -= 1
+                return None
+            if isinstance(stmt, tirx.IfThenElse):
+                if _uses(stmt.condition, launch.shave_var) and shave_branch.pop():
+                    # the fill ran on one SHAVE; the tile still has to meet, and the meeting point is HERE,
+                    # after the branch, where every SHAVE arrives
+                    return tirx.SeqStmt([stmt, _storage_sync_shared()])
                 return None
             if not _is_call(stmt, DMA_COPY):
                 return None
@@ -219,6 +228,12 @@ def PlanIntelNpuDistribution():
                 return None
             # Resident SEGMENTED (or tile-invariant) fill into a tile-shared buffer: split the rows
             # over the tile's SHAVEs, one per DMA port, then meet.
+            if shave_branch:
+                # the author already chose which SHAVE fills, so there is nothing to split, and the sync cannot
+                # go here because the other SHAVE never reaches it: the enclosing branch emits it after itself
+                shave_branch[-1] = True
+                notes.append(f"{dst.buffer.name}: filled under a SHAVE-dependent branch, tile sync after the branch")
+                return None
             rows = _const(args[3])
             spt = launch.shaves
             tx = launch.shave_var
@@ -246,7 +261,7 @@ def PlanIntelNpuDistribution():
                          f"{rows} rows split {per} per SHAVE, tile sync after")
             return tirx.SeqStmt([fill, _storage_sync_shared()])
 
-        body = ir_transform(func.body, pre, post, ["tirx.For", "tirx.Evaluate"])
+        body = ir_transform(func.body, pre, post, ["tirx.For", "tirx.IfThenElse", "tirx.Evaluate"])
         func = func.with_body(body)
         if notes:
             func = _with_notes(func, "distribution: " + "; ".join(notes))

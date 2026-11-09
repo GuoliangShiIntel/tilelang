@@ -191,3 +191,32 @@ def test_flow_checker_passes_the_flow_trace_and_fails_a_plain_gemm():
     assert problems and any("multicast" in p for p in problems), problems
     # the busy threshold is a live check: an impossible bar fails the flow trace too
     assert any("DPU busy" in p for p in _check(flow, chunks=32, tiles=3, min_busy=99))
+
+
+def test_a_shared_fill_under_a_shave_branch_syncs_after_the_branch():
+    """PlanIntelNpuDistribution ends every DDR -> shared fill with a tile sync. Under `if shave == 0` that sync
+    used to land INSIDE the branch, where the other SHAVE never arrives and the tile waits forever -- emitted
+    silently from six ordinary lines. The sync now goes after the branch, which is where the tile actually meets.
+    The control is the unguarded twin, whose fill the pass hands to SHAVE 0 by itself: both lower, and in neither
+    does a sync sit inside a SHAVE branch."""
+
+    def make(guard: bool):
+        @T.prim_func
+        def k(A: T.Tensor((1, 64), T.float16), Y: T.Tensor((4, 64), T.float16)):
+            with T.Kernel(2, threads=2) as tile:
+                shave = T.get_thread_binding()
+                s_cmx = T.alloc_shared((1, 64), T.float16)
+                if guard:   # Python-level: the two arms are different kernels
+                    if shave == 0:
+                        T.copy(A[0, 0], s_cmx)
+                else:
+                    T.copy(A[0, 0], s_cmx)
+                T.copy(s_cmx, Y[tile * 2 + shave, 0])
+
+        return k
+
+    for guard in (True, False):
+        body = _src(make(guard)).split("kernel_entry")[0]
+        assert "ctx.sync_tile();" in body, guard
+        inside = body.split("if (shave == 0) {", 1)[1].split("}", 1)[0]
+        assert "sync_tile" not in inside, f"the tile barrier is unreachable for the other SHAVE (guard={guard})"
