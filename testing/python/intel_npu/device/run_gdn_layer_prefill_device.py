@@ -22,7 +22,7 @@ sys.path.insert(0, str(HERE))
 import tilelang  # noqa: E402,F401
 import runner  # noqa: E402
 import lowering  # noqa: E402
-from kernels import gdn_layer_prefill_reference, make_gdn_layer_prefill, pack_int4  # noqa: E402
+from kernels import gdn_layer_prefill_reference, gm_scales, make_gdn_layer_prefill, pack_int4  # noqa: E402
 
 TILES, SHAVES = 3, 2
 H, KH, VH, DK, DV, G = 2048, 16, 32, 128, 128, 128
@@ -73,10 +73,10 @@ def main(argv):
 
     def run(wo_in, wos_in):
         hio, sm = h.copy(), ssm.copy()
-        arrays = {"Hio": ("inout", hio), "InNorm": ("in", inn), "WinQ": ("in", pack_int4(wi)), "WinS": ("in", ws),
+        arrays = {"Hio": ("inout", hio), "InNorm": ("in", inn), "WinQ": ("in", pack_int4(wi)), "WinS": ("in", gm_scales(ws)),
                   "ConvW": ("in", cw), "ConvState": ("in", cs), "ALog": ("in", al), "DtBias": ("in", dbias),
                   "GNorm": ("in", gn), "Nt": ("in", np.array([[n]], np.int32)), "Ssm": ("inout", sm),
-                  "WoutQ": ("in", pack_int4(wo_in)), "WoutS": ("in", wos_in),
+                  "WoutQ": ("in", pack_int4(wo_in)), "WoutS": ("in", gm_scales(wos_in)),
                   "Xs": ("out", np.zeros((NP, H), np.float16)), "Ys": ("out", np.zeros((NP, NIN_pad), np.float16)),
                   "QKs": ("out", np.zeros((KH, NP, 2 * DK), np.float32)),
                   "Vs": ("out", np.zeros((VH, NP, DV), np.float16)),

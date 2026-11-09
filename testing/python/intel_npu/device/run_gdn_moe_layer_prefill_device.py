@@ -26,7 +26,7 @@ sys.path.insert(0, str(HERE))
 import tilelang  # noqa: E402,F401
 import runner  # noqa: E402
 import lowering  # noqa: E402
-from kernels import (gdn_moe_layer_prefill_reference, make_gdn_moe_layer_prefill,  # noqa: E402
+from kernels import (gdn_moe_layer_prefill_reference, gm_scales, make_gdn_moe_layer_prefill,  # noqa: E402
                      make_moe_route_prefill, pack_int4)
 
 TILES, SHAVES = 3, 2
@@ -93,12 +93,12 @@ def main(argv):
     def run(wo_in, wos_in, d_in, ds_in):
         hio, sm = h.copy(), ssm.copy()
         arrays = {"Hio": ("inout", hio), "InNorm": ("in", inn), "PostNorm": ("in", post),
-                  "WinQ": ("in", pack_int4(wi)), "WinS": ("in", ws),
+                  "WinQ": ("in", pack_int4(wi)), "WinS": ("in", gm_scales(ws)),
                   "ConvW": ("in", cw), "ConvState": ("in", cs), "ALog": ("in", al), "DtBias": ("in", dbias),
                   "GNorm": ("in", gn), "Nt": ("in", np.array([[n]], np.int32)), "Ssm": ("inout", sm),
-                  "WoutQ": ("in", pack_int4(wo_in)), "WoutS": ("in", wos_in), "Wr": ("in", wr_pad),
-                  "WguQ": ("in", pack_int4(gu_int.reshape(-1, H))), "WguS": ("in", gu_s.reshape(-1, KGH)),
-                  "WdQ": ("in", pack_int4(d_in.reshape(-1, I))), "WdS": ("in", ds_in.reshape(-1, KGI)),
+                  "WoutQ": ("in", pack_int4(wo_in)), "WoutS": ("in", gm_scales(wos_in)), "Wr": ("in", wr_pad),
+                  "WguQ": ("in", pack_int4(gu_int.reshape(-1, H))), "WguS": ("in", gm_scales(gu_s.reshape(-1, KGH))),
+                  "WdQ": ("in", pack_int4(d_in.reshape(-1, I))), "WdS": ("in", gm_scales(ds_in.reshape(-1, KGI))),
                   "Xs": ("out", np.zeros((NP, H), np.float16)), "Ys": ("out", np.zeros((NP, NIN_pad), np.float16)),
                   "QKs": ("out", np.zeros((KH, NP, 2 * DK), np.float32)),
                   "Vs": ("out", np.zeros((VH, NP, DV), np.float16)),

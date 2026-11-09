@@ -18,7 +18,7 @@ import tilelang  # noqa: F401
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_sim  # noqa: E402
 import lowering  # noqa: E402
-from kernels import gdn_layer_prefill_reference, make_gdn_layer_prefill, pack_int4  # noqa: E402
+from kernels import gdn_layer_prefill_reference, gm_scales, make_gdn_layer_prefill, pack_int4  # noqa: E402
 from test_intel_npu_scoped_cmx import allocations_inside_loops  # noqa: E402
 
 TILES, SHAVES = 2, 2
@@ -64,9 +64,9 @@ def _run(h, inn, wi, ws, wo, wos, cw, cs, al, db, gn, ssm, n=N):
                                                 BN1=BN1, BN2=BN2, MB=MB, tiles=TILES, shaves=SHAVES))
     lib = host_sim.build(low.source, "gdn_layer_prefill")
     hio, sm, cso = h.copy(), ssm.copy(), np.zeros((3, CONV), np.float16)
-    arrays = {"Hio": hio, "InNorm": inn, "WinQ": pack_int4(wi), "WinS": ws, "ConvW": cw, "ConvState": cs,
+    arrays = {"Hio": hio, "InNorm": inn, "WinQ": pack_int4(wi), "WinS": gm_scales(ws), "ConvW": cw, "ConvState": cs,
               "ALog": al, "DtBias": db, "GNorm": gn, "Nt": np.array([[n]], np.int32), "Ssm": sm,
-              "WoutQ": pack_int4(wo), "WoutS": wos,
+              "WoutQ": pack_int4(wo), "WoutS": gm_scales(wos),
               "Xs": np.zeros((N, H), np.float16), "Ys": np.zeros((N, NIN_pad), np.float16),
               "QKs": np.zeros((KH, N, 2 * DK), np.float32), "Vs": np.zeros((VH, N, DV), np.float16),
               "Gbs": np.zeros((VH, N, 2), np.float32), "Zs": np.zeros((VH, N, DV), np.float16),

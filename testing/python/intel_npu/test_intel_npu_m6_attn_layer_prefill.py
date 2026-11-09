@@ -20,7 +20,7 @@ import tilelang  # noqa: F401
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_sim  # noqa: E402
 import lowering  # noqa: E402
-from kernels import (attn_layer_prefill_reference, make_attn_layer_prefill, pack_int4,  # noqa: E402
+from kernels import (attn_layer_prefill_reference, gm_scales, make_attn_layer_prefill, pack_int4,  # noqa: E402
                      rope_cos_sin)
 from test_intel_npu_scoped_cmx import allocations_inside_loops  # noqa: E402
 
@@ -71,9 +71,9 @@ def _run(h, inn, wq, wqs, wo, wos, qn, kn, pos0=0, n=N, kc=None, vt=None):
     kc = np.zeros((NKV, SMAX, D), np.float16) if kc is None else kc.copy()
     vt = np.zeros((NKV, D, SMAX), np.float16) if vt is None else vt.copy()
     hio = h.copy()
-    arrays = {"Hio": hio, "InNorm": inn, "WqkvQ": pack_int4(wq), "WqkvS": wqs, "QNormW": qn, "KNormW": kn,
+    arrays = {"Hio": hio, "InNorm": inn, "WqkvQ": pack_int4(wq), "WqkvS": gm_scales(wqs), "QNormW": qn, "KNormW": kn,
               "CosSin": cs, "Pos": np.array([[pos0]], np.int32), "Nt": np.array([[n]], np.int32),
-              "Kc": kc, "Vt": vt, "WoQ": pack_int4(wo), "WoS": wos,
+              "Kc": kc, "Vt": vt, "WoQ": pack_int4(wo), "WoS": gm_scales(wos),
               "Xs": np.zeros((N, H), np.float16), "Ys": np.zeros((N, NQKV_pad), np.float16),
               "Q": np.zeros((NKV, N, GQ, D), np.float16), "Gate": np.zeros((N, KO), np.float16),
               "Os": np.zeros((N, KO), np.float16), "Mix": np.zeros((N, H), np.float16)}

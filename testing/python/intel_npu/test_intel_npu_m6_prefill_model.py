@@ -20,7 +20,7 @@ import tilelang  # noqa: F401
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_sim  # noqa: E402
 import lowering  # noqa: E402
-from kernels import (GDN_PREFILL_TABLE, PREFILL_TABLE_COLS, make_moe_route_prefill,  # noqa: E402
+from kernels import (GDN_PREFILL_TABLE, PREFILL_TABLE_COLS, gm_scales, make_moe_route_prefill,  # noqa: E402
                      make_prefill_model, pack_int4, prefill_model_reference, rope_cos_sin)
 
 TILES, SHAVES = 2, 2
@@ -116,15 +116,16 @@ def _host_arrays(layers):
         wr_pad = np.zeros((RR, H), np.float16)
         wr_pad[:E + 1] = p["wr"]
         a = {"InNorm": p["in_norm"], "PostNorm": p["post_norm"], "Wr": wr_pad,
-             "WguQ": pack_int4(p["gu_int"].reshape(-1, H)), "WguS": p["gu_s"].reshape(-1, KGH),
-             "WdQ": pack_int4(p["d_int"].reshape(-1, I)), "WdS": p["d_s"].reshape(-1, KGI)}
+             "WguQ": pack_int4(p["gu_int"].reshape(-1, H)), "WguS": gm_scales(p["gu_s"].reshape(-1, KGH)),
+             "WdQ": pack_int4(p["d_int"].reshape(-1, I)), "WdS": gm_scales(p["d_s"].reshape(-1, KGI))}
         if p["kind"] == "gdn":
-            a.update({"W0": pack_int4(p["win_int"]), "W1": p["win_s"], "W2": p["conv_w"], "W3": p["a_log"],
-                      "W4": p["dt_bias"], "W5": p["gnorm"], "W6": pack_int4(p["wout_int"]), "W7": p["wout_s"],
+            a.update({"W0": pack_int4(p["win_int"]), "W1": gm_scales(p["win_s"]), "W2": p["conv_w"],
+                      "W3": p["a_log"], "W4": p["dt_bias"], "W5": p["gnorm"], "W6": pack_int4(p["wout_int"]),
+                      "W7": gm_scales(p["wout_s"]),
                       "S0": p["conv_state"].copy(), "S1": p["ssm"].copy()})
         else:
-            a.update({"W0": pack_int4(p["wqkv_int"]), "W1": p["wqkv_s"], "W2": p["qnorm"], "W3": p["knorm"],
-                      "W4": pack_int4(p["wo_int"]), "W5": p["wo_s"]})
+            a.update({"W0": pack_int4(p["wqkv_int"]), "W1": gm_scales(p["wqkv_s"]), "W2": p["qnorm"],
+                      "W3": p["knorm"], "W4": pack_int4(p["wo_int"]), "W5": gm_scales(p["wo_s"])})
         a = {k: np.ascontiguousarray(v) for k, v in a.items()}
         keep.update({f"L{li}_{k}": v for k, v in a.items()})
         rows.append(a)

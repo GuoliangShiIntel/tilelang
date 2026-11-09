@@ -26,8 +26,8 @@ import tvm
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_sim  # noqa: E402
 import lowering  # noqa: E402
-from kernels import (make_moe_expert_prefill, moe_expert_prefill_reference, moe_route_prefill_reference,  # noqa: E402
-                     pack_int4)
+from kernels import (gm_scales, make_moe_expert_prefill, moe_expert_prefill_reference,  # noqa: E402
+                     moe_route_prefill_reference, pack_int4)
 
 N, H, I, E, TOPK, G = 12, 128, 128, 8, 2, 128
 MB, BNG, BND, TILES, SHAVES = 4, 64, 64, 3, 2
@@ -71,8 +71,8 @@ def _sim(p):
     lib = host_sim.build(low.source, "tl_moe_expert_sim")
     out = np.zeros((N, H), np.float32)
     arrays = dict(X=p["x"],
-                  WguQ=pack_int4(p["gu_int"].reshape(-1, H)), WguS=p["gu_s"].reshape(-1, H // G),
-                  WdQ=pack_int4(p["d_int"].reshape(-1, I)), WdS=p["d_s"].reshape(-1, I // G),
+                  WguQ=pack_int4(p["gu_int"].reshape(-1, H)), WguS=gm_scales(p["gu_s"].reshape(-1, H // G)),
+                  WdQ=pack_int4(p["d_int"].reshape(-1, I)), WdS=gm_scales(p["d_s"].reshape(-1, I // G)),
                   Wts=p["wts"].astype(np.float32), Off=p["off"].astype(np.int32),
                   Slot=p["slot"].astype(np.int32), Part=np.zeros((TILES, N, H), np.float32), Out=out)
     host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, arrays), TILES, SHAVES))
@@ -82,7 +82,8 @@ def _sim(p):
 def test_lowers_with_a_dequant_per_weight_chunk_and_no_merged_fc():
     src = _lower(make_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MB, BNG=BNG, BND=BND,
                                          tiles=TILES, shaves=SHAVES)).source
-    assert "tl_npu_dequant_i4_block" in src        # the prefill path dequantises a whole chunk per call
+    assert "tl_npu_dequant_i4_gm(" in src          # a whole chunk per call, from the SHARED group-major scales
+    assert "tl_npu_dequant_i4_block(" not in src   # ... never the row-major form, which needs a second upload
     assert "tl_npu_dequant_i4_row(" not in src     # ... never a call per row
     assert "dpu_matmul_i4g" not in src             # ... and does not use decode's merged-FC
     assert "ctx.sync_grid();" in src               # the combine sits behind a grid barrier

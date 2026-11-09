@@ -19,7 +19,7 @@ import tilelang  # noqa: F401
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_sim  # noqa: E402
 import lowering  # noqa: E402
-from kernels import (gdn_moe_layer_prefill_reference, make_gdn_moe_layer_prefill,  # noqa: E402
+from kernels import (gdn_moe_layer_prefill_reference, gm_scales, make_gdn_moe_layer_prefill,  # noqa: E402
                      make_moe_route_prefill, pack_int4)
 from test_intel_npu_scoped_cmx import allocations_inside_loops  # noqa: E402
 
@@ -88,11 +88,11 @@ def _run(p, n=N):
     wr_pad = np.zeros((RR, H), np.float16)
     wr_pad[:E + 1] = p["wr"]
     arrays = {"Hio": hio, "InNorm": p["inn"], "PostNorm": p["post"],
-              "WinQ": pack_int4(p["wi"]), "WinS": p["ws"], "ConvW": p["cw"], "ConvState": p["cs"],
+              "WinQ": pack_int4(p["wi"]), "WinS": gm_scales(p["ws"]), "ConvW": p["cw"], "ConvState": p["cs"],
               "ALog": p["al"], "DtBias": p["db"], "GNorm": p["gn"], "Nt": np.array([[n]], np.int32), "Ssm": sm,
-              "WoutQ": pack_int4(p["wo"]), "WoutS": p["wos"], "Wr": wr_pad,
-              "WguQ": pack_int4(p["gu_int"].reshape(-1, H)), "WguS": p["gu_s"].reshape(-1, KGH),
-              "WdQ": pack_int4(p["d_int"].reshape(-1, I)), "WdS": p["d_s"].reshape(-1, KGI),
+              "WoutQ": pack_int4(p["wo"]), "WoutS": gm_scales(p["wos"]), "Wr": wr_pad,
+              "WguQ": pack_int4(p["gu_int"].reshape(-1, H)), "WguS": gm_scales(p["gu_s"].reshape(-1, KGH)),
+              "WdQ": pack_int4(p["d_int"].reshape(-1, I)), "WdS": gm_scales(p["d_s"].reshape(-1, KGI)),
               "Xs": np.zeros((N, H), np.float16), "Ys": np.zeros((N, NIN_pad), np.float16),
               "QKs": np.zeros((KH, N, 2 * DK), np.float32), "Vs": np.zeros((VH, N, DV), np.float16),
               "Gbs": np.zeros((VH, N, 2), np.float32), "Zs": np.zeros((VH, N, DV), np.float16),

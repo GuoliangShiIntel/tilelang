@@ -837,10 +837,12 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
 
     Oracle: `moe_expert_prefill_reference`.
 
-    The weights arrive as `make_w4a16_flow`'s pair -- packed values and **row-major** scales -- not as decode's
-    chunk blocks: those carry the scales group-major so the DPU can read them in place, which is the one layout the
-    SHAVE row dequant cannot use. The int4 bytes are the same either way and scales are 1/64 of them at G = 128,
-    so a model that runs both paths carries one extra scale layout, not one extra weight tensor.
+    The weights arrive as `make_w4a16_flow`'s pair -- packed values and a SEPARATE scale tensor, carried
+    **group-major** `[K/G, N]`. That is the layout decode's DPU int4 path reads in place (`dpu_matmul_i4`'s
+    `sStride > 0`), so prefill and decode share one weight upload rather than one each; at 40 layers and 256
+    experts the second copy is the difference between fitting the box and not. The SHAVE reads it through
+    `tl_npu_dequant_i4_gm`, which keeps the VPUX assembly by transposing a chunk's scales into a stack buffer
+    first, so the layout costs the scales only -- 1/64 of the bytes at G = 128.
 
     `probe_skip='dequant'`: MEASUREMENT ARM ONLY -- the weights are still read from DDR and the gemms still run,
     but the int4 rows are not expanded (the output is wrong by design). The difference is the dequant's share."""
@@ -873,15 +875,16 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
         wts_cmx = T.alloc_local((N, 16), T.float32)
         x_cmx = T.alloc_shared((MB, H), T.float16)          # the chunk's tokens: both SHAVEs read them
         wq_cmx = T.alloc_local((BNG, H // 2), T.uint8)      # a SHAVE's own chunk of weights
-        ws_cmx = T.alloc_local((BNG, KGH), T.float16)
+        ws_cmx = T.alloc_local((KGH, BNG), T.float16)
         wg_cmx = T.alloc_local((BNG, H), T.float16)
         y_cmx = T.alloc_local((MB, BNG), T.float16)
         gu_cmx = T.alloc_shared((MB, 2 * I), T.float16)     # the SHAVEs write disjoint column ranges
         h_cmx = T.alloc_shared((MB, I), T.float16)
         wqd_cmx = T.alloc_local((DB * BND, I // 2), T.uint8)
         # the expert's down scales in one DMA instead of one per chunk: CD = 32 jobs for 16 KiB, where the same
-        # hoist on the gate/up side would cost 32 KiB to save 16, and the layer kernel has no room for both
-        wsd_all = T.alloc_shared((H, KGI), T.float16)
+        # hoist on the gate/up side would cost 32 KiB to save 16, and the layer kernel has no room for both.
+        # Group-major, so a chunk is a COLUMN range of this and the dequant reads it in place at pitch H.
+        wsd_all = T.alloc_shared((KGI, H), T.float16)
         wd_cmx = T.alloc_local((BND, I), T.float16)
         yd_cmx = T.alloc_local((MB, BND), T.float16)
         yo = T.alloc_shared((MB, H), T.float16)     # the chunk's whole down output, so Part is touched once per token
@@ -904,7 +907,7 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
             if e < E + 1:
                 # a DDR -> shared fill is split over the tile's SHAVEs and gets a tile sync, so it must not sit
                 # under a SHAVE-dependent branch: guarding one would leave the other waiting at that sync
-                T.copy(WdS[e * H, 0], wsd_all)
+                T.copy(WdS[0, e * H], wsd_all)
                 for c in T.serial(T.ceildiv(off_cmx[e + 1] - off_cmx[e], MB)):
                     # gather the chunk's token rows; a short tail keeps the last row, whose result is dropped
                     perf_begin("gath")
@@ -916,11 +919,11 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
                     for n in T.serial(CG):
                         if n % shaves == shave:
                             T.copy(WguQ[e * 2 * I + n * BNG, 0], wq_cmx)
-                            T.copy(WguS[e * 2 * I + n * BNG, 0], ws_cmx)
+                            T.copy(WguS[0, e * 2 * I + n * BNG], ws_cmx)
                             perf_begin("gdeq")
                             if not skip_dequant:
-                                T.call_extern("handle", "tl_npu_dequant_i4_block", T.address_of(wg_cmx[0, 0]),
-                                              T.address_of(wq_cmx[0, 0]), T.address_of(ws_cmx[0, 0]), BNG, H, G)
+                                T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wg_cmx[0, 0]),
+                                              T.address_of(wq_cmx[0, 0]), T.address_of(ws_cmx[0, 0]), BNG, H, G, BNG)
                             perf_end()
                             perf_begin("ggem")
                             T.gemm(x_cmx, wg_cmx, y_cmx, transpose_B=True, clear_accum=True)
@@ -945,10 +948,10 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
                         for j in T.serial(DB):
                             perf_begin("ddeq")
                             if not skip_dequant:
-                                T.call_extern("handle", "tl_npu_dequant_i4_block", T.address_of(wd_cmx[0, 0]),
+                                T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wd_cmx[0, 0]),
                                               T.address_of(wqd_cmx[j * BND, 0]),
-                                              T.address_of(wsd_all[((nb * shaves + shave) * DB + j) * BND, 0]),
-                                              BND, I, G)
+                                              T.address_of(wsd_all[0, ((nb * shaves + shave) * DB + j) * BND]),
+                                              BND, I, G, H)
                             perf_end()
                             perf_begin("dgem")
                             T.gemm(h_cmx, wd_cmx, yd_cmx, transpose_B=True, clear_accum=True)
@@ -1005,8 +1008,8 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
 
     @T.prim_func
     def moe_expert(X: T.Tensor((N, H), T.float16),
-                   WguQ: T.Tensor(((E + 1) * 2 * I, H // 2), T.uint8), WguS: T.Tensor(((E + 1) * 2 * I, KGH), T.float16),
-                   WdQ: T.Tensor(((E + 1) * H, I // 2), T.uint8), WdS: T.Tensor(((E + 1) * H, KGI), T.float16),
+                   WguQ: T.Tensor(((E + 1) * 2 * I, H // 2), T.uint8), WguS: T.Tensor((KGH, (E + 1) * 2 * I), T.float16),
+                   WdQ: T.Tensor(((E + 1) * H, I // 2), T.uint8), WdS: T.Tensor((KGI, (E + 1) * H), T.float16),
                    Wts: T.Tensor((N, 16), T.float32), Off: T.Tensor((E + 2,), T.int32),
                    Slot: T.Tensor((SLOTS,), T.int32), Part: T.Tensor((tiles, N, H), T.float32),
                    Out: T.Tensor((N, H), T.float32)):
@@ -2360,7 +2363,7 @@ def make_gdn_mixer_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 1
 
 
 def make_proj_prefill(NP: int = 128, M: int = 1024, K: int = 2048, BN: int = 64, MB: int = 32, G: int = 128,
-                      tiles: int = 3, shaves: int = 2, as_block: bool = False):
+                      tiles: int = 3, shaves: int = 2, as_block: bool = False, scales_gm: bool = False):
     """P4 step 4: a PREFILL projection -- `Yout[NP, M] = X[NP, K] . dequant(Wq[M, K])^T`, int4 symmetric with one
     fp16 scale per group of G along K.
 
@@ -2373,9 +2376,11 @@ def make_proj_prefill(NP: int = 128, M: int = 1024, K: int = 2048, BN: int = 64,
     tokens in blocks of MB against it. That ordering is the point: the other way round re-dequantises the same
     weights for every token block.
 
-    Weights are the packed values and **row-major** scales of `make_w4a16_flow`, not decode's chunk blocks, for the
-    reason `make_moe_expert_prefill` gives: chunk blocks carry the scales group-major for the DPU to read in place,
-    which is the one layout the SHAVE row dequant cannot use. Oracle: `proj_prefill_reference`."""
+    `scales_gm`: the scales are GROUP-MAJOR `[K/G, M]`, which is the layout the DPU's int4 path reads in place, so
+    one scale tensor serves prefill and decode and the weights are uploaded once (npu_dsl's arrangement). The
+    chunk's scales are then a `[K/G, BN]` 2-D read at stride M, and the dequant is `tl_npu_dequant_i4_gm`, which
+    keeps the VPUX assembly by transposing a chunk's scales first. `False` is the ROW-MAJOR `[M, K/G]` form.
+    Oracle: `proj_prefill_reference`."""
     assert M % BN == 0 and NP % MB == 0 and K % G == 0 and K % 32 == 0
     KG = K // G
     NCH, NTB = M // BN, NP // MB
@@ -2387,7 +2392,7 @@ def make_proj_prefill(NP: int = 128, M: int = 1024, K: int = 2048, BN: int = 64,
     def proj_phase(X, Wq, S, Yout, tile, shave):
         worker = tile * shaves + shave
         wq_cmx = T.alloc_local((BN, K // 2), T.uint8)
-        s_cmx = T.alloc_local((BN, KG), T.float16)
+        s_cmx = T.alloc_local((KG, BN) if scales_gm else (BN, KG), T.float16)
         w_cmx = T.alloc_local((BN, K), T.float16)
         x_cmx = T.alloc_local((MB, K), T.float16)
         y_cmx = T.alloc_local((MB, BN), T.float16)
@@ -2400,9 +2405,14 @@ def make_proj_prefill(NP: int = 128, M: int = 1024, K: int = 2048, BN: int = 64,
             n = it * workers + worker
             if n < NCH:
                 T.copy(Wq[n * BN, 0], wq_cmx)
-                T.copy(S[n * BN, 0], s_cmx)
-                T.call_extern("handle", "tl_npu_dequant_i4_block", T.address_of(w_cmx[0, 0]),
-                              T.address_of(wq_cmx[0, 0]), T.address_of(s_cmx[0, 0]), BN, K, G)
+                if scales_gm:
+                    T.copy(S[0, n * BN], s_cmx)
+                    T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(w_cmx[0, 0]),
+                                  T.address_of(wq_cmx[0, 0]), T.address_of(s_cmx[0, 0]), BN, K, G)
+                else:
+                    T.copy(S[n * BN, 0], s_cmx)
+                    T.call_extern("handle", "tl_npu_dequant_i4_block", T.address_of(w_cmx[0, 0]),
+                                  T.address_of(wq_cmx[0, 0]), T.address_of(s_cmx[0, 0]), BN, K, G)
                 for b in T.serial(NTB):
                     T.copy(X[b * MB, 0], x_cmx)
                     T.gemm(x_cmx, w_cmx, y_cmx, transpose_B=True, clear_accum=True)
@@ -2413,7 +2423,7 @@ def make_proj_prefill(NP: int = 128, M: int = 1024, K: int = 2048, BN: int = 64,
 
     @T.prim_func
     def proj(X: T.Tensor((NP, K), T.float16), Wq: T.Tensor((M, K // 2), T.uint8),
-             S: T.Tensor((M, KG), T.float16), Yout: T.Tensor((NP, M), T.float16)):
+             S: T.Tensor((KG, M) if scales_gm else (M, KG), T.float16), Yout: T.Tensor((NP, M), T.float16)):
         with T.Kernel(tiles, threads=shaves) as tile:
             proj_phase(X, Wq, S, Yout, tile, T.get_thread_binding())
 
@@ -2481,8 +2491,9 @@ def make_gdn_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: int = 
     NP = -(-N // step) * step
     NIN_pad = -(-NIN // BN1) * BN1
     in_proj, _ = make_proj_prefill(NP=NP, M=NIN_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves,
-                                   as_block=True)
-    out_proj, _ = make_proj_prefill(NP=NP, M=H, K=VC, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True)
+                                   as_block=True, scales_gm=True)
+    out_proj, _ = make_proj_prefill(NP=NP, M=H, K=VC, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True,
+                                    scales_gm=True)
     workers = tiles * shaves
     FL = 16
     assert H % FL == 0 and NP % workers == 0
@@ -2490,12 +2501,12 @@ def make_gdn_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: int = 
 
     @T.prim_func
     def gdn_layer_prefill(Hio: T.Tensor((NP, H), T.float32), InNorm: T.Tensor((1, H), T.float16),
-                          WinQ: T.Tensor((NIN_pad, H // 2), T.uint8), WinS: T.Tensor((NIN_pad, H // G), T.float16),
+                          WinQ: T.Tensor((NIN_pad, H // 2), T.uint8), WinS: T.Tensor((H // G, NIN_pad), T.float16),
                           ConvW: T.Tensor((4, CONV), T.float16), ConvState: T.Tensor((3, CONV), T.float16),
                           ALog: T.Tensor((1, VH), T.float32), DtBias: T.Tensor((1, VH), T.float32),
                           GNorm: T.Tensor((1, DV), T.float16), Nt: T.Tensor((1, 1), T.int32),
                           Ssm: T.Tensor((VH, DK, DV), T.float32),
-                          WoutQ: T.Tensor((H, VC // 2), T.uint8), WoutS: T.Tensor((H, VC // G), T.float16),
+                          WoutQ: T.Tensor((H, VC // 2), T.uint8), WoutS: T.Tensor((VC // G, H), T.float16),
                           Xs: T.Tensor((NP, H), T.float16), Ys: T.Tensor((NP, NIN_pad), T.float16),
                           QKs: T.Tensor((KH, NP, 2 * DK), T.float32), Vs: T.Tensor((VH, NP, DV), T.float16),
                           Gbs: T.Tensor((VH, NP, 2), T.float32), Zs: T.Tensor((VH, NP, DV), T.float16),
@@ -2582,8 +2593,9 @@ def make_gdn_moe_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: in
     NP = -(-N // step) * step
     NIN_pad = -(-NIN // BN1) * BN1
     in_proj, _ = make_proj_prefill(NP=NP, M=NIN_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves,
-                                   as_block=True)
-    out_proj, _ = make_proj_prefill(NP=NP, M=H, K=VC, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True)
+                                   as_block=True, scales_gm=True)
+    out_proj, _ = make_proj_prefill(NP=NP, M=H, K=VC, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True,
+                                    scales_gm=True)
     route_phase, rs = make_moe_route_prefill(N=NP, H=H, E=E, TOPK=TOPK, BM=BM, BNR=BNR, tiles=tiles, shaves=shaves,
                                              as_block=True)
     expert_phase, es = make_moe_expert_prefill(N=NP, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MBe, BNG=BNG, BND=BND,
@@ -2598,16 +2610,16 @@ def make_gdn_moe_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: in
     @T.prim_func
     def gdn_moe_layer(Hio: T.Tensor((NP, H), T.float32), InNorm: T.Tensor((1, H), T.float16),
                       PostNorm: T.Tensor((1, H), T.float16),
-                      WinQ: T.Tensor((NIN_pad, H // 2), T.uint8), WinS: T.Tensor((NIN_pad, H // G), T.float16),
+                      WinQ: T.Tensor((NIN_pad, H // 2), T.uint8), WinS: T.Tensor((H // G, NIN_pad), T.float16),
                       ConvW: T.Tensor((4, CONV), T.float16), ConvState: T.Tensor((3, CONV), T.float16),
                       ALog: T.Tensor((1, VH), T.float32), DtBias: T.Tensor((1, VH), T.float32),
                       GNorm: T.Tensor((1, DV), T.float16), Nt: T.Tensor((1, 1), T.int32),
                       Ssm: T.Tensor((VH, DK, DV), T.float32),
-                      WoutQ: T.Tensor((H, VC // 2), T.uint8), WoutS: T.Tensor((H, VC // G), T.float16),
+                      WoutQ: T.Tensor((H, VC // 2), T.uint8), WoutS: T.Tensor((VC // G, H), T.float16),
                       Wr: T.Tensor((RR, H), T.float16),
                       WguQ: T.Tensor(((E + 1) * 2 * I, H // 2), T.uint8),
-                      WguS: T.Tensor(((E + 1) * 2 * I, KGH), T.float16),
-                      WdQ: T.Tensor(((E + 1) * H, I // 2), T.uint8), WdS: T.Tensor(((E + 1) * H, KGI), T.float16),
+                      WguS: T.Tensor((KGH, (E + 1) * 2 * I), T.float16),
+                      WdQ: T.Tensor(((E + 1) * H, I // 2), T.uint8), WdS: T.Tensor((KGI, (E + 1) * H), T.float16),
                       Xs: T.Tensor((NP, H), T.float16), Ys: T.Tensor((NP, NIN_pad), T.float16),
                       QKs: T.Tensor((KH, NP, 2 * DK), T.float32), Vs: T.Tensor((VH, NP, DV), T.float16),
                       Gbs: T.Tensor((VH, NP, 2), T.float32), Zs: T.Tensor((VH, NP, DV), T.float16),
@@ -3058,8 +3070,9 @@ def make_attn_layer_prefill(N: int = 64, H: int = 2048, NH: int = 16, NKV: int =
     NQKV = qs["NQKV"]
     NQKV_pad = -(-NQKV // BN1) * BN1
     qkv_proj, _ = make_proj_prefill(NP=NP, M=NQKV_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves,
-                                    as_block=True)
-    o_proj, _ = make_proj_prefill(NP=NP, M=H, K=KO, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True)
+                                    as_block=True, scales_gm=True)
+    o_proj, _ = make_proj_prefill(NP=NP, M=H, K=KO, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True,
+                                  scales_gm=True)
     assert fs["KO"] == KO
     FL = 16
     assert H % FL == 0 and NP % workers == 0
@@ -3068,12 +3081,12 @@ def make_attn_layer_prefill(N: int = 64, H: int = 2048, NH: int = 16, NKV: int =
     @T.prim_func
     def attn_layer_prefill(Hio: T.Tensor((NP, H), T.float32), InNorm: T.Tensor((1, H), T.float16),
                            WqkvQ: T.Tensor((NQKV_pad, H // 2), T.uint8),
-                           WqkvS: T.Tensor((NQKV_pad, H // G), T.float16),
+                           WqkvS: T.Tensor((H // G, NQKV_pad), T.float16),
                            QNormW: T.Tensor((1, D), T.float16), KNormW: T.Tensor((1, D), T.float16),
                            CosSin: T.Tensor((NP, 2 * ROT), T.float32), Pos: T.Tensor((1, 1), T.int32),
                            Nt: T.Tensor((1, 1), T.int32), Kc: T.Tensor((NKV, SMAX, D), T.float16),
                            Vt: T.Tensor((NKV, D, SMAX), T.float16),
-                           WoQ: T.Tensor((H, KO // 2), T.uint8), WoS: T.Tensor((H, KO // G), T.float16),
+                           WoQ: T.Tensor((H, KO // 2), T.uint8), WoS: T.Tensor((KO // G, H), T.float16),
                            Xs: T.Tensor((NP, H), T.float16), Ys: T.Tensor((NP, NQKV_pad), T.float16),
                            Q: T.Tensor((NKV, NP, GQ, D), T.float16), Gate: T.Tensor((NP, KO), T.float16),
                            Os: T.Tensor((NP, KO), T.float16), Mix: T.Tensor((NP, H), T.float16)):
@@ -3163,8 +3176,9 @@ def make_attn_moe_layer_prefill(N: int = 64, H: int = 2048, NH: int = 16, NKV: i
     NQKV = qs["NQKV"]
     NQKV_pad = -(-NQKV // BN1) * BN1
     qkv_proj, _ = make_proj_prefill(NP=NP, M=NQKV_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves,
-                                    as_block=True)
-    o_proj, _ = make_proj_prefill(NP=NP, M=H, K=KO, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True)
+                                    as_block=True, scales_gm=True)
+    o_proj, _ = make_proj_prefill(NP=NP, M=H, K=KO, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True,
+                                  scales_gm=True)
     route_phase, rs = make_moe_route_prefill(N=NP, H=H, E=E, TOPK=TOPK, BM=BM, BNR=BNR, tiles=tiles, shaves=shaves,
                                              as_block=True)
     expert_phase, _ = make_moe_expert_prefill(N=NP, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MBe, BNG=BNG, BND=BND,
@@ -3178,16 +3192,16 @@ def make_attn_moe_layer_prefill(N: int = 64, H: int = 2048, NH: int = 16, NKV: i
     @T.prim_func
     def attn_moe_layer(Hio: T.Tensor((NP, H), T.float32), InNorm: T.Tensor((1, H), T.float16),
                        PostNorm: T.Tensor((1, H), T.float16),
-                       WqkvQ: T.Tensor((NQKV_pad, H // 2), T.uint8), WqkvS: T.Tensor((NQKV_pad, H // G), T.float16),
+                       WqkvQ: T.Tensor((NQKV_pad, H // 2), T.uint8), WqkvS: T.Tensor((H // G, NQKV_pad), T.float16),
                        QNormW: T.Tensor((1, D), T.float16), KNormW: T.Tensor((1, D), T.float16),
                        CosSin: T.Tensor((NP, 2 * ROT), T.float32), Pos: T.Tensor((1, 1), T.int32),
                        Nt: T.Tensor((1, 1), T.int32), Kc: T.Tensor((NKV, SMAX, D), T.float16),
                        Vt: T.Tensor((NKV, D, SMAX), T.float16),
-                       WoQ: T.Tensor((H, KO // 2), T.uint8), WoS: T.Tensor((H, KO // G), T.float16),
+                       WoQ: T.Tensor((H, KO // 2), T.uint8), WoS: T.Tensor((KO // G, H), T.float16),
                        Wr: T.Tensor((RR, H), T.float16),
                        WguQ: T.Tensor(((E + 1) * 2 * I, H // 2), T.uint8),
-                       WguS: T.Tensor(((E + 1) * 2 * I, KGH), T.float16),
-                       WdQ: T.Tensor(((E + 1) * H, I // 2), T.uint8), WdS: T.Tensor(((E + 1) * H, KGI), T.float16),
+                       WguS: T.Tensor((KGH, (E + 1) * 2 * I), T.float16),
+                       WdQ: T.Tensor(((E + 1) * H, I // 2), T.uint8), WdS: T.Tensor((KGI, (E + 1) * H), T.float16),
                        Xs: T.Tensor((NP, H), T.float16), Ys: T.Tensor((NP, NQKV_pad), T.float16),
                        Q: T.Tensor((NKV, NP, GQ, D), T.float16), Gate: T.Tensor((NP, KO), T.float16),
                        Os: T.Tensor((NP, KO), T.float16), Mix: T.Tensor((NP, H), T.float16),
@@ -3372,6 +3386,19 @@ def pack_int4(w_int: "np.ndarray") -> "np.ndarray":
     import numpy as np
     q = (w_int.astype(np.int16) & 0xF).astype(np.uint8)
     return (q[:, 0::2] | (q[:, 1::2] << 4)).astype(np.uint8)
+
+
+def gm_scales(s: "np.ndarray") -> "np.ndarray":
+    """Row-major scales `[N, K/G]` -> the GROUP-MAJOR `[K/G, N]` the kernels read.
+
+    One layout serves both paths: the DPU's int4 GEMV takes it in place (`dpu_matmul_i4`'s `sStride > 0`) and the
+    prefill SHAVE dequant reads it through `tl_npu_dequant_i4_gm`. That is what lets prefill and decode share a
+    single weight upload -- decode alone moves 17.91 GB of the 40 layers per prompt, so a second copy does not
+    fit the box. It is npu_dsl's arrangement, deliberately copied.
+
+    This is the TEST-side packer; `e2e/pack.py` writes the same bytes from the checkpoint."""
+    import numpy as np
+    return np.ascontiguousarray(s.T)
 
 
 def make_head(H: int = 2048, V: int = 248320, G: int = 128, tiles: int = 3, shaves: int = 2, BN: int = 128, R: int = 64,
@@ -4003,12 +4030,13 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
     NQKV_pad = -(-qs["NQKV"] // BN1) * BN1
     YW, OW = max(NIN_pad, NQKV_pad), max(VC, KO)
     in_proj, _ = make_proj_prefill(NP=NP, M=NIN_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves,
-                                   as_block=True)
+                                   as_block=True, scales_gm=True)
     gdn_out_proj, _ = make_proj_prefill(NP=NP, M=H, K=VC, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves,
-                                        as_block=True)
+                                        as_block=True, scales_gm=True)
     qkv_proj, _ = make_proj_prefill(NP=NP, M=NQKV_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves,
-                                    as_block=True)
-    o_proj, _ = make_proj_prefill(NP=NP, M=H, K=KO, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True)
+                                    as_block=True, scales_gm=True)
+    o_proj, _ = make_proj_prefill(NP=NP, M=H, K=KO, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True,
+                                  scales_gm=True)
     route_phase, rs = make_moe_route_prefill(N=NP, H=H, E=E, TOPK=TOPK, BM=BM, BNR=BNR, tiles=tiles,
                                              shaves=shaves, as_block=True)
     expert_phase, _ = make_moe_expert_prefill(N=NP, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MBe, BNG=BNG, BND=BND,
@@ -4099,21 +4127,21 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
                 PostNorm = T.ddr_view(Table[li, col["PostNorm"]], (1, H), T.float16)
                 Wr = T.ddr_view(Table[li, col["Wr"]], (RR, H), T.float16)
                 WguQ = T.ddr_view(Table[li, col["WguQ"]], ((E + 1) * 2 * I, H // 2), T.uint8)
-                WguS = T.ddr_view(Table[li, col["WguS"]], ((E + 1) * 2 * I, KGH), T.float16)
+                WguS = T.ddr_view(Table[li, col["WguS"]], (KGH, (E + 1) * 2 * I), T.float16)
                 WdQ = T.ddr_view(Table[li, col["WdQ"]], ((E + 1) * H, I // 2), T.uint8)
-                WdS = T.ddr_view(Table[li, col["WdS"]], ((E + 1) * H, KGI), T.float16)
+                WdS = T.ddr_view(Table[li, col["WdS"]], (KGI, (E + 1) * H), T.float16)
                 if "norm" not in skip:
                     norm_tokens(Hio, InNorm, Xs, nw, hrow, xrow, ls, st, worker)
                 T.sync_grid()
                 if Kind[li, 0] == 0:
                     WinQ = T.ddr_view(Table[li, col["W0"]], (NIN_pad, H // 2), T.uint8)
-                    WinS = T.ddr_view(Table[li, col["W1"]], (NIN_pad, H // G), T.float16)
+                    WinS = T.ddr_view(Table[li, col["W1"]], (H // G, NIN_pad), T.float16)
                     ConvW = T.ddr_view(Table[li, col["W2"]], (4, CONV), T.float16)
                     ALog = T.ddr_view(Table[li, col["W3"]], (1, VH), T.float32)
                     DtBias = T.ddr_view(Table[li, col["W4"]], (1, VH), T.float32)
                     GNorm = T.ddr_view(Table[li, col["W5"]], (1, DV), T.float16)
                     WoutQ = T.ddr_view(Table[li, col["W6"]], (H, VC // 2), T.uint8)
-                    WoutS = T.ddr_view(Table[li, col["W7"]], (H, VC // G), T.float16)
+                    WoutS = T.ddr_view(Table[li, col["W7"]], (VC // G, H), T.float16)
                     ConvState = T.ddr_view(Table[li, col["S0"]], (3, CONV), T.float16)
                     Ssm = T.ddr_view(Table[li, col["S1"]], (VH, DK, DV), T.float32)
                     if "gdn" not in skip:
@@ -4129,11 +4157,11 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
                         add_mix(Hio, Mix, hrow, mrow, nt, worker)
                 else:
                     WqkvQ = T.ddr_view(Table[li, col["W0"]], (NQKV_pad, H // 2), T.uint8)
-                    WqkvS = T.ddr_view(Table[li, col["W1"]], (NQKV_pad, H // G), T.float16)
+                    WqkvS = T.ddr_view(Table[li, col["W1"]], (H // G, NQKV_pad), T.float16)
                     QNormW = T.ddr_view(Table[li, col["W2"]], (1, D), T.float16)
                     KNormW = T.ddr_view(Table[li, col["W3"]], (1, D), T.float16)
                     WoQ = T.ddr_view(Table[li, col["W4"]], (H, KO // 2), T.uint8)
-                    WoS = T.ddr_view(Table[li, col["W5"]], (H, KO // G), T.float16)
+                    WoS = T.ddr_view(Table[li, col["W5"]], (KO // G, H), T.float16)
                     if "attn" not in skip:
                         qkv_proj(Xs, WqkvQ, WqkvS, Ys, tile, shave)
                         T.sync_grid()

@@ -117,6 +117,18 @@ static inline void tl_npu_dequant_i4_block(half *dst, const unsigned char *src, 
   for (unsigned r = 0; r < rows; ++r)
     tl_npu_dequant_i4_row(dst + r * width, src + r * (width / 2), scales + r * (width / group), width, group);
 }
+// Group-major scales, the device runtime's `tl_npu_dequant_i4_gm`: s[(k / group) * sStride + r], where sStride
+// defaults to `rows` (a chunk in its own buffer) and is larger when the chunk sits inside a wider scale table.
+static inline void tl_npu_dequant_i4_gm(half *dst, const unsigned char *src, const half *s, unsigned rows,
+                                        unsigned width, unsigned group, unsigned sStride = 0) {
+  if (sStride == 0) sStride = rows;
+  for (unsigned r = 0; r < rows; ++r)
+    for (unsigned k = 0; k < width; ++k) {
+      const unsigned i = r * width + k;
+      const int n = (i & 1) ? (src[i >> 1] >> 4) : (src[i >> 1] & 0xF);
+      dst[i] = (half)((float)((n ^ 8) - 8) * (float)s[(k / group) * sStride + r]);
+    }
+}
 
 #if defined(_WIN32)
 #define NPU_SIM_EXPORT extern "C" __declspec(dllexport)

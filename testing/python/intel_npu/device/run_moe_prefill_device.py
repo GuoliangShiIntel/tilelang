@@ -25,8 +25,8 @@ sys.path.insert(0, str(HERE))
 import tilelang  # noqa: E402,F401
 import runner  # noqa: E402
 import lowering  # noqa: E402
-from kernels import (make_moe_expert_prefill, make_moe_route_prefill, moe_expert_prefill_reference,  # noqa: E402
-                     moe_route_prefill_reference, pack_int4)
+from kernels import (gm_scales, make_moe_expert_prefill, make_moe_route_prefill,  # noqa: E402
+                     moe_expert_prefill_reference, moe_route_prefill_reference, pack_int4)
 
 TILES, SHAVES = 3, 2
 WORKERS = TILES * SHAVES
@@ -115,8 +115,9 @@ def main(argv):
         def run(gu, dw, profile=False):
             out = np.zeros((N, H), np.float32)
             arrays = {"X": ("in", x), "WguQ": ("in", pack_int4(gu.reshape(-1, H))),
-                      "WguS": ("in", gu_s.reshape(-1, H // G)), "WdQ": ("in", pack_int4(dw.reshape(-1, I))),
-                      "WdS": ("in", d_s.reshape(-1, I // G)), "Wts": ("in", ref["wts"].astype(np.float32)),
+                      "WguS": ("in", gm_scales(gu_s.reshape(-1, H // G))),
+                      "WdQ": ("in", pack_int4(dw.reshape(-1, I))),
+                      "WdS": ("in", gm_scales(d_s.reshape(-1, I // G))), "Wts": ("in", ref["wts"].astype(np.float32)),
                       "Off": ("in", ref["off"].astype(np.int32)), "Slot": ("in", ref["slot"].astype(np.int32)),
                       "Part": ("out", np.zeros((TILES, N, H), np.float32)), "Out": ("out", out)}
             trace = HERE / "evidence" / f"tl_moe_expert_prefill_n{N}_trace.json" if profile else None

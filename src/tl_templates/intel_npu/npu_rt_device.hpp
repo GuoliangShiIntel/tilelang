@@ -190,6 +190,90 @@ static inline void tl_npu_dequant_i4_block(half *__restrict dst, const unsigned 
     tl_npu_dequant_i4_row(dst + r * width, src + r * (width / 2), scales + r * (width / group), width, group);
 }
 
+// The same block with GROUP-MAJOR scales: `out[r, k] = q[r, k] * s[(k / group) * sStride + r]`, which is the
+// layout the DPU's int4 path reads in place (`dpu_matmul_i4`'s sStride > 0), so one scale tensor serves both the
+// DPU GEMV and this SHAVE dequantisation and a model that runs both paths uploads its weights once.
+//
+// `sStride` is the scale table's row pitch and defaults to `rows`, which is the compact case -- a chunk DMA'd
+// into its own CMX buffer. Passing a larger pitch reads a chunk out of a WIDER hoisted table in place, which is
+// what the MoE expert's down projection does: it fetches one expert's scales in a single DMA and then hands each
+// row chunk a pointer into it, so the layout costs no extra copy.
+//
+// Ported from npu_dsl's `dequant_i4_gm` (kernels_poc/common/fused_ops.hpp; plan section 0's amendment: its
+// hardware-verified SHAVE algorithms may be ported with the origin named), with the stride generalised. The
+// point of the port is that the VPUX assembly is KEPT: a chunk of rows has its scales transposed into a
+// 512-entry stack buffer first -- four groups x eight rows per step, four half8 loads and eight half4 stores --
+// so the per-element rate stays the asm's 0.043 cycles and only the scales (1/`group` of the values) pay for the
+// layout.
+static inline void tl_npu_dequant_i4_gm(half *__restrict dst, const unsigned char *__restrict src,
+                                        const half *__restrict s, std::uint32_t rows, std::uint32_t width,
+                                        std::uint32_t group, std::uint32_t sStride = 0) {
+  if (sStride == 0) sStride = rows;
+  if (group == 128 && width % 128 == 0 && width >= 256 && width / 128 <= 512) {
+    const std::uint32_t ng = width / 128, per = 512 / ng;
+    half st[512];
+    for (std::uint32_t r0 = 0; r0 < rows; r0 += per) {
+      const std::uint32_t rc = rows - r0 < per ? rows - r0 : per;
+      // every half8 load below is `s + g * sStride + r0 + r`, so the pitch, the chunk base and the chunk length
+      // all have to be 8 halves (16 bytes) wide for the vector transpose to be legal
+      if (ng % 4 == 0 && rc % 8 == 0 && r0 % 8 == 0 && sStride % 8 == 0 &&
+          (reinterpret_cast<std::uintptr_t>(s) & 15) == 0) {
+        for (std::uint32_t g = 0; g < ng; g += 4)
+          for (std::uint32_t r = 0; r < rc; r += 8) {
+            const half *p = s + g * sStride + r0 + r;
+            const half8 a = *reinterpret_cast<const half8 *>(p), b = *reinterpret_cast<const half8 *>(p + sStride);
+            const half8 c = *reinterpret_cast<const half8 *>(p + 2 * sStride), d = *reinterpret_cast<const half8 *>(p + 3 * sStride);
+            const half8 ab0 = __builtin_shufflevector(a, b, 0, 8, 1, 9, 2, 10, 3, 11);
+            const half8 ab1 = __builtin_shufflevector(a, b, 4, 12, 5, 13, 6, 14, 7, 15);
+            const half8 cd0 = __builtin_shufflevector(c, d, 0, 8, 1, 9, 2, 10, 3, 11);
+            const half8 cd1 = __builtin_shufflevector(c, d, 4, 12, 5, 13, 6, 14, 7, 15);
+            half *o = st + r * ng + g;
+            *reinterpret_cast<half4 *>(o + 0 * ng) = __builtin_shufflevector(ab0, cd0, 0, 1, 8, 9);
+            *reinterpret_cast<half4 *>(o + 1 * ng) = __builtin_shufflevector(ab0, cd0, 2, 3, 10, 11);
+            *reinterpret_cast<half4 *>(o + 2 * ng) = __builtin_shufflevector(ab0, cd0, 4, 5, 12, 13);
+            *reinterpret_cast<half4 *>(o + 3 * ng) = __builtin_shufflevector(ab0, cd0, 6, 7, 14, 15);
+            *reinterpret_cast<half4 *>(o + 4 * ng) = __builtin_shufflevector(ab1, cd1, 0, 1, 8, 9);
+            *reinterpret_cast<half4 *>(o + 5 * ng) = __builtin_shufflevector(ab1, cd1, 2, 3, 10, 11);
+            *reinterpret_cast<half4 *>(o + 6 * ng) = __builtin_shufflevector(ab1, cd1, 4, 5, 12, 13);
+            *reinterpret_cast<half4 *>(o + 7 * ng) = __builtin_shufflevector(ab1, cd1, 6, 7, 14, 15);
+          }
+      } else {
+        for (std::uint32_t r = 0; r < rc; ++r)
+          for (std::uint32_t g = 0; g < ng; ++g)
+            st[r * ng + g] = s[g * sStride + r0 + r];
+      }
+      asm_dequant_dynamic_i4_f16_v0(src + r0 * width / 2, st, dst + r0 * width, (int)(rc * ng));
+    }
+    return;
+  }
+  if (width % 512 == 0 && group % 64 == 0) {
+    for (std::uint32_t r = 0; r < rows; ++r)
+      for (std::uint32_t b = 0; b < width / 512; ++b) {
+        const unsigned char *__restrict q = src + (r * width + b * 512) / 2;
+        half32 *__restrict d = reinterpret_cast<half32 *>(dst + r * width + b * 512);
+        schar64 v[8];
+        half32 sc[8];
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i) {
+          v[i] = __builtin_shave_lsu_ld512_i4_i8_r((const char64 *)(q + i * 32));
+          sc[i] = (half32)(s[((b * 512 + i * 64) / group) * sStride + r]);
+        }
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i) {
+          d[2 * i] = __builtin_convertvector(v[i].lo, half32) * sc[i];
+          d[2 * i + 1] = __builtin_convertvector(v[i].hi, half32) * sc[i];
+        }
+      }
+    return;
+  }
+  for (std::uint32_t r = 0; r < rows; ++r)
+    for (std::uint32_t k = 0; k < width; ++k) {
+      const std::uint32_t i = r * width + k;
+      const std::int32_t nib = (i % 2 == 0) ? (src[i / 2] & 0xF) : (src[i / 2] >> 4);
+      dst[i] = static_cast<half>(static_cast<float>((nib ^ 8) - 8) * static_cast<float>(s[(k / group) * sStride + r]));
+    }
+}
+
 namespace npu {
 
 // Status word 0 per SHAVE, read by the host runner; word 1 is the detail.

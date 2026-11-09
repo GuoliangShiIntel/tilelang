@@ -26,7 +26,7 @@ sys.path.insert(0, str(HERE))
 import tilelang  # noqa: E402,F401
 import runner  # noqa: E402
 import lowering  # noqa: E402
-from kernels import (attn_moe_layer_prefill_reference, make_attn_moe_layer_prefill,  # noqa: E402
+from kernels import (attn_moe_layer_prefill_reference, gm_scales, make_attn_moe_layer_prefill,  # noqa: E402
                      make_moe_route_prefill, pack_int4, rope_cos_sin)
 
 TILES, SHAVES = 3, 2
@@ -99,12 +99,13 @@ def main(argv):
     def run(wo_in, wos_in, d_in, ds_in):
         hio, kc, vt = h.copy(), kc0.copy(), vt0.copy()
         arrays = {"Hio": ("inout", hio), "InNorm": ("in", inn), "PostNorm": ("in", post),
-                  "WqkvQ": ("in", pack_int4(wq)), "WqkvS": ("in", wqs), "QNormW": ("in", qn), "KNormW": ("in", kn),
+                  "WqkvQ": ("in", pack_int4(wq)), "WqkvS": ("in", gm_scales(wqs)), "QNormW": ("in", qn),
+                  "KNormW": ("in", kn),
                   "CosSin": ("in", cs), "Pos": ("in", np.array([[pos0]], np.int32)),
                   "Nt": ("in", np.array([[n]], np.int32)), "Kc": ("inout", kc), "Vt": ("inout", vt),
-                  "WoQ": ("in", pack_int4(wo_in)), "WoS": ("in", wos_in), "Wr": ("in", wr_pad),
-                  "WguQ": ("in", pack_int4(gu_int.reshape(-1, H))), "WguS": ("in", gu_s.reshape(-1, KGH)),
-                  "WdQ": ("in", pack_int4(d_in.reshape(-1, I))), "WdS": ("in", ds_in.reshape(-1, KGI)),
+                  "WoQ": ("in", pack_int4(wo_in)), "WoS": ("in", gm_scales(wos_in)), "Wr": ("in", wr_pad),
+                  "WguQ": ("in", pack_int4(gu_int.reshape(-1, H))), "WguS": ("in", gm_scales(gu_s.reshape(-1, KGH))),
+                  "WdQ": ("in", pack_int4(d_in.reshape(-1, I))), "WdS": ("in", gm_scales(ds_in.reshape(-1, KGI))),
                   "Xs": ("out", np.zeros((NP, H), np.float16)),
                   "Ys": ("out", np.zeros((NP, NQKV_pad), np.float16)),
                   "Q": ("out", np.zeros((NKV, NP, GQ, D), np.float16)),

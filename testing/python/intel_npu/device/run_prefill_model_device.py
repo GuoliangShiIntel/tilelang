@@ -30,8 +30,8 @@ import tilelang  # noqa: E402,F401
 import tvm  # noqa: E402
 import runner  # noqa: E402
 import lowering  # noqa: E402
-from kernels import (ATTN_PREFILL_TABLE, GDN_PREFILL_TABLE, PREFILL_TABLE_COLS, make_moe_route_prefill,  # noqa: E402
-                     make_prefill_model, pack_int4, prefill_model_reference, rope_cos_sin)
+from kernels import (ATTN_PREFILL_TABLE, GDN_PREFILL_TABLE, PREFILL_TABLE_COLS, gm_scales,  # noqa: E402
+                     make_moe_route_prefill, make_prefill_model, pack_int4, prefill_model_reference, rope_cos_sin)
 
 TILES, SHAVES = 3, 2
 H, KH, VH, DK, DV, G = 2048, 16, 32, 128, 128, 128
@@ -96,19 +96,19 @@ def table_arrays(p: dict, RR: int, zero_out: bool = False) -> dict:
     d_int = np.zeros_like(p["d_int"]) if zero_out else p["d_int"]
     d_s = np.zeros_like(p["d_s"]) if zero_out else p["d_s"]
     a = {"InNorm": p["in_norm"], "PostNorm": p["post_norm"], "Wr": wr_pad,
-         "WguQ": pack_int4(p["gu_int"].reshape(-1, H)), "WguS": p["gu_s"].reshape(-1, KGH),
-         "WdQ": pack_int4(d_int.reshape(-1, I)), "WdS": d_s.reshape(-1, KGI)}
+         "WguQ": pack_int4(p["gu_int"].reshape(-1, H)), "WguS": gm_scales(p["gu_s"].reshape(-1, KGH)),
+         "WdQ": pack_int4(d_int.reshape(-1, I)), "WdS": gm_scales(d_s.reshape(-1, KGI))}
     if p["kind"] == "gdn":
         wout = np.zeros_like(p["wout_int"]) if zero_out else p["wout_int"]
         wos = np.zeros_like(p["wout_s"]) if zero_out else p["wout_s"]
-        a.update({"W0": pack_int4(p["win_int"]), "W1": p["win_s"], "W2": p["conv_w"], "W3": p["a_log"],
-                  "W4": p["dt_bias"], "W5": p["gnorm"], "W6": pack_int4(wout), "W7": wos,
+        a.update({"W0": pack_int4(p["win_int"]), "W1": gm_scales(p["win_s"]), "W2": p["conv_w"], "W3": p["a_log"],
+                  "W4": p["dt_bias"], "W5": p["gnorm"], "W6": pack_int4(wout), "W7": gm_scales(wos),
                   "S0": p["conv_state"], "S1": p["ssm"]})
     else:
         wo = np.zeros_like(p["wo_int"]) if zero_out else p["wo_int"]
         wos = np.zeros_like(p["wo_s"]) if zero_out else p["wo_s"]
-        a.update({"W0": pack_int4(p["wqkv_int"]), "W1": p["wqkv_s"], "W2": p["qnorm"], "W3": p["knorm"],
-                  "W4": pack_int4(wo), "W5": wos})
+        a.update({"W0": pack_int4(p["wqkv_int"]), "W1": gm_scales(p["wqkv_s"]), "W2": p["qnorm"], "W3": p["knorm"],
+                  "W4": pack_int4(wo), "W5": gm_scales(wos)})
     return {k: np.ascontiguousarray(v) for k, v in a.items()}
 
 
