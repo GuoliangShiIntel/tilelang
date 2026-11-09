@@ -68,7 +68,7 @@ def main(argv):
         y[3] = y[3] + np.float16(4.0)
 
     q = np.zeros((NKV, NP, GQ, D), np.float16)
-    gate = np.zeros((NKV, NP, GQ, D), np.float16)
+    gate = np.zeros((NP, NH * D), np.float16)
     arrays = {"Ys": ("in", y), "QNormW": ("in", qw), "KNormW": ("in", kw), "CosSin": ("in", cs),
               "Pos": ("in", np.array([[pos0]], np.int32)), "Nt": ("in", np.array([[N]], np.int32)),
               "Q": ("out", q), "Gate": ("out", gate), "Kc": ("inout", kc), "Vt": ("inout", vt)}

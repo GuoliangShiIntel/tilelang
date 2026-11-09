@@ -57,7 +57,7 @@ def main(argv):
 
     rng = np.random.default_rng(0)
     q = rng.standard_normal((NKV, N, GQ, D), np.float32).astype(np.float16)
-    gate = rng.standard_normal((NKV, N, GQ, D), np.float32).astype(np.float16)
+    gate = rng.standard_normal((N, NKV * GQ * D), np.float32).astype(np.float16)
     kc = np.zeros((NKV, SMAX, D), np.float16)
     vt = np.zeros((NKV, D, SMAX), np.float16)
     last = pos0 + N
@@ -67,11 +67,11 @@ def main(argv):
     if "--negative" in argv:          # a key no token of this chunk may see: the mask must absorb it
         kc[:, last - 1] += np.float16(8.0)
         ref_mask = attn_prefill_reference(q, kc, vt, gate, pos0)
-        ref[:, N - 1] = ref_mask[:, N - 1]   # the last token legitimately sees it
+        ref[N - 1] = ref_mask[N - 1]   # the last token legitimately sees it
     if "--negative-seen" in argv:     # a key every token sees: the comparison must FAIL
         kc[:, 0] += np.float16(8.0)
 
-    out = np.zeros((NKV, N, GQ, D), np.float16)
+    out = np.zeros((N, NKV * GQ * D), np.float16)
     arrays = {"Q": ("in", q), "Kc": ("in", kc), "Vt": ("in", vt), "Gate": ("in", gate),
               "Pos": ("in", np.array([[pos0]], np.int32)), "O": ("out", out)}
     profile = None

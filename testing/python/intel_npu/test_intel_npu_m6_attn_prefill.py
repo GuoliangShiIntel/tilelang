@@ -50,7 +50,7 @@ def _has_host_cxx() -> bool:
 def _problem(pos0: int, seed: int = 0):
     rng = np.random.default_rng(seed)
     q = rng.standard_normal((NKV, N, GQ, D), np.float32).astype(np.float16)
-    gate = rng.standard_normal((NKV, N, GQ, D), np.float32).astype(np.float16)
+    gate = rng.standard_normal((N, NKV * GQ * D), np.float32).astype(np.float16)
     kc = np.zeros((NKV, SMAX, D), np.float16)
     vt = np.zeros((NKV, D, SMAX), np.float16)
     # the cache holds every position this call can see; the rest stays zero as on the device
@@ -63,7 +63,7 @@ def _problem(pos0: int, seed: int = 0):
 def _sim(q, kc, vt, gate, pos0: int):
     low = _lower(make_attn_prefill(N=N, NKV=NKV, GQ=GQ, D=D, SMAX=SMAX, TB=TB, BKV=BKV, tiles=TILES, shaves=SHAVES))
     lib = host_sim.build(low.source, "tl_attn_prefill_sim")
-    out = np.zeros((NKV, N, GQ, D), np.float16)
+    out = np.zeros((N, NKV * GQ * D), np.float16)
     arrays = dict(Q=q, Kc=kc, Vt=vt, Gate=gate, Pos=np.array([[pos0]], np.int32), O=out)
     host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, arrays), TILES, SHAVES))
     return out
@@ -110,5 +110,5 @@ def test_future_keys_are_not_seen():
     kc2 = kc.copy()
     kc2[:, N - 1] = kc2[:, N - 1] + np.float16(8.0)   # the last position: only token N-1 may see it
     b = _sim(q, kc2, vt, gate, pos0)
-    assert np.array_equal(a[:, :N - 1], b[:, :N - 1]), "an earlier token saw a later key: the causal mask is not live"
-    assert not np.array_equal(a[:, N - 1], b[:, N - 1]), "the last token did not see its own key"
+    assert np.array_equal(a[:N - 1], b[:N - 1]), "an earlier token saw a later key: the causal mask is not live"
+    assert not np.array_equal(a[N - 1], b[N - 1]), "the last token did not see its own key"

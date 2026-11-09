@@ -68,7 +68,7 @@ def _sim(y, qw, kw, cs, kc, vt, pos0: int, nt: int):
     low = _lower(_kernel())
     lib = host_sim.build(low.source, "tl_attn_qkv_prefill_sim")
     q = np.zeros((NKV, N, GQ, D), np.float16)
-    gate = np.zeros((NKV, N, GQ, D), np.float16)
+    gate = np.zeros((N, NH * D), np.float16)
     kc, vt = kc.copy(), vt.copy()
     arrays = dict(Ys=y, QNormW=qw, KNormW=kw, CosSin=cs, Pos=np.array([[pos0]], np.int32),
                   Nt=np.array([[nt]], np.int32), Q=q, Gate=gate, Kc=kc, Vt=vt)
@@ -139,5 +139,5 @@ def test_rows_past_the_live_count_are_zero():
     q, gate, okc, ovt = _sim(y, qw, kw, cs, kc, vt, 0, live)
     assert np.abs(okc[:, live:N]).max() == 0, "a dead token was appended to the key cache"
     assert np.abs(ovt[:, :, live:N]).max() == 0, "a dead token was appended to the value cache"
-    assert np.abs(q[:, live:N]).max() == 0 and np.abs(gate[:, live:N]).max() == 0
+    assert np.abs(q[:, live:N]).max() == 0 and np.abs(gate[live:N]).max() == 0
     assert np.abs(okc[:, :live]).max() > 0, "control: the live rows were written"
