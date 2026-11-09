@@ -2116,6 +2116,126 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
     workers = tiles * shaves
     FL, HL = 16, 32
 
+    @T.macro
+    def conv_phase(Y, ConvW, ConvState, ALog, DtBias, Nt, QKo, Vo, Gb, Zo, CsOut, tile, shave):
+        """The phase as a macro so P4 can put it in a layer launch; `make_gdn_conv_prefill` is the
+        standalone wrapper. `tile` and `shave` come from the caller's launch."""
+        worker = tile * shaves + shave
+        nt = T.alloc_shared((1, 1), T.int32)
+        al = T.alloc_shared((1, VH), T.float32)
+        db = T.alloc_shared((1, VH), T.float32)
+        win = T.alloc_local((3, DK), T.float16)      # the 3 tokens before the current row, per channel
+        keep = T.alloc_local((3, DK), T.float16)     # that window as it stood after the last LIVE token
+        cw = T.alloc_local((4, DK), T.float16)
+        xb = T.alloc_local((TB, DK), T.float16)      # one block of tokens for this head's channels
+        cv = T.alloc_local((TB, DK), T.float32)      # conv + SiLU
+        ob = T.alloc_local((TB, DK), T.float32)
+        zb = T.alloc_local((TB, DV), T.float16)
+        bb = T.alloc_local((TB, 1), T.float16)       # b and a are VH columns apart in the projection row
+        aa = T.alloc_local((TB, 1), T.float16)
+        gbb = T.alloc_local((TB, 2), T.float32)
+        acc = T.alloc_local((FL,), T.float32)
+        eh = T.alloc_local((FL,), T.float16)
+        ls = T.alloc_local((FL,), T.float32)
+        st = T.alloc_local((8,), T.float32)
+        # first use here keeps every CMX scope at kernel level (question 10)
+        win[0, 0] = T.float16(0)
+        keep[0, 0] = T.float16(0)
+        cw[0, 0] = T.float16(0)
+        xb[0, 0] = T.float16(0)
+        cv[0, 0] = T.float32(0)
+        ob[0, 0] = T.float32(0)
+        zb[0, 0] = T.float16(0)
+        bb[0, 0] = T.float16(0)
+        aa[0, 0] = T.float16(0)
+        gbb[0, 0] = T.float32(0)
+        acc[0] = T.float32(0)
+        ls[0] = T.float32(0)
+        eh[0] = T.float16(0)
+        st[0] = T.float32(0)
+        T.copy(Nt[0, 0], nt)
+        T.copy(ALog[0, 0], al)
+        T.copy(DtBias[0, 0], db)
+        T.sync_threads()
+        for it in T.serial(T.ceildiv(ITEMS, workers)):
+            hb = it * workers + worker
+            if hb < ITEMS:
+                # channel base of this item: k-heads take q then k, v-heads take their v slice
+                for part in T.serial(2):
+                    if hb >= KH and part == 1:
+                        st[0] = T.float32(0)        # a v-head has one channel slice, not two
+                    else:
+                        st[1] = T.float32(0)
+                        cb = T.if_then_else(hb < KH, hb * DK + part * QK, 2 * QK + (hb - KH) * DV)
+                        T.copy(ConvState[0, cb], win)
+                        T.copy(ConvW[0, cb], cw)
+                        for tb in T.serial(NT):
+                            T.copy(Y[tb * TB, cb], xb)
+                            for r in T.serial(TB):
+                                for c0 in T.serial(DK // FL):
+                                    for v in T.vectorized(FL):
+                                        acc[v] = (T.cast(win[0, c0 * FL + v], T.float32) * T.cast(cw[0, c0 * FL + v], T.float32)
+                                                  + T.cast(win[1, c0 * FL + v], T.float32) * T.cast(cw[1, c0 * FL + v], T.float32)
+                                                  + T.cast(win[2, c0 * FL + v], T.float32) * T.cast(cw[2, c0 * FL + v], T.float32)
+                                                  + T.cast(xb[r, c0 * FL + v], T.float32) * T.cast(cw[3, c0 * FL + v], T.float32))
+                                        eh[v] = T.exp(T.cast(T.float32(0) - acc[v], T.float16))
+                                        cv[r, c0 * FL + v] = acc[v] / (T.float32(1) + T.cast(eh[v], T.float32))
+                                        win[0, c0 * FL + v] = win[1, c0 * FL + v]
+                                        win[1, c0 * FL + v] = win[2, c0 * FL + v]
+                                        win[2, c0 * FL + v] = xb[r, c0 * FL + v]
+                                if tb * TB + r == nt[0, 0] - 1:
+                                    for c0 in T.serial(DK // HL):
+                                        for v in T.vectorized(HL):
+                                            keep[0, c0 * HL + v] = win[0, c0 * HL + v]
+                                            keep[1, c0 * HL + v] = win[1, c0 * HL + v]
+                                            keep[2, c0 * HL + v] = win[2, c0 * HL + v]
+                            # l2 norm per token, then the slice's destination
+                            for r in T.serial(TB):
+                                for v in T.vectorized(FL):
+                                    ls[v] = T.float32(0)
+                                for c0 in T.serial(DK // FL):
+                                    for v in T.vectorized(FL):
+                                        ls[v] = ls[v] + cv[r, c0 * FL + v] * cv[r, c0 * FL + v]
+                                st[2] = T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL])
+                                st[3] = T.float32(1) / T.sqrt(st[2] + T.float32(1e-6))
+                                if hb < KH and part == 0:
+                                    st[3] = st[3] * T.float32(1.0 / (DK ** 0.5))
+                                st[4] = T.if_then_else(tb * TB + r < nt[0, 0], T.float32(1), T.float32(0))
+                                for c0 in T.serial(DK // FL):
+                                    for v in T.vectorized(FL):
+                                        ob[r, c0 * FL + v] = T.if_then_else(
+                                            hb < KH, cv[r, c0 * FL + v] * st[3], cv[r, c0 * FL + v]) * st[4]
+                            if hb < KH:
+                                T.copy(ob, QKo[hb, tb * TB, part * DK])
+                            else:
+                                for r in T.serial(TB):
+                                    for c0 in T.serial(DV // FL):
+                                        for v in T.vectorized(FL):
+                                            zb[r, c0 * FL + v] = T.cast(ob[r, c0 * FL + v], T.float16)
+                                T.copy(zb, Vo[hb - KH, tb * TB, 0])
+                        T.copy(keep, CsOut[0, cb])
+        T.sync_grid()
+        # z, beta and g: one v-head per item, read straight out of the projection row
+        for it in T.serial(T.ceildiv(VH, workers)):
+            h = it * workers + worker
+            if h < VH:
+                for tb in T.serial(NT):
+                    T.copy(Y[tb * TB, CONV + h * DV], zb)
+                    for r in T.serial(TB):
+                        st[5] = T.if_then_else(tb * TB + r < nt[0, 0], T.float32(1), T.float32(0))
+                        for c0 in T.serial(DV // FL):
+                            for v in T.vectorized(FL):
+                                zb[r, c0 * FL + v] = T.cast(T.cast(zb[r, c0 * FL + v], T.float32) * st[5], T.float16)
+                    T.copy(zb, Zo[h, tb * TB, 0])
+                    T.copy(Y[tb * TB, CONV + VC + h], bb)
+                    T.copy(Y[tb * TB, CONV + VC + VH + h], aa)
+                    for r in T.serial(TB):
+                        st[6] = T.if_then_else(tb * TB + r < nt[0, 0], T.float32(1), T.float32(0))
+                        gbb[r, 1] = st[6] / (T.float32(1) + T.exp(T.float32(0) - T.cast(bb[r, 0], T.float32)))
+                        st[7] = T.cast(aa[r, 0], T.float32) + db[0, h]
+                        gbb[r, 0] = (T.float32(0) - T.exp(al[0, h])) * T.log(T.float32(1) + T.exp(st[7])) * st[6]
+                    T.copy(gbb, Gb[h, tb * TB, 0])
+
     @T.prim_func
     def gdn_conv(Y: T.Tensor((NP, NIN), T.float16), ConvW: T.Tensor((4, CONV), T.float16),
                  ConvState: T.Tensor((3, CONV), T.float16), ALog: T.Tensor((1, VH), T.float32),
@@ -2124,122 +2244,8 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
                  Gb: T.Tensor((VH, NP, 2), T.float32), Zo: T.Tensor((VH, NP, DV), T.float16),
                  CsOut: T.Tensor((3, CONV), T.float16)):
         with T.Kernel(tiles, threads=shaves) as tile:
-            shave = T.get_thread_binding()
-            worker = tile * shaves + shave
-            nt = T.alloc_shared((1, 1), T.int32)
-            al = T.alloc_shared((1, VH), T.float32)
-            db = T.alloc_shared((1, VH), T.float32)
-            win = T.alloc_local((3, DK), T.float16)      # the 3 tokens before the current row, per channel
-            keep = T.alloc_local((3, DK), T.float16)     # that window as it stood after the last LIVE token
-            cw = T.alloc_local((4, DK), T.float16)
-            xb = T.alloc_local((TB, DK), T.float16)      # one block of tokens for this head's channels
-            cv = T.alloc_local((TB, DK), T.float32)      # conv + SiLU
-            ob = T.alloc_local((TB, DK), T.float32)
-            zb = T.alloc_local((TB, DV), T.float16)
-            bb = T.alloc_local((TB, 1), T.float16)       # b and a are VH columns apart in the projection row
-            aa = T.alloc_local((TB, 1), T.float16)
-            gbb = T.alloc_local((TB, 2), T.float32)
-            acc = T.alloc_local((FL,), T.float32)
-            eh = T.alloc_local((FL,), T.float16)
-            ls = T.alloc_local((FL,), T.float32)
-            st = T.alloc_local((8,), T.float32)
-            # first use here keeps every CMX scope at kernel level (question 10)
-            win[0, 0] = T.float16(0)
-            keep[0, 0] = T.float16(0)
-            cw[0, 0] = T.float16(0)
-            xb[0, 0] = T.float16(0)
-            cv[0, 0] = T.float32(0)
-            ob[0, 0] = T.float32(0)
-            zb[0, 0] = T.float16(0)
-            bb[0, 0] = T.float16(0)
-            aa[0, 0] = T.float16(0)
-            gbb[0, 0] = T.float32(0)
-            acc[0] = T.float32(0)
-            ls[0] = T.float32(0)
-            eh[0] = T.float16(0)
-            st[0] = T.float32(0)
-            T.copy(Nt[0, 0], nt)
-            T.copy(ALog[0, 0], al)
-            T.copy(DtBias[0, 0], db)
-            T.sync_threads()
-            for it in T.serial(T.ceildiv(ITEMS, workers)):
-                hb = it * workers + worker
-                if hb < ITEMS:
-                    # channel base of this item: k-heads take q then k, v-heads take their v slice
-                    for part in T.serial(2):
-                        if hb >= KH and part == 1:
-                            st[0] = T.float32(0)        # a v-head has one channel slice, not two
-                        else:
-                            st[1] = T.float32(0)
-                            cb = T.if_then_else(hb < KH, hb * DK + part * QK, 2 * QK + (hb - KH) * DV)
-                            T.copy(ConvState[0, cb], win)
-                            T.copy(ConvW[0, cb], cw)
-                            for tb in T.serial(NT):
-                                T.copy(Y[tb * TB, cb], xb)
-                                for r in T.serial(TB):
-                                    for c0 in T.serial(DK // FL):
-                                        for v in T.vectorized(FL):
-                                            acc[v] = (T.cast(win[0, c0 * FL + v], T.float32) * T.cast(cw[0, c0 * FL + v], T.float32)
-                                                      + T.cast(win[1, c0 * FL + v], T.float32) * T.cast(cw[1, c0 * FL + v], T.float32)
-                                                      + T.cast(win[2, c0 * FL + v], T.float32) * T.cast(cw[2, c0 * FL + v], T.float32)
-                                                      + T.cast(xb[r, c0 * FL + v], T.float32) * T.cast(cw[3, c0 * FL + v], T.float32))
-                                            eh[v] = T.exp(T.cast(T.float32(0) - acc[v], T.float16))
-                                            cv[r, c0 * FL + v] = acc[v] / (T.float32(1) + T.cast(eh[v], T.float32))
-                                            win[0, c0 * FL + v] = win[1, c0 * FL + v]
-                                            win[1, c0 * FL + v] = win[2, c0 * FL + v]
-                                            win[2, c0 * FL + v] = xb[r, c0 * FL + v]
-                                    if tb * TB + r == nt[0, 0] - 1:
-                                        for c0 in T.serial(DK // HL):
-                                            for v in T.vectorized(HL):
-                                                keep[0, c0 * HL + v] = win[0, c0 * HL + v]
-                                                keep[1, c0 * HL + v] = win[1, c0 * HL + v]
-                                                keep[2, c0 * HL + v] = win[2, c0 * HL + v]
-                                # l2 norm per token, then the slice's destination
-                                for r in T.serial(TB):
-                                    for v in T.vectorized(FL):
-                                        ls[v] = T.float32(0)
-                                    for c0 in T.serial(DK // FL):
-                                        for v in T.vectorized(FL):
-                                            ls[v] = ls[v] + cv[r, c0 * FL + v] * cv[r, c0 * FL + v]
-                                    st[2] = T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL])
-                                    st[3] = T.float32(1) / T.sqrt(st[2] + T.float32(1e-6))
-                                    if hb < KH and part == 0:
-                                        st[3] = st[3] * T.float32(1.0 / (DK ** 0.5))
-                                    st[4] = T.if_then_else(tb * TB + r < nt[0, 0], T.float32(1), T.float32(0))
-                                    for c0 in T.serial(DK // FL):
-                                        for v in T.vectorized(FL):
-                                            ob[r, c0 * FL + v] = T.if_then_else(
-                                                hb < KH, cv[r, c0 * FL + v] * st[3], cv[r, c0 * FL + v]) * st[4]
-                                if hb < KH:
-                                    T.copy(ob, QKo[hb, tb * TB, part * DK])
-                                else:
-                                    for r in T.serial(TB):
-                                        for c0 in T.serial(DV // FL):
-                                            for v in T.vectorized(FL):
-                                                zb[r, c0 * FL + v] = T.cast(ob[r, c0 * FL + v], T.float16)
-                                    T.copy(zb, Vo[hb - KH, tb * TB, 0])
-                            T.copy(keep, CsOut[0, cb])
-            T.sync_grid()
-            # z, beta and g: one v-head per item, read straight out of the projection row
-            for it in T.serial(T.ceildiv(VH, workers)):
-                h = it * workers + worker
-                if h < VH:
-                    for tb in T.serial(NT):
-                        T.copy(Y[tb * TB, CONV + h * DV], zb)
-                        for r in T.serial(TB):
-                            st[5] = T.if_then_else(tb * TB + r < nt[0, 0], T.float32(1), T.float32(0))
-                            for c0 in T.serial(DV // FL):
-                                for v in T.vectorized(FL):
-                                    zb[r, c0 * FL + v] = T.cast(T.cast(zb[r, c0 * FL + v], T.float32) * st[5], T.float16)
-                        T.copy(zb, Zo[h, tb * TB, 0])
-                        T.copy(Y[tb * TB, CONV + VC + h], bb)
-                        T.copy(Y[tb * TB, CONV + VC + VH + h], aa)
-                        for r in T.serial(TB):
-                            st[6] = T.if_then_else(tb * TB + r < nt[0, 0], T.float32(1), T.float32(0))
-                            gbb[r, 1] = st[6] / (T.float32(1) + T.exp(T.float32(0) - T.cast(bb[r, 0], T.float32)))
-                            st[7] = T.cast(aa[r, 0], T.float32) + db[0, h]
-                            gbb[r, 0] = (T.float32(0) - T.exp(al[0, h])) * T.log(T.float32(1) + T.exp(st[7])) * st[6]
-                        T.copy(gbb, Gb[h, tb * TB, 0])
+            conv_phase(Y, ConvW, ConvState, ALog, DtBias, Nt, QKo, Vo, Gb, Zo, CsOut,
+                       tile, T.get_thread_binding())
 
     return gdn_conv
 
