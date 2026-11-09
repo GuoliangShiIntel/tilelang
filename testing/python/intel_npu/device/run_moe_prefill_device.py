@@ -107,8 +107,10 @@ def main(argv):
         d_int = rng.integers(-8, 8, (E + 1, H, I), dtype=np.int8)
         d_s = (rng.standard_normal((E + 1, H, I // G), np.float32) * 0.02).astype(np.float16)
         low = lowering.lower(make_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MB,
-                                                     BNG=64, BND=64, tiles=TILES, shaves=SHAVES))
-        db = build(low.source, f"tl_moe_expert_prefill_n{N}_h{H}_i{I}_e{E}_mb{MB}", argv)
+                                                     BNG=64, BND=64, tiles=TILES, shaves=SHAVES,
+                                                     probe_skip="dequant" if "--skip-dequant" in argv else None))
+        db = build(low.source, f"tl_moe_expert_prefill_n{N}_h{H}_i{I}_e{E}_mb{MB}"
+                   + ("_nodeq" if "--skip-dequant" in argv else ""), argv)
 
         def run(gu, dw, profile=False):
             out = np.zeros((N, H), np.float32)
@@ -127,6 +129,12 @@ def main(argv):
             return out, r
 
         got, res = run(gu_int, d_int)
+        if "--skip-dequant" in argv:
+            # a measurement arm: the weights are read and the gemms run, but the int4 rows are not expanded,
+            # so the result is wrong by design and only the time means anything
+            print(f"expert [SKIP-DEQUANT probe, output wrong by design]: {res.median_kernel_ms:.3f} ms "
+                  f"[{runner.condition(res, False)}]; sha {db.source_sha256[:12]}")
+            return rc
         oracle = moe_expert_prefill_reference(x, gu_int, gu_s, d_int, d_s, ref["wts"], ref["off"], ref["slot"],
                                               TOPK=TOPK, G=G)
         scale = np.abs(oracle).max()

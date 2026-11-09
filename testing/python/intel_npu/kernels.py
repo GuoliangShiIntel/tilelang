@@ -819,7 +819,8 @@ def moe_route_prefill_reference(x, wr, E: int, TOPK: int, logits=None):
 
 
 def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16, TOPK: int = 4, G: int = 128,
-                            MB: int = 16, BNG: int = 64, BND: int = 64, tiles: int = 3, shaves: int = 2, as_block: bool = False):
+                            MB: int = 16, BNG: int = 64, BND: int = 64, tiles: int = 3, shaves: int = 2,
+                            as_block: bool = False, probe_skip: str | None = None):
     """P2b: the grouped expert FFN for `N` prompt tokens, over P2a's grouping.
 
     Each worker owns whole experts, so **an expert's weights are read once per launch** instead of once per
@@ -839,8 +840,12 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
     The weights arrive as `make_w4a16_flow`'s pair -- packed values and **row-major** scales -- not as decode's
     chunk blocks: those carry the scales group-major so the DPU can read them in place, which is the one layout the
     SHAVE row dequant cannot use. The int4 bytes are the same either way and scales are 1/64 of them at G = 128,
-    so a model that runs both paths carries one extra scale layout, not one extra weight tensor."""
+    so a model that runs both paths carries one extra scale layout, not one extra weight tensor.
+
+    `probe_skip='dequant'`: MEASUREMENT ARM ONLY -- the weights are still read from DDR and the gemms still run,
+    but the int4 rows are not expanded (the output is wrong by design). The difference is the dequant's share."""
     FL, HL = 16, 32
+    skip_dequant = probe_skip == "dequant"
     workers = tiles * shaves
     SLOTS = N * (TOPK + 1)
     CG, CD = (2 * I) // BNG, H // BND
@@ -889,9 +894,10 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
                     for n in T.serial(CG):
                         T.copy(WguQ[e * 2 * I + n * BNG, 0], wq_cmx)
                         T.copy(WguS[e * 2 * I + n * BNG, 0], ws_cmx)
-                        for r in T.serial(BNG):
-                            T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wg_cmx[r, 0]),
-                                          T.address_of(wq_cmx[r, 0]), T.address_of(ws_cmx[r, 0]), H, G)
+                        if not skip_dequant:
+                            for r in T.serial(BNG):
+                                T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wg_cmx[r, 0]),
+                                              T.address_of(wq_cmx[r, 0]), T.address_of(ws_cmx[r, 0]), H, G)
                         T.gemm(x_cmx, wg_cmx, y_cmx, transpose_B=True, clear_accum=True)
                         for i, c0 in T.grid(MB, BNG // HL):
                             for v in T.vectorized(HL):
@@ -903,9 +909,10 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
                     for n in T.serial(CD):
                         T.copy(WdQ[e * H + n * BND, 0], wqd_cmx)
                         T.copy(WdS[e * H + n * BND, 0], wsd_cmx)
-                        for r in T.serial(BND):
-                            T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wd_cmx[r, 0]),
-                                          T.address_of(wqd_cmx[r, 0]), T.address_of(wsd_cmx[r, 0]), I, G)
+                        if not skip_dequant:
+                            for r in T.serial(BND):
+                                T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wd_cmx[r, 0]),
+                                              T.address_of(wqd_cmx[r, 0]), T.address_of(wsd_cmx[r, 0]), I, G)
                         T.gemm(h_cmx, wd_cmx, yd_cmx, transpose_B=True, clear_accum=True)
                         for i, c0 in T.grid(MB, BND // HL):
                             for v in T.vectorized(HL):
