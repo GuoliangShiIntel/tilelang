@@ -561,16 +561,27 @@ interop; a Python `nl.*`-compatible shim.
     A grid barrier after the head loop is **not** a fix and is informative: 2 x 2 went 7/12 -> 12/12 while
     3 x 2 went 4/12 -> 0/12, so the defect is strongly timing sensitive.
 
-    **The runtime is excluded: the same kernel on npu_dsl's `fused_rt` is 3/12 at 3 x 2, against our 4/12.**
-    The generated source is unchanged; only `TL_NPU_RUNTIME_FRT` is defined, which swaps the whole `npu::Ctx`
-    surface onto npu_dsl's runtime through `npu_rt_device_frt.hpp` -- a runtime with different disciplines
-    throughout (one synchronous load descriptor and one store descriptor, every DPU workload waited for by the
-    SHAVE that issued it, grid sync by the toolkit's software rendezvous). Two independent runtimes fail at the
-    same rate, so the mechanism is below both. **Repairing the shim to get this answer**: it had bit-rotted,
-    reaching `frt::Ctx` members (`ok_`, `tile_`, `shave_`, `tiles_`, `spt_`, `cmx_`, `desc_`, `dma_`) that
-    `fused_rt.hpp` has since made private. The run above opened the single `private:` label in a **local copy**
-    of that header, in our generated directory; npu_dsl's tree was not touched, and access control is
-    compile-time only, so the measurement stands. The shim needs a real repair before it can be used again.
+    **The runtime is excluded, and the hardware is NOT implicated -- an earlier reading of this entry said it
+    was and was wrong.** The same generated source on npu_dsl's `fused_rt` is 3/12 at 3 x 2 against our 4/12;
+    only `TL_NPU_RUNTIME_FRT` is defined, which swaps the whole `npu::Ctx` surface through
+    `npu_rt_device_frt.hpp` onto a runtime with different disciplines throughout (one synchronous load
+    descriptor and one store descriptor, every DPU workload waited for by the SHAVE that issued it, grid sync
+    by the toolkit's software rendezvous). That excludes the runtime and nothing more: **both arms share the
+    same TileLang lowering** -- the same CMX scoping, the same sequence of `dma_load` / `dpu_matmul` calls, the
+    same VPUNN workload plan -- so a missing wait or a bad call order that neither runtime can invent for us
+    reproduces identically in both. The remaining candidates are **this kernel's source and the TileLang
+    compiler**.
+    **npu_dsl's end-to-end is deterministic over 8 runs on this box**, prefill included, so the hardware does
+    the same work correctly: `QWEN36_CKPT=D:\models\qwen38-w4a16 QWEN36_DEV_WEIGHTS=D:\models\qwen38_npudsl_export
+    python -m qwen36_e2e.run_ptl --host local --golden D:\models\qwen38_golden\intro.pt` gives 32/32 argmax and
+    **logits rel error mean 0.0185, max 0.0449 -- identical to four decimals on every one of 8 runs**, which a
+    sparse corruption would move. (Its prefill is one short prompt, so it matches our failing head count,
+    5-6 v-heads per worker, but not our chunk count; a long-prompt run is the stronger check and has not been
+    done.) **Repairing the shim to get the runtime answer**: it had bit-rotted, reaching `frt::Ctx` members
+    (`ok_`, `tile_`, `shave_`, `tiles_`, `spt_`, `cmx_`, `desc_`, `dma_`) that `fused_rt.hpp` has since made
+    private. The run opened the single `private:` label in a **local copy** of that header in our gitignored
+    generated directory; npu_dsl's tree was not touched and access control is compile-time only, so the
+    measurement stands. The copy was deleted again. The shim needs a real repair before it is leaned on.
 
     **npu_dsl does the same thing, and cannot be used to exonerate the hardware.** Its prefill GDN
     (`kernels_poc/qwen36_dsl_poc/generated/qwen36_prefill_gdn_layer.cpp:449-472`) distributes v-heads over the
@@ -589,11 +600,10 @@ interop; a Python `nl.*`-compatible shim.
     rounds of observations taken that way ("1 x 2 fails 6/8", "the state is correct and only the output is
     sparse-wrong") were artifacts and are struck. Every number above comes from `runner.build`.
 
-    **Question for the hardware owner:** is there a per-job resource behind a DDR -> CMX `dma_load` that is
-    shared between tiles and must not be re-entered -- or an ordering requirement between a tile's DMA into a
-    CMX buffer that the SHAVE has been writing, when other tiles are issuing DMAs at the same time? Nothing in
-    the kernel is shared across tiles: each worker owns whole v-heads, so its `Ssm` block, its `Out` columns and
-    its CMX are disjoint from every other worker's.
+    **Question for the hardware owner:** none yet. An earlier version of this entry asked one; it was premature,
+    because npu_dsl runs the same per-head state load on the same three tiles deterministically. The next
+    instruments are ours: read the emitted C++ for the head loop against what the DSL asked for, and run
+    npu_dsl's prefill at a long prompt so its chunk count per head matches ours.
 
 ## 9. Model target: Qwen3.8-35B-A3B-Distill, and what it needs (2026-11-06)
 
