@@ -3106,6 +3106,141 @@ def attn_layer_prefill_reference(h, in_norm, wqkv_int, wqkv_scales, qnorm_w, kno
     return out, kc, vt
 
 
+def make_attn_moe_layer_prefill(N: int = 64, H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, ROT: int = 64,
+                                SMAX: int = 1536, I: int = 512, E: int = 256, TOPK: int = 8, G: int = 128,
+                                TB: int = 8, TBF: int = 4, BKV: int = 128, BN1: int = 16, BN2: int = 16,
+                                MB: int = 16, BM: int = 64, BNR: int = 16, MBe: int = 16, BNG: int = 64,
+                                BND: int = 64, tiles: int = 3, shaves: int = 2, eps: float = 1e-6):
+    """P1 step 3: a WHOLE full-attention PREFILL decoder layer in ONE launch -- `make_attn_layer_prefill`'s mixer
+    half followed by the second norm, P2a's routing and grouping, P2b's grouped expert FFN, and the weighted sum
+    back into the fp32 residual stream. The attention counterpart of `make_gdn_moe_layer_prefill`, and the second
+    of the two layer kinds the prefill model kernel runs.
+
+    Ten phases, each dealing its work differently, so every boundary is a grid barrier. The dead-token guard of the
+    mixer half applies to the MoE half too: past `Nt` the router sees a normed zero row and would route it.
+
+    Oracle: `attn_moe_layer_prefill_reference`."""
+    GQ = NH // NKV
+    KO = NH * D
+    workers = tiles * shaves
+    step = TB * TBF // math.gcd(TB, TBF)
+    step = step * workers // math.gcd(step, workers)
+    step = step * BM // math.gcd(step, BM)
+    NP = -(-N // step) * step
+    qkv_phase, qs = make_attn_qkv_prefill(N=NP, H=H, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX, TB=TB, tiles=tiles,
+                                          shaves=shaves, eps=eps, as_block=True)
+    flash_phase, _ = make_attn_prefill(N=NP, NKV=NKV, GQ=GQ, D=D, SMAX=SMAX, TB=TBF, BKV=BKV, tiles=tiles,
+                                       shaves=shaves, as_block=True)
+    NQKV = qs["NQKV"]
+    NQKV_pad = -(-NQKV // BN1) * BN1
+    qkv_proj, _ = make_proj_prefill(NP=NP, M=NQKV_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves,
+                                    as_block=True)
+    o_proj, _ = make_proj_prefill(NP=NP, M=H, K=KO, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True)
+    route_phase, rs = make_moe_route_prefill(N=NP, H=H, E=E, TOPK=TOPK, BM=BM, BNR=BNR, tiles=tiles, shaves=shaves,
+                                             as_block=True)
+    expert_phase, _ = make_moe_expert_prefill(N=NP, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MBe, BNG=BNG, BND=BND,
+                                              tiles=tiles, shaves=shaves, as_block=True)
+    RR, SLOTS = rs["RR"], rs["SLOTS"]
+    KGH, KGI = H // G, I // G
+    FL = 16
+    assert H % FL == 0 and NP % workers == 0
+    norm_tokens = prefill_norm_block(H, NP, workers, eps, FL)
+
+    @T.prim_func
+    def attn_moe_layer(Hio: T.Tensor((NP, H), T.float32), InNorm: T.Tensor((1, H), T.float16),
+                       PostNorm: T.Tensor((1, H), T.float16),
+                       WqkvQ: T.Tensor((NQKV_pad, H // 2), T.uint8), WqkvS: T.Tensor((NQKV_pad, H // G), T.float16),
+                       QNormW: T.Tensor((1, D), T.float16), KNormW: T.Tensor((1, D), T.float16),
+                       CosSin: T.Tensor((NP, 2 * ROT), T.float32), Pos: T.Tensor((1, 1), T.int32),
+                       Nt: T.Tensor((1, 1), T.int32), Kc: T.Tensor((NKV, SMAX, D), T.float16),
+                       Vt: T.Tensor((NKV, D, SMAX), T.float16),
+                       WoQ: T.Tensor((H, KO // 2), T.uint8), WoS: T.Tensor((H, KO // G), T.float16),
+                       Wr: T.Tensor((RR, H), T.float16),
+                       WguQ: T.Tensor(((E + 1) * 2 * I, H // 2), T.uint8),
+                       WguS: T.Tensor(((E + 1) * 2 * I, KGH), T.float16),
+                       WdQ: T.Tensor(((E + 1) * H, I // 2), T.uint8), WdS: T.Tensor(((E + 1) * H, KGI), T.float16),
+                       Xs: T.Tensor((NP, H), T.float16), Ys: T.Tensor((NP, NQKV_pad), T.float16),
+                       Q: T.Tensor((NKV, NP, GQ, D), T.float16), Gate: T.Tensor((NP, KO), T.float16),
+                       Os: T.Tensor((NP, KO), T.float16), Mix: T.Tensor((NP, H), T.float16),
+                       Logits: T.Tensor((NP, RR), T.float16), Ids: T.Tensor((NP, TOPK), T.int32),
+                       Wts: T.Tensor((NP, 16), T.float32), Cnt: T.Tensor((E + 1,), T.int32),
+                       Off: T.Tensor((E + 2,), T.int32), Slot: T.Tensor((SLOTS,), T.int32),
+                       PartE: T.Tensor((tiles, NP, H), T.float32), MoeOut: T.Tensor((NP, H), T.float32)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            nw = T.alloc_shared((1, H), T.float16)
+            nt = T.alloc_shared((1, 1), T.int32)
+            hrow = T.alloc_local((1, H), T.float32)
+            xrow = T.alloc_local((1, H), T.float16)
+            mrow = T.alloc_local((1, H), T.float16)
+            erow = T.alloc_local((1, H), T.float32)
+            ls = T.alloc_local((FL,), T.float32)
+            st = T.alloc_local((4,), T.float32)
+            hrow[0, 0] = T.float32(0)     # pins the scope at kernel level (question 10)
+            xrow[0, 0] = T.float16(0)
+            mrow[0, 0] = T.float16(0)
+            erow[0, 0] = T.float32(0)
+            ls[0] = T.float32(0)
+            st[0] = T.float32(0)
+            T.copy(Nt[0, 0], nt)
+
+            norm_tokens(Hio, InNorm, Xs, nw, hrow, xrow, ls, st, worker)
+            T.sync_grid()
+            qkv_proj(Xs, WqkvQ, WqkvS, Ys, tile, shave)
+            T.sync_grid()
+            qkv_phase(Ys, QNormW, KNormW, CosSin, Pos, Nt, Q, Gate, Kc, Vt, tile, shave)
+            T.sync_grid()
+            flash_phase(Q, Kc, Vt, Gate, Pos, Os, tile, shave)
+            T.sync_grid()
+            o_proj(Os, WoQ, WoS, Mix, tile, shave)
+            T.sync_grid()
+            for it in T.serial(NP // workers):     # h += mix, live tokens only
+                t = it * workers + worker
+                if t < nt[0, 0]:
+                    T.copy(Hio[t, 0], hrow)
+                    T.copy(Mix[t, 0], mrow)
+                    for d0 in T.serial(H // FL):
+                        for v in T.vectorized(FL):
+                            hrow[0, d0 * FL + v] = hrow[0, d0 * FL + v] + T.cast(mrow[0, d0 * FL + v], T.float32)
+                    T.copy(hrow, Hio[t, 0])
+            T.sync_grid()
+            norm_tokens(Hio, PostNorm, Xs, nw, hrow, xrow, ls, st, worker)
+            T.sync_grid()
+            route_phase(Xs, Wr, Logits, Ids, Wts, Cnt, Off, Slot, tile, shave)
+            expert_phase(Xs, WguQ, WguS, WdQ, WdS, Wts, Off, Slot, PartE, MoeOut, tile, shave)
+            T.sync_grid()
+            for it in T.serial(NP // workers):     # h += the MoE output, live tokens only
+                t = it * workers + worker
+                if t < nt[0, 0]:
+                    T.copy(Hio[t, 0], hrow)
+                    T.copy(MoeOut[t, 0], erow)
+                    for d0 in T.serial(H // FL):
+                        for v in T.vectorized(FL):
+                            hrow[0, d0 * FL + v] = hrow[0, d0 * FL + v] + erow[0, d0 * FL + v]
+                    T.copy(hrow, Hio[t, 0])
+
+    return attn_moe_layer
+
+
+def attn_moe_layer_prefill_reference(h, in_norm, post_norm, wqkv_int, wqkv_scales, qnorm_w, knorm_w, cos_sin,
+                                     wo_int, wo_scales, kc, vt, router, gu_int, gu_scales, d_int, d_scales,
+                                     pos0: int, n: int, NH: int, NKV: int, D: int, ROT: int, E: int, TOPK: int,
+                                     G: int, eps: float = 1e-6):
+    """numpy oracle of make_attn_moe_layer_prefill (fp32), built from the phase oracles: the mixer half, then the
+    post norm, P2a's routing and P2b's grouped expert FFN, summed back into the stream."""
+    import numpy as np
+    out, kc, vt = attn_layer_prefill_reference(h, in_norm, wqkv_int, wqkv_scales, qnorm_w, knorm_w, cos_sin,
+                                               wo_int, wo_scales, kc, vt, pos0, n, NH, NKV, D, ROT, G, eps)
+    x = out / np.sqrt((out * out).mean(-1, keepdims=True) + eps) * (1.0 + post_norm.astype(np.float32).reshape(1, -1))
+    x16 = x.astype(np.float16)
+    r = moe_route_prefill_reference(x16, router, E=E, TOPK=TOPK)
+    moe = moe_expert_prefill_reference(x16, gu_int, gu_scales, d_int, d_scales, r["wts"], r["off"], r["slot"],
+                                       TOPK=TOPK, G=G)
+    out[:n] += moe[:n]
+    return out, kc, vt
+
+
 def attn_reference(x, res, wqkv_int, wqkv_scales, wo_int, wo_scales, qnorm_w, knorm_w, cos_sin, pos, kc, vt,
                    NH: int, NKV: int, D: int, ROT: int, G: int, eps: float = 1e-6):
     """numpy oracle of make_attn_decode (fp32): returns out [H], the K cache and transposed V cache after the append."""
