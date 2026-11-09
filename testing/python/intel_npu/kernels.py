@@ -2300,6 +2300,192 @@ def make_gdn_mixer_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 1
     return gdn_mixer_prefill
 
 
+def make_proj_prefill(NP: int = 128, M: int = 1024, K: int = 2048, BN: int = 64, MB: int = 32, G: int = 128,
+                      tiles: int = 3, shaves: int = 2, as_block: bool = False):
+    """P4 step 4: a PREFILL projection -- `Yout[NP, M] = X[NP, K] . dequant(Wq[M, K])^T`, int4 symmetric with one
+    fp16 scale per group of G along K.
+
+    Decode's projection is a GEMV and goes through the DPU's merged-FC (`T.gemm_i4`), whose scratch is sized for
+    M = 1. Prefill takes `make_w4a16_flow`'s path instead -- the SHAVE dequantises a chunk of output rows into fp16
+    and the DPU runs an ordinary fp16 gemm -- because the dequant's cost does not grow with the token count and so
+    amortises over the whole prompt, while the merged-FC scratch grows with it.
+
+    Output-row chunks of BN are dealt over the workers and a worker dequantises its chunk ONCE, then walks the
+    tokens in blocks of MB against it. That ordering is the point: the other way round re-dequantises the same
+    weights for every token block.
+
+    Weights are the packed values and **row-major** scales of `make_w4a16_flow`, not decode's chunk blocks, for the
+    reason `make_moe_expert_prefill` gives: chunk blocks carry the scales group-major for the DPU to read in place,
+    which is the one layout the SHAVE row dequant cannot use. Oracle: `proj_prefill_reference`."""
+    assert M % BN == 0 and NP % MB == 0 and K % G == 0 and K % 32 == 0
+    KG = K // G
+    NCH, NTB = M // BN, NP // MB
+    workers = tiles * shaves
+    HL = 32
+    assert MB <= 8192 and BN <= 8192 and K <= 8192, "every workload dimension is bounded by 8192 (dpu.md 4.6)"
+
+    @T.macro
+    def proj_phase(X, Wq, S, Yout, tile, shave):
+        worker = tile * shaves + shave
+        wq_cmx = T.alloc_local((BN, K // 2), T.uint8)
+        s_cmx = T.alloc_local((BN, KG), T.float16)
+        w_cmx = T.alloc_local((BN, K), T.float16)
+        x_cmx = T.alloc_local((MB, K), T.float16)
+        y_cmx = T.alloc_local((MB, BN), T.float16)
+        wq_cmx[0, 0] = T.uint8(0)      # first use before the loops: question 10's authoring rule
+        s_cmx[0, 0] = T.float16(0)
+        w_cmx[0, 0] = T.float16(0)
+        x_cmx[0, 0] = T.float16(0)
+        y_cmx[0, 0] = T.float16(0)
+        for it in T.serial(T.ceildiv(NCH, workers)):
+            n = it * workers + worker
+            if n < NCH:
+                T.copy(Wq[n * BN, 0], wq_cmx)
+                T.copy(S[n * BN, 0], s_cmx)
+                for r in T.serial(BN):
+                    T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(w_cmx[r, 0]),
+                                  T.address_of(wq_cmx[r, 0]), T.address_of(s_cmx[r, 0]), K, G)
+                for b in T.serial(NTB):
+                    T.copy(X[b * MB, 0], x_cmx)
+                    T.gemm(x_cmx, w_cmx, y_cmx, transpose_B=True, clear_accum=True)
+                    T.copy(y_cmx, Yout[b * MB, n * BN])
+
+    if as_block:
+        return proj_phase, dict(NCH=NCH, NTB=NTB, KG=KG)
+
+    @T.prim_func
+    def proj(X: T.Tensor((NP, K), T.float16), Wq: T.Tensor((M, K // 2), T.uint8),
+             S: T.Tensor((M, KG), T.float16), Yout: T.Tensor((NP, M), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            proj_phase(X, Wq, S, Yout, tile, T.get_thread_binding())
+
+    return proj
+
+
+def proj_prefill_reference(x, w_int, scales, G: int):
+    """numpy oracle of make_proj_prefill (fp32): y[NP, M] = x @ dequant(w)^T."""
+    import numpy as np
+    w = w_int.astype(np.float32) * np.repeat(scales.astype(np.float32), G, axis=1)
+    return x.astype(np.float32) @ w.T
+
+
+def make_gdn_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV: int = 128,
+                           G: int = 128, TB: int = 32, C: int = 64, BN1: int = 64, BN2: int = 64, MB: int = 32,
+                           tiles: int = 3, shaves: int = 2, eps: float = 1e-6):
+    """P4 step 4: a whole Gated DeltaNet PREFILL mixer layer in ONE launch, over `N` prompt tokens --
+    `make_gdn_layer`'s shape with every phase in its prefill form:
+
+      x = rmsnorm_zc(h, in_norm) per token -> in_proj (P4 step 4's SHAVE-dequant projection) -> the conv phase
+      (P3b) -> the chunked scan (P3) -> out_proj -> h += mix
+
+    The residual stream is fp32 in DDR (`Hio[NP, H]`), read at entry and written at exit, as the decode layer does.
+    Four phases separated by grid barriers, because each deals its work differently: the projections by output-row
+    chunk, the conv by head, the scan by v-head.
+
+    MoE is NOT in here yet; this is the mixer layer. Oracle: `gdn_layer_prefill_reference`."""
+    conv_phase, _ = make_gdn_conv_prefill(N=N, KH=KH, VH=VH, DK=DK, DV=DV, TB=TB, tiles=tiles, shaves=shaves,
+                                          as_block=True)
+    scan_phase, _ = make_gdn_scan_prefill(N=N, KH=KH, VH=VH, DK=DK, DV=DV, C=C, tiles=tiles, shaves=shaves, eps=eps,
+                                          as_block=True)
+    QK, VC = KH * DK, VH * DV
+    CONV = 2 * QK + VC
+    NIN = CONV + VC + 2 * VH
+    step = TB * C // math.gcd(TB, C)
+    NP = -(-N // step) * step
+    NIN_pad = -(-NIN // BN1) * BN1
+    in_proj, _ = make_proj_prefill(NP=NP, M=NIN_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves,
+                                   as_block=True)
+    out_proj, _ = make_proj_prefill(NP=NP, M=H, K=VC, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True)
+    workers = tiles * shaves
+    FL = 16
+    assert H % FL == 0 and NP % workers == 0
+
+    @T.prim_func
+    def gdn_layer_prefill(Hio: T.Tensor((NP, H), T.float32), InNorm: T.Tensor((1, H), T.float16),
+                          WinQ: T.Tensor((NIN_pad, H // 2), T.uint8), WinS: T.Tensor((NIN_pad, H // G), T.float16),
+                          ConvW: T.Tensor((4, CONV), T.float16), ConvState: T.Tensor((3, CONV), T.float16),
+                          ALog: T.Tensor((1, VH), T.float32), DtBias: T.Tensor((1, VH), T.float32),
+                          GNorm: T.Tensor((1, DV), T.float16), Nt: T.Tensor((1, 1), T.int32),
+                          Ssm: T.Tensor((VH, DK, DV), T.float32),
+                          WoutQ: T.Tensor((H, VC // 2), T.uint8), WoutS: T.Tensor((H, VC // G), T.float16),
+                          Xs: T.Tensor((NP, H), T.float16), Ys: T.Tensor((NP, NIN_pad), T.float16),
+                          QKs: T.Tensor((KH, NP, 2 * DK), T.float32), Vs: T.Tensor((VH, NP, DV), T.float16),
+                          Gbs: T.Tensor((VH, NP, 2), T.float32), Zs: T.Tensor((VH, NP, DV), T.float16),
+                          Os: T.Tensor((NP, VC), T.float16), Mix: T.Tensor((NP, H), T.float16),
+                          CsOut: T.Tensor((3, CONV), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            nw = T.alloc_shared((1, H), T.float16)
+            hrow = T.alloc_local((1, H), T.float32)
+            xrow = T.alloc_local((1, H), T.float16)
+            mrow = T.alloc_local((1, H), T.float16)
+            ls = T.alloc_local((FL,), T.float32)
+            st = T.alloc_local((4,), T.float32)
+            hrow[0, 0] = T.float32(0)     # question 10's rule: first use above the loops
+            xrow[0, 0] = T.float16(0)
+            mrow[0, 0] = T.float16(0)
+            ls[0] = T.float32(0)
+            st[0] = T.float32(0)
+            T.copy(InNorm[0, 0], nw)
+            # --- the per-token input norm, tokens dealt over the workers ---------------------------------
+            for it in T.serial(NP // workers):
+                t = it * workers + worker
+                T.copy(Hio[t, 0], hrow)
+                for v in T.vectorized(FL):
+                    ls[v] = T.float32(0)
+                for d0 in T.serial(H // FL):
+                    for v in T.vectorized(FL):
+                        ls[v] = ls[v] + hrow[0, d0 * FL + v] * hrow[0, d0 * FL + v]
+                st[0] = T.float32(1) / T.sqrt(T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL]) / T.float32(H)
+                                              + T.float32(eps))
+                for d0 in T.serial(H // FL):
+                    for v in T.vectorized(FL):
+                        xrow[0, d0 * FL + v] = T.cast(hrow[0, d0 * FL + v] * st[0]
+                                                      * (T.float32(1) + T.cast(nw[0, d0 * FL + v], T.float32)),
+                                                      T.float16)
+                T.copy(xrow, Xs[t, 0])
+            T.sync_grid()
+            in_proj(Xs, WinQ, WinS, Ys, tile, shave)
+            T.sync_grid()
+            conv_phase(Ys, ConvW, ConvState, ALog, DtBias, Nt, QKs, Vs, Gbs, Zs, CsOut, tile, shave)
+            T.sync_grid()
+            scan_phase(QKs, Vs, Gbs, Zs, GNorm, Nt, Ssm, Os, tile, shave)
+            T.sync_grid()
+            out_proj(Os, WoutQ, WoutS, Mix, tile, shave)
+            T.sync_grid()
+            # --- residual: the tokens dealt over the workers ---------------------------------------------
+            for it in T.serial(NP // workers):
+                t = it * workers + worker
+                T.copy(Hio[t, 0], hrow)
+                T.copy(Mix[t, 0], mrow)
+                for d0 in T.serial(H // FL):
+                    for v in T.vectorized(FL):
+                        hrow[0, d0 * FL + v] = hrow[0, d0 * FL + v] + T.cast(mrow[0, d0 * FL + v], T.float32)
+                T.copy(hrow, Hio[t, 0])
+
+    return gdn_layer_prefill
+
+
+def gdn_layer_prefill_reference(h, in_norm, win_int, win_scales, conv_w, conv_state, a_log, dt_bias, gnorm,
+                                wout_int, wout_scales, ssm, n: int, KH: int, VH: int, DK: int, DV: int, G: int,
+                                eps: float = 1e-6):
+    """numpy oracle of make_gdn_layer_prefill (fp32), built from the phase oracles so the layer's claim is that
+    they compose: norm -> in_proj -> conv -> scan -> out_proj -> residual. Returns (h after the layer, conv state,
+    ssm)."""
+    import numpy as np
+    hf = h.astype(np.float32)
+    x = hf / np.sqrt((hf * hf).mean(-1, keepdims=True) + eps) * (1.0 + in_norm.astype(np.float32).reshape(1, -1))
+    y = proj_prefill_reference(x.astype(np.float16), win_int, win_scales, G)
+    qk, v, gb, z, new_cs = gdn_conv_prefill_reference(y.astype(np.float16), conv_w, conv_state, a_log, dt_bias,
+                                                      n, KH, VH, DK, DV)
+    o, new_ssm = gdn_scan_prefill_reference(qk, v, gb, z, gnorm, ssm, n)
+    mix = proj_prefill_reference(o.astype(np.float16), wout_int, wout_scales, G)
+    out = hf.copy()
+    out[:n] += mix[:n]
+    return out, new_cs, new_ssm
+
+
 def make_attn_prefill(N: int = 64, NKV: int = 2, GQ: int = 8, D: int = 256, SMAX: int = 1536, TB: int = 4,
                       BKV: int = 128, tiles: int = 3, shaves: int = 2, pipelined: bool = False):
     """P1: the full-attention PREFILL phase -- flash attention over `N` query tokens already normed, roped and
