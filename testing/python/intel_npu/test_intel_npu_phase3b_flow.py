@@ -220,3 +220,32 @@ def test_a_shared_fill_under_a_shave_branch_syncs_after_the_branch():
         assert "ctx.sync_tile();" in body, guard
         inside = body.split("if (shave == 0) {", 1)[1].split("}", 1)[0]
         assert "sync_tile" not in inside, f"the tile barrier is unreachable for the other SHAVE (guard={guard})"
+
+
+def test_a_loop_of_unsplittable_fills_is_dealt_over_the_shaves():
+    """A one-row DDR -> shared fill cannot be split across the tile's SHAVEs, so the per-statement rule gives it
+    to SHAVE 0 and brackets it with barriers. In a loop that is once per ITERATION: the MoE gather of 16 token
+    rows became 16 serialized DMAs on SHAVE 0 and 32 tile barriers, with SHAVE 1 only waiting. Iterations writing
+    disjoint rows have no hazard between them, so the loop is dealt over the SHAVEs and meets once."""
+
+    def make(by_iteration: bool):
+        @T.prim_func
+        def k(A: T.Tensor((16, 64), T.float16), Y: T.Tensor((4, 64), T.float16)):
+            with T.Kernel(2, threads=2) as tile:
+                shave = T.get_thread_binding()
+                s_cmx = T.alloc_shared((16, 64), T.float16)
+                for i in T.serial(16):
+                    # control: every iteration writing the SAME row is a real serial chain, never dealt out
+                    T.copy(A[i, 0], s_cmx[i if by_iteration else 0, 0:64])
+                T.copy(s_cmx[0:1, 0:64], Y[tile * 2 + shave, 0])
+
+        return k
+
+    dealt = _src(make(True)).split("kernel_entry")[0]
+    assert "if ((i & 1) == shave)" in dealt, "the iterations are not dealt over the tile's SHAVEs"
+    loop = dealt.split("for (int32_t i = 0;", 1)[1].split("\n  }", 1)[0]
+    assert "sync_tile" not in loop, "a barrier per iteration is exactly the cost being removed"
+
+    same_row = _src(make(False)).split("kernel_entry")[0]
+    assert "if ((i & 1) == shave)" not in same_row, "iterations that alias must stay serialized"
+    assert "if (shave == 0)" in same_row

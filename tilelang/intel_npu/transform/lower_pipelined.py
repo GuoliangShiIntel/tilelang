@@ -177,8 +177,50 @@ def PlanIntelNpuDistribution():
         loop_depth = [0]
         shave_branch = []   # one flag per enclosing SHAVE-dependent branch: did it fill a shared buffer?
 
+        def deal_fill_loop(stmt):
+            """A loop whose whole body is ONE unsplittable DDR -> shared fill writing a different row each
+            iteration: deal the ITERATIONS over the tile's SHAVEs and meet once after the loop.
+
+            The per-statement rule below cannot see the loop, so it gives every iteration to SHAVE 0 between two
+            barriers -- a gather of MB token rows became MB serialized DMAs on one SHAVE and 2 x MB tile barriers,
+            with the other SHAVE only waiting. Iterations that write disjoint rows have no hazard between them, so
+            the only barriers needed are one before (WAR against the previous contents) and one after (RAW)."""
+            if shave_branch or pipelined_depth[0] > 0:
+                return None
+            if stmt.kind != tirx.ForKind.SERIAL or not isinstance(stmt.extent, tirx.IntImm):
+                return None
+            if int(stmt.extent) < launch.shaves:
+                return None
+            body = stmt.body
+            while isinstance(body, tirx.SeqStmt) and len(body.seq) == 1:
+                body = body.seq[0]
+            if not _is_call(body, DMA_COPY):
+                return None
+            args = body.value.args
+            if _const_or(args[6], 0) != 1:
+                return None                              # a store
+            dst = _load_of(args[0])
+            if dst.buffer.scope() == "local":
+                return None                              # SHAVE-private: nothing to share
+            if _const_or(args[3], 0) % launch.shaves == 0:
+                return None                              # the row split already uses both SHAVEs
+            if not any(_uses(i, stmt.loop_var) for i in dst.indices):
+                return None                              # every iteration writes the same rows: a real serial chain
+            if _uses(body.value, launch.shave_var):
+                return None                              # the author already chose which SHAVE fills
+            notes.append(f"{dst.buffer.name}: unsplittable fill, the loop's {int(stmt.extent)} iterations dealt "
+                         f"over the tile's SHAVEs, tile sync before and after the loop")
+            guarded = tirx.IfThenElse(tirx.floormod(stmt.loop_var, _i32(launch.shaves)) == launch.shave_var,
+                                      body, None)
+            loop = tirx.For(stmt.loop_var, stmt.min, stmt.extent, stmt.kind, guarded, stmt.thread_binding,
+                            stmt.annotations)
+            return tirx.SeqStmt([_storage_sync_shared(), loop, _storage_sync_shared()])
+
         def pre(stmt):
             if isinstance(stmt, tirx.For):
+                dealt = deal_fill_loop(stmt)
+                if dealt is not None:
+                    return dealt
                 loop_depth[0] += 1
                 if int(stmt.annotations.get("num_stages", 0)) > 0:
                     pipelined_depth[0] += 1
