@@ -2140,7 +2140,7 @@ def gdn_conv_prefill_reference(y, conv_w, conv_state, a_log, dt_bias, n: int, KH
 
 
 def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 128, DV: int = 128, TB: int = 32,
-                          tiles: int = 3, shaves: int = 2, as_block: bool = False):
+                          tiles: int = 3, shaves: int = 2, as_block: bool = False, blocked_items: bool = False):
     """P3b: the Gated DeltaNet PREFILL phase between the input projection and the chunked scan -- a causal conv1d of
     width 4 with SiLU, then the per-head normalisations -- producing exactly what `make_gdn_scan_prefill` consumes.
 
@@ -2157,7 +2157,12 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
     only out to the innermost enclosing non-loop scope; the touch pins them at kernel level, which is the form
     this kernel's device gate was run in (plan question 10).
 
-    Oracle: `gdn_conv_prefill_reference`."""
+    Oracle: `gdn_conv_prefill_reference`.
+
+    `blocked_items`: a worker takes a CONTIGUOUS run of heads instead of every `workers`-th one, which is how
+    npu_dsl splits the same work (by channel block). The channels a worker owns are then contiguous, so its state
+    slices could become one wide DMA; it also changes WHICH worker owns a channel, which is what makes it a
+    diagnostic for the 3-tile multi-layer defect."""
     assert DK == DV and VH % KH == 0 and DK % 32 == 0 and TB % 16 == 0
     QK, VC = KH * DK, VH * DV
     CONV = 2 * QK + VC
@@ -2166,51 +2171,58 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
     NT = NP // TB
     ITEMS = KH + VH
     workers = tiles * shaves
+    PER = -(-ITEMS // workers)
     FL, HL = 16, 32
 
     @T.macro
-    def conv_phase(Y, ConvW, ConvState, ALog, DtBias, Nt, QKo, Vo, Gb, Zo, CsOut, tile, shave):
+    def conv_phase(Y, ConvW, ConvState, ALog, DtBias, Nt, QKo, Vo, Gb, Zo, CsOut, tile, shave, bufs=None):
         """The phase as a macro so P4 can put it in a layer launch; `make_gdn_conv_prefill` is the
-        standalone wrapper. `tile` and `shave` come from the caller's launch."""
+        standalone wrapper. `tile` and `shave` come from the caller's launch.
+
+        `bufs`: a dict of pre-allocated buffers from the caller. A kernel whose layer loop runs this phase inside
+        an `if` on the layer kind must pass them: ScopeIntelNpuCmx hoists only a loop body's TOP-LEVEL
+        declarations, so allocations inside the branch are re-made every iteration -- the state plan question 10
+        showed to be unsound, and the one npu_dsl never enters (it packs one arena once)."""
         worker = tile * shaves + shave
-        nt = T.alloc_shared((1, 1), T.int32)
-        al = T.alloc_shared((1, VH), T.float32)
-        db = T.alloc_shared((1, VH), T.float32)
-        win = T.alloc_local((3, DK), T.float16)      # the 3 tokens before the current row, per channel
-        keep = T.alloc_local((3, DK), T.float16)     # that window as it stood after the last LIVE token
-        cw = T.alloc_local((4, DK), T.float16)
-        xb = T.alloc_local((TB, DK), T.float16)      # one block of tokens for this head's channels
-        cv = T.alloc_local((TB, DK), T.float32)      # conv + SiLU
-        ob = T.alloc_local((TB, DK), T.float32)
-        zb = T.alloc_local((TB, DV), T.float16)
-        bb = T.alloc_local((TB, 1), T.float16)       # b and a are VH columns apart in the projection row
-        aa = T.alloc_local((TB, 1), T.float16)
-        gbb = T.alloc_local((TB, 2), T.float32)
-        acc = T.alloc_local((FL,), T.float32)
-        eh = T.alloc_local((FL,), T.float16)
-        ls = T.alloc_local((FL,), T.float32)
-        st = T.alloc_local((8,), T.float32)
-        # first use here pins every CMX scope at kernel level (question 10)
-        win[0, 0] = T.float16(0)
-        keep[0, 0] = T.float16(0)
-        cw[0, 0] = T.float16(0)
-        xb[0, 0] = T.float16(0)
-        cv[0, 0] = T.float32(0)
-        ob[0, 0] = T.float32(0)
-        zb[0, 0] = T.float16(0)
-        bb[0, 0] = T.float16(0)
-        aa[0, 0] = T.float16(0)
-        gbb[0, 0] = T.float32(0)
-        acc[0] = T.float32(0)
-        ls[0] = T.float32(0)
-        eh[0] = T.float16(0)
-        st[0] = T.float32(0)
+        nt = T.alloc_shared((1, 1), T.int32) if bufs is None else bufs["nt"]
+        al = T.alloc_shared((1, VH), T.float32) if bufs is None else bufs["al"]
+        db = T.alloc_shared((1, VH), T.float32) if bufs is None else bufs["db"]
+        win = (T.alloc_local((3, DK), T.float16) if bufs is None else bufs["win"])    # the 3 tokens before the row
+        keep = (T.alloc_local((3, DK), T.float16) if bufs is None else bufs["keep"])  # that window at the last LIVE token
+        cw = T.alloc_local((4, DK), T.float16) if bufs is None else bufs["cw"]
+        xb = (T.alloc_local((TB, DK), T.float16) if bufs is None else bufs["xb"])     # a token block of this head's channels
+        cv = (T.alloc_local((TB, DK), T.float32) if bufs is None else bufs["cv"])     # conv + SiLU
+        ob = T.alloc_local((TB, DK), T.float32) if bufs is None else bufs["ob"]
+        zb = T.alloc_local((TB, DV), T.float16) if bufs is None else bufs["zb"]
+        bb = (T.alloc_local((TB, 1), T.float16) if bufs is None else bufs["bb"])      # b and a are VH columns apart
+        aa = T.alloc_local((TB, 1), T.float16) if bufs is None else bufs["aa"]
+        gbb = T.alloc_local((TB, 2), T.float32) if bufs is None else bufs["gbb"]
+        acc = T.alloc_local((FL,), T.float32) if bufs is None else bufs["acc"]
+        eh = T.alloc_local((FL,), T.float16) if bufs is None else bufs["eh"]
+        ls = T.alloc_local((FL,), T.float32) if bufs is None else bufs["ls"]
+        st = T.alloc_local((8,), T.float32) if bufs is None else bufs["st"]
+        if bufs is None:
+            # first use here pins every CMX scope at kernel level (question 10)
+            win[0, 0] = T.float16(0)
+            keep[0, 0] = T.float16(0)
+            cw[0, 0] = T.float16(0)
+            xb[0, 0] = T.float16(0)
+            cv[0, 0] = T.float32(0)
+            ob[0, 0] = T.float32(0)
+            zb[0, 0] = T.float16(0)
+            bb[0, 0] = T.float16(0)
+            aa[0, 0] = T.float16(0)
+            gbb[0, 0] = T.float32(0)
+            acc[0] = T.float32(0)
+            ls[0] = T.float32(0)
+            eh[0] = T.float16(0)
+            st[0] = T.float32(0)
         T.copy(Nt[0, 0], nt)
         T.copy(ALog[0, 0], al)
         T.copy(DtBias[0, 0], db)
         T.sync_threads()
         for it in T.serial(T.ceildiv(ITEMS, workers)):
-            hb = it * workers + worker
+            hb = (worker * PER + it) if blocked_items else (it * workers + worker)
             if hb < ITEMS:
                 # channel base of this item: k-heads take q then k, v-heads take their v slice
                 for part in T.serial(2):
@@ -3890,7 +3902,8 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
                        I: int = 512, E: int = 256, TOPK: int = 8, G: int = 128, TB: int = 32, C: int = 64,
                        TBq: int = 8, TBF: int = 16, BKV: int = 128, BN1: int = 32, BN2: int = 32, MB: int = 16,
                        BM: int = 64, BNR: int = 16, MBe: int = 16, BNG: int = 64, BND: int = 64, tiles: int = 3,
-                       shaves: int = 2, eps: float = 1e-6, KVL: int | None = None, skip: frozenset = frozenset()):
+                       shaves: int = 2, eps: float = 1e-6, KVL: int | None = None, skip: frozenset = frozenset(),
+                       unroll_layers: bool = False, conv_blocked: bool = True):
     """P5: a whole PREFILL chunk of `N` prompt tokens through `L` layers in ONE launch -- the prefill counterpart
     of `make_decode_model`. A device-side loop over the layers, `Kind[li, 0]` selecting the Gated DeltaNet or the
     full-attention mixer, every layer's weights reached through `Table[li, :]` (`PREFILL_TABLE_COLS`), the residual
@@ -3919,7 +3932,7 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
         step = step * k // math.gcd(step, k)
     NP = -(-N // step) * step
     conv_phase, _ = make_gdn_conv_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, TB=TB, tiles=tiles, shaves=shaves,
-                                          as_block=True)
+                                          as_block=True, blocked_items=conv_blocked)
     scan_phase, _ = make_gdn_scan_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, C=C, tiles=tiles, shaves=shaves,
                                           eps=eps, as_block=True)
     qkv_phase, qs = make_attn_qkv_prefill(N=NP, H=H, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX, TB=TBq, tiles=tiles,
@@ -3995,7 +4008,33 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
             ls[0] = T.float32(0)
             st[0] = T.float32(0)
             T.copy(Nt[0, 0], nt)
-            for li in T.serial(L):
+            # The GDN conv phase's buffers live HERE, not inside the layer loop's Kind branch: ScopeIntelNpuCmx
+            # hoists only a loop body's top-level declarations, so an allocation inside the branch is re-made
+            # every iteration -- question 10's unsound state, and the one npu_dsl never enters (one packed arena).
+            cbuf = dict(nt=T.alloc_shared((1, 1), T.int32), al=T.alloc_shared((1, VH), T.float32),
+                        db=T.alloc_shared((1, VH), T.float32), win=T.alloc_local((3, DK), T.float16),
+                        keep=T.alloc_local((3, DK), T.float16), cw=T.alloc_local((4, DK), T.float16),
+                        xb=T.alloc_local((TB, DK), T.float16), cv=T.alloc_local((TB, DK), T.float32),
+                        ob=T.alloc_local((TB, DK), T.float32), zb=T.alloc_local((TB, DV), T.float16),
+                        bb=T.alloc_local((TB, 1), T.float16), aa=T.alloc_local((TB, 1), T.float16),
+                        gbb=T.alloc_local((TB, 2), T.float32), acc=T.alloc_local((FL,), T.float32),
+                        eh=T.alloc_local((FL,), T.float16), ls=T.alloc_local((FL,), T.float32),
+                        st=T.alloc_local((8,), T.float32))
+            cbuf["win"][0, 0] = T.float16(0)     # first use pins each scope at kernel level (question 10)
+            cbuf["keep"][0, 0] = T.float16(0)
+            cbuf["cw"][0, 0] = T.float16(0)
+            cbuf["xb"][0, 0] = T.float16(0)
+            cbuf["cv"][0, 0] = T.float32(0)
+            cbuf["ob"][0, 0] = T.float32(0)
+            cbuf["zb"][0, 0] = T.float16(0)
+            cbuf["bb"][0, 0] = T.float16(0)
+            cbuf["aa"][0, 0] = T.float16(0)
+            cbuf["gbb"][0, 0] = T.float32(0)
+            cbuf["acc"][0] = T.float32(0)
+            cbuf["ls"][0] = T.float32(0)
+            cbuf["eh"][0] = T.float16(0)
+            cbuf["st"][0] = T.float32(0)
+            for li in (range(L) if unroll_layers else T.serial(L)):
                 InNorm = T.ddr_view(Table[li, col["InNorm"]], (1, H), T.float16)
                 PostNorm = T.ddr_view(Table[li, col["PostNorm"]], (1, H), T.float16)
                 Wr = T.ddr_view(Table[li, col["Wr"]], (RR, H), T.float16)
@@ -4020,7 +4059,8 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
                     if "gdn" not in skip:
                         in_proj(Xs, WinQ, WinS, Ys, tile, shave)
                         T.sync_grid()
-                        conv_phase(Ys, ConvW, ConvState, ALog, DtBias, Nt, QKs, Vs, Gbs, Zs, ConvState, tile, shave)
+                        conv_phase(Ys, ConvW, ConvState, ALog, DtBias, Nt, QKs, Vs, Gbs, Zs, ConvState, tile,
+                                   shave, cbuf)
                         T.sync_grid()
                         scan_phase(QKs, Vs, Gbs, Zs, GNorm, Nt, Ssm, Os, tile, shave)
                         T.sync_grid()
