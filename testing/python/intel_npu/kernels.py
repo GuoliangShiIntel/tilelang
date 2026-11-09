@@ -2814,6 +2814,177 @@ def attn_prefill_reference(q, kc, vt, gate, pos0: int, eps: float = 0.0):
     return out
 
 
+def make_attn_qkv_prefill(N: int = 64, H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, ROT: int = 64,
+                          SMAX: int = 1536, TB: int = 8, tiles: int = 3, shaves: int = 2, eps: float = 1e-6,
+                          as_block: bool = False):
+    """P1b: the attention layer's PREFILL phase between the qkv projection and the flash phase -- what
+    `attn_block`'s stage B does for ONE token, over `N` of them.
+
+      q_h  = rope(rmsnorm_zc(Y[t, h*2D : h*2D+D], qnorm), pos0 + t)      -> Q[h // GQ, t, h % GQ, :]
+      gate = Y[t, h*2D+D : h*2D+2D]                                      -> Gate[h // GQ, t, h % GQ, :]
+      k_g  = rope(rmsnorm_zc(Y[t, KOFF + g*D ...], knorm), pos0 + t)     -> Kc[g, pos0 + t, :]
+      v_g  = Y[t, VOFF + g*D ...]                                        -> Vt[g, :, pos0 + t]
+
+    `make_attn_prefill` reads Kc / Vt and never writes them, so without this phase nothing fills the cache and
+    prefill cannot feed decode. The work item is a (token block, kv group) pair, which is what makes the stores
+    cheap: one kv group's GQ query heads are adjacent in Y AND adjacent in Q, so a block is one [TB, GQ*2D] read
+    and two contiguous [TB*GQ, D] writes, and the keys of TB tokens are one contiguous run of Kc. Only V needs a
+    transpose, into one [D, TB] store instead of TB stores of [D, 1] -- a 256-row DMA of 2 bytes per row is the
+    shape the per-job cost punishes hardest.
+
+    `Nt[0, 0]` is the live token count: a row past it is written as ZERO, because `make_attn_prefill` relies on
+    unseen cache positions holding zeros rather than masking them. Oracle: `attn_qkv_prefill_reference`."""
+    GQ = NH // NKV
+    NQKV = NH * 2 * D + 2 * NKV * D
+    KOFF, VOFF = NH * 2 * D, NH * 2 * D + NKV * D
+    NP = -(-N // TB) * TB
+    NB = NP // TB
+    workers = tiles * shaves
+    FL, HL = 16, 32
+    HR = ROT // 2
+    assert NH % NKV == 0 and D % HL == 0 and ROT % 2 == 0 and ROT <= D
+
+    @T.macro
+    def qkv_phase(Ys, QNormW, KNormW, CosSin, Pos, Nt, Q, Gate, Kc, Vt, tile, shave):
+        """The phase as a macro so the attention layer can call it; `make_attn_qkv_prefill` is the wrapper."""
+        worker = tile * shaves + shave
+        qw = T.alloc_shared((1, D), T.float16)
+        kw = T.alloc_shared((1, D), T.float16)
+        pos = T.alloc_shared((1, 1), T.int32)
+        nt = T.alloc_shared((1, 1), T.int32)
+        qg = T.alloc_local((TB, GQ * 2 * D), T.float16)   # one kv group's q and gate for TB tokens: one DMA
+        cs = T.alloc_local((TB, 2 * ROT), T.float32)
+        qo = T.alloc_local((TB * GQ, D), T.float16)
+        go = T.alloc_local((TB * GQ, D), T.float16)
+        kb = T.alloc_local((TB, D), T.float16)
+        vb = T.alloc_local((TB, D), T.float16)
+        vt = T.alloc_local((D, TB), T.float16)
+        rowf = T.alloc_local((D,), T.float32)
+        ls = T.alloc_local((FL,), T.float32)
+        st = T.alloc_local((8,), T.float32)
+        T.copy(QNormW[0, 0], qw)
+        T.copy(KNormW[0, 0], kw)
+        T.copy(Pos[0, 0], pos)
+        T.copy(Nt[0, 0], nt)
+        T.sync_threads()
+        for it in T.serial(T.ceildiv(NB * NKV, workers)):
+            item = it * workers + worker
+            if item < NB * NKV:
+                b = item // NKV
+                g = item % NKV
+                T.copy(CosSin[b * TB, 0], cs)
+                # --- the group's GQ query heads and their gates ------------------------------------------
+                T.copy(Ys[b * TB, (g * GQ) * 2 * D], qg)
+                for r, hh in T.grid(TB, GQ):
+                    st[3] = T.if_then_else(b * TB + r < nt[0, 0], T.float32(1), T.float32(0))
+                    for v in T.vectorized(FL):
+                        ls[v] = T.float32(0)
+                    for d0 in T.serial(D // FL):
+                        for v in T.vectorized(FL):
+                            rowf[d0 * FL + v] = T.cast(qg[r, hh * 2 * D + d0 * FL + v], T.float32)
+                            ls[v] = ls[v] + rowf[d0 * FL + v] * rowf[d0 * FL + v]
+                    st[0] = T.float32(1) / T.sqrt(T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL]) / T.float32(D)
+                                                  + T.float32(eps))
+                    for d0 in T.serial(D // FL):
+                        for v in T.vectorized(FL):
+                            rowf[d0 * FL + v] = (rowf[d0 * FL + v] * st[0]
+                                                 * (T.float32(1) + T.cast(qw[0, d0 * FL + v], T.float32)))
+                    for rr in T.serial(HR):      # rotate-half on the first ROT dims
+                        st[1] = rowf[rr]
+                        st[2] = rowf[HR + rr]
+                        rowf[rr] = st[1] * cs[r, rr] - st[2] * cs[r, ROT + rr]
+                        rowf[HR + rr] = st[2] * cs[r, HR + rr] + st[1] * cs[r, ROT + HR + rr]
+                    for d0 in T.serial(D // FL):
+                        for v in T.vectorized(FL):
+                            qo[r * GQ + hh, d0 * FL + v] = T.cast(rowf[d0 * FL + v] * st[3], T.float16)
+                            go[r * GQ + hh, d0 * FL + v] = T.cast(
+                                T.cast(qg[r, hh * 2 * D + D + d0 * FL + v], T.float32) * st[3], T.float16)
+                T.copy(qo, Q[g, b * TB, 0, 0])
+                T.copy(go, Gate[g, b * TB, 0, 0])
+                # --- the group's key: normed, roped, appended to the cache -------------------------------
+                T.copy(Ys[b * TB, KOFF + g * D], kb)
+                for r in T.serial(TB):
+                    st[3] = T.if_then_else(b * TB + r < nt[0, 0], T.float32(1), T.float32(0))
+                    for v in T.vectorized(FL):
+                        ls[v] = T.float32(0)
+                    for d0 in T.serial(D // FL):
+                        for v in T.vectorized(FL):
+                            rowf[d0 * FL + v] = T.cast(kb[r, d0 * FL + v], T.float32)
+                            ls[v] = ls[v] + rowf[d0 * FL + v] * rowf[d0 * FL + v]
+                    st[0] = T.float32(1) / T.sqrt(T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL]) / T.float32(D)
+                                                  + T.float32(eps))
+                    for d0 in T.serial(D // FL):
+                        for v in T.vectorized(FL):
+                            rowf[d0 * FL + v] = (rowf[d0 * FL + v] * st[0]
+                                                 * (T.float32(1) + T.cast(kw[0, d0 * FL + v], T.float32)))
+                    for rr in T.serial(HR):
+                        st[1] = rowf[rr]
+                        st[2] = rowf[HR + rr]
+                        rowf[rr] = st[1] * cs[r, rr] - st[2] * cs[r, ROT + rr]
+                        rowf[HR + rr] = st[2] * cs[r, HR + rr] + st[1] * cs[r, ROT + HR + rr]
+                    for d0 in T.serial(D // FL):
+                        for v in T.vectorized(FL):
+                            kb[r, d0 * FL + v] = T.cast(rowf[d0 * FL + v] * st[3], T.float16)
+                T.copy(kb, Kc[g, pos[0, 0] + b * TB, 0])
+                # --- the group's value, transposed once per block into the cache's column layout ---------
+                T.copy(Ys[b * TB, VOFF + g * D], vb)
+                for r in T.serial(TB):
+                    st[3] = T.if_then_else(b * TB + r < nt[0, 0], T.float32(1), T.float32(0))
+                    for d in T.serial(D):
+                        vt[d, r] = T.cast(T.cast(vb[r, d], T.float32) * st[3], T.float16)
+                T.copy(vt, Vt[g, 0, pos[0, 0] + b * TB])
+
+    if as_block:
+        return qkv_phase, dict(NP=NP, NB=NB, NQKV=NQKV, GQ=GQ, KOFF=KOFF, VOFF=VOFF)
+
+    @T.prim_func
+    def attn_qkv(Ys: T.Tensor((NP, NQKV), T.float16), QNormW: T.Tensor((1, D), T.float16),
+                 KNormW: T.Tensor((1, D), T.float16), CosSin: T.Tensor((NP, 2 * ROT), T.float32),
+                 Pos: T.Tensor((1, 1), T.int32), Nt: T.Tensor((1, 1), T.int32),
+                 Q: T.Tensor((NKV, NP, GQ, D), T.float16), Gate: T.Tensor((NKV, NP, GQ, D), T.float16),
+                 Kc: T.Tensor((NKV, SMAX, D), T.float16), Vt: T.Tensor((NKV, D, SMAX), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            qkv_phase(Ys, QNormW, KNormW, CosSin, Pos, Nt, Q, Gate, Kc, Vt, tile, T.get_thread_binding())
+
+    return attn_qkv
+
+
+def attn_qkv_prefill_reference(y, qnorm_w, knorm_w, cos_sin, pos0: int, n: int, NH: int, NKV: int, D: int,
+                               ROT: int, kc, vt, eps: float = 1e-6):
+    """numpy oracle of make_attn_qkv_prefill (fp32). `y` [NP, NQKV] is the projection output, `cos_sin` [NP, 2*ROT]
+    (cos then sin per token, the layout the kernel reads a whole block of in one copy); returns (Q, Gate, kc, vt)
+    with the caches updated in place for positions pos0 .. pos0 + n - 1. The norm and the rotate-half are
+    `attn_reference`'s, so a prefill that disagrees with decode on one token shows up here."""
+    import numpy as np
+    NP = y.shape[0]
+    GQ = NH // NKV
+    KOFF, VOFF = NH * 2 * D, NH * 2 * D + NKV * D
+    HR = ROT // 2
+    Q = np.zeros((NKV, NP, GQ, D), np.float16)
+    Gate = np.zeros((NKV, NP, GQ, D), np.float16)
+    kc, vt = kc.copy(), vt.copy()
+
+    def norm_rope(v, wn, cs):
+        v = v * (1.0 / np.sqrt((v * v).mean() + eps)) * (1.0 + wn.astype(np.float32).reshape(-1))
+        r = v[:ROT].copy()
+        out = v.copy()
+        out[:HR] = r[:HR] * cs[0, :HR] - r[HR:] * cs[1, :HR]
+        out[HR:ROT] = r[HR:] * cs[0, HR:] + r[:HR] * cs[1, HR:]
+        return out
+
+    for t in range(n):
+        cs = cos_sin[t].astype(np.float32).reshape(2, ROT)
+        for h in range(NH):
+            q = norm_rope(y[t, h * 2 * D:h * 2 * D + D].astype(np.float32), qnorm_w, cs)
+            Q[h // GQ, t, h % GQ] = q.astype(np.float16)
+            Gate[h // GQ, t, h % GQ] = y[t, h * 2 * D + D:h * 2 * D + 2 * D]
+        for g in range(NKV):
+            kc[g, pos0 + t] = norm_rope(y[t, KOFF + g * D:KOFF + (g + 1) * D].astype(np.float32),
+                                        knorm_w, cs).astype(np.float16)
+            vt[g, :, pos0 + t] = y[t, VOFF + g * D:VOFF + (g + 1) * D]
+    return Q, Gate, kc, vt
+
+
 def attn_reference(x, res, wqkv_int, wqkv_scales, wo_int, wo_scales, qnorm_w, knorm_w, cos_sin, pos, kc, vt,
                    NH: int, NKV: int, D: int, ROT: int, G: int, eps: float = 1e-6):
     """numpy oracle of make_attn_decode (fp32): returns out [H], the K cache and transposed V cache after the append."""
