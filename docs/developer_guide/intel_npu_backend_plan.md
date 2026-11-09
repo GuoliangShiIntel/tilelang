@@ -641,8 +641,8 @@ device-verified and measured here.
 | Projections, prefill | int4 group-128: SHAVE dequant -> fp16 DPU; fp16 (`baProj`) | **have** (log 2026-11-07 M2): W4A16 flow in both role assignments, device PASS; 0.82x npu_dsl's tuned probe at its shape, dequant row op 0.26 cyc/value | M2 |
 | Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | **have** (log 2026-11-07 M2): `T.gemm_i4` / `T.gemm_i8` merged-FC DPU path, device PASS, 30 / 41 GB/s of weights (DMA bound ~126) | M2 |
 | Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | `T.vectorized` loops lower to half32/float16 SHAVE vector ops with VAU exp/log/tanh (**have**, log 2026-11-07); the ops themselves not yet written | M1 |
-| Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash prefill phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**, 960x1024x64 vectorised 1.042 ms TURBO; **decode layer have** (log 2026-11-08): qkv GEMV, zero-centred q/k norm, RoPE, cache append, flash-decoding over 1536 positions with GQA 8:1 and the output gate, o_proj, in one launch, device PASS, **0.563 ms** TURBO; prefill GQA / gate / causal mask open | M1 |
-| Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | **decode have** (log 2026-11-08 M4, M5 step 5): one launch at Qwen3.6's shape, device PASS with both states checked, **0.640 ms** TURBO (delta rule at npu_dsl's gdn_scan code quality; its SHAVE section 323 vs npu_dsl's 247 us); the prefill chunked scan (`make_gdn_scan_prefill`, 11 DPU matmuls per chunk incl. transposes) is **device golden** at Qwen3.6's GDN shape: 12/12 trials at rel 7.10e-04 on 3 x 2, 26.7 us per token, causality control biting -- but only with its CMX scopes hoisted by hand, which is a kernel-side workaround for question 10; the prefill conv1d is open | M4 |
+| Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | **prefill layer have** (log 2026-11-09): the whole mixer in one launch -- norm, qkv int4, per-head norms + RoPE + cache append, flash with GQA / causal mask / output gate, o_proj, residual -- device **12/12 trials** at 192 tokens, 52.5 us/token, and 5/5 at pos0 192 with an inherited cache; **with MoE** 205.8 us/token, 12/12; **decode layer have** (log 2026-11-08): qkv GEMV, zero-centred q/k norm, RoPE, cache append, flash-decoding over 1536 positions with GQA 8:1 and the output gate, o_proj, in one launch, device PASS, **0.563 ms** TURBO | M1 |
+| Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | **decode have** (log 2026-11-08 M4, M5 step 5): one launch at Qwen3.6's shape, device PASS with both states checked, **0.640 ms** TURBO (delta rule at npu_dsl's gdn_scan code quality; its SHAVE section 323 vs npu_dsl's 247 us); **prefill layer have** (log 2026-11-08): conv1d + chunked scan + both projections + MoE in one launch, device 12/12 trials, 285.8 us/token at 192 tokens | M4 |
 | MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | **have** (log 2026-11-08 M3): one launch at Qwen3.6's shape, device PASS (routing == oracle), **0.560 ms** TURBO = 28 GB/s of the 15.8 MB it reads; expert phase ~0.43 ms at 34 GB/s (DMA-latency bound, see the log's cost split) | M3 |
 | Head | final norm + lm_head (int8 g128) + greedy argmax | **have** (log 2026-11-08): one launch at Qwen3.6's vocabulary, device PASS, **8.78 ms** TURBO = 58.9 GB/s vs npu_dsl's head 9.44 ms same day; both at <50% of the DMA bound | M5 |
 | Compiler | layer table + device-side layer loop with two layer kinds; long-prompt chunk loop; CMX reuse across phases; barrier id reuse; `.text` per kernel | **have** (log 2026-11-08 M5 step 3, unblocked M6): `T.ddr_view` address table, device-side `for li` with `Kind[li]`, scoped CMX across the loop, 40 layers lower and fit (`.text` 127 KB); question 8's device loss is **worked around** -- the KV cache is a kernel parameter, not a table address, so one launch may hold any mix of layers; rings do not yet hoist over the layer loop (cross-layer prefetch, npu_dsl's 14 ms of fusion gain); long-prompt chunk loop open | M5 |
@@ -653,6 +653,35 @@ Baseline to beat: npu_dsl's Qwen3.6-35B-A3B numbers (`qwen36_e2e`, its `docs/des
 re-measured on the same day as ours, since the box's DPU rate has changed since October (section 7 question 5).
 
 ## 8. Log
+
+* 2026-11-09: **Prefill's attention half catches up with its GDN half: the whole layer, then the whole layer with
+  MoE, each in ONE launch.** P1 and P1b were two phases with nothing joining them; `make_attn_layer_prefill` is
+  norm -> qkv projection -> P1b (per-head norms, RoPE, the cache append) -> P1's flash attention -> o_proj ->
+  residual, and `make_attn_moe_layer_prefill` adds the post norm, P2a's routing, P2b's grouped expert FFN and the
+  MoE sum. **Device, UNPROFILED TURBO, 3 x 2, Qwen3.8 shape, n=192:** the mixer **10.081 ms = 52.5 us/token,
+  12/12 trials** vs the composed oracle (stream AND both caches), worst rel 7.92e-04, plus **5/5 at pos0 192 with
+  an inherited cache** -- the chunked-prefill case; the layer with MoE **39.521 ms = 205.8 us/token, 12/12**, worst
+  rel 1.00e-02. Both negatives bite (zero the o_proj, and every expert's down projection, and the stream comes back
+  at **exactly** its input while the cache is still filled). `.text` 21.8% / 29.5%.
+  **Three things worth keeping.** (1) **`T.copy` infers the DDR row stride from the source's INNERMOST extent**, so
+  reading a head-major `Gate[g, t0, 0, 0]` into a `[TB, GQ*D]` buffer emitted width 128 B at src stride 64 B --
+  overlapping rows, and the layer's first oracle run came out at rel 0.68. The gate and the flash output are now
+  both **token-major `[N, NH*D]`**: the output had to be (the o_proj that reads it is an ordinary `[N, KO]` gemm and
+  `make_proj_prefill` reads contiguous rows of length K), and with the gate following, the gate is one 2-D DMA in and
+  the gated output one 2-D DMA out of the same CMX buffer -- no extra allocation. Only the query stays head-major:
+  it is a DPU operand. (2) **A dead token needs an explicit guard through attention**, unlike GDN: past `Nt` the GDN
+  phases emit zeros, but a zero query gives a **uniform** softmax over the keys it may see, so its mix is the mean of
+  V. Both halves of the attention layer skip `t >= Nt`, which is what a chunked prefill's last partial chunk relies
+  on. (3) The per-token norm the three prefill layers share became `prefill_norm_block`; both GDN layers lower to a
+  **byte-identical** source after the move (sha taken before and after), which is how a refactor of device-verified
+  code is made cheap to trust.
+  **Attribution for the next step:** the MoE half is ~29.5 ms of the 39.5, which is the standalone expert phase's
+  28.694 ms at the same prompt -- so the layer composes at no cost and **MoE is 75% of it**. With the GDN+MoE layer
+  at 54.873 ms, a 40-layer prefill chunk of 192 tokens is **~1.9 s of device time, three quarters in the expert
+  FFN**. Still open for e2e prefill: the prefill model kernel (layer table, device-side layer loop, last-token
+  head), the prefill weight layout in `e2e/pack.py` (`make_proj_prefill` wants raw packed int4 + row-major scales,
+  not decode's chunk blocks), and the driver (`chunked prompt, pos0 / Nt, the cos/sin table, scratch sizing, state
+  carry, TTFT`). Commits `c7bb03f0`, `9f6b5955`.
 
 * 2026-11-08: **The DPU's "8192 output points" was a misreading, it cost real time, and a device probe killed it.**
   `dpu.md` §13 says "max output points per operation 8192 on VPU5"; this plan and `hw_facts.py` recorded that as the
