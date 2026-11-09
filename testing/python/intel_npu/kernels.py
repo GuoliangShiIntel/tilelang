@@ -852,94 +852,114 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
     KGH, KGI = H // G, I // G
     assert H % G == 0 and I % G == 0 and (2 * I) % BNG == 0 and H % BND == 0
     assert H % HL == 0 and I % HL == 0 and MB * BNG <= 8192 and MB * BND <= 8192
-    EPW = -(-(E + 1) // workers)          # experts per worker
+    assert I % (shaves * HL) == 0 and N % shaves == 0
+    EPT = -(-(E + 1) // tiles)            # experts per TILE: the tile's SHAVEs cooperate on one expert
 
     @T.macro
     def expert_phase(X, WguQ, WguS, WdQ, WdS, Wts, Off, Slot, Part, Out, tile, shave):
-        """The phase as a macro so a layer kernel can call it; `make_moe_expert_prefill` is the standalone wrapper."""
+        """The phase as a macro so a layer kernel can call it; `make_moe_expert_prefill` is the standalone wrapper.
+
+        A TILE owns whole experts and its two SHAVEs split that expert's weight chunks, rather than each worker
+        owning its own experts. The flow's ping-pong needs the tile's SHAVEs alternating on chunks of ONE loop
+        (docs/examples/pingpong_multitile/README.md 1-3), which per-worker ownership cannot offer; it also halves
+        the partials, so the zero fill, the accumulation and the combine all read and write three rows per token
+        instead of six."""
         worker = tile * shaves + shave
         off_cmx = T.alloc_local((E + 2,), T.int32)
         slot_cmx = T.alloc_local((SLOTS,), T.int32)
         wts_cmx = T.alloc_local((N, 16), T.float32)
-        x_cmx = T.alloc_local((MB, H), T.float16)
-        wq_cmx = T.alloc_local((BNG, H // 2), T.uint8)
+        x_cmx = T.alloc_shared((MB, H), T.float16)          # the chunk's tokens: both SHAVEs read them
+        wq_cmx = T.alloc_local((BNG, H // 2), T.uint8)      # a SHAVE's own chunk of weights
         ws_cmx = T.alloc_local((BNG, KGH), T.float16)
         wg_cmx = T.alloc_local((BNG, H), T.float16)
         y_cmx = T.alloc_local((MB, BNG), T.float16)
-        gu_cmx = T.alloc_local((MB, 2 * I), T.float16)
-        h_cmx = T.alloc_local((MB, I), T.float16)
+        gu_cmx = T.alloc_shared((MB, 2 * I), T.float16)     # the SHAVEs write disjoint column ranges
+        h_cmx = T.alloc_shared((MB, I), T.float16)
         wqd_cmx = T.alloc_local((BND, I // 2), T.uint8)
         # the expert's down scales in one DMA instead of one per chunk: CD = 32 jobs for 16 KiB, where the same
         # hoist on the gate/up side would cost 32 KiB to save 16, and the layer kernel has no room for both
-        wsd_all = T.alloc_local((H, KGI), T.float16)
+        wsd_all = T.alloc_shared((H, KGI), T.float16)
         wd_cmx = T.alloc_local((BND, I), T.float16)
         yd_cmx = T.alloc_local((MB, BND), T.float16)
-        yo = T.alloc_local((MB, H), T.float16)      # the chunk's whole down output, so Part is touched once per token
+        yo = T.alloc_shared((MB, H), T.float16)     # the chunk's whole down output, so Part is touched once per token
         pw = T.alloc_local((1, H), T.float32)
         pa = T.alloc_local((1, H), T.float32)
         T.copy(Off[0], off_cmx)
         T.copy(Slot[0], slot_cmx)
         T.copy(Wts[0, 0], wts_cmx)
-        for t in T.serial(N):             # this worker's partial starts at zero
-            for c0 in T.serial(H // FL):
-                for v in T.vectorized(FL):
-                    pw[0, c0 * FL + v] = T.float32(0)
-            T.copy(pw, Part[worker, t, 0])
-        for ei in T.serial(EPW):
-            e = ei * workers + worker
+        for t in T.serial(N):             # this TILE's partial starts at zero, the rows split over its SHAVEs
+            if t % shaves == shave:
+                for c0 in T.serial(H // FL):
+                    for v in T.vectorized(FL):
+                        pw[0, c0 * FL + v] = T.float32(0)
+                T.copy(pw, Part[tile, t, 0])
+        for ei in T.serial(EPT):
+            e = ei * tiles + tile
             if e < E + 1:
+                # a DDR -> shared fill is split over the tile's SHAVEs and gets a tile sync, so it must not sit
+                # under a SHAVE-dependent branch: guarding one would leave the other waiting at that sync
                 T.copy(WdS[e * H, 0], wsd_all)
                 for c in T.serial(T.ceildiv(off_cmx[e + 1] - off_cmx[e], MB)):
                     # gather the chunk's token rows; a short tail keeps the last row, whose result is dropped
                     for i in T.serial(MB):
                         T.copy(X[slot_cmx[T.min(off_cmx[e] + c * MB + i, off_cmx[e + 1] - 1)] // (TOPK + 1), 0],
                                x_cmx[i:i + 1, 0:H])
+                    T.sync_threads()
                     for n in T.serial(CG):
-                        T.copy(WguQ[e * 2 * I + n * BNG, 0], wq_cmx)
-                        T.copy(WguS[e * 2 * I + n * BNG, 0], ws_cmx)
-                        if not skip_dequant:
-                            for r in T.serial(BNG):
-                                T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wg_cmx[r, 0]),
-                                              T.address_of(wq_cmx[r, 0]), T.address_of(ws_cmx[r, 0]), H, G)
-                        T.gemm(x_cmx, wg_cmx, y_cmx, transpose_B=True, clear_accum=True)
-                        for i, c0 in T.grid(MB, BNG // HL):
-                            for v in T.vectorized(HL):
-                                gu_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
-                    for i, c0 in T.grid(MB, I // HL):
+                        if n % shaves == shave:
+                            T.copy(WguQ[e * 2 * I + n * BNG, 0], wq_cmx)
+                            T.copy(WguS[e * 2 * I + n * BNG, 0], ws_cmx)
+                            if not skip_dequant:
+                                for r in T.serial(BNG):
+                                    T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wg_cmx[r, 0]),
+                                                  T.address_of(wq_cmx[r, 0]), T.address_of(ws_cmx[r, 0]), H, G)
+                            T.gemm(x_cmx, wg_cmx, y_cmx, transpose_B=True, clear_accum=True)
+                            for i, c0 in T.grid(MB, BNG // HL):
+                                for v in T.vectorized(HL):
+                                    gu_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
+                    T.sync_threads()
+                    for i, c0 in T.grid(MB, I // shaves // HL):
                         for v in T.vectorized(HL):
-                            h_cmx[i, c0 * HL + v] = (gu_cmx[i, c0 * HL + v] * T.sigmoid(gu_cmx[i, c0 * HL + v])
-                                                     * gu_cmx[i, I + c0 * HL + v])
+                            h_cmx[i, shave * (I // shaves) + c0 * HL + v] = (
+                                gu_cmx[i, shave * (I // shaves) + c0 * HL + v]
+                                * T.sigmoid(gu_cmx[i, shave * (I // shaves) + c0 * HL + v])
+                                * gu_cmx[i, I + shave * (I // shaves) + c0 * HL + v])
+                    T.sync_threads()
                     for n in T.serial(CD):
-                        T.copy(WdQ[e * H + n * BND, 0], wqd_cmx)
-                        if not skip_dequant:
-                            for r in T.serial(BND):
-                                T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wd_cmx[r, 0]),
-                                              T.address_of(wqd_cmx[r, 0]), T.address_of(wsd_all[n * BND + r, 0]), I, G)
-                        T.gemm(h_cmx, wd_cmx, yd_cmx, transpose_B=True, clear_accum=True)
-                        for i, c0 in T.grid(MB, BND // HL):
-                            for v in T.vectorized(HL):
-                                yo[i, n * BND + c0 * HL + v] = yd_cmx[i, c0 * HL + v]
+                        if n % shaves == shave:
+                            T.copy(WdQ[e * H + n * BND, 0], wqd_cmx)
+                            if not skip_dequant:
+                                for r in T.serial(BND):
+                                    T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wd_cmx[r, 0]),
+                                                  T.address_of(wqd_cmx[r, 0]), T.address_of(wsd_all[n * BND + r, 0]),
+                                                  I, G)
+                            T.gemm(h_cmx, wd_cmx, yd_cmx, transpose_B=True, clear_accum=True)
+                            for i, c0 in T.grid(MB, BND // HL):
+                                for v in T.vectorized(HL):
+                                    yo[i, n * BND + c0 * HL + v] = yd_cmx[i, c0 * HL + v]
+                    T.sync_threads()
                     # one read-modify-write of the whole row per live token: the chunk-wise form cost CD of
                     # them, and at BND = 64 those are 256-byte DDR jobs whose count dominated the phase
                     for i in T.serial(MB):
-                        if off_cmx[e] + c * MB + i < off_cmx[e + 1]:
-                            T.copy(Part[worker, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), 0], pw)
+                        if i % shaves == shave and off_cmx[e] + c * MB + i < off_cmx[e + 1]:
+                            T.copy(Part[tile, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), 0], pw)
                             for c0 in T.serial(H // FL):
                                 for v in T.vectorized(FL):
                                     pw[0, c0 * FL + v] = (pw[0, c0 * FL + v]
                                                           + wts_cmx[slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1),
                                                                     slot_cmx[off_cmx[e] + c * MB + i] % (TOPK + 1)]
                                                           * T.cast(yo[i, c0 * FL + v], T.float32))
-                            T.copy(pw, Part[worker, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), 0])
+                            T.copy(pw, Part[tile, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), 0])
+                    T.sync_threads()
         T.sync_grid()
-        # --- combine: the tokens dealt over the workers, the six partials summed ----------------------
+        # --- combine: the tokens dealt over the workers, the tiles' partials summed -------------------
         for it in T.serial(T.ceildiv(N, workers)):
             t = it * workers + worker
             if t < N:
                 for c0 in T.serial(H // FL):
                     for v in T.vectorized(FL):
                         pw[0, c0 * FL + v] = T.float32(0)
-                for w in T.serial(workers):
+                for w in T.serial(tiles):
                     T.copy(Part[w, t, 0], pa)     # a DDR row is a DMA into CMX, never a vector load
                     for c0 in T.serial(H // FL):
                         for v in T.vectorized(FL):
@@ -947,14 +967,14 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
                 T.copy(pw, Out[t, 0])
 
     if as_block:
-        return expert_phase, dict(SLOTS=SLOTS, CG=CG, CD=CD, KGH=KGH, KGI=KGI, workers=workers)
+        return expert_phase, dict(SLOTS=SLOTS, CG=CG, CD=CD, KGH=KGH, KGI=KGI, workers=workers, parts=tiles)
 
     @T.prim_func
     def moe_expert(X: T.Tensor((N, H), T.float16),
                    WguQ: T.Tensor(((E + 1) * 2 * I, H // 2), T.uint8), WguS: T.Tensor(((E + 1) * 2 * I, KGH), T.float16),
                    WdQ: T.Tensor(((E + 1) * H, I // 2), T.uint8), WdS: T.Tensor(((E + 1) * H, KGI), T.float16),
                    Wts: T.Tensor((N, 16), T.float32), Off: T.Tensor((E + 2,), T.int32),
-                   Slot: T.Tensor((SLOTS,), T.int32), Part: T.Tensor((workers, N, H), T.float32),
+                   Slot: T.Tensor((SLOTS,), T.int32), Part: T.Tensor((tiles, N, H), T.float32),
                    Out: T.Tensor((N, H), T.float32)):
         with T.Kernel(tiles, threads=shaves) as tile:
             expert_phase(X, WguQ, WguS, WdQ, WdS, Wts, Off, Slot, Part, Out, tile, T.get_thread_binding())
@@ -2555,7 +2575,7 @@ def make_gdn_moe_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: in
                       Logits: T.Tensor((NP, RR), T.float16), Ids: T.Tensor((NP, TOPK), T.int32),
                       Wts: T.Tensor((NP, 16), T.float32), Cnt: T.Tensor((E + 1,), T.int32),
                       Off: T.Tensor((E + 2,), T.int32), Slot: T.Tensor((SLOTS,), T.int32),
-                      PartE: T.Tensor((workers, NP, H), T.float32), MoeOut: T.Tensor((NP, H), T.float32)):
+                      PartE: T.Tensor((tiles, NP, H), T.float32), MoeOut: T.Tensor((NP, H), T.float32)):
         with T.Kernel(tiles, threads=shaves) as tile:
             shave = T.get_thread_binding()
             worker = tile * shaves + shave

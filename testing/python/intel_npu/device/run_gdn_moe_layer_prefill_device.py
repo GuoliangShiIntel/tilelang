@@ -111,7 +111,7 @@ def main(argv):
                   "Wts": ("out", np.zeros((NP, 16), np.float32)),
                   "Cnt": ("out", np.zeros((E + 1,), np.int32)), "Off": ("out", np.zeros((E + 2,), np.int32)),
                   "Slot": ("out", np.zeros((SLOTS,), np.int32)),
-                  "PartE": ("out", np.zeros((WORKERS, NP, H), np.float32)),
+                  "PartE": ("out", np.zeros((TILES, NP, H), np.float32)),
                   "MoeOut": ("out", np.zeros((NP, H), np.float32))}
         r = runner.run(db, lowering.order_arrays(low, arrays), TILES, SHAVES, HERE / "run_gdn_moe_layer_prefill",
                        repeat=3, warmup=3, timeout_s=1800)

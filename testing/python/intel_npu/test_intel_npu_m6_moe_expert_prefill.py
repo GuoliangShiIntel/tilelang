@@ -74,7 +74,7 @@ def _sim(p):
                   WguQ=pack_int4(p["gu_int"].reshape(-1, H)), WguS=p["gu_s"].reshape(-1, H // G),
                   WdQ=pack_int4(p["d_int"].reshape(-1, I)), WdS=p["d_s"].reshape(-1, I // G),
                   Wts=p["wts"].astype(np.float32), Off=p["off"].astype(np.int32),
-                  Slot=p["slot"].astype(np.int32), Part=np.zeros((WORKERS, N, H), np.float32), Out=out)
+                  Slot=p["slot"].astype(np.int32), Part=np.zeros((TILES, N, H), np.float32), Out=out)
     host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, arrays), TILES, SHAVES))
     return out
 

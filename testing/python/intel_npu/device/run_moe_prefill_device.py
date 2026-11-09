@@ -118,7 +118,7 @@ def main(argv):
                       "WguS": ("in", gu_s.reshape(-1, H // G)), "WdQ": ("in", pack_int4(dw.reshape(-1, I))),
                       "WdS": ("in", d_s.reshape(-1, I // G)), "Wts": ("in", ref["wts"].astype(np.float32)),
                       "Off": ("in", ref["off"].astype(np.int32)), "Slot": ("in", ref["slot"].astype(np.int32)),
-                      "Part": ("out", np.zeros((WORKERS, N, H), np.float32)), "Out": ("out", out)}
+                      "Part": ("out", np.zeros((TILES, N, H), np.float32)), "Out": ("out", out)}
             trace = HERE / "evidence" / f"tl_moe_expert_prefill_n{N}_trace.json" if profile else None
             if trace is not None:
                 trace.parent.mkdir(parents=True, exist_ok=True)
