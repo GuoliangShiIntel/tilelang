@@ -26,7 +26,7 @@ import tilelang  # noqa: E402,F401
 import runner  # noqa: E402
 import lowering  # noqa: E402
 from kernels import (gdn_conv_prefill_reference, gdn_scan_prefill_reference,  # noqa: E402
-                     make_gdn_conv_prefill, make_gdn_scan_prefill)
+                     make_gdn_conv_prefill, make_gdn_mixer_prefill, make_gdn_scan_prefill)
 
 TILES, SHAVES = 3, 2
 KH, VH, DK, DV = 16, 32, 128, 128
@@ -135,6 +135,33 @@ def main(argv):
               f"{res.median_kernel_ms + r.median_kernel_ms:.3f} ms for the pair, "
               f"{1e3 * (res.median_kernel_ms + r.median_kernel_ms) / n:.1f} us per token")
         rc |= 0 if rel < 5e-2 else 1
+    if "--fused" in argv:
+        C = 64
+        gnorm = (1.0 + np.random.default_rng(1).standard_normal((1, DV), np.float32) * 0.1).astype(np.float16)
+        ssm = (np.random.default_rng(2).standard_normal((VH, DK, DV), np.float32) * 0.05).astype(np.float32)
+        flow = lowering.lower(make_gdn_mixer_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, TB=TB, C=C,
+                                                     tiles=TILES, shaves=SHAVES))
+        fdb = runner.build(flow.source, f"tl_gdn_mixer_prefill_n{NP}_tb{TB}_c{C}")
+        oracle = gdn_scan_prefill_reference(*gdn_conv_prefill_reference(y, cw, cs, al, dbias, n, KH, VH, DK, DV)[:4],
+                                            gnorm, ssm, n)[0]
+        goodf, worstf, rf = 0, 0.0, None
+        for _ in range(trials):
+            out, sm = np.zeros((NP, VC), np.float16), ssm.copy()
+            rf = runner.run(fdb, lowering.order_arrays(flow, {
+                "Y": ("in", y), "ConvW": ("in", cw), "ConvState": ("in", cs), "ALog": ("in", al),
+                "DtBias": ("in", dbias), "GNorm": ("in", gnorm), "Nt": ("in", np.array([[n]], np.int32)),
+                "Ssm": ("inout", sm), "QKs": ("out", np.zeros((KH, NP, 2 * DK), np.float32)),
+                "Vs": ("out", np.zeros((VH, NP, DV), np.float16)), "Gbs": ("out", np.zeros((VH, NP, 2), np.float32)),
+                "Zs": ("out", np.zeros((VH, NP, DV), np.float16)), "CsOut": ("out", np.zeros((3, CONV), np.float16)),
+                "Out": ("out", out)}), TILES, SHAVES, HERE / "run_gdn_conv_prefill", repeat=3, warmup=3, timeout_s=600)
+            runner.check_status(rf.status)
+            rel = float(np.abs(out.astype(np.float32)[:n] - oracle[:n]).max() / np.abs(oracle[:n]).max())
+            worstf = max(worstf, rel)
+            goodf += int(rel < 5e-2)
+        print(f"fused mixer (one launch): {'PASS' if goodf == trials else 'FAIL'}; {goodf}/{trials} trials, "
+              f"worst rel {worstf:.2e}; {rf.median_kernel_ms:.3f} ms = "
+              f"{1e3 * rf.median_kernel_ms / n:.1f} us per token; sha {fdb.source_sha256[:12]}")
+        rc |= 0 if goodf == trials else 1
     return rc
 
 
