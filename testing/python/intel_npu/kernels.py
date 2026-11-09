@@ -2140,7 +2140,8 @@ def gdn_conv_prefill_reference(y, conv_w, conv_state, a_log, dt_bias, n: int, KH
 
 
 def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 128, DV: int = 128, TB: int = 32,
-                          tiles: int = 3, shaves: int = 2, as_block: bool = False, blocked_items: bool = False):
+                          tiles: int = 3, shaves: int = 2, as_block: bool = False, blocked_items: bool = False,
+                          item_worker: str = "tile"):
     """P3b: the Gated DeltaNet PREFILL phase between the input projection and the chunked scan -- a causal conv1d of
     width 4 with SiLU, then the per-head normalisations -- producing exactly what `make_gdn_scan_prefill` consumes.
 
@@ -2162,7 +2163,9 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
     `blocked_items`: a worker takes a CONTIGUOUS run of heads instead of every `workers`-th one, which is how
     npu_dsl splits the same work (by channel block). The channels a worker owns are then contiguous, so its state
     slices could become one wide DMA; it also changes WHICH worker owns a channel, which is what makes it a
-    diagnostic for the 3-tile multi-layer defect."""
+    diagnostic for the 3-tile multi-layer defect. `item_worker='shave'` deals those contiguous runs shave-major
+    (`shave * tiles + tile`), which keeps the runs contiguous but spreads them over the tiles -- the control that
+    separates "contiguous per worker" from "how many tiles write the same region"."""
     assert DK == DV and VH % KH == 0 and DK % 32 == 0 and TB % 16 == 0
     QK, VC = KH * DK, VH * DV
     CONV = 2 * QK + VC
@@ -2222,7 +2225,8 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
         T.copy(DtBias[0, 0], db)
         T.sync_threads()
         for it in T.serial(T.ceildiv(ITEMS, workers)):
-            hb = (worker * PER + it) if blocked_items else (it * workers + worker)
+            wid = (shave * tiles + tile) if item_worker == "shave" else worker
+            hb = (wid * PER + it) if blocked_items else (it * workers + worker)
             if hb < ITEMS:
                 # channel base of this item: k-heads take q then k, v-heads take their v slice
                 for part in T.serial(2):
@@ -3307,6 +3311,62 @@ def attn_reference(x, res, wqkv_int, wqkv_scales, wo_int, wo_scales, qnorm_w, kn
     return out, kc, vt
 
 
+def make_dma_page_probe(KH: int = 16, VH: int = 32, DK: int = 128, ROWS: int = 3, rounds: int = 2,
+                        blocked: bool = False, item_worker: str = "tile", rw: bool = False,
+                        tiles: int = 3, shaves: int = 2):
+    """Plan question 11's store pattern with the computation removed -- and it does NOT reproduce the defect.
+
+    `Dst[ROWS, CONV]` has the conv state's shape and a slot is the same 2-D job the real kernel issues: ROWS rows
+    of `DK` halves at column `cb`, i.e. `DK * 2` bytes per row at stride `CONV * 2`. The addresses are the point --
+    slots 0..KH-1 are `DK * 2` bytes apart, so **they all live in the first 4 KiB of a row** -- and `blocked`
+    decides whether that page is written by one tile or interleaved by all of them. Each slot is written once per
+    round with `slot + 1 + 100 * round`, so the host can tell a LOST store (an earlier round's value, or the -1 the
+    buffer was pre-filled with) from a wrong one and say which round lost it; `rw` adds the load the real phase
+    does before its store, so a page carries both directions from different tiles.
+
+    **Result (2026-11-09, `device/run_dma_page_probe.py`): all six arms CLEAN** -- tiles 1/2/3 x
+    {round-robin, blocked}, with and without `rw`. So "three tiles writing interleaved 256 B pieces of one 4 KiB
+    DDR page, read-modify-write, over several rounds" is **not sufficient** to lose a store, and the hypothesis the
+    probe was built to test is falsified. Something the probe leaves out is necessary; the model kernel's `--skip
+    moe` arm says the MoE phases (about 0.4 GB of concurrent expert-weight DMA and the DPU work beside it) are part
+    of it. Kept as the skeleton: the next version adds that load rather than re-deriving this one."""
+    QK = KH * DK
+    CONV = 2 * QK + VH * DK
+    NSLOT = 2 * KH + VH
+    workers = tiles * shaves
+    PER = -(-NSLOT // workers)
+
+    @T.prim_func
+    def dma_page_probe(Dst: T.Tensor((ROWS, CONV), T.float16)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            shave = T.get_thread_binding()
+            worker = tile * shaves + shave
+            wid = (shave * tiles + tile) if item_worker == "shave" else worker
+            buf = T.alloc_local((ROWS, DK), T.float16)
+            tmp = T.alloc_local((ROWS, DK), T.float16)
+            buf[0, 0] = T.float16(0)
+            tmp[0, 0] = T.float16(0)
+            for r in T.serial(rounds):
+                for it in T.serial(PER):
+                    s = (wid * PER + it) if blocked else (it * workers + wid)
+                    if s < NSLOT:
+                        cb = T.if_then_else(s < 2 * KH, s * DK, 2 * QK + (s - 2 * KH) * DK)
+                        if rw:
+                            T.copy(Dst[0, cb], tmp)
+                        for i, c in T.grid(ROWS, DK):
+                            buf[i, c] = T.cast(s + 1 + 100 * r, T.float16)
+                        T.copy(buf, Dst[0, cb])
+                T.sync_grid()
+
+    return dma_page_probe
+
+
+def dma_page_probe_sizes(KH: int = 16, VH: int = 32, DK: int = 128, tiles: int = 3, shaves: int = 2, **_):
+    """(CONV halves per row, slot count, slots per worker) for `make_dma_page_probe`."""
+    NSLOT = 2 * KH + VH
+    return dict(CONV=2 * KH * DK + VH * DK, NSLOT=NSLOT, PER=-(-NSLOT // (tiles * shaves)))
+
+
 def pack_int4(w_int: "np.ndarray") -> "np.ndarray":
     """[N, K] signed int4 values in [-8, 7] -> [N, K/2] bytes, low nibble first (the reference packer)."""
     import numpy as np
@@ -3903,7 +3963,7 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
                        TBq: int = 8, TBF: int = 16, BKV: int = 128, BN1: int = 32, BN2: int = 32, MB: int = 16,
                        BM: int = 64, BNR: int = 16, MBe: int = 16, BNG: int = 64, BND: int = 64, tiles: int = 3,
                        shaves: int = 2, eps: float = 1e-6, KVL: int | None = None, skip: frozenset = frozenset(),
-                       unroll_layers: bool = False, conv_blocked: bool = True):
+                       unroll_layers: bool = False, conv_blocked: bool = True, conv_item_worker: str = "tile"):
     """P5: a whole PREFILL chunk of `N` prompt tokens through `L` layers in ONE launch -- the prefill counterpart
     of `make_decode_model`. A device-side loop over the layers, `Kind[li, 0]` selecting the Gated DeltaNet or the
     full-attention mixer, every layer's weights reached through `Table[li, :]` (`PREFILL_TABLE_COLS`), the residual
@@ -3932,7 +3992,7 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
         step = step * k // math.gcd(step, k)
     NP = -(-N // step) * step
     conv_phase, _ = make_gdn_conv_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, TB=TB, tiles=tiles, shaves=shaves,
-                                          as_block=True, blocked_items=conv_blocked)
+                                          as_block=True, blocked_items=conv_blocked, item_worker=conv_item_worker)
     scan_phase, _ = make_gdn_scan_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, C=C, tiles=tiles, shaves=shaves,
                                           eps=eps, as_block=True)
     qkv_phase, qs = make_attn_qkv_prefill(N=NP, H=H, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX, TB=TBq, tiles=tiles,

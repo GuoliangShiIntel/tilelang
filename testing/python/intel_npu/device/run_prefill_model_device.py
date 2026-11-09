@@ -143,9 +143,11 @@ def main(argv):
                                                 TBF=TBF, BKV=BKV, BN1=BN1, BN2=BN2, MB=MB, BM=BM, BNR=BNR,
                                                 MBe=MBe, BNG=BNG, BND=BND, tiles=TILES, shaves=SHAVES, KVL=KVL,
                                                 skip=skip, unroll_layers="--unroll" in argv,
-                                                conv_blocked="--roundrobin" not in argv))
+                                                conv_blocked="--roundrobin" not in argv,
+                                                conv_item_worker="shave" if "--shave-major" in argv else "tile"))
     name = (f"tl_prefill_model_l{L}_n{NP}_h{H}_s{SMAX}_bn{BN1}"
             + (f"_t{TILES}" if TILES != 3 else "")
+            + ("_sm" if "--shave-major" in argv else "")
             + ("_rr" if "--roundrobin" in argv else "")
             + ("_unroll" if "--unroll" in argv else "")
             + ("_frt" if "--frt" in argv else "")
