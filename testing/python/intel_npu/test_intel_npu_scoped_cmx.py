@@ -86,15 +86,14 @@ def test_allocation_under_a_shave_branch_is_hoisted():
     src = _lower(k).source
     body = src.split("kernel_entry")[0]
     s_pos, if_shave = body.index("half* __restrict s_cmx"), body.index("if (shave == 0)")
-    assert body.index("for (int32_t it") < s_pos < if_shave, "hoisted out of the SHAVE-dependent branch, inside the loop body"
+    assert s_pos < body.index("for (int32_t it") < if_shave, "out of the SHAVE-dependent branch and its loop"
 
 
-@pytest.mark.xfail(strict=True, reason="plan question 10: the hoist that fixes this hangs the 40-layer model kernel")
 def test_a_loop_invariant_allocation_bubbles_out_of_every_enclosing_loop():
-    """What a correct question-10 fix must achieve. A buffer sunk into a loop body is re-marked and re-allocated
-    every iteration for an address that never changes, and that made the GDN prefill scan intermittently wrong on
-    2+ tiles (4/12 trials clean at 3 x 2). Strict xfail: it fails the suite the day it starts passing, which is
-    the signal that the fix landed."""
+    """A buffer sunk into a loop body is re-marked and re-allocated every iteration for an address that never
+    changes, and that made the GDN prefill scan intermittently wrong on 2+ tiles (4/12 trials clean at 3 x 2).
+    Was a strict xfail while the hoist that fixes it hung the 40-layer model kernel; the hoist now skips loops
+    holding a ring, which is where the hang came from (plan question 10)."""
 
     @T.prim_func
     def k(A: T.Tensor((64,), T.float16), Y: T.Tensor((TILES * SHAVES, 64), T.float16)):
@@ -111,11 +110,48 @@ def test_a_loop_invariant_allocation_bubbles_out_of_every_enclosing_loop():
     assert alloc < body.index("for (int32_t outer"), "hoisted past the OUTER loop, not just the inner one"
 
 
+def _ring_kernel(pipelined: bool):
+    M, N, K, BM, BN = 512, TILES * 256, 256, 32, 256
+
+    @T.prim_func
+    def k(X: T.Tensor((M, K), T.float16), W: T.Tensor((N, K), T.float16), Y: T.Tensor((M, N), T.float16)):
+        with T.Kernel(TILES, threads=SHAVES) as tile:
+            W_cmx = T.alloc_shared((BN, K), T.float16)
+            X_cmx = T.alloc_shared((BM, K), T.float16)
+            Y_cmx = T.alloc_local((BM, BN), T.float16)
+            T.copy(W[tile * BN, 0], W_cmx)
+            for c in (T.Pipelined(M // BM, num_stages=SHAVES) if pipelined else T.serial(M // BM)):
+                T.copy(X[c * BM, 0], X_cmx)
+                T.gemm(X_cmx, W_cmx, Y_cmx, transpose_B=True, clear_accum=True)
+                s = T.alloc_local((BM, BN), T.float16)   # used only in the loop: the allocator sinks it in
+                for i, j in T.grid(BM, BN):
+                    s[i, j] = Y_cmx[i, j]
+                T.copy(s, Y[c * BM, tile * BN])
+
+    return k
+
+
+def test_a_loop_holding_a_ring_keeps_its_allocations():
+    """The hoist stops at a loop that holds a ring. Hoisting out of one anyway builds a decode model kernel that
+    takes the device down (ZE_RESULT_ERROR_DEVICE_LOST at the watchdog, sha 9d4b9a4e4634) where the restricted
+    hoist runs 10/10 golden (sha 6e54ddf02e1a) -- plan question 10. The serial twin is the control: the same
+    loop-invariant buffer does leave the loop when no ring is in it, so a pass that hoisted nothing at all would
+    fail here rather than look correct."""
+    ringed = _lower(_ring_kernel(True)).source.split("kernel_entry")[0]
+    assert "ctx.ring_begin(" in ringed
+    assert [b for b, _ in allocations_inside_loops(ringed)], "nothing left inside the ring's loop to guard"
+
+    serial = _lower(_ring_kernel(False)).source.split("kernel_entry")[0]
+    assert "ctx.ring_begin(" not in serial
+    assert allocations_inside_loops(serial) == [], "the control must hoist: without a ring the loop keeps nothing"
+
+
 def allocations_inside_loops(src: str) -> list[tuple[str, int]]:
     """(buffer, loop depth) for every `ctx.alloc` the generated source makes inside a loop body. Those are the
     allocations question 10's defect acts on: the runtime re-runs mark / alloc / restore every iteration for an
-    address that never changes, and one of them made the GDN prefill scan wrong on 2+ tiles. Until the pass is
-    fixed this is the exposure list, so a kernel that grows one is seen rather than discovered on the device."""
+    address that never changes, and one of them made the GDN prefill scan wrong on 2+ tiles. Read the depths, not
+    the count: the hoist took the scan's `xr` from depth 3 to depth 1 -- a hundredfold drop in allocations per
+    worker -- while the count of buffers under some loop only went 32 -> 29."""
     out, depth, loops = [], 0, []
     for ln in src.splitlines():
         st = ln.strip()
@@ -133,8 +169,14 @@ def allocations_inside_loops(src: str) -> list[tuple[str, int]]:
 def test_the_kernels_that_allocate_inside_a_loop_are_the_ones_we_know_about():
     """Question 10's exposure list, pinned. A kernel that starts allocating inside a loop either stops doing it or
     is added here with a reason -- it cannot arrive unnoticed, which is how P3 shipped a kernel that was wrong two
-    runs in three. The author's lever is a first use of the buffer before the loops (`make_gdn_scan_prefill`)."""
+    runs in three. All three now report zero: the pass hoists loop-invariant allocations itself."""
     import kernels
+
+    # positive control first: a zero below means the pass hoisted, not that the detector is broken
+    assert allocations_inside_loops(
+        "for (int32_t it = 0; it < 2; ++it) {\n"
+        "  half* __restrict c = ctx.alloc<half>(64);\n"
+        "}\n") == [("c", 1)]
 
     cases = {
         "gemm": kernels.make_gemm(256, 256, 512, 64, 64, TILES, SHAVES),
@@ -142,7 +184,7 @@ def test_the_kernels_that_allocate_inside_a_loop_are_the_ones_we_know_about():
         "moe_route_prefill": kernels.make_moe_route_prefill(tiles=TILES, shaves=SHAVES),
     }
     seen = {name: len(allocations_inside_loops(_lower(func).source)) for name, func in cases.items()}
-    expected = {"gemm": 3, "attn_prefill": 11, "moe_route_prefill": 7}
+    expected = {"gemm": 0, "attn_prefill": 0, "moe_route_prefill": 0}
     assert seen == expected, f"exposure to question 10 changed: {seen} != {expected}"
     # the control: the detector can report zero. A kernel whose allocations are all above its loops has none.
 
