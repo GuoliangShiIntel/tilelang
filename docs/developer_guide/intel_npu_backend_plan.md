@@ -553,11 +553,25 @@ interop; a Python `nl.*`-compatible shim.
       confirmed in the emitted source: still fails);
     * total work per worker (matched DPU counts, above);
     * the 64 KB transfer size (split into two 32 KB loads: still fails);
+    * the DMA landing in the long-lived `Sf` that the SHAVE also writes (the same split test loads into a
+      fresh staging buffer and the SHAVE copies it into `Sf`: still fails);
     * a missing publish before the outgoing DMA -- `dma_store` already calls `flushCmxWrites()`
       (`npu_rt_device.hpp:1283`).
 
     A grid barrier after the head loop is **not** a fix and is informative: 2 x 2 went 7/12 -> 12/12 while
     3 x 2 went 4/12 -> 0/12, so the defect is strongly timing sensitive.
+
+    **npu_dsl does the same thing, and cannot be used to exonerate the hardware.** Its prefill GDN
+    (`kernels_poc/qwen36_dsl_poc/generated/qwen36_prefill_gdn_layer.cpp:449-472`) distributes v-heads over the
+    same 3 x 2 workers and loads the state with the identical per-head 1-D 65536 B DMA
+    (`ctx.dma_load(S, params[24] + vHead * 65536, 65536, 1, 65536)`), loops chunks updating it in CMX, and
+    stores it back -- structurally our kernel. But in that repo the prefill GDN has **no isolated device
+    verification**: it is absent from `docs/VERIFIED_KERNELS.md`'s 28 verified configurations, from
+    `docs/RUN_AND_RESULTS.md` and from `evidence/traces/INDEX.md`; the only device runner is the whole model
+    (`qwen36_e2e/run_ptl.py --golden`), and `qwen36_e2e/golden_check.py` runs once per call. So "npu_dsl's GDN
+    is correct" rests on single whole-model runs -- the same evidence strength that reported this kernel as
+    working -- and a sparse corruption of a few rows in a few heads need not move 16 greedy tokens. Worth
+    running that golden repeatedly; it has not been done, here or there.
 
     **Method note, because it cost real time:** `runner.write_kernel` plus a hand-built `DeviceBuild` runs
     whatever ELF is already registered under that name, which is not necessarily the source just written. Two
