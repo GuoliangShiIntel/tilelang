@@ -884,15 +884,18 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
         yo = T.alloc_shared((MB, H), T.float16)     # the chunk's whole down output, so Part is touched once per token
         pw = T.alloc_local((1, H), T.float32)
         pa = T.alloc_local((1, H), T.float32)
+        zr = T.alloc_local((1, H), T.float32)
+        seen = T.alloc_shared((N,), T.int32)       # per token: has an expert of this TILE written its partial yet?
         T.copy(Off[0], off_cmx)
         T.copy(Slot[0], slot_cmx)
         T.copy(Wts[0, 0], wts_cmx)
-        for t in T.serial(N):             # this TILE's partial starts at zero, the rows split over its SHAVEs
+        for c0 in T.serial(H // FL):
+            for v in T.vectorized(FL):
+                zr[0, c0 * FL + v] = T.float32(0)
+        for t in T.serial(N):
             if t % shaves == shave:
-                for c0 in T.serial(H // FL):
-                    for v in T.vectorized(FL):
-                        pw[0, c0 * FL + v] = T.float32(0)
-                T.copy(pw, Part[tile, t, 0])
+                seen[t] = 0
+        T.sync_threads()
         for ei in T.serial(EPT):
             e = ei * tiles + tile
             if e < E + 1:
@@ -901,48 +904,72 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
                 T.copy(WdS[e * H, 0], wsd_all)
                 for c in T.serial(T.ceildiv(off_cmx[e + 1] - off_cmx[e], MB)):
                     # gather the chunk's token rows; a short tail keeps the last row, whose result is dropped
+                    perf_begin("gath")
                     for i in T.serial(MB):
                         T.copy(X[slot_cmx[T.min(off_cmx[e] + c * MB + i, off_cmx[e + 1] - 1)] // (TOPK + 1), 0],
                                x_cmx[i:i + 1, 0:H])
+                    perf_end()
                     T.sync_threads()
                     for n in T.serial(CG):
                         if n % shaves == shave:
                             T.copy(WguQ[e * 2 * I + n * BNG, 0], wq_cmx)
                             T.copy(WguS[e * 2 * I + n * BNG, 0], ws_cmx)
+                            perf_begin("gdeq")
                             if not skip_dequant:
                                 for r in T.serial(BNG):
                                     T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wg_cmx[r, 0]),
                                                   T.address_of(wq_cmx[r, 0]), T.address_of(ws_cmx[r, 0]), H, G)
+                            perf_end()
+                            perf_begin("ggem")
                             T.gemm(x_cmx, wg_cmx, y_cmx, transpose_B=True, clear_accum=True)
+                            perf_end()
+                            perf_begin("gcpy")
                             for i, c0 in T.grid(MB, BNG // HL):
                                 for v in T.vectorized(HL):
                                     gu_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
+                            perf_end()
                     T.sync_threads()
+                    perf_begin("swig")
                     for i, c0 in T.grid(MB, I // shaves // HL):
                         for v in T.vectorized(HL):
                             h_cmx[i, shave * (I // shaves) + c0 * HL + v] = (
                                 gu_cmx[i, shave * (I // shaves) + c0 * HL + v]
                                 * T.sigmoid(gu_cmx[i, shave * (I // shaves) + c0 * HL + v])
                                 * gu_cmx[i, I + shave * (I // shaves) + c0 * HL + v])
+                    perf_end()
                     T.sync_threads()
                     for n in T.serial(CD):
                         if n % shaves == shave:
                             T.copy(WdQ[e * H + n * BND, 0], wqd_cmx)
+                            perf_begin("ddeq")
                             if not skip_dequant:
                                 for r in T.serial(BND):
                                     T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wd_cmx[r, 0]),
                                                   T.address_of(wqd_cmx[r, 0]), T.address_of(wsd_all[n * BND + r, 0]),
                                                   I, G)
+                            perf_end()
+                            perf_begin("dgem")
                             T.gemm(h_cmx, wd_cmx, yd_cmx, transpose_B=True, clear_accum=True)
+                            perf_end()
+                            perf_begin("dcpy")
                             for i, c0 in T.grid(MB, BND // HL):
                                 for v in T.vectorized(HL):
                                     yo[i, n * BND + c0 * HL + v] = yd_cmx[i, c0 * HL + v]
+                            perf_end()
                     T.sync_threads()
                     # one read-modify-write of the whole row per live token: the chunk-wise form cost CD of
                     # them, and at BND = 64 those are 256-byte DDR jobs whose count dominated the phase
+                    perf_begin("accm")
                     for i in T.serial(MB):
                         if i % shaves == shave and off_cmx[e] + c * MB + i < off_cmx[e + 1]:
-                            T.copy(Part[tile, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), 0], pw)
+                            # the first touch of a row stores, so the partial never has to be zeroed up front
+                            if seen[slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1)] == 0:
+                                seen[slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1)] = 1
+                                for c0 in T.serial(H // FL):
+                                    for v in T.vectorized(FL):
+                                        pw[0, c0 * FL + v] = T.float32(0)
+                            else:
+                                T.copy(Part[tile, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), 0], pw)
                             for c0 in T.serial(H // FL):
                                 for v in T.vectorized(FL):
                                     pw[0, c0 * FL + v] = (pw[0, c0 * FL + v]
@@ -950,7 +977,12 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
                                                                     slot_cmx[off_cmx[e] + c * MB + i] % (TOPK + 1)]
                                                           * T.cast(yo[i, c0 * FL + v], T.float32))
                             T.copy(pw, Part[tile, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), 0])
+                    perf_end()
                     T.sync_threads()
+        T.sync_threads()
+        for t in T.serial(N):                      # only the tokens no expert of this tile saw still need zeros
+            if t % shaves == shave and seen[t] == 0:
+                T.copy(zr, Part[tile, t, 0])
         T.sync_grid()
         # --- combine: the tokens dealt over the workers, the tiles' partials summed -------------------
         for it in T.serial(T.ceildiv(N, workers)):
