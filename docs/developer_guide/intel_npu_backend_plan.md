@@ -396,6 +396,47 @@ Rules carried into M1-M6:
   Numbers and citations travel; the knowledge text does not. Open questions stay in section 7 with what was
   looked up and what was measured.
 
+### 5.1 What the question-10 hunt got wrong, and the rules that came out of it (2026-11-08)
+
+One defect -- a 512 B buffer the compiler sank into a loop -- took a day, **eight falsified hypotheses and
+five wrong conclusions published along the way**. The wrong turns cost more than the fix, so they are the
+part worth keeping.
+
+* **A device claim needs independent trials. One run inside a tolerance is not evidence.** The GDN prefill
+  scan was committed as "device PASS rel 5e-4" and was in fact wrong about two runs in three at 3 x 2: a
+  single launch passes most of the time, which is exactly how a flaky kernel reports as working.
+  `run_gdn_scan_prefill_device.py` and `run_moe_prefill_device.py` take `--trials` and print `n/N`; P2a and
+  P2b were re-earned under it, and P1 was re-earned by five consecutive runs agreeing to three digits. **The
+  other device runners still report one run and their PASSes are worth what P3's was.** A tolerance cannot
+  tell a kernel that is right from one that is right four times in five.
+* **Build what you measure.** Two rounds of observations -- "1 x 2 fails 6/8", "the state is correct and only
+  the output is sparse-wrong" -- were artifacts of `runner.write_kernel` plus a hand-built `DeviceBuild`,
+  which runs whatever ELF is already registered under that name, not the source just written. Both were
+  published before the instrument was checked. Use `runner.build`.
+* **Read the first-party consumer before explaining a number.** Two mechanisms were invented and written down
+  without opening the code they rested on: "the `inout` state drifts across repeats" (`npu_run.cpp` restores
+  every input before each launch, so repeating only re-rolls the dice) and "cmx_used says the peak is 5.5%"
+  (the word is sampled in `finish()`, after the scopes are released, so it is what is still held; the peak is
+  priced at compile time by `CheckIntelNpuBudgets`).
+* **Say what an A/B actually varies.** Running the same kernel on npu_dsl's `fused_rt` and getting the same
+  failure rate was read as "the mechanism is below both runtimes, so it is the hardware". Both arms shared
+  this backend's lowering -- the same CMX scoping, the same call sequence -- so the experiment could only ever
+  exclude the runtime. `<user>` rejected the conclusion and it was withdrawn.
+* **A partial version of a hypothesis failing does not falsify the hypothesis.** Hoisting three of the
+  kernel's buffers out of the loops did not help, so CMX scoping was struck off the list -- while the one
+  buffer that mattered sat two loop levels deeper. It cost five more hypotheses to come back to it.
+* **A hardware constant constrains nothing until a probe has tried to break it.** Separately the same day, a
+  "max 8192 output points" reading of `hw/npu5/dpu.md` had been written into `hw_facts.py` and into a compiler
+  check that refused `M*N > 8192`; a working npu_dsl kernel issues 128x128, and `device/run_dpu_points_probe.py`
+  then reached 128x512. The check became per-dimension and prefill attention got 8.9% faster for it.
+* **An assertion that cannot fail is worse than none.** `assert src.count("ctx.alloc<half>(64)") == 1` was
+  written to check an allocation had been hoisted; a sunk allocation is also emitted once textually. Every new
+  gate here is now run against the broken state first -- both scoped-CMX tests were seen to FAIL with the fix
+  disabled.
+* **Our own setup error is not someone else's defect.** The first npu_dsl baseline run produced token 9 at
+  every step. That was the wrong exported weights directory; with the right one it is 32/32 and deterministic
+  over 8 runs. It was one command away from being filed as an npu_dsl bug.
+
 ## 6. Out of scope for this plan
 
 NPU60XX values; a TVM upstream change (`3rdparty/` is not edited); OpenVINO/VPUX graph path
