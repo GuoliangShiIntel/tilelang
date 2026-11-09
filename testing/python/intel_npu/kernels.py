@@ -869,7 +869,9 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
         gu_cmx = T.alloc_local((MB, 2 * I), T.float16)
         h_cmx = T.alloc_local((MB, I), T.float16)
         wqd_cmx = T.alloc_local((BND, I // 2), T.uint8)
-        wsd_cmx = T.alloc_local((BND, KGI), T.float16)
+        # the expert's down scales in one DMA instead of one per chunk: CD = 32 jobs for 16 KiB, where the same
+        # hoist on the gate/up side would cost 32 KiB to save 16, and the layer kernel has no room for both
+        wsd_all = T.alloc_local((H, KGI), T.float16)
         wd_cmx = T.alloc_local((BND, I), T.float16)
         yd_cmx = T.alloc_local((MB, BND), T.float16)
         yo = T.alloc_local((MB, H), T.float16)      # the chunk's whole down output, so Part is touched once per token
@@ -886,6 +888,7 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
         for ei in T.serial(EPW):
             e = ei * workers + worker
             if e < E + 1:
+                T.copy(WdS[e * H, 0], wsd_all)
                 for c in T.serial(T.ceildiv(off_cmx[e + 1] - off_cmx[e], MB)):
                     # gather the chunk's token rows; a short tail keeps the last row, whose result is dropped
                     for i in T.serial(MB):
@@ -908,11 +911,10 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
                                                      * gu_cmx[i, I + c0 * HL + v])
                     for n in T.serial(CD):
                         T.copy(WdQ[e * H + n * BND, 0], wqd_cmx)
-                        T.copy(WdS[e * H + n * BND, 0], wsd_cmx)
                         if not skip_dequant:
                             for r in T.serial(BND):
                                 T.call_extern("handle", "tl_npu_dequant_i4_row", T.address_of(wd_cmx[r, 0]),
-                                              T.address_of(wqd_cmx[r, 0]), T.address_of(wsd_cmx[r, 0]), I, G)
+                                              T.address_of(wqd_cmx[r, 0]), T.address_of(wsd_all[n * BND + r, 0]), I, G)
                         T.gemm(h_cmx, wd_cmx, yd_cmx, transpose_B=True, clear_accum=True)
                         for i, c0 in T.grid(MB, BND // HL):
                             for v in T.vectorized(HL):
