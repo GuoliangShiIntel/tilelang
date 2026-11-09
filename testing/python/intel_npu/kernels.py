@@ -853,6 +853,9 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
     assert H % G == 0 and I % G == 0 and (2 * I) % BNG == 0 and H % BND == 0
     assert H % HL == 0 and I % HL == 0 and MB * BNG <= 8192 and MB * BND <= 8192
     assert I % (shaves * HL) == 0 and N % shaves == 0
+    # down chunks per DMA: at BND = 64 a job is 16 KiB and 70% of it is the 1.55 us per-job fixed cost, and the
+    # PACKED buffer is 8x smaller than wd_cmx, so DMA granularity is cheap to decouple from compute granularity
+    DB = next(d for d in (4, 2, 1) if CD % (d * shaves) == 0)
     EPT = -(-(E + 1) // tiles)            # experts per TILE: the tile's SHAVEs cooperate on one expert
 
     @T.macro
@@ -875,7 +878,7 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
         y_cmx = T.alloc_local((MB, BNG), T.float16)
         gu_cmx = T.alloc_shared((MB, 2 * I), T.float16)     # the SHAVEs write disjoint column ranges
         h_cmx = T.alloc_shared((MB, I), T.float16)
-        wqd_cmx = T.alloc_local((BND, I // 2), T.uint8)
+        wqd_cmx = T.alloc_local((DB * BND, I // 2), T.uint8)
         # the expert's down scales in one DMA instead of one per chunk: CD = 32 jobs for 16 KiB, where the same
         # hoist on the gate/up side would cost 32 KiB to save 16, and the layer kernel has no room for both
         wsd_all = T.alloc_shared((H, KGI), T.float16)
@@ -937,13 +940,14 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
                                 * gu_cmx[i, I + shave * (I // shaves) + c0 * HL + v])
                     perf_end()
                     T.sync_threads()
-                    for n in T.serial(CD):
-                        if n % shaves == shave:
-                            T.copy(WdQ[e * H + n * BND, 0], wqd_cmx)
+                    for nb in T.serial(CD // (DB * shaves)):
+                        T.copy(WdQ[e * H + ((nb * shaves + shave) * DB) * BND, 0], wqd_cmx)
+                        for j in T.serial(DB):
                             perf_begin("ddeq")
                             if not skip_dequant:
                                 T.call_extern("handle", "tl_npu_dequant_i4_block", T.address_of(wd_cmx[0, 0]),
-                                              T.address_of(wqd_cmx[0, 0]), T.address_of(wsd_all[n * BND, 0]),
+                                              T.address_of(wqd_cmx[j * BND, 0]),
+                                              T.address_of(wsd_all[((nb * shaves + shave) * DB + j) * BND, 0]),
                                               BND, I, G)
                             perf_end()
                             perf_begin("dgem")
@@ -952,7 +956,7 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
                             perf_begin("dcpy")
                             for i, c0 in T.grid(MB, BND // HL):
                                 for v in T.vectorized(HL):
-                                    yo[i, n * BND + c0 * HL + v] = yd_cmx[i, c0 * HL + v]
+                                    yo[i, ((nb * shaves + shave) * DB + j) * BND + c0 * HL + v] = yd_cmx[i, c0 * HL + v]
                             perf_end()
                     T.sync_threads()
                     # one read-modify-write of the whole row per live token: the chunk-wise form cost CD of
