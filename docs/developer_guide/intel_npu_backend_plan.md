@@ -525,85 +525,56 @@ interop; a Python `nl.*`-compatible shim.
 9. **Where SHAVE code is fetched from, and the instruction cache size.** Asked while attributing the (since explained)
    in-model slowdown; still useful: it decides whether a 130-260 KB `.text` has a cost beyond the budget.
 
-10. **The P3 GDN chunked scan is intermittently wrong on more than one tile, and it is the per-head state LOAD
-    (2026-11-08, M6 P3). OPEN, narrowed to one statement.** Reproducer, 12 independent trials each, every
-    binary freshly built, `n=192 C=32 VH=32` at Qwen3.6's GDN shape:
+10. **CMX scope reuse across loop iterations is unsound on 2+ tiles; it made the P3 GDN scan intermittently
+    wrong (2026-11-08, M6 P3). FIXED IN THE KERNEL, NOT YET IN THE COMPILER; the mechanism is still unknown.**
+    **Hoisting every CMX allocation to kernel scope makes it 12/12 clean at 2 x 2 and 3 x 2**, where the
+    compiler's own scoping gives 7/12 and 4/12. The change is a first use of each buffer before the loops
+    (`kernels.py`, `make_gdn_scan_prefill`), which keeps each `CmxScope` at kernel level instead of letting the
+    compiler sink it into the head and chunk loops. It is also **faster** -- 26.7 us per token against 30.4 --
+    so the churn cost time as well as correctness. Gate after the change:
+    `run_gdn_scan_prefill_device.py --n 192 --c 32 --trials 12 --negative` gives 12/12 at worst rel 7.10e-04
+    with the causality control biting (0.00e+00 before the perturbed token, 6.22e-01 at and after it).
+    **npu_dsl never meets this**: it allocates one arena once (`ctx.alloc_mirror`), rather than allocating and
+    freeing ~28 buffers per chunk iteration.
 
-    | config | heads per worker | clean |
+    | config | compiler scoping | all scopes hoisted |
     |---|---|---|
-    | 1 x 1 | 32 | **12/12** |
-    | 1 x 2 | 16 | **12/12** |
-    | 2 x 2 | 8 | 7/12 |
-    | 3 x 2 | 5-6 | 4/12 |
+    | 1 x 1 | 12/12 | - |
+    | 1 x 2 | 12/12 | - |
+    | 2 x 2 | 7/12 | **12/12** |
+    | 3 x 2 | 4/12 | **12/12** |
 
-    **It needs concurrency AND repetition, and the repetition that counts is the HEAD boundary, not the work.**
-    At 3 x 2 with the work per worker held at ~340 DPU workloads: 1 head x 32 chunks is **12/12**, 5 heads x 6
-    chunks is **3/12**. Heads per worker at a fixed n: 1 -> 12/12, 2 -> 11/12, 5 -> 0/12. The corruption lands on
-    the LATE heads, hits both `Out` and the state, and every SHAVE still reports `kStatusOk` with exactly the
-    expected DPU workload count (402 for the six-head workers, 335 for the five-head ones, i.e. 67 per head).
-    **Removing the per-head `T.copy(Ssm[h, 0, 0], Sf)` -- a 64 KB DDR -> CMX load -- and starting each head from
-    a CMX zero-fill makes it 12/12 at 3 x 2.** Keeping that load and dropping only the matching store is still
-    4/12, so the load alone is sufficient.
+    **The workaround is in the wrong place and the real fix belongs in the pass that places `CmxScope`.** It has
+    not been written because **why reuse is unsound is still unknown**, and changing scope placement without the
+    mechanism would trade a measured fix for a guess. Reuse is also what the CMX budget is sized for
+    (`CheckIntelNpuBudgets` prices "the heaviest nesting", which is why C = 128 is refused at 2274752 B), so
+    hoisting cannot simply become the default. The shape of a real fix is probably "never allocate inside a
+    loop body; reuse freely across disjoint blocks", which would need the budget model to follow.
 
-    Falsified, each by an experiment, each reverted:
-    * the shared identity matrix and the tile barrier (per-SHAVE `eye` in `alloc_local`: still fails);
-    * the `Out` write pattern (head-major contiguous instead of 256 B slices of a shared 8192 B row: still fails);
-    * `Ssm` being `inout` (split into a read-only `Ssm` and a write-only `SsmO`: still fails);
-    * CMX scope churn at the head boundary (first-use widened the scopes from the head loop to the whole kernel,
-      confirmed in the emitted source: still fails);
-    * total work per worker (matched DPU counts, above);
-    * the 64 KB transfer size (split into two 32 KB loads: still fails);
-    * the DMA landing in the long-lived `Sf` that the SHAVE also writes (the same split test loads into a
-      fresh staging buffer and the SHAVE copies it into `Sf`: still fails);
-    * a missing publish before the outgoing DMA -- `dma_store` already calls `flushCmxWrites()`
-      (`npu_rt_device.hpp:1283`).
+    Falsified on the way, each by an experiment, each reverted: the shared identity matrix and the tile barrier;
+    the `Out` write pattern; `Ssm` being `inout`; total work per worker (at ~340 DPU workloads either way,
+    1 head x 32 chunks is 12/12 and 5 heads x 6 chunks is 3/12); the 64 KB transfer size; the DMA landing in a
+    buffer the SHAVE also writes; **hoisting only the three head-level buffers, which still failed 3/12** and is
+    why scoping was dropped as a candidate the first time; and **the DmaDrv40xx trap-descriptor window** --
+    reserving `[kTrapLo, kTrapHi)` up front so no data buffer can land in it left 3 x 2 at 1/12.
 
-    A grid barrier after the head loop is **not** a fix and is informative: 2 x 2 went 7/12 -> 12/12 while
-    3 x 2 went 4/12 -> 0/12, so the defect is strongly timing sensitive.
+    **Blast radius, not yet checked:** the decode model kernel relies on scoped CMX across a device-side layer
+    loop on 3 tiles (section 9, Compiler row) and its "golden 16/16, 47.0 ms per token" is a **single run**. It
+    should be re-run under the trials gate before being quoted again. P1 and P2 are clear -- P1 is bit-identical
+    over 5 runs, P2a and P2b are 5/5.
 
-    **The runtime is excluded, and the hardware is NOT implicated -- an earlier reading of this entry said it
-    was and was wrong.** The same generated source on npu_dsl's `fused_rt` is 3/12 at 3 x 2 against our 4/12;
-    only `TL_NPU_RUNTIME_FRT` is defined, which swaps the whole `npu::Ctx` surface through
-    `npu_rt_device_frt.hpp` onto a runtime with different disciplines throughout (one synchronous load
-    descriptor and one store descriptor, every DPU workload waited for by the SHAVE that issued it, grid sync
-    by the toolkit's software rendezvous). That excludes the runtime and nothing more: **both arms share the
-    same TileLang lowering** -- the same CMX scoping, the same sequence of `dma_load` / `dpu_matmul` calls, the
-    same VPUNN workload plan -- so a missing wait or a bad call order that neither runtime can invent for us
-    reproduces identically in both. The remaining candidates are **this kernel's source and the TileLang
-    compiler**.
-    **npu_dsl's end-to-end is deterministic over 8 runs on this box**, prefill included, so the hardware does
-    the same work correctly: `QWEN36_CKPT=D:\models\qwen38-w4a16 QWEN36_DEV_WEIGHTS=D:\models\qwen38_npudsl_export
-    python -m qwen36_e2e.run_ptl --host local --golden D:\models\qwen38_golden\intro.pt` gives 32/32 argmax and
-    **logits rel error mean 0.0185, max 0.0449 -- identical to four decimals on every one of 8 runs**, which a
-    sparse corruption would move. (Its prefill is one short prompt, so it matches our failing head count,
-    5-6 v-heads per worker, but not our chunk count; a long-prompt run is the stronger check and has not been
-    done.) **Repairing the shim to get the runtime answer**: it had bit-rotted, reaching `frt::Ctx` members
-    (`ok_`, `tile_`, `shave_`, `tiles_`, `spt_`, `cmx_`, `desc_`, `dma_`) that `fused_rt.hpp` has since made
-    private. The run opened the single `private:` label in a **local copy** of that header in our gitignored
-    generated directory; npu_dsl's tree was not touched and access control is compile-time only, so the
-    measurement stands. The copy was deleted again. The shim needs a real repair before it is leaned on.
-
-    **npu_dsl does the same thing, and cannot be used to exonerate the hardware.** Its prefill GDN
-    (`kernels_poc/qwen36_dsl_poc/generated/qwen36_prefill_gdn_layer.cpp:449-472`) distributes v-heads over the
-    same 3 x 2 workers and loads the state with the identical per-head 1-D 65536 B DMA
-    (`ctx.dma_load(S, params[24] + vHead * 65536, 65536, 1, 65536)`), loops chunks updating it in CMX, and
-    stores it back -- structurally our kernel. But in that repo the prefill GDN has **no isolated device
-    verification**: it is absent from `docs/VERIFIED_KERNELS.md`'s 28 verified configurations, from
-    `docs/RUN_AND_RESULTS.md` and from `evidence/traces/INDEX.md`; the only device runner is the whole model
-    (`qwen36_e2e/run_ptl.py --golden`), and `qwen36_e2e/golden_check.py` runs once per call. So "npu_dsl's GDN
-    is correct" rests on single whole-model runs -- the same evidence strength that reported this kernel as
-    working -- and a sparse corruption of a few rows in a few heads need not move 16 greedy tokens. Worth
-    running that golden repeatedly; it has not been done, here or there.
-
-    **Method note, because it cost real time:** `runner.write_kernel` plus a hand-built `DeviceBuild` runs
-    whatever ELF is already registered under that name, which is not necessarily the source just written. Two
-    rounds of observations taken that way ("1 x 2 fails 6/8", "the state is correct and only the output is
-    sparse-wrong") were artifacts and are struck. Every number above comes from `runner.build`.
-
-    **Question for the hardware owner:** none yet. An earlier version of this entry asked one; it was premature,
-    because npu_dsl runs the same per-head state load on the same three tiles deterministically. The next
-    instruments are ours: read the emitted C++ for the head loop against what the DSL asked for, and run
-    npu_dsl's prefill at a long prompt so its chunk count per head matches ours.
+    **Two instruments cost real time and are written down so they are not reused.** `runner.write_kernel` plus a
+    hand-built `DeviceBuild` runs whatever ELF is registered under that name, not the source just written; two
+    rounds of observations taken that way were artifacts. And **the runtime swap excluded the runtime only** --
+    defining `TL_NPU_RUNTIME_FRT` puts the same generated source on npu_dsl's `fused_rt` (3/12 against our
+    4/12), but both arms share this lowering, so it could never have implicated the hardware. What settled that
+    was npu_dsl's end-to-end being deterministic here over 8 runs (32/32 argmax; logits rel error mean 0.0185,
+    max 0.0449, identical to four decimals):
+    `QWEN36_CKPT=D:\models\qwen38-w4a16 QWEN36_DEV_WEIGHTS=D:\models\qwen38_npudsl_export python -m
+    qwen36_e2e.run_ptl --host local --golden D:\models\qwen38_golden\intro.pt`. (A first attempt with the
+    wrong weights directory produced token 9 at every step -- a setup error, not an npu_dsl defect.) Repairing
+    the shim enough to compile needed the one `private:` label opened in a **local copy** of `fused_rt.hpp`;
+    npu_dsl's tree was untouched and the copy was deleted. The shim has bit-rotted and needs a real repair.
 
 ## 9. Model target: Qwen3.8-35B-A3B-Distill, and what it needs (2026-11-06)
 
@@ -617,7 +588,7 @@ device-verified and measured here.
 | Projections, decode (M = 1) | SHAVE GEMV over int4 g128 rows; int8 g128 lm_head | **have** (log 2026-11-07 M2): `T.gemm_i4` / `T.gemm_i8` merged-FC DPU path, device PASS, 30 / 41 GB/s of weights (DMA bound ~126) | M2 |
 | Norms, embedding, RoPE | RMSNorm rows (fp32 residual), gated RMSNorm, per-head q/k norm, RoPE angles on the SHAVE, embedding rows | `T.vectorized` loops lower to half32/float16 SHAVE vector ops with VAU exp/log/tanh (**have**, log 2026-11-07); the ops themselves not yet written | M1 |
 | Full attention | flash prefill (GQA, output gate), flash-decoding, KV cache layout / append | one flash prefill phase (Q resident, K/Vt streamed through two rings, fp32 online softmax) **device golden PASS**, 960x1024x64 vectorised 1.042 ms TURBO; **decode layer have** (log 2026-11-08): qkv GEMV, zero-centred q/k norm, RoPE, cache append, flash-decoding over 1536 positions with GQA 8:1 and the output gate, o_proj, in one launch, device PASS, **0.563 ms** TURBO; prefill GQA / gate / causal mask open | M1 |
-| Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | **decode have** (log 2026-11-08 M4, M5 step 5): one launch at Qwen3.6's shape, device PASS with both states checked, **0.640 ms** TURBO (delta rule at npu_dsl's gdn_scan code quality; its SHAVE section 323 vs npu_dsl's 247 us); the prefill chunked scan (`make_gdn_scan_prefill`, 11 DPU matmuls per chunk incl. transposes) is **NOT have**: correct and stable on one tile (5/5 at rel 7.10e-04, ~30-40 us per token) but **intermittently wrong on 3 x 2 -- see question 10**; the prefill conv1d is open | M4 |
+| Gated DeltaNet | causal conv1d, delta-rule chunked scan, gated norm | **decode have** (log 2026-11-08 M4, M5 step 5): one launch at Qwen3.6's shape, device PASS with both states checked, **0.640 ms** TURBO (delta rule at npu_dsl's gdn_scan code quality; its SHAVE section 323 vs npu_dsl's 247 us); the prefill chunked scan (`make_gdn_scan_prefill`, 11 DPU matmuls per chunk incl. transposes) is **device golden** at Qwen3.6's GDN shape: 12/12 trials at rel 7.10e-04 on 3 x 2, 26.7 us per token, causality control biting -- but only with its CMX scopes hoisted by hand, which is a kernel-side workaround for question 10; the prefill conv1d is open | M4 |
 | MoE | top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert (sigmoid gate), combine | **have** (log 2026-11-08 M3): one launch at Qwen3.6's shape, device PASS (routing == oracle), **0.560 ms** TURBO = 28 GB/s of the 15.8 MB it reads; expert phase ~0.43 ms at 34 GB/s (DMA-latency bound, see the log's cost split) | M3 |
 | Head | final norm + lm_head (int8 g128) + greedy argmax | **have** (log 2026-11-08): one launch at Qwen3.6's vocabulary, device PASS, **8.78 ms** TURBO = 58.9 GB/s vs npu_dsl's head 9.44 ms same day; both at <50% of the DMA bound | M5 |
 | Compiler | layer table + device-side layer loop with two layer kinds; long-prompt chunk loop; CMX reuse across phases; barrier id reuse; `.text` per kernel | **have** (log 2026-11-08 M5 step 3, unblocked M6): `T.ddr_view` address table, device-side `for li` with `Kind[li]`, scoped CMX across the loop, 40 layers lower and fit (`.text` 127 KB); question 8's device loss is **worked around** -- the KV cache is a kernel parameter, not a table address, so one launch may hold any mix of layers; rings do not yet hoist over the layer loop (cross-layer prefetch, npu_dsl's 14 ms of fusion gain); long-prompt chunk loop open | M5 |
