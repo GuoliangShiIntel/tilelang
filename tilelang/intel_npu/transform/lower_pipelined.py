@@ -612,6 +612,8 @@ def LowerIntelNpuPipelined():
             the fill's source tensor is not a view bound inside the iteration."""
             if not isinstance(outer, tirx.For) or outer.kind != tirx.ForKind.SERIAL or is_pipelined(outer):
                 return []
+            if not isinstance(outer.extent, tirx.IntImm):
+                return []   # a runtime trip count (an expert's token chunks): one ring per iteration
             stmts = list(outer.body.seq) if isinstance(outer.body, tirx.SeqStmt) else [outer.body]
             written = _written_in(outer.body)
             bound = _let_bound_in(outer.body)
