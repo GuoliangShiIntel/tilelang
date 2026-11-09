@@ -111,6 +111,53 @@ def test_a_loop_invariant_allocation_bubbles_out_of_every_enclosing_loop():
     assert alloc < body.index("for (int32_t outer"), "hoisted past the OUTER loop, not just the inner one"
 
 
+def allocations_inside_loops(src: str) -> list[tuple[str, int]]:
+    """(buffer, loop depth) for every `ctx.alloc` the generated source makes inside a loop body. Those are the
+    allocations question 10's defect acts on: the runtime re-runs mark / alloc / restore every iteration for an
+    address that never changes, and one of them made the GDN prefill scan wrong on 2+ tiles. Until the pass is
+    fixed this is the exposure list, so a kernel that grows one is seen rather than discovered on the device."""
+    out, depth, loops = [], 0, []
+    for ln in src.splitlines():
+        st = ln.strip()
+        if re.search(r"ctx\.alloc(_shared)?<", st) and loops:
+            m = re.search(r"__restrict (\w+)", st)
+            out.append((m.group(1) if m else "?", len(loops)))
+        if st.startswith("for ("):
+            loops.append(depth)
+        depth += st.count("{") - st.count("}")
+        while loops and depth <= loops[-1]:
+            loops.pop()
+    return out
+
+
+def test_the_kernels_that_allocate_inside_a_loop_are_the_ones_we_know_about():
+    """Question 10's exposure list, pinned. A kernel that starts allocating inside a loop either stops doing it or
+    is added here with a reason -- it cannot arrive unnoticed, which is how P3 shipped a kernel that was wrong two
+    runs in three. The author's lever is a first use of the buffer before the loops (`make_gdn_scan_prefill`)."""
+    import kernels
+
+    cases = {
+        "gemm": kernels.make_gemm(256, 256, 512, 64, 64, TILES, SHAVES),
+        "attn_prefill": kernels.make_attn_prefill(tiles=TILES, shaves=SHAVES),
+        "moe_route_prefill": kernels.make_moe_route_prefill(tiles=TILES, shaves=SHAVES),
+    }
+    seen = {name: len(allocations_inside_loops(_lower(func).source)) for name, func in cases.items()}
+    expected = {"gemm": 3, "attn_prefill": 11, "moe_route_prefill": 7}
+    assert seen == expected, f"exposure to question 10 changed: {seen} != {expected}"
+    # the control: the detector can report zero. A kernel whose allocations are all above its loops has none.
+
+    @T.prim_func
+    def clean(A: T.Tensor((64,), T.float16), Y: T.Tensor((TILES * SHAVES, 64), T.float16)):
+        with T.Kernel(TILES, threads=SHAVES) as tile:
+            shave = T.get_thread_binding()
+            c = T.alloc_local((64,), T.float16)
+            T.copy(A[0], c)
+            for it in T.serial(2):
+                T.copy(c, Y[tile * SHAVES + shave, 0])
+
+    assert allocations_inside_loops(_lower(clean).source) == []
+
+
 @pytest.mark.skipif(not _has_host_cxx(), reason="host sim needs clang++ (TL_HOST_CXX or PATH)")
 def test_two_phase_kernel_is_correct_in_the_host_sim():
     n = 4096

@@ -334,6 +334,9 @@ def main(argv):
     ap.add_argument("--new", type=int, default=16)
     ap.add_argument("--smax", type=int, default=1536)
     ap.add_argument("--golden", default=None, help="reference_golden.py's .npz: teacher-forced comparison (prompt and layers from it)")
+    ap.add_argument("--trials", type=int, default=1,
+                    help="repeat the teacher-forced comparison N times and report n/N; one run cannot tell a "
+                         "correct kernel from one that is right four times in five (plan question 10)")
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--per-layer", action="store_true", help="one launch per layer + head (the A/B baseline) instead of one per token")
     ap.add_argument("--layer-ids", default=None, help="run only these checkpoint layers, in order (e.g. 3 or 0,1,3): device bisection")
@@ -386,24 +389,35 @@ def main(argv):
                 print(f"first prompt token, residual stream after layer {layers - 1}: max |h_dev - h_ref| / max |h_ref| = "
                       f"{np.abs(h_dev - ref_out).max() / np.abs(ref_out).max():.2e}")
             # the rest of the prompt, then the reference's greedy tokens, teacher-forced
-            for t in ids[1:]:
-                dev_tok, ms = m.step(t)
             ref_logits = gold["logits"].astype(np.float32)        # [1 + new, V]
             out_ids = [int(x) for x in gold["out_ids"]]
-            agree, lines = 0, []
-            dev_logits = m.head_logits()
-            for k, r in enumerate(out_ids):
-                ok = dev_tok == r
-                agree += int(ok)
-                dl_err = float(np.abs(dev_logits - ref_logits[k]).max())
-                lines.append(f"  step {k:2d}: dev {dev_tok:6d} ref {r:6d} {'OK  ' if ok else 'DIFF'} ({tok.decode([r])!r}); "
-                             f"max |logits dev - ref| {dl_err:.3f} over {np.abs(ref_logits[k]).max():.1f}; "
-                             f"device {sum(v for kk, v in ms.items() if kk != 'host_wall'):.1f} ms, host wall {ms['host_wall']:.0f} ms")
-                print(lines[-1], flush=True)
-                dev_tok, ms = m.step(r)
+            clean = 0
+            for trial in range(a.trials):
+                if trial:
+                    m.reset_state()
+                    dev_tok, ms = m.step(ids[0])
+                for t in ids[1:]:
+                    dev_tok, ms = m.step(t)
+                agree, worst = 0, 0.0
                 dev_logits = m.head_logits()
-            print(f"golden: {agree}/{len(out_ids)} greedy tokens agree with the reference (teacher-forced; {time.perf_counter() - t0:.0f} s)")
-            return 0 if agree == len(out_ids) else 1
+                for k, r in enumerate(out_ids):
+                    ok = dev_tok == r
+                    agree += int(ok)
+                    dl_err = float(np.abs(dev_logits - ref_logits[k]).max())
+                    worst = max(worst, dl_err)
+                    if a.trials == 1:
+                        print(f"  step {k:2d}: dev {dev_tok:6d} ref {r:6d} {'OK  ' if ok else 'DIFF'} ({tok.decode([r])!r}); "
+                              f"max |logits dev - ref| {dl_err:.3f} over {np.abs(ref_logits[k]).max():.1f}; "
+                              f"device {sum(v for kk, v in ms.items() if kk != 'host_wall'):.1f} ms, "
+                              f"host wall {ms['host_wall']:.0f} ms", flush=True)
+                    dev_tok, ms = m.step(r)
+                    dev_logits = m.head_logits()
+                clean += int(agree == len(out_ids))
+                if a.trials > 1:
+                    print(f"  trial {trial}: {agree}/{len(out_ids)} agree, worst |logits dev - ref| {worst:.3f}", flush=True)
+            print(f"golden: {clean}/{a.trials} trials agree with the reference at all {len(out_ids)} greedy tokens "
+                  f"(teacher-forced; {time.perf_counter() - t0:.0f} s)")
+            return 0 if clean == a.trials else 1
         # free generation
         out, times = [], []
         for t in ids[:-1]:
