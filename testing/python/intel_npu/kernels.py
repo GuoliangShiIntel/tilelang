@@ -1067,6 +1067,7 @@ def make_moe_expert_prefill(
     slot_output: bool = False,
     separate_shared: bool = False,
     combine_rows: int = 1,
+    reuse_input: bool = False,
 ):
     """P2b: the grouped expert FFN for `N` prompt tokens, over P2a's grouping.
 
@@ -1096,6 +1097,8 @@ def make_moe_expert_prefill(
 
     `separate_shared`: dense projections and a batch activation process the shared expert on all workers before
     the routed grouped loop. Requires slot output and N % MB == 0; SharedGu/SharedAct are reusable DDR scratch.
+
+    `reuse_input`: reuse the gathered input tile for down-projection output after gate/up and the tile rendezvous.
 
     `probe_skip='dequant'`: MEASUREMENT ARM ONLY -- the weights are still read from DDR and the gemms still run,
     but the int4 rows are not expanded (the output is wrong by design). The difference is the dequant's share."""
@@ -1159,7 +1162,10 @@ def make_moe_expert_prefill(
         wsd_all = T.alloc_shared((KGI, H), T.float16)
         wd_cmx = T.alloc_local((BND, I), T.float16)
         yd_cmx = T.alloc_local((MB, BND), T.float16)
-        yo = T.alloc_shared((MB, H), T.float16)  # the chunk's whole down output, so Part is touched once per token
+        if reuse_input:
+            yo = x_cmx
+        else:
+            yo = T.alloc_shared((MB, H), T.float16)  # the chunk's whole down output, so Part is touched once per token
         pw = T.alloc_local((1, H), T.float32)
         pa = T.alloc_local((1, H), T.float32)
         zr = T.alloc_local((1, H), T.float32)
@@ -5476,6 +5482,7 @@ def make_prefill_model(
     conv_fp16: bool = False,
     register_tri: bool = False,
     gdn_live_chunks: bool = False,
+    moe_reuse_input: bool = False,
 ):
     """P5: a whole PREFILL chunk of `N` prompt tokens through `L` layers in ONE launch -- the prefill counterpart
     of `make_decode_model`. A device-side loop over the layers, `Kind[li, 0]` selecting the Gated DeltaNet or the
@@ -5547,7 +5554,7 @@ def make_prefill_model(
     expert_phase, _ = make_moe_expert_prefill(
         N=NP, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MBe, BNG=BNG, BND=BND, DB=DB, tiles=tiles, shaves=shaves,
         as_block=True, slot_output=moe_slot_output, separate_shared=separate_shared_expert,
-        combine_rows=moe_combine_rows
+        combine_rows=moe_combine_rows, reuse_input=moe_reuse_input
     )
     RR, SLOTS = rs["RR"], rs["SLOTS"]
     part_shape = (SLOTS, H) if moe_slot_output else (tiles, NP, H)

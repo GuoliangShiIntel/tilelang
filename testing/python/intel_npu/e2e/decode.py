@@ -85,7 +85,8 @@ class DeviceModel:
                  prefill_moe_slots: bool = False, prefill_shared_expert: bool = False,
                  prefill_dpu_overlap: bool = False, prefill_combine_rows: int = 1,
                  prefill_batch_dma: bool = False, prefill_register_conv: bool = False, prefill_conv_fp16: bool = False,
-                 prefill_register_tri: bool = False, prefill_gdn_live: bool = False):
+                 prefill_register_tri: bool = False, prefill_gdn_live: bool = False,
+                 prefill_moe_reuse_input: bool = False):
         self.ck, self.c, self.log = ck, ck.cfg, log
         c = self.c
         self.layer_ids = list(layer_ids) if layer_ids is not None else list(range(layers))   # checkpoint layers, in run order
@@ -180,7 +181,7 @@ class DeviceModel:
                         moe_slot_output=prefill_moe_slots, separate_shared_expert=prefill_shared_expert,
                         moe_combine_rows=prefill_combine_rows, register_conv=prefill_register_conv,
                         conv_fp16=prefill_conv_fp16, register_tri=prefill_register_tri,
-                        gdn_live_chunks=prefill_gdn_live, **pgeom)
+                        gdn_live_chunks=prefill_gdn_live, moe_reuse_input=prefill_moe_reuse_input, **pgeom)
                     names[f"prefill{pl}"] = (f"tl_e2e_prefill_l{pl}_n{ps['NP']}_h{c.hidden}_s{smax}"
                                              + (f"_bn{pgeom['BN1']}_mb{pgeom['MB']}" if prefill_shared or prefill_bn1 is not None or prefill_mb is not None else "")
                                              + ("_sharedproj" if prefill_shared else "")
@@ -195,11 +196,12 @@ class DeviceModel:
                                              + ("_cv16" if prefill_conv_fp16 else "")
                                              + ("_rtri" if prefill_register_tri else "")
                                              + ("_live" if prefill_gdn_live else "")
+                                             + ("_reuse" if prefill_moe_reuse_input else "")
                                              + ("_skip_" + "_".join(sorted(pskip)) if pskip else ""))
                     if prefill_dpu_overlap or prefill_batch_dma or prefill_combine_rows != 1 or prefill_register_conv or prefill_conv_fp16 or prefill_register_tri:
                         names[f"prefill{pl}"] = (names[f"prefill{pl}"].replace("_sharedproj_overlap", "_spov")
                                                 .replace("_moeslots", "_ms").replace("_sharedexpert", "_se"))
-                    if prefill_gdn_live:
+                    if prefill_gdn_live or prefill_moe_reuse_input:
                         names[f"prefill{pl}"] = names[f"prefill{pl}"].replace("tl_e2e_prefill", "tl_pf")
         else:
             kernels = {
@@ -592,6 +594,7 @@ def main(argv):
     ap.add_argument("--prefill-conv-fp16", action="store_true")
     ap.add_argument("--prefill-register-tri", action="store_true")
     ap.add_argument("--prefill-gdn-live", action="store_true")
+    ap.add_argument("--prefill-moe-reuse-input", action="store_true")
     ap.add_argument("--prefill-sweep", default=None, metavar="L1,L2,...",
                     help="layer counts to launch prefill at, ascending, from ONE session: the kernels are built in "
                          "one pass and share the weight upload, so a bisect point costs a launch instead of a "
@@ -636,7 +639,7 @@ def main(argv):
                     prefill_dpu_overlap=a.prefill_dpu_overlap, prefill_combine_rows=a.prefill_combine_rows,
                     prefill_batch_dma=a.prefill_batch_dma, prefill_register_conv=a.prefill_register_conv,
                     prefill_conv_fp16=a.prefill_conv_fp16, prefill_register_tri=a.prefill_register_tri,
-                    prefill_gdn_live=a.prefill_gdn_live)
+                    prefill_gdn_live=a.prefill_gdn_live, prefill_moe_reuse_input=a.prefill_moe_reuse_input)
     if a.chunked:
         print(f"chunks: {len(m.chunks)} launches per token: " + " ".join("/".join(str(i) for i in ch) for ch in m.chunks))
     try:

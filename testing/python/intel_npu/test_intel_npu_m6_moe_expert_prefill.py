@@ -67,9 +67,9 @@ def _problem(seed: int = 0):
     return dict(x=x, gu_int=gu_int, gu_s=gu_s, d_int=d_int, d_s=d_s, wts=r["wts"], off=r["off"], slot=r["slot"])
 
 
-def _sim(p, slot_output=False, separate_shared=False):
+def _sim(p, slot_output=False, separate_shared=False, reuse_input=False):
     low = _lower(make_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MB, BNG=BNG, BND=BND,
-                                         tiles=TILES, shaves=SHAVES,
+                                         tiles=TILES, shaves=SHAVES, reuse_input=reuse_input,
                                          **({"slot_output": True} if slot_output else {}),
                                          **({"separate_shared": True} if separate_shared else {})))
     lib = host_sim.build(low.source, "tl_moe_expert_sim")
@@ -214,11 +214,12 @@ def test_blocked_combine_matches_slot_order_with_invalid_capacity(tokens, block_
 
 @needs_cxx
 @pytest.mark.parametrize("slot_output", [False, True])
-def test_matches_the_oracle(slot_output):
+@pytest.mark.parametrize("reuse_input", [False, True])
+def test_matches_the_oracle(slot_output, reuse_input):
     p = _problem()
     ref = moe_expert_prefill_reference(p["x"], p["gu_int"], p["gu_s"], p["d_int"], p["d_s"],
                                        p["wts"], p["off"], p["slot"], TOPK=TOPK, G=G)
-    got = _sim(p, slot_output=slot_output)
+    got = _sim(p, slot_output=slot_output, reuse_input=reuse_input)
     rel = np.abs(got - ref).max() / np.abs(ref).max()
     assert rel < REL, f"rel {rel:.3e}"
 

@@ -60,12 +60,13 @@ needs_cxx = pytest.mark.skipif(not _has_host_cxx(), reason="no host clang++ for 
 
 
 def _kernel(shared_projections=False, expert_block=MBe, moe_slot_output=False, separate_shared_expert=False,
-            combine_rows=1):
+            combine_rows=1, moe_reuse_input=False):
     return make_prefill_model(L=L, N=N, H=H, KH=KH, VH=VH, DK=DK, DV=DV, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX,
                               I=I, E=E, TOPK=TOPK, G=G, TB=TB, C=C, TBq=TBq, TBF=TBF, BKV=BKV, BN1=BN1, BN2=BN2,
                               MB=MB, BM=BM, BNR=BNR, MBe=expert_block, BNG=BNG, BND=BND, tiles=TILES, shaves=SHAVES,
                               KVL=KVL, shared_projections=shared_projections, moe_slot_output=moe_slot_output,
-                              separate_shared_expert=separate_shared_expert, moe_combine_rows=combine_rows)
+                              separate_shared_expert=separate_shared_expert, moe_combine_rows=combine_rows,
+                              moe_reuse_input=moe_reuse_input)
 
 
 def _layers(seed=0):
@@ -137,11 +138,12 @@ def _host_arrays(layers):
 
 
 def _run(layers, h, pos0=0, n=N, shared_projections=False, expert_block=MBe, moe_slot_output=False,
-         separate_shared_expert=False, dpu_overlap=False, combine_rows=1, batch_dma=False):
+         separate_shared_expert=False, dpu_overlap=False, combine_rows=1, batch_dma=False, moe_reuse_input=False):
     with tvm.transform.PassContext(config={"tl.intel_npu.multicast": shared_projections,
                                            "tl.intel_npu.dpu_overlap": dpu_overlap,
                                            "tl.intel_npu.batch_dma": batch_dma}):
-        low = lowering.lower(_kernel(shared_projections, expert_block, moe_slot_output, separate_shared_expert, combine_rows))
+        low = lowering.lower(_kernel(shared_projections, expert_block, moe_slot_output, separate_shared_expert,
+                         combine_rows, moe_reuse_input))
     if batch_dma:
         assert "ctx.dma_batch_add(" in low.source
     if dpu_overlap:
@@ -272,14 +274,15 @@ def test_model_projection_overlap_under_readonly_kind_table():
 
 
 @needs_cxx
-@pytest.mark.parametrize("separate_shared_expert,dpu_overlap,combine_rows", [(False, False, 1), (True, False, 1), (True, True, 1), (True, False, 4)])
-def test_slot_outputs_preserve_live_model_state(separate_shared_expert, dpu_overlap, combine_rows):
+@pytest.mark.parametrize("separate_shared_expert,dpu_overlap,combine_rows,reuse_input",
+                         [(False, False, 1, False), (True, False, 1, False), (True, True, 1, False), (True, False, 4, True)])
+def test_slot_outputs_preserve_live_model_state(separate_shared_expert, dpu_overlap, combine_rows, reuse_input):
     layers = _layers(seed=7)
     h = np.random.default_rng(7).normal(size=(N, H)).astype(np.float32)
     expected = _run(layers, h, n=N - TB, shared_projections=True, expert_block=32)
     actual = _run(layers, h, n=N - TB, shared_projections=True, expert_block=32, moe_slot_output=True,
                   separate_shared_expert=separate_shared_expert, dpu_overlap=dpu_overlap,
-                  combine_rows=combine_rows, batch_dma=combine_rows > 1)
+                  combine_rows=combine_rows, batch_dma=combine_rows > 1, moe_reuse_input=reuse_input)
     for got, ref in zip(actual[:3], expected[:3]):
         assert np.isfinite(got).all()
         error = np.abs(got.astype(np.float32) - ref.astype(np.float32)).max()
