@@ -230,9 +230,20 @@ def PlanIntelNpuDistribution():
             if trips < 2 or int(loop.annotations.get("num_stages", 0)) > 0:
                 return None
             items = list(loop.body.seq) if isinstance(loop.body, tirx.SeqStmt) else [loop.body]
-            if len(items) != 3 or not all(_is_call(item, name) for item, name in zip(items, [DMA_COPY, DPU_MATMUL, DMA_COPY])):
+            if len(items) < 3 or not _is_call(items[0], DMA_COPY) or not _is_call(items[1], DPU_MATMUL):
                 return None
-            fill, gemm, store = (item.value for item in items)
+            fill, gemm = items[0].value, items[1].value
+            stores = []
+
+            def find_store(node):
+                if isinstance(node, tirx.Call) and getattr(node.op, "name", "") == DMA_COPY and _const_or(node.args[6], 1) == 0:
+                    stores.append(node)
+
+            tail = items[2] if len(items) == 3 else tirx.SeqStmt(items[2:])
+            post_order_visit(tail, find_store)
+            if len(stores) != 1:
+                return None
+            store = stores[0]
             if len(fill.args) != 7 or _const_or(fill.args[6], 0) != 1 or _const_or(store.args[6], 1) != 0:
                 return None
             activation, source = _load_of(fill.args[0]), _load_of(fill.args[1])
@@ -247,6 +258,34 @@ def PlanIntelNpuDistribution():
             if not _load_of(store.args[1]).buffer.same_as(output.buffer):
                 return None
             if source.buffer.data.same_as(destination.buffer.data):
+                return None
+            safe_tail = [True]
+
+            def inspect_tail(node):
+                if isinstance(node, tirx.BufferLoad):
+                    if node.buffer.data.same_as(activation.buffer.data):
+                        safe_tail[0] = False
+                    elif node.buffer.data.same_as(destination.buffer.data):
+                        pass
+                    elif node.buffer.scope() not in ("local", "shared"):
+                        safe_tail[0] = False
+                elif isinstance(node, tirx.BufferStore):
+                    if node.buffer.scope() != "local" or node.buffer.data.same_as(activation.buffer.data):
+                        safe_tail[0] = False
+                elif isinstance(node, tirx.Call):
+                    name = getattr(node.op, "name", "")
+                    if name == DMA_COPY:
+                        target = _load_of(node.args[0])
+                        if node.same_as(store):
+                            pass
+                        elif (_const_or(node.args[6], 0) != 1 or target.buffer.scope() != "local"
+                              or not tvm.ir.structural_equal(node.args[1], store.args[0])):
+                            safe_tail[0] = False
+                    elif name != "tirx.address_of":
+                        safe_tail[0] = False
+
+            post_order_visit(tail, inspect_tail)
+            if not safe_tail[0]:
                 return None
             if any(_uses(weights, var) for var in (loop.loop_var, launch.shave_var)):
                 return None
@@ -283,7 +322,7 @@ def PlanIntelNpuDistribution():
             body = substitute(loop.body, sub)
             new_items = list(body.seq)
             new_source = _load_of(new_items[0].value.args[1])
-            new_destination = _load_of(new_items[2].value.args[0])
+            new_destination = _load_of(substitute(store.args[0], sub))
             rows = _const_or(gemm.args[3], 0)
             analyzer = tvm.arith.Analyzer()
             for address in (new_source, new_destination):

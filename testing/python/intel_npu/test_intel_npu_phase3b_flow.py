@@ -64,7 +64,7 @@ def test_flow_is_generic_over_roles_and_names():
     assert "ctx.ring_begin((&(wstream[0])), 131072, 2, 64, 8, 12, -1, 1, 0);" in src
 
 
-def _serial_projection(split=False, guarded=False, shave_guard=False, repeated_output=False):
+def _serial_projection(split=False, guarded=False, shave_guard=False, repeated_output=False, rewrite_activation=False):
     @T.prim_func
     def projection(X: T.Tensor((128, 64), T.float16), W: T.Tensor((64, 64), T.float16), Y: T.Tensor((64, 64), T.float16)):
         with T.Kernel(2, threads=2) as tile:
@@ -77,6 +77,8 @@ def _serial_projection(split=False, guarded=False, shave_guard=False, repeated_o
                 if (not guarded or tile == 0) and (not shave_guard or shave == 0):
                     T.copy(X[(tile * 64 if split else 0) + (block * 2 + shave) * 16, 0], activation)
                     T.gemm(activation, weights, result, transpose_B=True, clear_accum=True)
+                    if rewrite_activation:
+                        activation[0, 0] = activation[0, 0] + T.float16(1)
                     T.copy(result, Y[(shave if repeated_output else block * 2 + shave) * 16, tile * 32])
 
     return projection
@@ -113,9 +115,11 @@ def test_serial_overlap_derives_a_ring_without_changing_token_ownership():
         split_src = tilelang.lower(_serial_projection(split=True), target="intel_npu").kernel_source
         guarded_src = tilelang.lower(_serial_projection(guarded=True), target="intel_npu").kernel_source
         repeated_src = tilelang.lower(_serial_projection(repeated_output=True), target="intel_npu").kernel_source
+        rewritten_src = tilelang.lower(_serial_projection(rewrite_activation=True), target="intel_npu").kernel_source
     assert "ctx.ring_begin(" not in split_src
     assert "ctx.ring_begin(" not in guarded_src
     assert "ctx.ring_begin(" not in repeated_src
+    assert "ctx.ring_begin(" not in rewritten_src
 
 
 @pytest.mark.parametrize("split,guarded", [(False, False), (True, False), (False, True)])

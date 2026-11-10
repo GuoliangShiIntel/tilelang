@@ -127,15 +127,22 @@ def test_shared_weight_overlap_stays_after_weight_preparation():
 
 @needs_cxx
 @pytest.mark.parametrize("block_k", [128, 256])
-def test_k_blocked_projection_preserves_output_with_incomplete_tile_round(block_k):
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("tiles", [1, 3])
+def test_k_blocked_projection_preserves_output_with_incomplete_tile_round(block_k, overlap, tiles):
     x, weights, packed, scales = _problem(seed=17)
-    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.multicast": True}):
-        low = lowering.lower(make_proj_prefill(NP=NP, M=M, K=K, BN=32, MB=16, G=G,
-                                              tiles=3, shaves=2, scales_gm=True, shared_weights=True, block_k=block_k))
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.multicast": True,
+                                           "tl.intel_npu.multicast_overlap": overlap}):
+        low = lowering.lower(make_proj_prefill(NP=NP, M=M, K=K, BN=32, MB=8, G=G,
+                                              tiles=tiles, shaves=2, scales_gm=True, shared_weights=True, block_k=block_k))
+    expected_ring = overlap and tiles > 1
+    assert ("ctx.ring_begin(" in low.source) == expected_ring
     output = np.full((NP, M), np.nan, np.float16)
     arrays = lowering.order_arrays(low, {"X": x, "Wq": packed, "S": np.ascontiguousarray(scales.T), "Yout": output})
+    if expected_ring:
+        return
     lib = host_sim.build(low.source, "blocked_projection_tail")
-    host_sim.check_status(host_sim.run(lib, arrays, tiles=3, shaves=2))
+    host_sim.check_status(host_sim.run(lib, arrays, tiles=tiles, shaves=2))
     expected = proj_prefill_reference(x, weights, scales, G)
     assert np.isfinite(output).all()
     assert np.abs(output.astype(np.float32) - expected).max() / np.abs(expected).max() < 2e-3
