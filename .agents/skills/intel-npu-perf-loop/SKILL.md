@@ -94,6 +94,14 @@ The older toolkit event trace (`--profile`, `perf_attr.py`) still reads the froz
 `device/evidence/`; it has real `dma_wait` / `dpu_wait` sub-intervals but only until its 1984-event budget
 runs out. `perf_attr.py` refuses a trace whose span falls short of the `tl.kernel_ms` stamped into it.
 
+**Bound trace conversion before expanding events.** A 40-layer npu_dsl `-DFRT_TRACE` file can be tens of MiB and
+contain millions of events. `qwen36_e2e.trace_json.read_dump()` reads the entire binary and materializes every launch
+before `--phase` / `--launch` selects one; those flags do not bound peak memory or parse time. First stream only the
+launch headers and per-worker `stored/dropped` counters, confirm `dropped == 0`, and identify the one layer launch
+needed. Then decode only that launch (or reuse its existing `.json.gz`). Do not print or JSON-expand the full-model
+event set to answer a one-layer scheduling question. Prefer a sweep-line/two-pointer interval join over all-pairs
+SHAVE/DPU comparisons; a quadratic join can itself look hung on a valid trace.
+
 For the phase you intend to touch, write down:
 
 1. **What bounds it** — the largest column. `shave` dominating means the arithmetic is the bound; a large
@@ -120,6 +128,7 @@ For schedule or geometry experiments, the control and candidate must differ in t
 capability changes which loop is selected, first prove that in generated source and run a matched control with
 the capability enabled but the target loop unchanged. Do not compare a BNG32+async arm with an older BNG64
 synchronous arm and attribute the result to either difference.
+  synchronous arm and attribute the result to either difference.
 
 ## Step 3: measure under step 0's condition, then reconcile
 
@@ -182,3 +191,7 @@ model that is kept produces the next wasted attempt). A golden failure is a stop
   budget. Correction: inspect the selected generated branch, compare actual workload shapes/counts and overlap
   intervals, then take a one-variable pair. The target is hidden dequant with no DPU bubble, not an unqualified
   named-site inequality.
+* 2026-11-10: reference trace conversion was attempted over the full 40-layer binary for a single-layer overlap
+  question. `trace_json` reads/materializes all launches before applying its launch filter; a subsequent PowerShell
+  all-pairs interval join also exceeded the useful interactive budget. Neither was a device or compiler blocker.
+  Index headers/worker counts in a streaming pass, select one launch, then use a sorted interval sweep.
