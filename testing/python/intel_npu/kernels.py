@@ -3399,11 +3399,36 @@ def prefill_norm_block(H: int, NP: int, workers: int, eps: float = 1e-6, FL: int
                 for v in T.vectorized(FL):
                     ls[v] = ls[v] + hrow[0, d0 * FL + v] * hrow[0, d0 * FL + v]
             st[0] = T.float32(1) / T.sqrt(T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL]) / T.float32(H) + T.float32(eps))
-            for d0 in T.serial(H // FL):
-                for v in T.vectorized(FL):
-                    xrow[0, d0 * FL + v] = T.cast(
-                        hrow[0, d0 * FL + v] * st[0] * (T.float32(1) + T.cast(nw[0, d0 * FL + v], T.float32)), T.float16
-                    )
+            if H % (4 * FL) == 0:
+                value0 = T.alloc_local((FL,), T.float32)
+                value1 = T.alloc_local((FL,), T.float32)
+                value2 = T.alloc_local((FL,), T.float32)
+                value3 = T.alloc_local((FL,), T.float32)
+                weight0 = T.alloc_local((FL,), T.float32)
+                weight1 = T.alloc_local((FL,), T.float32)
+                weight2 = T.alloc_local((FL,), T.float32)
+                weight3 = T.alloc_local((FL,), T.float32)
+                for block in T.serial(H // (4 * FL)):
+                    for lane in T.vectorized(FL):
+                        value0[lane] = hrow[0, (block * 4 + 0) * FL + lane]
+                        value1[lane] = hrow[0, (block * 4 + 1) * FL + lane]
+                        value2[lane] = hrow[0, (block * 4 + 2) * FL + lane]
+                        value3[lane] = hrow[0, (block * 4 + 3) * FL + lane]
+                        weight0[lane] = T.float32(1) + T.cast(nw[0, (block * 4 + 0) * FL + lane], T.float32)
+                        weight1[lane] = T.float32(1) + T.cast(nw[0, (block * 4 + 1) * FL + lane], T.float32)
+                        weight2[lane] = T.float32(1) + T.cast(nw[0, (block * 4 + 2) * FL + lane], T.float32)
+                        weight3[lane] = T.float32(1) + T.cast(nw[0, (block * 4 + 3) * FL + lane], T.float32)
+                    for lane in T.vectorized(FL):
+                        xrow[0, (block * 4 + 0) * FL + lane] = T.cast(value0[lane] * st[0] * weight0[lane], T.float16)
+                        xrow[0, (block * 4 + 1) * FL + lane] = T.cast(value1[lane] * st[0] * weight1[lane], T.float16)
+                        xrow[0, (block * 4 + 2) * FL + lane] = T.cast(value2[lane] * st[0] * weight2[lane], T.float16)
+                        xrow[0, (block * 4 + 3) * FL + lane] = T.cast(value3[lane] * st[0] * weight3[lane], T.float16)
+            else:
+                for d0 in T.serial(H // FL):
+                    for v in T.vectorized(FL):
+                        xrow[0, d0 * FL + v] = T.cast(
+                            hrow[0, d0 * FL + v] * st[0] * (T.float32(1) + T.cast(nw[0, d0 * FL + v], T.float32)), T.float16
+                        )
             T.copy(xrow, Xs[t, 0])
 
     return norm_tokens
