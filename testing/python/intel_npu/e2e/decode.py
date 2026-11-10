@@ -86,8 +86,9 @@ class DeviceModel:
                  prefill_dpu_overlap: bool = False, prefill_combine_rows: int = 1,
                  prefill_batch_dma: bool = False, prefill_register_conv: bool = False, prefill_conv_fp16: bool = False,
                  prefill_register_tri: bool = False, prefill_gdn_live: bool = False,
-                 prefill_moe_reuse_input: bool = False):
+                 prefill_moe_reuse_input: bool = False, prefill_phases: Path | None = None):
         self.ck, self.c, self.log = ck, ck.cfg, log
+        self.prefill_phases = prefill_phases
         c = self.c
         self.layer_ids = list(layer_ids) if layer_ids is not None else list(range(layers))   # checkpoint layers, in run order
         layers = len(self.layer_ids)
@@ -236,6 +237,11 @@ class DeviceModel:
             for k in kernels:
                 self.low[k].source = prefix.replace("\\n", "\n") + "\n" + self.low[k].source
                 names[k] += "_dbg"
+        if prefill_phases is not None:
+            for key in kernels:
+                if key.startswith("prefill"):
+                    self.low[key].source = "#define TL_NPU_PHASE_PROF 1\n" + self.low[key].source
+                    names[key] += "_prof"
         if build:
             t0 = time.perf_counter()
             runner.build_all({names[k]: self.low[k].source for k in kernels}, log=log)
@@ -422,6 +428,20 @@ class DeviceModel:
                                            for t in range(NP)]).astype(np.float32))
             _, km = s.launch(alias, *self._prefill_bufs(alias))
             dev_ms += km
+            if self.prefill_phases is not None:
+                import shutil
+                import task_report
+                path = self.prefill_phases
+                if len(ids) > NP:
+                    path = path.with_name(f"{path.stem}_{self.pos}{path.suffix}")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(s.phases(), path)
+                per, dropped = task_report.load(path, TILES * SHAVES)
+                task_report.table(per, dropped)
+                if any(dropped):
+                    raise RuntimeError("prefill task capture is truncated")
+                self.log(f"complete INSTRUMENTED prefill capture: {path}; workers={len(per)}, "
+                         f"records={sum(len(records) for records in per)}, dropped=0; not a latency run")
             if os.environ.get("TL_NPU_PREFILL_DBG") == "1":
                 hio = s.download("P_Hio", np.float32, (NP, H))
                 live = hio[:len(blk)]
@@ -595,11 +615,14 @@ def main(argv):
     ap.add_argument("--prefill-register-tri", action="store_true")
     ap.add_argument("--prefill-gdn-live", action="store_true")
     ap.add_argument("--prefill-moe-reuse-input", action="store_true")
+    ap.add_argument("--prefill-phases", type=Path, help="write complete task records; requires --prefill-only")
     ap.add_argument("--prefill-sweep", default=None, metavar="L1,L2,...",
                     help="layer counts to launch prefill at, ascending, from ONE session: the kernels are built in "
                          "one pass and share the weight upload, so a bisect point costs a launch instead of a "
                          "rebuild. A hang ends the session, so the sweep stops there and names the layer count")
     a = ap.parse_args(argv)
+    if a.prefill_phases is not None and (not a.prefill_only or not a.prefill):
+        ap.error("--prefill-phases requires --prefill and --prefill-only; instrumented runs are not timings")
     if not a.ckpt or not a.pack_dir:
         print("--ckpt and --pack-dir (or TL_NPU_CKPT / TL_NPU_PACK_DIR) are required")
         return 2
@@ -639,7 +662,8 @@ def main(argv):
                     prefill_dpu_overlap=a.prefill_dpu_overlap, prefill_combine_rows=a.prefill_combine_rows,
                     prefill_batch_dma=a.prefill_batch_dma, prefill_register_conv=a.prefill_register_conv,
                     prefill_conv_fp16=a.prefill_conv_fp16, prefill_register_tri=a.prefill_register_tri,
-                    prefill_gdn_live=a.prefill_gdn_live, prefill_moe_reuse_input=a.prefill_moe_reuse_input)
+                    prefill_gdn_live=a.prefill_gdn_live, prefill_moe_reuse_input=a.prefill_moe_reuse_input,
+                    prefill_phases=a.prefill_phases)
     if a.chunked:
         print(f"chunks: {len(m.chunks)} launches per token: " + " ".join("/".join(str(i) for i in ch) for ch in m.chunks))
     try:
@@ -723,7 +747,8 @@ def main(argv):
                 pre_ms = m.prefill(ids[:-1])
             if a.prefill_only:
                 print(f"prefill only: {len(ids) - 1} tokens through {m.L} layers in "
-                      f"{-(-(len(ids) - 1) // m.ps['NP'])} launch(es), {pre_ms:.1f} ms device [UNPROFILED, "
+                      f"{-(-(len(ids) - 1) // m.ps['NP'])} launch(es), {pre_ms:.1f} ms device "
+                      f"[{'INSTRUMENTED observability; NOT a timing' if a.prefill_phases is not None else 'UNPROFILED'}, "
                       f"{'TURBO' if m.s.turbo else 'NO TURBO'}] -> the prefill kernels returned")
                 return 0
         else:

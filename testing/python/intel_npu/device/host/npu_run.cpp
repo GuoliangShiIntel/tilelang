@@ -39,7 +39,7 @@ constexpr std::uint32_t kStatusWords = kStatusBytesPerShave / 4;
 // Format -- VPUX's arrangement (guides/how_to_use_profiling.md), which is what gives DMA, DPU and SHAVE their
 // own real tracks instead of one aggregate.
 constexpr std::uint32_t kStatusReserve = 4096;
-constexpr std::uint32_t kPhaseBytesPerWorker = 16 * (128u * 1024u + 4u);
+constexpr std::uint32_t kPhaseBytesPerWorker = 16 * (2048u * 1024u + 4u);
 // Status words 8 and 9: NCE_TIME free-running counter at kernel entry and at finish (19.2 MHz on this box).
 constexpr std::uint32_t kStampStart = 8, kStampEnd = 9;
 constexpr double kPerfClkMHz = 19.2;

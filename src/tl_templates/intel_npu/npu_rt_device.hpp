@@ -1625,7 +1625,7 @@ public:
     kTaskShave = 7
   };
   static constexpr std::uint32_t kTaskWords = 4;
-  static constexpr std::uint32_t kTaskMax = 128u * 1024u; // 2 MiB a worker
+  static constexpr std::uint32_t kTaskMax = 2048u * 1024u; // 32 MiB a worker
   static constexpr std::uint32_t kTaskBytes =
       4 * kTaskWords * (kTaskMax + 4); // + a 4-word header
   static constexpr std::uint32_t kStatusReserve =
