@@ -2458,6 +2458,7 @@ def make_gdn_scan_prefill(
     shaves: int = 2,
     eps: float = 1e-6,
     as_block: bool = False,
+    register_tri: bool = False,
 ):
     """P3: the Gated DeltaNet recurrence over `n` prompt tokens in **CHUNKED** form -- the prefill shape of the
     delta rule that `make_gdn_decode` runs one token at a time. Takes the conv phase's output (q / k l2-normalised
@@ -2493,6 +2494,46 @@ def make_gdn_scan_prefill(
     workers = tiles * shaves
     HL, FL = 32, 16
     INV = 1.0 / GDN_Q_SCALE
+
+    @T.macro
+    def triangular_registers(result, scratch, products, decay):
+        sum0 = T.alloc_local((HL,), T.float16)
+        sum1 = T.alloc_local((HL,), T.float16)
+        sum2 = T.alloc_local((HL,), T.float16)
+        sum3 = T.alloc_local((HL,), T.float16)
+        for block in T.serial(C // HL):
+            for lane in T.vectorized(HL):
+                result[0, block * HL + lane] = T.float16(0)
+        for row in T.serial(1, C):
+            for block in T.serial(C // HL):
+                for lane in T.vectorized(HL):
+                    scratch[block * HL + lane] = (T.float16(0)
+                        - products[row, block * HL + lane] * decay[row, block * HL + lane])
+            for column in T.serial(row, C):
+                scratch[column] = T.float16(0)
+            for block in T.unroll(C // HL):
+                if row > block * HL:
+                    for lane in T.vectorized(HL):
+                        sum0[lane] = scratch[block * HL + lane]
+                        sum1[lane] = T.float16(0)
+                        sum2[lane] = T.float16(0)
+                        sum3[lane] = T.float16(0)
+                    for previous in T.serial(row // 4):
+                        for lane in T.vectorized(HL):
+                            sum0[lane] = sum0[lane] + result[previous * 4, block * HL + lane] * scratch[previous * 4]
+                            sum1[lane] = sum1[lane] + result[previous * 4 + 1, block * HL + lane] * scratch[previous * 4 + 1]
+                            sum2[lane] = sum2[lane] + result[previous * 4 + 2, block * HL + lane] * scratch[previous * 4 + 2]
+                            sum3[lane] = sum3[lane] + result[previous * 4 + 3, block * HL + lane] * scratch[previous * 4 + 3]
+                    for previous in T.serial((row // 4) * 4, row):
+                        for lane in T.vectorized(HL):
+                            sum0[lane] = sum0[lane] + result[previous, block * HL + lane] * scratch[previous]
+                    for lane in T.vectorized(HL):
+                        result[row, block * HL + lane] = (sum0[lane] + sum1[lane]) + (sum2[lane] + sum3[lane])
+                else:
+                    for lane in T.vectorized(HL):
+                        result[row, block * HL + lane] = T.float16(0)
+        for row in T.serial(C):
+            result[row, row] = T.float16(1)
 
     @T.macro
     def scan_phase(QK, V, Gb, Z, GNorm, Nt, Ssm, Out, tile, shave):
@@ -2616,38 +2657,31 @@ def make_gdn_scan_prefill(
                     T.gemm(eye, kd, kdT, transpose_B=True, clear_accum=True)
                     # --- T = (I + strictly_lower(A . D))^-1 by forward substitution ----------------------
                     perf_begin("stri")
-                    for j0 in T.serial(C // HL):
-                        for v in T.vectorized(HL):
-                            tri[0, j0 * HL + v] = T.float16(0)
-                    for i in T.serial(1, C):
-                        # fp16 end to end on HL lanes: `ap` and `dm` are already fp16, so the fp32 form paid two
-                        # conversions and twice the vector ops for a value that is written back to fp16 `tri`
-                        # anyway. npu_dsl's gdn_chunk_tri is half32 throughout for the same reason.
+                    if register_tri:
+                        triangular_registers(tri, la, ap, dm)
+                    else:
                         for j0 in T.serial(C // HL):
                             for v in T.vectorized(HL):
-                                la[j0 * HL + v] = T.float16(0) - (ap[i, j0 * HL + v] * dm[i, j0 * HL + v])
-                        for j in T.serial(i, C):
-                            la[j] = T.float16(0)  # row i is strictly lower; column i on is not its own
-                        for j0 in T.serial(C // HL):
-                            for v in T.vectorized(HL):
-                                ac[j0 * HL + v] = la[j0 * HL + v]
-                        # ONE accumulator, and not for want of trying. npu_dsl's gdn_chunk_tri uses FOUR to break
-                        # this FMA dependency chain; ported here it measured 419.652 -> 427.565 ms in fp32 and
-                        # 401.395 -> 413.139 ms in fp16, so the dtype was not what made the difference. Its four
-                        # live in `half32 a0[NB]` C++ LOCALS -- registers. A T.alloc_local array indexed in a loop
-                        # is CMX through a pointer and moviCompile will not promote it, so every FMA pays a load
-                        # and a store and the extra traffic outweighs the parallelism. Needs register-resident
-                        # accumulators in the DSL, not a different accumulator count.
-                        for m in T.serial(i):
-                            eh[0] = la[m]
+                                tri[0, j0 * HL + v] = T.float16(0)
+                        for i in T.serial(1, C):
                             for j0 in T.serial(C // HL):
                                 for v in T.vectorized(HL):
-                                    ac[j0 * HL + v] = ac[j0 * HL + v] + tri[m, j0 * HL + v] * eh[0]
-                        for j0 in T.serial(C // HL):
-                            for v in T.vectorized(HL):
-                                tri[i, j0 * HL + v] = ac[j0 * HL + v]
-                    for i in T.serial(C):
-                        tri[i, i] = T.float16(1)
+                                    la[j0 * HL + v] = T.float16(0) - (ap[i, j0 * HL + v] * dm[i, j0 * HL + v])
+                            for j in T.serial(i, C):
+                                la[j] = T.float16(0)
+                            for j0 in T.serial(C // HL):
+                                for v in T.vectorized(HL):
+                                    ac[j0 * HL + v] = la[j0 * HL + v]
+                            for m in T.serial(i):
+                                eh[0] = la[m]
+                                for j0 in T.serial(C // HL):
+                                    for v in T.vectorized(HL):
+                                        ac[j0 * HL + v] = ac[j0 * HL + v] + tri[m, j0 * HL + v] * eh[0]
+                            for j0 in T.serial(C // HL):
+                                for v in T.vectorized(HL):
+                                    tri[i, j0 * HL + v] = ac[j0 * HL + v]
+                        for i in T.serial(C):
+                            tri[i, i] = T.float16(1)
                     perf_end()
                     perf_begin("spm")
                     for i in T.serial(C):
@@ -5408,6 +5442,7 @@ def make_prefill_model(
     moe_combine_rows: int = 1,
     register_conv: bool = False,
     conv_fp16: bool = False,
+    register_tri: bool = False,
 ):
     """P5: a whole PREFILL chunk of `N` prompt tokens through `L` layers in ONE launch -- the prefill counterpart
     of `make_decode_model`. A device-side loop over the layers, `Kind[li, 0]` selecting the Gated DeltaNet or the
@@ -5457,7 +5492,8 @@ def make_prefill_model(
         register_conv=register_conv,
         conv_fp16=conv_fp16,
     )
-    scan_phase, _ = make_gdn_scan_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, C=C, tiles=tiles, shaves=shaves, eps=eps, as_block=True)
+    scan_phase, _ = make_gdn_scan_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, C=C, tiles=tiles, shaves=shaves,
+                                        eps=eps, as_block=True, register_tri=register_tri)
     qkv_phase, qs = make_attn_qkv_prefill(
         N=NP, H=H, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX, TB=TBq, tiles=tiles, shaves=shaves, eps=eps, as_block=True, kv4=True
     )

@@ -55,10 +55,10 @@ def _problem(n, NP, seed=0):
     return qk, v, gb, z, gnorm, ssm
 
 
-def _sim(n, N, qk, v, gb, z, gnorm, ssm, tiles=TILES, shaves=SHAVES):
+def _sim(n, N, qk, v, gb, z, gnorm, ssm, tiles=TILES, shaves=SHAVES, register_tri=False):
     NP = -(-N // C) * C
     low = lowering.lower(make_gdn_scan_prefill(N=N, KH=KH, VH=VH, DK=DK, DV=DV, C=C, tiles=tiles, shaves=shaves,
-                                               eps=EPS))
+                                               eps=EPS, **({"register_tri": True} if register_tri else {})))
     lib = host_sim.build(low.source, "gdn_scan_prefill")
     out = np.zeros((NP, VH * DV), np.float16)
     sm = ssm.copy()
@@ -86,10 +86,11 @@ def test_lowers_with_the_eleven_chunk_matmuls():
 
 
 @needs_cxx
-def test_chunked_scan_matches_the_recurrence():
+@pytest.mark.parametrize("register_tri", [False, True])
+def test_chunked_scan_matches_the_recurrence(register_tri):
     n, N = 128, 128
     qk, v, gb, z, gnorm, ssm = _problem(n, N)
-    got, sm = _sim(n, N, qk, v, gb, z, gnorm, ssm)
+    got, sm = _sim(n, N, qk, v, gb, z, gnorm, ssm, register_tri=register_tri)
     ref, sref = gdn_scan_prefill_reference(qk, v, gb, z, gnorm, ssm, n, eps=EPS)
     rel = np.abs(got[:n].astype(np.float32) - ref[:n]).max() / np.abs(ref[:n]).max()
     assert rel < 5e-2, f"output rel {rel}"
@@ -98,13 +99,14 @@ def test_chunked_scan_matches_the_recurrence():
 
 
 @needs_cxx
-def test_a_partial_last_chunk_is_masked():
+@pytest.mark.parametrize("register_tri", [False, True])
+def test_a_partial_last_chunk_is_masked(register_tri):
     """n = 100 leaves 28 padding rows in the second chunk. They must not reach gc, the products or the state --
     the whole-chunk answer for the first 100 tokens has to be identical to the n = 128 run's first 100."""
     N = 128
     qk, v, gb, z, gnorm, ssm = _problem(128, N)
-    full, _ = _sim(128, N, qk, v, gb, z, gnorm, ssm)
-    part, sm = _sim(100, N, qk, v, gb, z, gnorm, ssm)
+    full, _ = _sim(128, N, qk, v, gb, z, gnorm, ssm, register_tri=register_tri)
+    part, sm = _sim(100, N, qk, v, gb, z, gnorm, ssm, register_tri=register_tri)
     ref, sref = gdn_scan_prefill_reference(qk, v, gb, z, gnorm, ssm, 100, eps=EPS)
     assert np.abs(part[:100].astype(np.float32) - ref[:100]).max() / np.abs(ref[:100]).max() < 5e-2
     assert np.abs(sm - sref).max() / np.abs(sref).max() < 5e-2
@@ -113,12 +115,13 @@ def test_a_partial_last_chunk_is_masked():
 
 
 @needs_cxx
-def test_the_chunk_size_does_not_change_the_answer():
+@pytest.mark.parametrize("register_tri", [False, True])
+def test_the_chunk_size_does_not_change_the_answer(register_tri):
     """C is a blocking choice, not a model choice: C = 32 and C = 64 must agree. If D, the triangular solve or
     the carry were wrong, they would disagree -- a single-chunk test cannot see any of it."""
     n = N = 128
     qk, v, gb, z, gnorm, ssm = _problem(n, N)
-    a, sa = _sim(n, N, qk, v, gb, z, gnorm, ssm)
+    a, sa = _sim(n, N, qk, v, gb, z, gnorm, ssm, register_tri=register_tri)
     low = lowering.lower(kernels.make_gdn_scan_prefill(N=N, KH=KH, VH=VH, DK=DK, DV=DV, C=32,
                                                        tiles=TILES, shaves=SHAVES, eps=EPS))
     lib = host_sim.build(low.source, "gdn_scan_prefill_c32")
@@ -134,15 +137,16 @@ def test_the_chunk_size_does_not_change_the_answer():
 
 
 @needs_cxx
-def test_a_perturbed_token_moves_only_later_outputs():
+@pytest.mark.parametrize("register_tri", [False, True])
+def test_a_perturbed_token_moves_only_later_outputs(register_tri):
     """The negative control, and the one that catches a scan running the wrong way: changing token 40's v may
     move tokens 40.. and must leave 0..39 bit-identical. A non-causal or reversed scan fails this."""
     n = N = 128
     qk, v, gb, z, gnorm, ssm = _problem(n, N)
-    base, _ = _sim(n, N, qk, v, gb, z, gnorm, ssm)
+    base, _ = _sim(n, N, qk, v, gb, z, gnorm, ssm, register_tri=register_tri)
     v2 = v.copy()
     v2[3, 40] = (v2[3, 40].astype(np.float32) + 1.0).astype(np.float16)
-    moved, _ = _sim(n, N, qk, v2, gb, z, gnorm, ssm)
+    moved, _ = _sim(n, N, qk, v2, gb, z, gnorm, ssm, register_tri=register_tri)
     head = slice(3 * DV, 4 * DV)
     assert np.array_equal(base[:40, head], moved[:40, head]), "an earlier token moved: the scan is not causal"
     assert not np.array_equal(base[40:, head], moved[40:, head]), "no later token moved: the state is not carried"

@@ -164,7 +164,7 @@ def main(argv):
                                                 separate_shared_expert="--shared-expert" in argv,
                                                 moe_combine_rows=arg(argv, "--combine-rows", 1),
                                                 register_conv="--register-conv" in argv,
-                                                conv_fp16="--conv-fp16" in argv))
+                                                conv_fp16="--conv-fp16" in argv, register_tri="--register-tri" in argv))
     print(f"lower {time.time() - t_low:.0f} s")
     name = (f"tl_prefill_model_l{L}_n{NP}_h{H}_s{SMAX}_bn{BN1}"
             + (f"_bn2{BN2}" if BN2 != BN1 else "")
@@ -197,6 +197,8 @@ def main(argv):
         assert "--shared-projections" in argv and "--overlap" in argv and "--moe-slots" in argv and "--shared-expert" in argv
     if "--dpu-overlap" in argv:
         name = name.replace("_sharedproj_overlap_moeslots_sharedexpert", "_spov_ms_se")
+    if "--register-tri" in argv:
+        name = name.replace("_sharedproj_overlap_moeslots_sharedexpert", "_spov_ms_se") + "_rtri"
     if "--phases" in argv:
         # instrumentation is opt-in: it costs ~5% (npu_rt_device.hpp's TL_NPU_PHASE_PROF), so the default
         # build is the one every latency number comes from

@@ -61,8 +61,10 @@ def main(argv):
     profile = "--profile" in argv
 
     low = lowering.lower(make_gdn_scan_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, C=C,
-                                               tiles=tiles, shaves=shaves, eps=EPS))
+                                               tiles=tiles, shaves=shaves, eps=EPS, register_tri="--register-tri" in argv))
     name = f"tl_gdn_scan_prefill_n{NP}_kh{KH}_vh{VH}_c{C}_t{tiles}s{shaves}"
+    if "--register-tri" in argv:
+        name += "_rtri"
     if "--no-build" in argv:
         _, sha = runner.write_kernel(low.source, name)
         db = runner.DeviceBuild(build_dir=HERE / "build", exe=HERE / "build" / "Release" / "npu_run.exe",
