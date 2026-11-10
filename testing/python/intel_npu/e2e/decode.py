@@ -86,7 +86,9 @@ class DeviceModel:
                  prefill_dpu_overlap: bool = False, prefill_combine_rows: int = 1,
                  prefill_batch_dma: bool = False, prefill_register_conv: bool = False, prefill_conv_fp16: bool = False,
                  prefill_register_tri: bool = False, prefill_gdn_live: bool = False,
-                 prefill_moe_reuse_input: bool = False, prefill_phases: Path | None = None):
+                 prefill_moe_reuse_input: bool = False, prefill_phases: Path | None = None,
+                 prefill_bn2: int | None = None, prefill_output_block_k: int | None = None,
+                 prefill_output_mb: int | None = None):
         self.ck, self.c, self.log = ck, ck.cfg, log
         self.prefill_phases = prefill_phases
         c = self.c
@@ -102,6 +104,8 @@ class DeviceModel:
         pgeom = dict(PREFILL_GEOM)
         if prefill_bn1 is not None:
             pgeom["BN1"] = prefill_bn1
+        if prefill_bn2 is not None:
+            pgeom["BN2"] = prefill_bn2
         if prefill_mb is not None:
             pgeom["MB"] = prefill_mb
         if prefill_mbe is not None:
@@ -182,7 +186,8 @@ class DeviceModel:
                         moe_slot_output=prefill_moe_slots, separate_shared_expert=prefill_shared_expert,
                         moe_combine_rows=prefill_combine_rows, register_conv=prefill_register_conv,
                         conv_fp16=prefill_conv_fp16, register_tri=prefill_register_tri,
-                        gdn_live_chunks=prefill_gdn_live, moe_reuse_input=prefill_moe_reuse_input, **pgeom)
+                        gdn_live_chunks=prefill_gdn_live, moe_reuse_input=prefill_moe_reuse_input,
+                        output_block_k=prefill_output_block_k, output_mb=prefill_output_mb, **pgeom)
                     names[f"prefill{pl}"] = (f"tl_e2e_prefill_l{pl}_n{ps['NP']}_h{c.hidden}_s{smax}"
                                              + (f"_bn{pgeom['BN1']}_mb{pgeom['MB']}" if prefill_shared or prefill_bn1 is not None or prefill_mb is not None else "")
                                              + ("_sharedproj" if prefill_shared else "")
@@ -204,6 +209,10 @@ class DeviceModel:
                                                 .replace("_moeslots", "_ms").replace("_sharedexpert", "_se"))
                     if prefill_gdn_live or prefill_moe_reuse_input:
                         names[f"prefill{pl}"] = names[f"prefill{pl}"].replace("tl_e2e_prefill", "tl_pf")
+                    if prefill_output_block_k is not None or prefill_bn2 is not None or prefill_output_mb is not None:
+                        names[f"prefill{pl}"] = (names[f"prefill{pl}"].replace("tl_e2e_prefill", "tl_pf")
+                                                 .replace("_rtri_live_reuse", "_trlvru")
+                                                 + f"_ob{pgeom['BN2']}_k{prefill_output_block_k or 0}_m{prefill_output_mb or pgeom['MB']}")
         else:
             kernels = {
                 "gdn": make_gdn_layer(H=c.hidden, KH=c.lin_kh, VH=c.lin_vh, DK=c.lin_dk, DV=c.lin_dv, I=c.moe_inter, E=c.n_experts,
@@ -616,6 +625,9 @@ def main(argv):
     ap.add_argument("--prefill-gdn-live", action="store_true")
     ap.add_argument("--prefill-moe-reuse-input", action="store_true")
     ap.add_argument("--prefill-phases", type=Path, help="write complete task records; requires --prefill-only")
+    ap.add_argument("--prefill-bn2", type=int)
+    ap.add_argument("--prefill-out-block-k", type=int)
+    ap.add_argument("--prefill-out-mb", type=int)
     ap.add_argument("--prefill-sweep", default=None, metavar="L1,L2,...",
                     help="layer counts to launch prefill at, ascending, from ONE session: the kernels are built in "
                          "one pass and share the weight upload, so a bisect point costs a launch instead of a "
@@ -663,7 +675,8 @@ def main(argv):
                     prefill_batch_dma=a.prefill_batch_dma, prefill_register_conv=a.prefill_register_conv,
                     prefill_conv_fp16=a.prefill_conv_fp16, prefill_register_tri=a.prefill_register_tri,
                     prefill_gdn_live=a.prefill_gdn_live, prefill_moe_reuse_input=a.prefill_moe_reuse_input,
-                    prefill_phases=a.prefill_phases)
+                    prefill_phases=a.prefill_phases, prefill_bn2=a.prefill_bn2,
+                    prefill_output_block_k=a.prefill_out_block_k, prefill_output_mb=a.prefill_out_mb)
     if a.chunked:
         print(f"chunks: {len(m.chunks)} launches per token: " + " ".join("/".join(str(i) for i in ch) for ch in m.chunks))
     try:

@@ -3223,6 +3223,7 @@ def make_proj_prefill(
     shared_weights: bool = False,
     weight_row_offset: int = 0,
     output_row_base: bool = False,
+    block_k: int | None = None,
 ):
     """P4 step 4: a PREFILL projection -- `Yout[NP, M] = X[NP, K] . dequant(Wq[M, K])^T`, int4 symmetric with one
     fp16 scale per group of G along K.
@@ -3243,6 +3244,9 @@ def make_proj_prefill(
     `weight_row_offset` selects weights/scales after a fixed row prefix. With `as_block=True`,
     `output_row_base=True` returns the private-weight macro with a final runtime output-row-origin argument.
 
+    `block_k`: tile-shared projections may split K into complete group-aligned blocks; fp16 partials are added
+    in fp32 and rounded to fp16 after each block. Incomplete output tile rounds execute without storing padding.
+
     `scales_gm`: the scales are GROUP-MAJOR `[K/G, M]`, which is the layout the DPU's int4 path reads in place, so
     one scale tensor serves prefill and decode and the weights are uploaded once (npu_dsl's arrangement). The
     chunk's scales are then a `[K/G, BN]` 2-D read at stride M, and the dequant is `tl_npu_dequant_i4_gm`, which
@@ -3257,9 +3261,50 @@ def make_proj_prefill(
     assert MB <= 8192 and BN <= 8192 and K <= 8192, "every workload dimension is bounded by 8192 (dpu.md 4.6)"
     if shared_weights:
         assert BN % shaves == 0, "shared weight rows must divide over the tile's SHAVEs"
-        assert NCH % tiles == 0, "shared weights currently require complete tile rounds"
+        assert NCH % tiles == 0 or block_k is not None, "shared weights currently require complete tile rounds"
         assert NTB % shaves == 0, "shared weights currently require complete SHAVE token rounds"
+    BK = K if block_k is None else block_k
+    if block_k is not None:
+        assert shared_weights and scales_gm, "K-blocked projection requires tile-shared weights and group-major scales"
+        assert BK > 0 and K % BK == 0 and BK % G == 0 and BK % HL == 0, "K blocks must divide K and quantization groups"
+        assert BN % 16 == 0, "K-blocked output rows must divide into 16-lane fp32 accumulation vectors"
     HALF = BN // shaves
+
+    @T.macro
+    def blocked_proj_phase(X, Wq, S, Yout, tile, shave):
+        packed = T.alloc_local((HALF, BK // 2), T.uint8)
+        scales = T.alloc_local((BK // G, HALF), T.float16)
+        weights = T.alloc_shared((BN, BK), T.float16)
+        activation = T.alloc_local((MB, BK), T.float16)
+        result = T.alloc_local((MB, BN), T.float16)
+        previous = T.alloc_local((MB, BN), T.float16)
+        for output_block in T.serial(T.ceildiv(NCH, tiles)):
+            row = (output_block * tiles + tile) * BN
+            for reduction_block in T.serial(K // BK):
+                T.sync_threads()
+                if row < M:
+                    T.copy(Wq[weight_row_offset + row + shave * HALF, reduction_block * (BK // 2)], packed)
+                    T.copy(S[reduction_block * (BK // G), weight_row_offset + row + shave * HALF], scales)
+                    T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(weights[shave * HALF, 0]),
+                                  T.address_of(packed[0, 0]), T.address_of(scales[0, 0]), HALF, BK, G)
+                else:
+                    for weight_row, column in T.grid(HALF, BK // HL):
+                        for lane in T.vectorized(HL):
+                            weights[shave * HALF + weight_row, column * HL + lane] = T.float16(0)
+                T.sync_threads()
+                for token_block in T.serial(NTB // shaves):
+                    token = (token_block * shaves + shave) * MB
+                    T.copy(X[token, reduction_block * BK], activation)
+                    T.gemm(activation, weights, result, transpose_B=True, clear_accum=True)
+                    if row < M:
+                        if reduction_block > 0:
+                            T.copy(Yout[token, row], previous)
+                            for token_row, column in T.grid(MB, BN // 16):
+                                for lane in T.vectorized(16):
+                                    result[token_row, column * 16 + lane] = T.cast(
+                                        T.cast(result[token_row, column * 16 + lane], T.float32)
+                                        + T.cast(previous[token_row, column * 16 + lane], T.float32), T.float16)
+                        T.copy(result, Yout[token, row])
 
     @T.macro
     def shared_proj_phase(X, Wq, S, Yout, tile, shave):
@@ -3357,7 +3402,8 @@ def make_proj_prefill(
     def proj_phase(X, Wq, S, Yout, tile, shave):
         private_proj_phase(X, Wq, S, Yout, tile, shave, 0)
 
-    selected_phase = private_proj_phase if output_row_base else shared_proj_phase if shared_weights else proj_phase
+    selected_phase = (blocked_proj_phase if block_k is not None else
+                      private_proj_phase if output_row_base else shared_proj_phase if shared_weights else proj_phase)
     if as_block:
         return selected_phase, dict(NCH=NCH, NTB=NTB, KG=KG)
 
@@ -5508,6 +5554,8 @@ def make_prefill_model(
     register_tri: bool = False,
     gdn_live_chunks: bool = False,
     moe_reuse_input: bool = False,
+    output_block_k: int | None = None,
+    output_mb: int | None = None,
 ):
     """P5: a whole PREFILL chunk of `N` prompt tokens through `L` layers in ONE launch -- the prefill counterpart
     of `make_decode_model`. A device-side loop over the layers, `Kind[li, 0]` selecting the Gated DeltaNet or the
@@ -5571,10 +5619,14 @@ def make_prefill_model(
     YW, OW = max(NIN_pad, NQKV_pad), max(VC, KO)
     in_proj, _ = make_proj_prefill(NP=NP, M=NIN_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True,
                                    scales_gm=True, shared_weights=shared_projections)
-    gdn_out_proj, _ = make_proj_prefill(NP=NP, M=H, K=VC, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True, scales_gm=True)
+    output_projection = dict(shared_weights=True, block_k=output_block_k) if output_block_k is not None else {}
+    output_tokens = MB if output_mb is None else output_mb
+    gdn_out_proj, _ = make_proj_prefill(NP=NP, M=H, K=VC, BN=BN2, MB=output_tokens, G=G, tiles=tiles, shaves=shaves,
+                                      as_block=True, scales_gm=True, **output_projection)
     qkv_proj, _ = make_proj_prefill(NP=NP, M=NQKV_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True,
                                     scales_gm=True, shared_weights=shared_projections)
-    o_proj, _ = make_proj_prefill(NP=NP, M=H, K=KO, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True, scales_gm=True)
+    o_proj, _ = make_proj_prefill(NP=NP, M=H, K=KO, BN=BN2, MB=output_tokens, G=G, tiles=tiles, shaves=shaves,
+                                as_block=True, scales_gm=True, **output_projection)
     route_phase, rs = make_moe_route_prefill(N=NP, H=H, E=E, TOPK=TOPK, BM=BM, BNR=BNR, tiles=tiles, shaves=shaves, as_block=True)
     expert_phase, _ = make_moe_expert_prefill(
         N=NP, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MBe, BNG=BNG, BND=BND, DB=DB, tiles=tiles, shaves=shaves,

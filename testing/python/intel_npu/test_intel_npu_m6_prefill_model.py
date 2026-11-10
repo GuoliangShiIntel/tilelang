@@ -60,13 +60,13 @@ needs_cxx = pytest.mark.skipif(not _has_host_cxx(), reason="no host clang++ for 
 
 
 def _kernel(shared_projections=False, expert_block=MBe, moe_slot_output=False, separate_shared_expert=False,
-            combine_rows=1, moe_reuse_input=False):
+            combine_rows=1, moe_reuse_input=False, output_block_k=None):
     return make_prefill_model(L=L, N=N, H=H, KH=KH, VH=VH, DK=DK, DV=DV, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX,
                               I=I, E=E, TOPK=TOPK, G=G, TB=TB, C=C, TBq=TBq, TBF=TBF, BKV=BKV, BN1=BN1, BN2=BN2,
                               MB=MB, BM=BM, BNR=BNR, MBe=expert_block, BNG=BNG, BND=BND, tiles=TILES, shaves=SHAVES,
                               KVL=KVL, shared_projections=shared_projections, moe_slot_output=moe_slot_output,
                               separate_shared_expert=separate_shared_expert, moe_combine_rows=combine_rows,
-                              moe_reuse_input=moe_reuse_input)
+                              moe_reuse_input=moe_reuse_input, output_block_k=output_block_k)
 
 
 def _layers(seed=0):
@@ -138,12 +138,13 @@ def _host_arrays(layers):
 
 
 def _run(layers, h, pos0=0, n=N, shared_projections=False, expert_block=MBe, moe_slot_output=False,
-         separate_shared_expert=False, dpu_overlap=False, combine_rows=1, batch_dma=False, moe_reuse_input=False):
+         separate_shared_expert=False, dpu_overlap=False, combine_rows=1, batch_dma=False, moe_reuse_input=False,
+         output_block_k=None):
     with tvm.transform.PassContext(config={"tl.intel_npu.multicast": shared_projections,
                                            "tl.intel_npu.dpu_overlap": dpu_overlap,
                                            "tl.intel_npu.batch_dma": batch_dma}):
         low = lowering.lower(_kernel(shared_projections, expert_block, moe_slot_output, separate_shared_expert,
-                         combine_rows, moe_reuse_input))
+                                     combine_rows, moe_reuse_input, output_block_k))
     if batch_dma:
         assert "ctx.dma_batch_add(" in low.source
     if dpu_overlap:
@@ -215,10 +216,11 @@ def test_the_model_does_not_reintroduce_question_10():
 
 
 @needs_cxx
-def test_the_model_matches_the_layer_oracles_chained():
+@pytest.mark.parametrize("output_block_k", [None, 128])
+def test_the_model_matches_the_layer_oracles_chained(output_block_k):
     layers = _layers()
     h = (np.random.default_rng(0).standard_normal((N, H), np.float32) * 0.5).astype(np.float32)
-    hio, kc, vt, rows, _ = _run(layers, h)
+    hio, kc, vt, rows, _ = _run(layers, h, output_block_k=output_block_k)
     ref, kc_ref, vt_ref, ref_rows = _oracle(layers, h)
     assert np.abs(hio - ref).max() / np.abs(ref).max() < REL
     for k in range(KVL):
