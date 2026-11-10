@@ -713,11 +713,12 @@ def make_moe_route_prefill(N: int = 128, H: int = 2048, E: int = 256, TOPK: int 
         pick = T.alloc_local((16,), T.float32)
         best = T.alloc_local((4,), T.float32)
         mx = T.alloc_local((HL,), T.float16)
-        ids_all = T.alloc_local((N, TOPK), T.int32)
-        cnt_cmx = T.alloc_local((E + 1,), T.int32)
-        off_cmx = T.alloc_local((E + 2,), T.int32)
-        cur_cmx = T.alloc_local((E + 1,), T.int32)
-        slot_cmx = T.alloc_local((SLOTS,), T.int32)
+        # section C's grouping runs on worker 0 alone, so a per-SHAVE copy is dead weight on every other worker
+        ids_all = T.alloc_shared((N, TOPK), T.int32)
+        cnt_cmx = T.alloc_shared((E + 1,), T.int32)
+        off_cmx = T.alloc_shared((E + 2,), T.int32)
+        cur_cmx = T.alloc_shared((E + 1,), T.int32)
+        slot_cmx = T.alloc_shared((SLOTS,), T.int32)
         # --- A. router GEMM over the token blocks ----------------------------------------------------
         T.copy(Wr[tile * RRT, 0], wr_cmx)
         for b in T.serial(N // BM):
@@ -839,7 +840,7 @@ def moe_route_prefill_reference(x, wr, E: int, TOPK: int, logits=None):
 
 def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16, TOPK: int = 4, G: int = 128,
                             MB: int = 16, BNG: int = 64, BND: int = 64, tiles: int = 3, shaves: int = 2,
-                            as_block: bool = False, probe_skip: str | None = None):
+                            DB: int = 4, as_block: bool = False, probe_skip: str | None = None):
     """P2b: the grouped expert FFN for `N` prompt tokens, over P2a's grouping.
 
     Each worker owns whole experts, so **an expert's weights are read once per launch** instead of once per
@@ -875,8 +876,9 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
     assert H % HL == 0 and I % HL == 0 and MB * BNG <= 8192 and MB * BND <= 8192
     assert I % (shaves * HL) == 0 and N % shaves == 0
     # down chunks per DMA: at BND = 64 a job is 16 KiB and 70% of it is the 1.55 us per-job fixed cost, and the
-    # PACKED buffer is 8x smaller than wd_cmx, so DMA granularity is cheap to decouple from compute granularity
-    DB = next(d for d in (4, 2, 1) if CD % (d * shaves) == 0)
+    # PACKED buffer is 8x smaller than wd_cmx, so DMA granularity is cheap to decouple from compute granularity.
+    # `DB` is an upper bound: it also sizes wqd_cmx, so a large chunk costs CMX the big prompt chunks need.
+    DB = next(d for d in (DB, 4, 2, 1) if d <= DB and CD % (d * shaves) == 0)
     EPT = -(-(E + 1) // tiles)            # experts per TILE: the tile's SHAVEs cooperate on one expert
 
     @T.macro
@@ -889,9 +891,10 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
         the partials, so the zero fill, the accumulation and the combine all read and write three rows per token
         instead of six."""
         worker = tile * shaves + shave
-        off_cmx = T.alloc_local((E + 2,), T.int32)
-        slot_cmx = T.alloc_local((SLOTS,), T.int32)
-        wts_cmx = T.alloc_local((N, 16), T.float32)
+        # read-only routing tables, identical on both SHAVEs: a private copy each cost 116 KB at N = 1024
+        off_cmx = T.alloc_shared((E + 2,), T.int32)
+        slot_cmx = T.alloc_shared((SLOTS,), T.int32)
+        wts_cmx = T.alloc_shared((N, 16), T.float32)
         x_cmx = T.alloc_shared((MB, H), T.float16)          # the chunk's tokens: both SHAVEs read them
         wq_cmx = T.alloc_local((BNG, H // 2), T.uint8)      # a SHAVE's own chunk of weights
         ws_cmx = T.alloc_local((KGH, BNG), T.float16)
@@ -4076,7 +4079,8 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
                        DV: int = 128, NH: int = 16, NKV: int = 2, D: int = 256, ROT: int = 64, SMAX: int = 1536,
                        I: int = 512, E: int = 256, TOPK: int = 8, G: int = 128, TB: int = 32, C: int = 64,
                        TBq: int = 8, TBF: int = 16, BKV: int = 128, BN1: int = 32, BN2: int = 32, MB: int = 16,
-                       BM: int = 64, BNR: int = 16, MBe: int = 16, BNG: int = 64, BND: int = 64, tiles: int = 3,
+                       BM: int = 64, BNR: int = 16, MBe: int = 16, BNG: int = 64, BND: int = 64, DB: int = 4,
+                       tiles: int = 3,
                        shaves: int = 2, eps: float = 1e-6, KVL: int | None = None, skip: frozenset = frozenset(),
                        unroll_layers: bool = False, conv_blocked: bool = True, conv_item_worker: str = "tile",
                        HW: int | None = None):
@@ -4135,7 +4139,7 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
     route_phase, rs = make_moe_route_prefill(N=NP, H=H, E=E, TOPK=TOPK, BM=BM, BNR=BNR, tiles=tiles,
                                              shaves=shaves, as_block=True)
     expert_phase, _ = make_moe_expert_prefill(N=NP, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MBe, BNG=BNG, BND=BND,
-                                              tiles=tiles, shaves=shaves, as_block=True)
+                                              DB=DB, tiles=tiles, shaves=shaves, as_block=True)
     RR, SLOTS = rs["RR"], rs["SLOTS"]
     KGH, KGI = H // G, I // G
     FL = 16

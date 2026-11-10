@@ -39,6 +39,7 @@ NH, NKV, D, ROT = 16, 2, 256, 64
 I, E, TOPK = 512, 256, 8
 TB, C, TBq, TBF, BKV, MB = 32, 64, 8, 16, 128, 16
 BM, BNR, MBe, BNG, BND = 64, 16, 16, 64, 64
+DB = 4
 GQ, KO = NH // NKV, NH * D
 QK, VC = KH * DK, VH * DV
 CONV = 2 * QK + VC
@@ -124,8 +125,9 @@ def main(argv):
     n, pos0 = arg(argv, "--n", 192), arg(argv, "--pos0", 0)
     trials = arg(argv, "--trials", 3)
     BN1 = BN2 = arg(argv, "--bn", 32)
-    global MBe
+    global MBe, DB
     MBe = arg(argv, "--mbe", MBe)
+    DB = arg(argv, "--db", DB)
     SMAX = arg(argv, "--smax", 1536)
     skip = frozenset(x for x in (argv[argv.index("--skip") + 1].split(",") if "--skip" in argv else []) if x)
     L = len(kinds)
@@ -141,16 +143,19 @@ def main(argv):
     YW, OW = max(NIN_pad, NQKV_pad), max(VC, KO)
 
     cfg = {"tl.intel_npu.scoped_cmx": "--no-scoped-cmx" not in argv}
+    t_low = time.time()
     with tvm.transform.PassContext(config=cfg):
         low = lowering.lower(make_prefill_model(L=L, N=NP, H=H, KH=KH, VH=VH, DK=DK, DV=DV, NH=NH, NKV=NKV, D=D,
                                                 ROT=ROT, SMAX=SMAX, I=I, E=E, TOPK=TOPK, G=G, TB=TB, C=C, TBq=TBq,
                                                 TBF=TBF, BKV=BKV, BN1=BN1, BN2=BN2, MB=MB, BM=BM, BNR=BNR,
-                                                MBe=MBe, BNG=BNG, BND=BND, tiles=TILES, shaves=SHAVES, KVL=KVL,
+                                                MBe=MBe, BNG=BNG, BND=BND, DB=DB, tiles=TILES, shaves=SHAVES, KVL=KVL,
                                                 skip=skip, unroll_layers="--unroll" in argv,
                                                 conv_blocked="--roundrobin" not in argv,
                                                 conv_item_worker="shave" if "--shave-major" in argv else "tile"))
+    print(f"lower {time.time() - t_low:.0f} s")
     name = (f"tl_prefill_model_l{L}_n{NP}_h{H}_s{SMAX}_bn{BN1}"
             + (f"_mbe{MBe}" if MBe != 16 else "")
+            + (f"_db{DB}" if DB != 4 else "")
             + (f"_t{TILES}" if TILES != 3 else "")
             + ("_sm" if "--shave-major" in argv else "")
             + ("_rr" if "--roundrobin" in argv else "")
@@ -186,16 +191,24 @@ def main(argv):
     # ---- weights: one layer at a time, uploaded and then kept only for the oracle -------------------------
     layers, kv = [], 0
     uploaded = {}      # name -> the array as uploaded, for --audit
-    t0 = time.time()
+    t_gen = t_up = 0.0
+    up_bytes = 0
     for li, kind in enumerate(kinds):
+        t0 = time.time()
         p = layer_weights(kind, kv if kind == "attn" else 0, seed=100 + li)
+        arrs = table_arrays(p, RR)
+        t_gen += time.time() - t0
         kv += 1 if kind == "attn" else 0
-        for cname, arr in table_arrays(p, RR).items():
+        t0 = time.time()
+        for cname, arr in arrs.items():
             s.upload(f"L{li}_{cname}", arr)
+            up_bytes += arr.nbytes
             if arr.nbytes < (1 << 24):      # the expert weights are ~0.4 GB a layer: not worth reading back
                 uploaded[f"L{li}_{cname}"] = arr
+        t_up += time.time() - t0
         layers.append(p)
-    print(f"weights uploaded in {time.time() - t0:.0f} s ({L} layers)")
+    print(f"weights: generate+pack {t_gen:.0f} s, upload {t_up:.0f} s "
+          f"({up_bytes / 2**30:.2f} GiB, {up_bytes / 2**20 / max(t_up, 1e-9):.0f} MiB/s), {L} layers")
 
     col = {c: i for i, c in enumerate(PREFILL_TABLE_COLS)}
     table = np.zeros((L, len(PREFILL_TABLE_COLS)), np.int64)
@@ -264,12 +277,34 @@ def main(argv):
         return hio, kc, states, kernel_ms
 
     t0 = time.time()
+    # the oracle is a pure function of the seeded weights and the fixed inputs, so a geometry sweep (MBe, DB,
+    # BNG ...) recomputes the same 20 s of numpy for every arm; the key carries the mtime of the two files that
+    # define it, so editing either one misses rather than returning a stale reference
+    import hashlib as _hl
+    _key = _hl.sha256(repr((kinds, NP, pos0, n, SMAX, KVL, H, E, TOPK, G, NH, NKV, D, ROT, KH, VH, DK, DV,
+                            Path(__file__).stat().st_mtime_ns,
+                            (HERE.parent / "kernels.py").stat().st_mtime_ns)).encode()).hexdigest()[:16]
+    _cache = HERE / "build" / f"oracle_{_key}.npz"
     ref_rows = [dict(p) for p in layers]
-    ref, kc_ref, _ = prefill_model_reference(ref_rows, h0, cs, pos0, n, NH=NH, NKV=NKV, D=D, ROT=ROT, KH=KH,
-                                             VH=VH, DK=DK, DV=DV, E=E, TOPK=TOPK, G=G,
-                                             kc=[np.zeros((NKV, SMAX, D), np.float16) for _ in range(KVL)],
-                                             vt=[np.zeros((NKV, D, SMAX), np.float16) for _ in range(KVL)])
-    print(f"oracle {time.time() - t0:.0f} s")
+    if _cache.exists() and "--no-oracle-cache" not in argv:
+        _z = np.load(_cache)
+        ref, kc_ref = _z["ref"], [_z[f"kc{i}"] for i in range(KVL)]
+        # prefill_model_reference ADVANCES conv_state/ssm in ref_rows in place and the trial loop compares
+        # against them, so the cache has to carry the advanced states too, not just the stream
+        for li, p in enumerate(ref_rows):
+            if p["kind"] == "gdn":
+                p["conv_state"], p["ssm"] = _z[f"cs{li}"], _z[f"ssm{li}"]
+        print(f"oracle {time.time() - t0:.0f} s (cached {_cache.name})")
+    else:
+        ref, kc_ref, _ = prefill_model_reference(ref_rows, h0, cs, pos0, n, NH=NH, NKV=NKV, D=D, ROT=ROT, KH=KH,
+                                                 VH=VH, DK=DK, DV=DV, E=E, TOPK=TOPK, G=G,
+                                                 kc=[np.zeros((NKV, SMAX, D), np.float16) for _ in range(KVL)],
+                                                 vt=[np.zeros((NKV, D, SMAX), np.float16) for _ in range(KVL)])
+        _st = {f"cs{li}": p["conv_state"] for li, p in enumerate(ref_rows) if p["kind"] == "gdn"}
+        _st |= {f"ssm{li}": p["ssm"] for li, p in enumerate(ref_rows) if p["kind"] == "gdn"}
+        _cache.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(_cache, ref=ref, **{f"kc{i}": a for i, a in enumerate(kc_ref)}, **_st)
+        print(f"oracle {time.time() - t0:.0f} s (cached to {_cache.name})")
 
     good, worst, kms = 0, 0.0, []
     for trial in range(trials):
