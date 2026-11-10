@@ -437,6 +437,67 @@ part worth keeping.
   every step. That was the wrong exported weights directory; with the right one it is 32/32 and deterministic
   over 8 runs. It was one command away from being filed as an npu_dsl bug.
 
+### 5.2 What the E2E prefill bring-up got wrong (2026-11-09)
+
+Getting prefill and decode onto one weight layout and through 40 layers end to end turned up one real
+hardware constraint and a run of self-inflicted wounds. The constraint is in `hw_facts` territory; the
+wounds are all the same shape -- **a measurement trusted without checking the thing that produced it**.
+
+* **A DMA whose buffer STRADDLES a 4 GiB boundary faults the device** (`ZE_RESULT_ERROR_DEVICE_LOST`); a
+  buffer wholly above one is fine. Found by padding: 9 layers at a 0.2 GiB pad (top 4.12 GB) returns, the
+  same 9 at 0.4 GiB (top 4.32 GB) faults, and 10 layers -- which had never once returned -- returns as soon
+  as a 4.5 GiB pad puts every weight above the line with nothing across it. The MoE expert tensors (269 MB)
+  hit it first simply because they are wide enough to land across a boundary. `Session.alloc` now predicts
+  the next address, inserts a filler allocation when the request would cross, and **asserts on the real
+  address afterwards** -- the prediction is a guess about an allocator we do not own, the assert is the
+  check. L=9/10/11/12 then return in 322/357/398/424 ms and L=40 in 1424.5 ms. **Why decode never hit this
+  is still unexplained**, and that is a loose end, not a result.
+* **A timeout is a property of the instrument, not of the kernel.** The watchdog was a hardcoded 20 s. A
+  40-layer prefill launch is 1.4 s of kernel on top of build and upload, so "hangs" and "is merely slow"
+  reported identically, and two bisects went down the wrong path before the constant was noticed. It is
+  `TL_NPU_WATCHDOG_S` now. The same lesson as §5.1's "build what you measure", one layer further out: a
+  constant inside the harness is as much a part of the experiment as the code under test.
+* **A device runner passing is not evidence the packed layout is right, because the runner does not use the
+  checkpoint.** Prefill's GDN half returned all-NaN from layer 2 on (43008 = 21 x 2048 NaNs) while
+  `run_prefill_model_device.py` passed 12/12. The runner's synthetic `layer_weights` builds the gate
+  projections b | a **into** `win_int`; the real `pack_gdn_layer` keeps them in a separate fp16 `Wba`, so the
+  packed `WinQ` is (12288, 1024) and not the (12352, ...) prefill assumed, and every group-major scale after
+  the first was read from the wrong column. The fix is `prefill_ba_block` plus `NIN = CONV + VC`; the lesson
+  is that an oracle built from the same wrong assumption as the kernel agrees with it perfectly. **Where a
+  runner's inputs are synthesised rather than packed, say so in its docstring.**
+* **The same class of bug twice in one file: a view whose pitch is not the packer's.** `WoutS` / `WoS` are
+  padded by the packer to the DECODE kernel's `BN2 * tiles` -- 2112 columns at H=2048 -- and prefill viewed
+  them as 2048 wide. Silent, and NaN again. `make_prefill_model` now takes the packed row count (`HW`), and
+  `decode.py` **asserts** the packed in-proj / qkv-proj row counts against the ones prefill derives, so the
+  third one is loud. A shared tensor has exactly one pitch, and it belongs to whoever wrote the bytes.
+* **Verify the device is healthy before believing the next measurement.** Three separate conclusions this
+  session were drawn from a device left in a bad state by an earlier `DEVICE_LOST`. A one-trial
+  `run_moe_device.py --trials 1 --no-build` between measurements costs seconds and would have caught all
+  three. "The device is in the same state it was in for the baseline" is an assumption, and it is the one
+  most often false.
+* **Check the instrument you are bisecting with.** `decode.py --layers N` / `--layer-ids` with N < 40 hangs
+  on a device that is demonstrably healthy -- an open defect, independent of prefill. It was used as the
+  bisect tool twice before that was noticed, which is §5.1's "build what you measure" restated: a tool that
+  has not been exercised on a known-good input is not a tool yet.
+* **Report what ran, not what was asked for.** An E2E decode run was reported as E2E prefill. The numbers
+  were real and the kernel was real; it was the wrong kernel. Name the kernel (and its sha256) in the claim,
+  which is what the `INDEX.md` row already forces and what prose skipped.
+* **A gate that cannot fire is not a gate.** `pack.cached_paths` read `m.get("geom", {})`, so a manifest with
+  no geometry passed the staleness check silently -- the check could only ever fire on a manifest that
+  already carried the field. It now refuses a geometry-less manifest outright, and
+  `test_intel_npu_e2e_pack_geometry.py` runs all three arms (matching geometry served, differing geometry
+  raises, geometry-less raises). Same file, the related rule: `PAD_KEYS` is held to the packed bytes by
+  comparing **sets**, not counts, because one key wrongly added and one wrongly dropped cancel in a count.
+* **One barrier in the wrong loop costs a ring.** MoE decode regressed to 0.639 ms on the new layout because
+  each item fetched its own experts' scales, and the per-item barrier drained the weight ring. Fetching all
+  `IPT` experts' scales once before the item loop (`wsg_all` / `wsd_all`, read in place via `scales_at`)
+  gives 0.543 ms, under the 0.551 ms baseline. The cost of a barrier is not the barrier; it is the prefetch
+  that was in flight.
+* **One cheap experiment beats a plausible story.** "The head is slow because its scale fetch should be a
+  ring" survived being written down and did not survive being run. `<user>` asked for the experiment before
+  the work; it was falsified in one build. The head is still ~10% off its 8.78 ms baseline and the reason is
+  still open -- which is the honest state, and better than a fix built on the wrong cause.
+
 ## 6. Out of scope for this plan
 
 NPU60XX values; a TVM upstream change (`3rdparty/` is not edited); OpenVINO/VPUX graph path
@@ -653,6 +714,25 @@ Baseline to beat: npu_dsl's Qwen3.6-35B-A3B numbers (`qwen36_e2e`, its `docs/des
 re-measured on the same day as ours, since the box's DPU rate has changed since October (section 7 question 5).
 
 ## 8. Log
+
+* 2026-11-09: **Prefill and decode run end to end on ONE weight layout, and the gate projection prefill never
+  had.** Decode moved onto the general pack (plain int4/int8 values plus a separate group-major scale tensor),
+  which is what prefill already read, so the 17.91 GB cache serves both; `gemm_i4` / `gemm_i8` gained
+  `scales_at=(row, col)` so one DMA serves many chunks, which is what keeps the MoE and the lm_head fast now
+  that the scales have left the weight tensor. **Device, UNPROFILED TURBO, 3 x 2, Qwen3.8, 40/40 layers:**
+  prefill **1688 ms for 21 tokens = 80.4 ms/token**, TTFT **1.79 s**, decode 51.1 ms/token = **18.2 tok/s**,
+  and the prefilled continuation matches the decode-only baseline **token for token** (`332, 33119, 11106,
+  26012, 318, ...`). MoE decode **0.543 ms** (baseline 0.551). Suite 164 passed.
+  Three things made it work. (1) **The checkpoint keeps the GDN gate projections in a separate fp16 `Wba`,
+  not inside the quantised `in_proj`**, so `NIN = CONV + VC`; prefill assumed otherwise and returned all-NaN.
+  `prefill_ba_block` computes `BAs = Xs @ Wba^T` as an fp16 DPU gemm and the conv phase reads b | a from it.
+  (2) **A group-major scale view must carry the PACKER's pitch**: out-projection rows are padded to the decode
+  kernel's `BN2 * tiles` (2112 at H=2048), so `make_prefill_model` takes `HW`. (3) **A DMA buffer that
+  straddles a 4 GiB boundary faults the device**; `Session.alloc` keeps every buffer clear of one and asserts
+  on the real address. Without it a 40-layer prefill could not be allocated at all.
+  **§5.2 records what this cost**: a 20 s watchdog that made a 1.4 s launch look like a hang, a bisect tool
+  that was itself broken, three conclusions drawn from a device left unhealthy by an earlier `DEVICE_LOST`,
+  a decode run reported as a prefill run, and a cache-staleness gate incapable of firing.
 
 * 2026-11-09: **Prefill's attention half catches up with its GDN half: the whole layer, then the whole layer with
   MoE, each in ONE launch.** P1 and P1b were two phases with nothing joining them; `make_attn_layer_prefill` is
