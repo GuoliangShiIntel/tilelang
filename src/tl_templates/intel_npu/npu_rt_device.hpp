@@ -375,6 +375,12 @@ static inline void tl_npu_dequant_i4_gm(half *__restrict dst,
     }
 }
 
+static inline void tl_npu_axpy(float *__restrict output, const half *__restrict input,
+                                float weight, std::uint32_t count) {
+  for (std::uint32_t element = 0; element < count; ++element)
+    output[element] += weight * static_cast<float>(input[element]);
+}
+
 namespace npu {
 
 // Status word 0 per SHAVE, read by the host runner; word 1 is the detail.
@@ -543,6 +549,48 @@ public:
                         dstStride, srcStride);
   }
   void dma_load_wait() { dma_load_wait_impl(); }
+  template <class T>
+  __attribute__((always_inline)) void dma_batch_add(T *dst, Ddr<T> src, std::uint32_t width,
+                                    std::uint32_t rows, std::uint32_t dstStride,
+                                    std::uint32_t srcStride) {
+    if (!ok_ || width == 0 || rows == 0)
+      return;
+    if (batchCount_ == 2 * kRingMaxDepth * kRingPool)
+      dma_batch_flush();
+    if (batchCount_ == 0) {
+      qg_flush();
+      port_retire(0);
+      port_retire(1);
+    }
+    if (!ok_)
+      return;
+    DmaDescriptor *descriptor = ringFill_ + batchCount_;
+    DmaDrv::initDesc(descriptor);
+    config_copy(descriptor, reinterpret_cast<std::uint32_t>(dst), src.addr,
+                width, rows, dstStride, srcStride);
+    if (batchCount_ != 0)
+      descriptor[-1].link_address = reinterpret_cast<std::uint32_t>(descriptor);
+    ++batchCount_;
+  }
+  TL_NPU_HW_CALL void dma_batch_flush() {
+    if (!ok_ || batchCount_ == 0)
+      return;
+    DmaDescriptor *tail = ringFill_ + batchCount_ - 1;
+    batchCount_ = 0;
+    TL_NPU_COMPILER_BARRIER();
+#if TL_NPU_PHASE_PROF
+    const std::uint32_t started = perf_ticks();
+#endif
+    dma_.start(ringFill_, tail, DmaSource::DDR);
+    dma_.wait(tail);
+    TL_NPU_COMPILER_BARRIER();
+#if TL_NPU_PHASE_PROF
+    const std::uint32_t ended = perf_ticks();
+    dmaTicks_ += ended - started;
+    ++dmaCalls_;
+    task_add(kTaskDmaLoad, started, ended);
+#endif
+  }
   template <class T>
   void dma_load_multicast(T *dst, Ddr<T> src, std::uint32_t width,
                           std::uint32_t rows, std::uint32_t dstStride,
@@ -2028,6 +2076,7 @@ private:
   std::uint32_t *ringOrder_ = nullptr;
   DmaDescriptor *ringFill_ = nullptr;
   std::uint32_t ringSeq_ = 0;
+  std::uint32_t batchCount_ = 0;
   // DPU descriptor sets, one per recently used workload shape
   // (CheckIntelNpuBudgets reserves their CMX: kDpuSets x (descriptors + 16 KiB
   // weight table) per SHAVE).

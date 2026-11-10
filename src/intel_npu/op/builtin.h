@@ -41,6 +41,7 @@ static constexpr const char *kIntelNpuScopedCmx = "tl.intel_npu.scoped_cmx";
 // Pass config: compiler-derived one-iteration DMA prefetch (default true);
 // false is the paired A/B control.
 static constexpr const char *kIntelNpuPrefetch = "tl.intel_npu.prefetch";
+static constexpr const char *kIntelNpuBatchDma = "tl.intel_npu.batch_dma";
 static constexpr const char *kIntelNpuDpuOverlap = "tl.intel_npu.dpu_overlap";
 static constexpr const char *kIntelNpuMulticast = "tl.intel_npu.multicast";
 static constexpr const char *kIntelNpuMulticastOverlap =
@@ -72,6 +73,9 @@ TVM_DLL const Op &intel_npu_dma_copy();
  * wait costs time rather than correctness.
  */
 TVM_DLL const Op &intel_npu_dma_wait();
+TVM_DLL const Op &intel_npu_dma_batch();
+TVM_DLL const Op &intel_npu_dma_batch_flush();
+TVM_DLL const Op &intel_npu_axpy();
 
 /*!
  * \brief One DPU fp16 matmul workload: out[M,N] = a[M,K] . bt[N,K]^T, every

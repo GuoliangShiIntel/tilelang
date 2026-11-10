@@ -13,8 +13,10 @@ from .quant import *  # noqa: F401,F403
 from .quant import __all__ as _QUANT_ALL
 from .ddr import *  # noqa: F401,F403
 from .ddr import __all__ as _DDR_ALL
+from .vector import *  # noqa: F401,F403
+from .vector import __all__ as _VECTOR_ALL
 
 __tilelang_dialect__ = "intel_npu"
-__all__ = tuple(dict.fromkeys((*_COMMON_ALL, *_KERNEL_ALL, *_MEMORY_ALL, *_QUANT_ALL, *_DDR_ALL)))
+__all__ = tuple(dict.fromkeys((*_COMMON_ALL, *_KERNEL_ALL, *_MEMORY_ALL, *_QUANT_ALL, *_DDR_ALL, *_VECTOR_ALL)))
 
-del _COMMON_ALL, _KERNEL_ALL, _MEMORY_ALL, _QUANT_ALL, _DDR_ALL
+del _COMMON_ALL, _KERNEL_ALL, _MEMORY_ALL, _QUANT_ALL, _DDR_ALL, _VECTOR_ALL

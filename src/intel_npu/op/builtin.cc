@@ -22,6 +22,7 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuPlanWorkloads, ffi::String);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuBarrierReuse, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuScopedCmx, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuPrefetch, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuBatchDma, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuDpuOverlap, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuMulticast, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuMulticastOverlap, Bool);
@@ -35,6 +36,18 @@ TIR_DEFINE_TL_BUILTIN(intel_npu_dma_wait)
     .set_num_inputs(0)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(intel_npu_dma_batch)
+    .set_num_inputs(6)
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(intel_npu_dma_batch_flush)
+    .set_num_inputs(0)
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(intel_npu_axpy)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_BUILTIN(intel_npu_dpu_matmul)
     .set_num_inputs(-1)

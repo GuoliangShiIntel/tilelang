@@ -97,6 +97,37 @@ def test_dynamic_dma_width_is_still_refused():
         _source(width_copy)
 
 
+@needs_cxx
+@pytest.mark.parametrize("interleave", [False, True])
+def test_pure_gather_loop_batches_without_changing_results(interleave):
+    @T.prim_func
+    def gather_rows(A: T.Tensor((6, 64), T.float16), Index: T.Tensor((6,), T.int32),
+                    B: T.Tensor((6, 64), T.float16)):
+        with T.Kernel(1, threads=1):
+            positions = T.alloc_local((6,), T.int32)
+            gathered = T.alloc_local((6, 64), T.float16)
+            T.copy(Index, positions)
+            for row in T.serial(6):
+                T.copy(A[positions[row], 0:64], gathered[row, 0:64])
+                if interleave:
+                    gathered[row, 0] = gathered[row, 0] + T.float16(1)
+            T.copy(gathered, B)
+
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.batch_dma": True}):
+        low = lowering.lower(gather_rows)
+    assert ("ctx.dma_batch_add(" in low.source) == (not interleave)
+    source = np.arange(384, dtype=np.float16).reshape(6, 64)
+    order = np.array([4, 1, 5, 0, 3, 2], np.int32)
+    output = np.full_like(source, np.nan)
+    lib = host_sim.build(low.source, "batch_gather_rows")
+    arrays = lowering.order_arrays(low, {"A": source, "Index": order, "B": output})
+    host_sim.check_status(host_sim.run(lib, arrays, tiles=1, shaves=1))
+    expected = source[order].copy()
+    if interleave:
+        expected[:, 0] += np.float16(1)
+    np.testing.assert_array_equal(output, expected)
+
+
 def _run_gemm(M, N, K, BM, BN, tiles, shaves, perturb=False):
     func = make_gemm(M, N, K, BM=BM, BN=BN, tiles=tiles, shaves=shaves)
     lib = host_sim.build(_source(func), f"gemm_{M}x{N}x{K}")

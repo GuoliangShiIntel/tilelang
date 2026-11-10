@@ -34,6 +34,12 @@
 #include "fused_rt.hpp"
 #include "npu_rt_device.hpp" // math helpers, status codes, Ddr<T>; its Ctx is compiled out (TL_NPU_RUNTIME_FRT)
 
+static inline void tl_npu_axpy(float *__restrict output, const half *__restrict input,
+                                float weight, std::uint32_t count) {
+  for (std::uint32_t element = 0; element < count; ++element)
+    output[element] += weight * static_cast<float>(input[element]);
+}
+
 namespace npu {
 
 class Ctx : public frt::Ctx {
@@ -162,6 +168,17 @@ public:
   void dpu_matmul_wait() {}
 
   // ---- DPU
+  template <class T>
+  void dma_batch_add(T *dst, Ddr<T> src, std::uint32_t width, std::uint32_t rows,
+                      std::uint32_t dstStride, std::uint32_t srcStride) {
+    if (dstStride != width) {
+      frt::Ctx::gather_flush();
+      dma_load(dst, src, width, rows, dstStride, srcStride);
+    } else {
+      frt::Ctx::gather_add(dst, src.addr, width, rows, srcStride);
+    }
+  }
+  void dma_batch_flush() { frt::Ctx::gather_flush(); }
   // --------------------------------------------------------------------------------------------------
   __attribute__((noinline)) void dpu_matmul(half *out, const half *a,
                                             const half *bt, std::uint32_t M,

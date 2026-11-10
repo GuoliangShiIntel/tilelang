@@ -154,6 +154,12 @@ static inline void tl_npu_dequant_i4_gm(half *dst, const unsigned char *src,
 #endif
 
 // The generated kernel's entry point (defined in the generated .cpp).
+static inline void tl_npu_axpy(float *__restrict output, const half *__restrict input,
+                                float weight, std::uint32_t count) {
+  for (std::uint32_t element = 0; element < count; ++element)
+    output[element] += weight * static_cast<float>(input[element]);
+}
+
 namespace npu {
 struct Environment;
 }
@@ -340,6 +346,12 @@ public:
     dma_load(dst, src, width, rows, dstStride, srcStride);
   }
   void dma_load_wait() {}
+  template <class T>
+  void dma_batch_add(T *dst, Ddr<T> src, std::uint32_t width, std::uint32_t rows,
+                      std::uint32_t dstStride, std::uint32_t srcStride) {
+    dma_load(dst, src, width, rows, dstStride, srcStride);
+  }
+  void dma_batch_flush() {}
   template <class T>
   void dma_load_multicast(T *dst, Ddr<T> src, std::uint32_t width,
                           std::uint32_t rows, std::uint32_t dstStride,

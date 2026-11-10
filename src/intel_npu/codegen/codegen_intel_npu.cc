@@ -362,6 +362,18 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << "ctx.dma_load_wait()";
     return;
   }
+  if (op->op.same_as(tl::intel_npu_dma_batch())) {
+    os << "ctx.dma_batch_add(" << args(0, 6) << ")";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_dma_batch_flush())) {
+    os << "ctx.dma_batch_flush()";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_axpy())) {
+    os << "tl_npu_axpy(" << args(0, 4) << ")";
+    return;
+  }
   if (op->op.same_as(tl::intel_npu_dpu_matmul())) {
     const auto *async = op->args.size() > 8 ? op->args[8].as<IntImmNode>() : nullptr;
     os << (async != nullptr && async->value != 0 ? "ctx.dpu_matmul_start(" : "ctx.dpu_matmul(")

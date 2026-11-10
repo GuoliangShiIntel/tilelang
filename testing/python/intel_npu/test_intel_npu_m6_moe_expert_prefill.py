@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_sim  # noqa: E402
 import lowering  # noqa: E402
 from kernels import (gm_scales, make_moe_expert_prefill, moe_expert_prefill_reference,  # noqa: E402
-                     moe_route_prefill_reference, pack_int4)
+                     moe_route_prefill_reference, pack_int4, make_moe_combine)
 
 N, H, I, E, TOPK, G = 12, 128, 128, 8, 2, 128
 MB, BNG, BND, TILES, SHAVES = 4, 64, 64, 3, 2
@@ -181,6 +181,35 @@ def test_typed_dequant_rejects_invalid_groups_and_offsets():
         T.dequant_i4_gm(output, packed, scales, packed_row=1)
     with pytest.raises(ValueError, match="scale column offset"):
         T.dequant_i4_gm(output, packed, scales, scales_col=1)
+
+
+@needs_cxx
+@pytest.mark.parametrize("tokens,block_rows", [(12, 4), (13, 4), (13, 8)])
+def test_blocked_combine_matches_slot_order_with_invalid_capacity(tokens, block_rows):
+    choices, hidden, experts = 9, 128, 16
+    slots, live = tokens * choices, tokens - 2
+    rng = np.random.default_rng(23)
+    order = np.zeros(slots, np.int32)
+    order[:live * choices] = rng.permutation(live * choices)
+    values = np.full((slots, hidden), np.nan, np.float16)
+    values[:live * choices] = rng.normal(size=(live * choices, hidden)).astype(np.float16)
+    weights = rng.uniform(size=(tokens, 16)).astype(np.float32)
+    offsets = np.full(experts + 2, live * choices, np.int32)
+    output = np.full((tokens, hidden), np.nan, np.float32)
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.batch_dma": True}):
+        low = lowering.lower(make_moe_combine(tokens, hidden, experts, choices - 1, block_rows, 3, 2))
+    assert "ctx.dma_batch_add(" in low.source
+    inverse = np.empty(live * choices, np.int32)
+    inverse[order[:live * choices]] = np.arange(live * choices)
+    expected = np.zeros_like(output)
+    for token in range(live):
+        for choice in range(choices):
+            expected[token] += weights[token, choice] * values[inverse[token * choices + choice]].astype(np.float32)
+    arrays = lowering.order_arrays(low, {"Part": values, "Slot": order, "Wts": weights, "Off": offsets, "Out": output})
+    lib = host_sim.build(low.source, "blocked_moe_combine")
+    host_sim.check_status(host_sim.run(lib, arrays, tiles=3, shaves=2))
+    assert np.isfinite(output).all()
+    np.testing.assert_allclose(output, expected, rtol=1e-6, atol=1e-6)
 
 
 @needs_cxx

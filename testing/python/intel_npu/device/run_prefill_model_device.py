@@ -145,6 +145,7 @@ def main(argv):
     YW, OW = max(NIN_pad, NQKV_pad), max(VC, KO)
 
     cfg = {"tl.intel_npu.scoped_cmx": "--no-scoped-cmx" not in argv,
+            "tl.intel_npu.batch_dma": "--batch-dma" in argv,
             "tl.intel_npu.dpu_overlap": "--dpu-overlap" in argv,
             "tl.intel_npu.prefetch": "--no-prefetch" not in argv,
             "tl.intel_npu.multicast": "--shared-projections" in argv,
@@ -160,7 +161,8 @@ def main(argv):
                                                 conv_item_worker="shave" if "--shave-major" in argv else "tile",
                                                 shared_projections="--shared-projections" in argv,
                                                 moe_slot_output="--moe-slots" in argv,
-                                                separate_shared_expert="--shared-expert" in argv))
+                                                separate_shared_expert="--shared-expert" in argv,
+                                                moe_combine_rows=arg(argv, "--combine-rows", 1)))
     print(f"lower {time.time() - t_low:.0f} s")
     name = (f"tl_prefill_model_l{L}_n{NP}_h{H}_s{SMAX}_bn{BN1}"
             + (f"_bn2{BN2}" if BN2 != BN1 else "")
@@ -181,6 +183,10 @@ def main(argv):
             + ("_skip_" + "_".join(sorted(skip)) if skip else "")
             + ("_noscope" if "--no-scoped-cmx" in argv else ""))
     source = low.source
+    if "--combine-rows" in argv or "--batch-dma" in argv:
+        name = f"tl_pf_l{L}_n{NP}_bn{BN1}_{BN2}_mb{MB}_me{MBe}_cb{arg(argv, '--combine-rows', 1)}"
+        name += "_batch" if "--batch-dma" in argv else "_sync"
+        assert "--shared-projections" in argv and "--overlap" in argv and "--moe-slots" in argv and "--shared-expert" in argv
     if "--dpu-overlap" in argv:
         name = name.replace("_sharedproj_overlap_moeslots_sharedexpert", "_spov_ms_se")
     if "--phases" in argv:

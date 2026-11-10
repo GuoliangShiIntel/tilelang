@@ -144,6 +144,31 @@ def test_serial_activation_multicast_numerical(split, guarded):
     np.testing.assert_allclose(output, expected, rtol=2e-3, atol=2e-3)
 
 
+def test_dma_batching_does_not_borrow_live_ring_descriptors():
+    @T.prim_func
+    def ring_and_gather(X: T.Tensor((64, 128), T.float16), W: T.Tensor((32, 128), T.float16),
+                        Y: T.Tensor((64, 32), T.float16), Sink: T.Tensor((4, 128), T.float16)):
+        with T.Kernel(2, threads=2) as tile:
+            shave = T.get_thread_binding()
+            weights = T.alloc_shared((16, 128), T.float16)
+            activation = T.alloc_shared((16, 128), T.float16)
+            result = T.alloc_local((16, 16), T.float16)
+            gathered = T.alloc_local((2, 128), T.float16)
+            T.copy(W[tile * 16, 0], weights)
+            for block in T.Pipelined(4, num_stages=2):
+                T.copy(X[block * 16, 0], activation)
+                T.gemm(activation, weights, result, transpose_B=True, clear_accum=True)
+                T.copy(result, Y[block * 16, tile * 16])
+                for row in T.serial(2):
+                    T.copy(W[row, 0:128], gathered[row, 0:128])
+                T.copy(gathered[0:1, 0:128], Sink[tile * 2 + shave, 0:128])
+
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.batch_dma": True}):
+        source = tilelang.lower(ring_and_gather, target="intel_npu").kernel_source
+    assert "ctx.ring_begin(" in source
+    assert "ctx.dma_batch_add(" not in source
+
+
 def test_ring_depth_must_match_shaves():
     with pytest.raises(Exception, match=r"num_stages=3\) on a tile with 2 SHAVEs"):
         _src(make_ring_flow(2048, 768, 2048, BM=32, BN=256, tiles=3, num_stages=3))

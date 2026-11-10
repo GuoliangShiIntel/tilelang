@@ -91,6 +91,7 @@ def IntelNpuPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     if _prefetch_enabled():
         mod = tilelang.intel_npu.transform.PlanIntelNpuPrefetch()(mod)
     mod = tilelang.intel_npu.transform.PlanIntelNpuDpuOverlap()(mod)
+    mod = tilelang.intel_npu.transform.PlanIntelNpuDmaBatch()(mod)
     mod = tilelang.intel_npu.transform.CheckIntelNpuBudgets()(mod)
     mod = tirx.transform.NarrowDataType(32)(mod)
     mod = tilelang.transform.FlattenBuffer()(mod)

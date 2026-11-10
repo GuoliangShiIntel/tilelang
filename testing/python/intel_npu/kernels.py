@@ -990,6 +990,65 @@ def moe_route_prefill_reference(x, wr, E: int, TOPK: int, logits=None):
     return dict(logits=logits, ids=ids, wts=wts, cnt=cnt, off=off, slot=slot)
 
 
+def make_moe_combine(N, H, E, TOPK, block_rows=4, tiles=3, shaves=2, as_block=False):
+    slots, choices, workers = N * (TOPK + 1), TOPK + 1, tiles * shaves
+    assert block_rows > 0 and H % 16 == 0
+
+    @T.macro
+    def combine(Part, Slot, Wts, Off, Out, tile, shave):
+        order = T.alloc_shared((slots,), T.int32)
+        inverse = T.alloc_shared((slots,), T.int32)
+        weights = T.alloc_shared((N, 16), T.float32)
+        entries = T.alloc_shared((1,), T.int32)
+        gathered = T.alloc_local((block_rows * choices, H), T.float16)
+        accumulated = T.alloc_local((block_rows, H), T.float32)
+        weight = T.alloc_local((16,), T.float32)
+        T.copy(Slot, order)
+        T.copy(Wts, weights)
+        T.copy(Off[E + 1:E + 2], entries)
+        for entry in T.serial(slots):
+            if entry % shaves == shave:
+                inverse[entry] = -1
+        T.sync_threads()
+        for entry in T.serial(entries[0]):
+            if entry % shaves == shave:
+                inverse[order[entry]] = entry
+        T.sync_threads()
+        worker = tile * shaves + shave
+        for iteration in T.serial(T.ceildiv(N, block_rows * workers)):
+            first = (iteration * workers + worker) * block_rows
+            perf_begin("comb")
+            if first < N:
+                for entry in T.serial(block_rows * choices):
+                    if first + entry // choices < N:
+                        if inverse[(first + entry // choices) * choices + entry % choices] >= 0:
+                            T.copy(Part[inverse[(first + entry // choices) * choices + entry % choices], 0:H],
+                                   gathered[entry, 0:H])
+                for row in T.serial(block_rows):
+                    if first + row < N:
+                        for column in T.serial(H // 16):
+                            for lane in T.vectorized(16):
+                                accumulated[row, column * 16 + lane] = T.float32(0)
+                        for choice in T.serial(choices):
+                            if inverse[(first + row) * choices + choice] >= 0:
+                                weight[0] = weights[first + row, choice]
+                                T.axpy(accumulated, gathered, weight[0], row, row * choices + choice)
+                count = T.min(block_rows, N - first)
+                T.copy(accumulated[0:count, 0:H], Out[first:first + count, 0:H])
+            perf_end()
+
+    if as_block:
+        return combine
+
+    @T.prim_func
+    def combine_kernel(Part: T.Tensor((slots, H), T.float16), Slot: T.Tensor((slots,), T.int32),
+                       Wts: T.Tensor((N, 16), T.float32), Off: T.Tensor((E + 2,), T.int32),
+                       Out: T.Tensor((N, H), T.float32)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            combine(Part, Slot, Wts, Off, Out, tile, T.get_thread_binding())
+    return combine_kernel
+
+
 def make_moe_expert_prefill(
     N: int = 32,
     H: int = 256,
@@ -1007,6 +1066,7 @@ def make_moe_expert_prefill(
     probe_skip: str | None = None,
     slot_output: bool = False,
     separate_shared: bool = False,
+    combine_rows: int = 1,
 ):
     """P2b: the grouped expert FFN for `N` prompt tokens, over P2a's grouping.
 
@@ -1058,6 +1118,9 @@ def make_moe_expert_prefill(
     EPT = -(-EXPERTS // tiles)
     part_shape = (SLOTS, H) if slot_output else (tiles, N, H)
     part_dtype = T.float16 if slot_output else T.float32
+    assert combine_rows == 1 or slot_output, "blocked combine requires slot output"
+    if combine_rows > 1:
+        blocked_combine = make_moe_combine(N, H, E, TOPK, combine_rows, tiles, shaves, as_block=True)
     if separate_shared:
         assert slot_output, "separate shared expert requires slot-major output"
         assert N % MB == 0, "dense shared expert requires complete token blocks"
@@ -1215,46 +1278,50 @@ def make_moe_expert_prefill(
                 if t % shaves == shave and seen[t] == 0:
                     T.copy(zr, Part[tile, t, 0])
         T.sync_grid()
-        if slot_output:
-            inverse = T.alloc_shared((SLOTS,), T.int32)
-            slot_row = T.alloc_local((1, H), T.float16)
-            combine_slots = T.alloc_shared((SLOTS,), T.int32)
-            combine_wts = T.alloc_shared((N, 16), T.float32)
-            entries = T.alloc_shared((1,), T.int32)
-            T.copy(Slot[0], combine_slots)
-            T.copy(Wts[0, 0], combine_wts)
-            T.copy(Off[E + 1:E + 2], entries)
-            for entry in T.serial(SLOTS):
-                if entry % shaves == shave:
-                    inverse[entry] = -1
-            T.sync_threads()
-            for entry in T.serial(entries[0]):
-                if entry % shaves == shave:
-                    inverse[combine_slots[entry]] = entry
-            T.sync_threads()
-        # --- combine: the tokens dealt over the workers, the tiles' partials summed -------------------
-        for it in T.serial(T.ceildiv(N, workers)):
-            t = it * workers + worker
-            if t < N:
-                for c0 in T.serial(H // FL):
-                    for v in T.vectorized(FL):
-                        pw[0, c0 * FL + v] = T.float32(0)
-                if slot_output:
-                    for choice in T.serial(TOPK + 1):
-                        if inverse[t * (TOPK + 1) + choice] >= 0:
-                            T.copy(Part[inverse[t * (TOPK + 1) + choice], 0], slot_row)
-                            aw[0] = combine_wts[t, choice]
+        if combine_rows > 1:
+            blocked_combine(Part, Slot, Wts, Off, Out, tile, shave)
+        else:
+            if slot_output:
+                inverse = T.alloc_shared((SLOTS,), T.int32)
+                slot_row = T.alloc_local((1, H), T.float16)
+                combine_slots = T.alloc_shared((SLOTS,), T.int32)
+                combine_wts = T.alloc_shared((N, 16), T.float32)
+                entries = T.alloc_shared((1,), T.int32)
+                T.copy(Slot[0], combine_slots)
+                T.copy(Wts[0, 0], combine_wts)
+                T.copy(Off[E + 1:E + 2], entries)
+                for entry in T.serial(SLOTS):
+                    if entry % shaves == shave:
+                        inverse[entry] = -1
+                T.sync_threads()
+                for entry in T.serial(entries[0]):
+                    if entry % shaves == shave:
+                        inverse[combine_slots[entry]] = entry
+                T.sync_threads()
+            for it in T.serial(T.ceildiv(N, workers)):
+                t = it * workers + worker
+                perf_begin("comb")
+                if t < N:
+                    for c0 in T.serial(H // FL):
+                        for v in T.vectorized(FL):
+                            pw[0, c0 * FL + v] = T.float32(0)
+                    if slot_output:
+                        for choice in T.serial(TOPK + 1):
+                            if inverse[t * (TOPK + 1) + choice] >= 0:
+                                T.copy(Part[inverse[t * (TOPK + 1) + choice], 0], slot_row)
+                                aw[0] = combine_wts[t, choice]
+                                for c0 in T.serial(H // FL):
+                                    for v in T.vectorized(FL):
+                                        pw[0, c0 * FL + v] = (pw[0, c0 * FL + v]
+                                            + aw[0] * T.cast(slot_row[0, c0 * FL + v], T.float32))
+                    else:
+                        for w in T.serial(tiles):
+                            T.copy(Part[w, t, 0], pa)
                             for c0 in T.serial(H // FL):
                                 for v in T.vectorized(FL):
-                                    pw[0, c0 * FL + v] = (pw[0, c0 * FL + v]
-                                        + aw[0] * T.cast(slot_row[0, c0 * FL + v], T.float32))
-                else:
-                    for w in T.serial(tiles):
-                        T.copy(Part[w, t, 0], pa)
-                        for c0 in T.serial(H // FL):
-                            for v in T.vectorized(FL):
-                                pw[0, c0 * FL + v] = pw[0, c0 * FL + v] + pa[0, c0 * FL + v]
-                T.copy(pw, Out[t, 0])
+                                    pw[0, c0 * FL + v] = pw[0, c0 * FL + v] + pa[0, c0 * FL + v]
+                    T.copy(pw, Out[t, 0])
+                perf_end()
 
     @T.macro
     def split_expert_phase(X, WguQ, WguS, WdQ, WdS, Wts, Off, Slot, Part, Out, tile, shave, SharedGu, SharedAct):
@@ -5283,6 +5350,7 @@ def make_prefill_model(
     shared_projections: bool = False,
     moe_slot_output: bool = False,
     separate_shared_expert: bool = False,
+    moe_combine_rows: int = 1,
 ):
     """P5: a whole PREFILL chunk of `N` prompt tokens through `L` layers in ONE launch -- the prefill counterpart
     of `make_decode_model`. A device-side loop over the layers, `Kind[li, 0]` selecting the Gated DeltaNet or the
@@ -5349,7 +5417,8 @@ def make_prefill_model(
     route_phase, rs = make_moe_route_prefill(N=NP, H=H, E=E, TOPK=TOPK, BM=BM, BNR=BNR, tiles=tiles, shaves=shaves, as_block=True)
     expert_phase, _ = make_moe_expert_prefill(
         N=NP, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MBe, BNG=BNG, BND=BND, DB=DB, tiles=tiles, shaves=shaves,
-        as_block=True, slot_output=moe_slot_output, separate_shared=separate_shared_expert
+        as_block=True, slot_output=moe_slot_output, separate_shared=separate_shared_expert,
+        combine_rows=moe_combine_rows
     )
     RR, SLOTS = rs["RR"], rs["SLOTS"]
     part_shape = (SLOTS, H) if moe_slot_output else (tiles, NP, H)

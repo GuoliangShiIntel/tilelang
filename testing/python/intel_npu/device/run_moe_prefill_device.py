@@ -12,6 +12,8 @@ the tokens routed to that expert may move, and the runner checks exactly that se
 """
 
 import sys
+import os
+import re
 import time
 from pathlib import Path
 
@@ -26,7 +28,7 @@ import tilelang  # noqa: E402,F401
 import runner  # noqa: E402
 import lowering  # noqa: E402
 from kernels import (gm_scales, make_moe_expert_prefill, make_moe_route_prefill,  # noqa: E402
-                     moe_expert_prefill_reference, moe_route_prefill_reference, pack_int4)
+                     moe_expert_prefill_reference, moe_route_prefill_reference, pack_int4, make_moe_combine)
 
 TILES, SHAVES = 3, 2
 WORKERS = TILES * SHAVES
@@ -49,9 +51,91 @@ def build(src, name, argv):
     return db
 
 
+def reference_combine_source(tokens, choices):
+    root = Path(runner.require_env("NPU_DSL_ROOT"))
+    sys.path.insert(0, str(root))
+    from dataclasses import replace
+    from npu_dsl.fused.ir import KernelDef, TensorSpec
+    from npu_dsl.fused.tracer import trace
+    from npu_dsl.fused.emit import emit
+    from npu_dsl.frontend.kernel_specs.qwen36_fused import Qwen36FusedConfig
+    from npu_dsl.lib.row_phase import row_phase, Rows, Gather
+    from run_npudsl_layer_device import WRAPPER
+
+    def source(nl, cfg, values, inverse, weights, residual, output):
+        def combine(row, token):
+            for choice in nl.range(0, choices, name="matchedSlot"):
+                nl.shave.axpy(row.acc, row.y[choice, :], row.wts.at(choice))
+        row_phase(nl, name="matched", rows=tokens, block_rows=4, compute=combine,
+                  inputs={"acc": Rows(residual), "wts": Rows(weights, cols=(0, choices)),
+                          "y": Gather(values, Rows(inverse, width=choices), count=choices)},
+                  outputs={"acc": Rows(output)})
+
+    tensors = [TensorSpec("Values", (tokens * choices, H), "fp16"),
+               TensorSpec("Inverse", (tokens * choices,), "u32"),
+               TensorSpec("Weights", (tokens, 16), "fp32"),
+               TensorSpec("Residual", (tokens, H), "fp32"), TensorSpec("Output", (tokens, H), "fp32")]
+    cfg = replace(Qwen36FusedConfig(), max_tokens=tokens, max_seq=1536, tiles=(("matched_row_block", 4),))
+    text = emit(trace(KernelDef("matched_combine", source, tensors, []), cfg))
+    common = root / "kernels_poc" / "common"
+    for header in ("fused_rt.hpp", "fused_ops.hpp"):
+        text = text.replace(f'#include "{header}"', f'#include "{(common / header).as_posix()}"')
+    text, count = re.subn(r"FRT_KERNEL_ENTRY\(numParams, params, env\)",
+                          "static void frt_layer_entry(int numParams, std::uint64_t* params, const npu::Environment& env)", text)
+    assert count == 1 and "ctx.gather_add(" in text
+    return text + WRAPPER
+
+
+def combine_benchmark(argv):
+    import tvm
+    tokens, choices = arg(argv, "--n", 1152), TOPK + 1
+    rng = np.random.default_rng(42)
+    order = rng.permutation(tokens * choices).astype(np.int32)
+    inverse = np.empty_like(order)
+    inverse[order] = np.arange(order.size)
+    values = rng.normal(size=(order.size, H)).astype(np.float16)
+    weights = rng.uniform(size=(tokens, 16)).astype(np.float32)
+    offsets = np.full(E + 2, order.size, np.int32)
+    sources, lowered = {}, {}
+    for block, batch in ((1, False), (4, True)):
+        name = f"tl_comb_n{tokens}_cb{block}"
+        with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.batch_dma": batch}):
+            low = lowering.lower(make_moe_combine(tokens, H, E, TOPK, block, TILES, SHAVES))
+        sources[name], lowered[name] = low.source, low
+    reference = "--reference" in argv
+    if reference:
+        sources[f"tl_npudsl_comb_n{tokens}"] = reference_combine_source(tokens, choices)
+    built = runner.build_all(sources)
+    expected = np.zeros((tokens, H), np.float32)
+    for choice in range(choices):
+        expected += weights[:, choice:choice + 1] * values[inverse.reshape(tokens, choices)[:, choice]].astype(np.float32)
+    for name in sources:
+        output = np.full_like(expected, np.nan)
+        if name in lowered:
+            by_name = {"Part": ("in", values), "Slot": ("in", order), "Wts": ("in", weights),
+                       "Off": ("in", offsets), "Out": ("out", output)}
+            arrays = lowering.order_arrays(lowered[name], by_name)
+        else:
+            arrays = [("in", np.zeros(1, np.uint32)), ("in", values), ("in", inverse.astype(np.uint32)),
+                      ("in", weights), ("in", np.zeros_like(expected)), ("out", output),
+                      ("out", np.zeros(WORKERS * 8, np.uint32))]
+        result = runner.run(built[name], arrays, TILES, SHAVES, HERE / "run_moe_combine",
+                            repeat=10, warmup=10, timeout_s=120)
+        runner.check_status(result.status)
+        relative = float(np.abs(output - expected).max() / max(float(np.abs(expected).max()), 1e-6))
+        assert np.isfinite(output).all() and relative < 2e-3, (name, relative)
+        print(f"{name}: {result.median_kernel_ms:.3f} ms [{runner.condition(result, False)}], warm=10/repeat=10; "
+              f"rel={relative:.2e} PASS; sha={built[name].source_sha256[:12]}")
+    if reference:
+        print("Reference: actual npu_dsl row_phase/Gather/axpy at block=4, 9 matched choices; includes an extra zero-residual read.")
+    return 0
+
+
 def main(argv):
     N, MB = arg(argv, "--n", 64), arg(argv, "--mb", 16)
     phase = argv[argv.index("--phase") + 1] if "--phase" in argv else "both"
+    if phase == "combine":
+        return combine_benchmark(argv)
     rng = np.random.default_rng(0)
     x = rng.standard_normal((N, H), np.float32).astype(np.float16)
     wr = np.zeros((RR, H), np.float16)

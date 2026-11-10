@@ -6,7 +6,7 @@ from .plan_workloads import PlanIntelNpuWorkloads  # noqa: F401
 from .lower_pipelined import PlanIntelNpuDistribution, LowerIntelNpuPipelined  # noqa: F401
 from .assign_barriers import AssignIntelNpuBarriers  # noqa: F401
 from .scope_cmx import ScopeIntelNpuCmx  # noqa: F401
-from .prefetch import PlanIntelNpuPrefetch, PlanIntelNpuDpuOverlap  # noqa: F401
+from .prefetch import PlanIntelNpuPrefetch, PlanIntelNpuDpuOverlap, PlanIntelNpuDmaBatch  # noqa: F401
 
 
 def LowerIntelNpuKernelLaunch():

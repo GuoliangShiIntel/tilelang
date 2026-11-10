@@ -441,6 +441,84 @@ class _DpuPlanner(_Planner):
                                loop.annotations, loop.step)])
 
 
+def PlanIntelNpuDmaBatch():
+    def transform(func: tirx.PrimFunc, mod, ctx):
+        if not bool(ctx.config.get("tl.intel_npu.batch_dma", False)):
+            return func
+        live_rings = [0]
+
+        def pre(node):
+            call = node.value if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call) else _call(node)
+            if call is not None:
+                name = getattr(call.op, "name", "")
+                if name == "tl.intel_npu_ring_begin":
+                    live_rings[0] += 1
+                elif name == "tl.intel_npu_ring_end":
+                    live_rings[0] = max(0, live_rings[0] - 1)
+            if not isinstance(node, tirx.For) or live_rings[0] or node.kind != tirx.ForKind.SERIAL:
+                return None
+            if node.thread_binding is not None or (node.step is not None and _int(node.step) != 1):
+                return None
+            body, conditions = node.body, []
+            while True:
+                if isinstance(body, tirx.SeqStmt) and len(body.seq) == 1:
+                    body = body.seq[0]
+                elif isinstance(body, tirx.IfThenElse) and body.else_case is None:
+                    conditions.append(body.condition)
+                    body = body.then_case
+                else:
+                    break
+            fill = _is_load(body)
+            if fill is None:
+                return None
+            dst = _dst_buffer(fill)
+            source = fill.args[1]
+            if dst is None or dst.scope() != "local" or len(dst.shape) != 2 or not _is_compact(dst):
+                return None
+            if not (isinstance(source, tirx.Call) and source.args and isinstance(source.args[0], tirx.BufferLoad)):
+                return None
+            rows, width, stride = (_int(fill.args[index]) for index in (3, 2, 4))
+            if rows is None or rows <= 0 or width is None or width != stride:
+                return None
+            address = fill.args[0].args[0]
+            if len(address.indices) != 2 or _uses_var(address.indices[1], node.loop_var):
+                return None
+            row = address.indices[0]
+            analyzer = tvm.arith.Analyzer()
+            delta = _subst(row, node.loop_var, node.loop_var + 1) - row
+            if not analyzer.can_prove_equal(delta, rows):
+                return None
+            safe = [True]
+
+            def inspect(expr):
+                if isinstance(expr, tirx.Call):
+                    safe[0] = False
+                elif isinstance(expr, tirx.BufferLoad) and expr.buffer.data.same_as(dst.data):
+                    safe[0] = False
+
+            for expr in conditions + list(source.args[0].indices) + list(address.indices) + [node.min, node.extent]:
+                post_order_visit(expr, inspect)
+            if not safe[0]:
+                return None
+
+            def batch(stmt):
+                if isinstance(stmt, tirx.Evaluate) and stmt.value.same_as(fill):
+                    return tirx.Evaluate(tirx.call_intrin("handle", tirx.op.Op.get("tl.intel_npu_dma_batch"),
+                                                         *list(fill.args[:6])))
+                return None
+
+            transformed = tirx.stmt_functor.ir_transform(node.body, None, batch, ["tirx.Evaluate"])
+            loop = tirx.For(node.loop_var, node.min, node.extent, node.kind, transformed,
+                            node.thread_binding, node.annotations, node.step)
+            flush = tirx.Evaluate(tirx.call_intrin("handle", tirx.op.Op.get("tl.intel_npu_dma_batch_flush")))
+            return _seq([loop, flush])
+
+        body = tirx.stmt_functor.ir_transform(func.body, pre, None, ["tirx.For", "tirx.Bind", "tirx.Evaluate"])
+        return func.with_body(body)
+
+    return prim_func_pass(transform, opt_level=0, name="tl.PlanIntelNpuDmaBatch")
+
+
 def PlanIntelNpuDpuOverlap():
     def transform(func: tirx.PrimFunc, mod, ctx):
         if not bool(ctx.config.get("tl.intel_npu.dpu_overlap", False)):
