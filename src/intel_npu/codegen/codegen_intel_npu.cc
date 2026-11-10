@@ -363,7 +363,17 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op, std::ostream &os) {
     return;
   }
   if (op->op.same_as(tl::intel_npu_dpu_matmul())) {
-    os << "ctx.dpu_matmul(" << args(0, 8) << ")";
+    const auto *async = op->args.size() > 8 ? op->args[8].as<IntImmNode>() : nullptr;
+    os << (async != nullptr && async->value != 0 ? "ctx.dpu_matmul_start(" : "ctx.dpu_matmul(")
+       << args(0, 8) << ")";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_dpu_wait())) {
+    os << "ctx.dpu_matmul_wait()";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_dequant_i4_gm())) {
+    os << "tl_npu_dequant_i4_gm(" << args(0, 7) << ")";
     return;
   }
   if (op->op.same_as(tl::intel_npu_dpu_matmul_i4g())) {

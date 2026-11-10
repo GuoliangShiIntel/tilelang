@@ -22,6 +22,7 @@ import pytest
 
 import tilelang  # noqa: F401  (loads the dev build before tvm)
 import tvm
+import tilelang.intel_npu.language as T
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_sim  # noqa: E402
@@ -36,8 +37,9 @@ SLOTS = N * (TOPK + 1)
 REL = 4e-2   # int4 weights, fp16 gemms and an fp32 accumulate over TOPK + 1 experts
 
 
-def _lower(func):
-    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off"}):
+def _lower(func, dpu_overlap=False):
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off",
+                                           "tl.intel_npu.dpu_overlap": dpu_overlap}):
         return lowering.lower(func)
 
 
@@ -93,6 +95,92 @@ def test_lowers_with_a_dequant_per_weight_chunk_and_no_merged_fc():
     assert "dpu_matmul_i4g" not in src             # ... and does not use decode's merged-FC
     assert "ctx.sync_grid();" in src               # the combine sits behind a grid barrier
     assert "tl_npu_dequant_i8_row" not in src      # control: the needle still discriminates
+
+
+def test_compiler_derives_dequant_dpu_overlap():
+    func = make_moe_expert_prefill(N=N, H=512, I=I, E=E, TOPK=TOPK, G=G, MB=MB,
+                                   BNG=BNG, BND=BND, tiles=TILES, shaves=SHAVES)
+    assert "ctx.dpu_matmul_start(" not in _lower(func).source
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.dpu_overlap": True}):
+        source = lowering.lower(func).source
+    assert "ctx.dpu_matmul_start(" in source
+    assert "ctx.dpu_matmul_wait();" in source
+
+
+def _overlap_kernel(chunks=3, rewrite_input=False, escape=False, dependent_index=False):
+    @T.prim_func
+    def quant_tiles(X: T.Tensor((4, 128), T.float16), Q: T.Tensor((chunks * 16, 64), T.uint8),
+                    S: T.Tensor((1, chunks * 16), T.float16), Y: T.Tensor((chunks, 4, 16), T.float16)):
+        with T.Kernel(1, threads=1):
+            activation = T.alloc_local((4, 128), T.float16)
+            packed = T.alloc_local((chunks * 16, 64), T.uint8)
+            scales = T.alloc_local((1, chunks * 16), T.float16)
+            weights = T.alloc_local((16, 128), T.float16)
+            result = T.alloc_local((4, 16), T.float16)
+            index_cmx = T.alloc_local((2,), T.int32)
+            index_cmx[0] = 0
+            T.copy(X, activation)
+            T.copy(Q, packed)
+            T.copy(S, scales)
+            for block in T.serial(chunks):
+                T.dequant_i4_gm(weights, packed, scales, 128,
+                               packed_row=block * 16 + (index_cmx[0] if dependent_index else 0), scales_col=block * 16)
+                T.gemm(activation, weights, result, transpose_B=True, clear_accum=True)
+                if rewrite_input:
+                    activation[0, 0] = T.float16(0)
+                if dependent_index:
+                    for row in T.serial(4):
+                        if row == 0:
+                            index_cmx[0] = 1 - index_cmx[0]
+                        T.copy(result[row:row + 1, 0:16], Y[block, row:row + 1, 0:16])
+                else:
+                    T.copy(result, Y[block, 0, 0])
+            if escape:
+                Y[0, 0, 0] = weights[0, 0]
+    return quant_tiles
+
+
+@needs_cxx
+@pytest.mark.parametrize("chunks", [1, 3, 4])
+def test_dpu_overlap_matches_serial_with_odd_and_even_tails(chunks):
+    rng = np.random.default_rng(42)
+    values = rng.integers(-8, 8, size=(chunks * 16, 128), dtype=np.int8)
+    arrays = {"X": rng.normal(size=(4, 128)).astype(np.float16), "Q": pack_int4(values),
+              "S": rng.uniform(0.01, 0.1, size=(1, chunks * 16)).astype(np.float16)}
+    outputs = []
+    for enabled in (False, True):
+        low = _lower(_overlap_kernel(chunks), dpu_overlap=enabled)
+        assert ("ctx.dpu_matmul_start(" in low.source) == (enabled and chunks > 1)
+        output = np.full((chunks, 4, 16), np.nan, np.float16)
+        lib = host_sim.build(low.source, "dpu_overlap_tiles")
+        args = lowering.order_arrays(low, {**arrays, "Y": output})
+        host_sim.check_status(host_sim.run(lib, args, tiles=1, shaves=1))
+        outputs.append(output)
+    assert np.isfinite(outputs[1]).all()
+    np.testing.assert_array_equal(outputs[1], outputs[0])
+
+
+@pytest.mark.parametrize("rewrite_input,escape", [(True, False), (False, True)])
+def test_dpu_overlap_rejects_mutation_and_escaping_weights(rewrite_input, escape):
+    source = _lower(_overlap_kernel(rewrite_input=rewrite_input, escape=escape), dpu_overlap=True).source
+    assert "ctx.dpu_matmul_start(" not in source
+
+
+def test_dpu_overlap_rejects_next_iteration_index_dependency():
+    source = _lower(_overlap_kernel(dependent_index=True), dpu_overlap=True).source
+    assert "ctx.dpu_matmul_start(" not in source
+
+
+def test_typed_dequant_rejects_invalid_groups_and_offsets():
+    output = tvm.tirx.decl_buffer((16, 128), "float16", scope="local")
+    packed = tvm.tirx.decl_buffer((16, 64), "uint8", scope="local")
+    scales = tvm.tirx.decl_buffer((1, 16), "float16", scope="local")
+    with pytest.raises(ValueError, match="incompatible"):
+        T.dequant_i4_gm(output, packed, scales, group=0)
+    with pytest.raises(ValueError, match="packed row offset"):
+        T.dequant_i4_gm(output, packed, scales, packed_row=1)
+    with pytest.raises(ValueError, match="scale column offset"):
+        T.dequant_i4_gm(output, packed, scales, scales_col=1)
 
 
 @needs_cxx

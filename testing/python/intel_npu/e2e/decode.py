@@ -82,7 +82,8 @@ class DeviceModel:
                  layer_ids: list[int] | None = None, chunked: bool = False, prefill: int = 0,
                  prefill_ls: list[int] | None = None, prefill_shared: bool = False, prefill_overlap: bool = False,
                  prefill_bn1: int | None = None, prefill_mb: int | None = None, prefill_mbe: int | None = None,
-                 prefill_moe_slots: bool = False, prefill_shared_expert: bool = False):
+                 prefill_moe_slots: bool = False, prefill_shared_expert: bool = False,
+                 prefill_dpu_overlap: bool = False):
         self.ck, self.c, self.log = ck, ck.cfg, log
         c = self.c
         self.layer_ids = list(layer_ids) if layer_ids is not None else list(range(layers))   # checkpoint layers, in run order
@@ -182,7 +183,11 @@ class DeviceModel:
                                              + (f"_mbe{prefill_mbe}" if prefill_mbe is not None else "")
                                              + ("_moeslots" if prefill_moe_slots else "")
                                              + ("_sharedexpert" if prefill_shared_expert else "")
+                                             + ("_dpuov" if prefill_dpu_overlap else "")
                                              + ("_skip_" + "_".join(sorted(pskip)) if pskip else ""))
+                    if prefill_dpu_overlap:
+                        names[f"prefill{pl}"] = (names[f"prefill{pl}"].replace("_sharedproj_overlap", "_spov")
+                                                .replace("_moeslots", "_ms").replace("_sharedexpert", "_se"))
         else:
             kernels = {
                 "gdn": make_gdn_layer(H=c.hidden, KH=c.lin_kh, VH=c.lin_vh, DK=c.lin_dk, DV=c.lin_dv, I=c.moe_inter, E=c.n_experts,
@@ -207,6 +212,7 @@ class DeviceModel:
             if key.startswith("prefill"):
                 options["tl.intel_npu.multicast"] = prefill_shared
                 options["tl.intel_npu.multicast_overlap"] = prefill_overlap
+                options["tl.intel_npu.dpu_overlap"] = prefill_dpu_overlap
             with tvm.transform.PassContext(config=options):
                 self.low[key] = lowering.lower(func)
         prefix = os.environ.get("TL_NPU_SOURCE_PREFIX")   # diagnostics: C++ lines prepended to every kernel (e.g. a #define)
@@ -565,6 +571,7 @@ def main(argv):
     ap.add_argument("--prefill-mbe", type=int, default=None)
     ap.add_argument("--prefill-moe-slots", action="store_true")
     ap.add_argument("--prefill-shared-expert", action="store_true")
+    ap.add_argument("--prefill-dpu-overlap", action="store_true")
     ap.add_argument("--prefill-sweep", default=None, metavar="L1,L2,...",
                     help="layer counts to launch prefill at, ascending, from ONE session: the kernels are built in "
                          "one pass and share the weight upload, so a bisect point costs a launch instead of a "
@@ -605,7 +612,8 @@ def main(argv):
                     prefill_ls=[int(x) for x in a.prefill_sweep.split(",")] if a.prefill_sweep else None,
                     prefill_shared=a.prefill_shared, prefill_overlap=a.prefill_overlap,
                     prefill_bn1=a.prefill_bn1, prefill_mb=a.prefill_mb, prefill_mbe=a.prefill_mbe,
-                    prefill_moe_slots=a.prefill_moe_slots, prefill_shared_expert=a.prefill_shared_expert)
+                    prefill_moe_slots=a.prefill_moe_slots, prefill_shared_expert=a.prefill_shared_expert,
+                    prefill_dpu_overlap=a.prefill_dpu_overlap)
     if a.chunked:
         print(f"chunks: {len(m.chunks)} launches per token: " + " ".join("/".join(str(i) for i in ch) for ch in m.chunks))
     try:

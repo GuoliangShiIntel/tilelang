@@ -313,6 +313,144 @@ class _Planner:
                                      loop.annotations, loop.step)])
 
 
+class _DpuPlanner(_Planner):
+    def prefetch(self, loop):
+        if self.done or loop.kind != tirx.ForKind.SERIAL or loop.thread_binding is not None:
+            return loop
+        if _int(loop.extent) is None or _int(loop.extent) < 2 or (loop.step is not None and _int(loop.step) != 1):
+            return loop
+        items = _items(loop.body)
+        groups = []
+        index = 0
+
+        def marker(stmt, name):
+            call = _call(stmt)
+            return (call is not None and getattr(call.op, "name", "") == "tirx.call_extern"
+                    and call.args and isinstance(call.args[0], tirx.StringImm) and call.args[0].value == name)
+
+        while index < len(items):
+            if marker(items[index], "ctx.task_begin"):
+                if index + 2 >= len(items) or not marker(items[index + 2], "ctx.task_end"):
+                    return loop
+                groups.append((items[index:index + 3], 1))
+                index += 3
+            else:
+                groups.append(([items[index]], 0))
+                index += 1
+        if len(groups) != 3:
+            return loop
+        dequant = _call(groups[0][0][groups[0][1]])
+        gemm = _call(groups[1][0][groups[1][1]])
+        if dequant is None or getattr(dequant.op, "name", "") != "tl.intel_npu_dequant_i4_gm":
+            return loop
+        if gemm is None or getattr(gemm.op, "name", "") != "tl.intel_npu_dpu_matmul" or len(gemm.args) != 8:
+            return loop
+        weights = _dst_buffer(dequant)
+        output = _dst_buffer(gemm)
+        if weights is None or output is None or not _reads(gemm.args[2], weights.data):
+            return loop
+        if weights.data.same_as(output.data) or _reads(gemm.args[1], weights.data):
+            return loop
+        for buffer in (weights, output):
+            if buffer.scope() != "local" or not _is_compact(buffer) or len(buffer.shape) != 2:
+                return loop
+            if any(_int(dim) is None for dim in buffer.shape):
+                return loop
+            if _refs(self.func.body, buffer.data) != _refs(loop.body, buffer.data):
+                return loop
+        if [_int(arg) for arg in dequant.args[3:5]] != [_int(dim) for dim in weights.shape]:
+            return loop
+        if [_int(arg) for arg in gemm.args[3:5]] != [_int(dim) for dim in output.shape]:
+            return loop
+        for call in (dequant, gemm):
+            load = call.args[0].args[0]
+            if not all(_int(value) == 0 for value in load.indices):
+                return loop
+        if not _uses_var(dequant.args[1], loop.loop_var) and not _uses_var(dequant.args[2], loop.loop_var):
+            return loop
+        tail = _seq(groups[2][0])
+        if not _reads(tail, output.data) or _refs(tail, weights.data):
+            return loop
+        protected = []
+        for address in list(dequant.args[1:3]) + [gemm.args[1]]:
+            if not (isinstance(address, tirx.Call) and isinstance(address.args[0], tirx.BufferLoad)):
+                return loop
+            def protect(node):
+                if isinstance(node, tirx.BufferLoad):
+                    protected.append(node.buffer.data)
+            post_order_visit(address, protect)
+        def protect_weight_indices(node):
+            if isinstance(node, tirx.BufferLoad) and not node.buffer.data.same_as(weights.data):
+                protected.append(node.buffer.data)
+        post_order_visit(gemm.args[2], protect_weight_indices)
+        if any(data.same_as(weights.data) or data.same_as(output.data) for data in protected):
+            return loop
+        safe = [True]
+
+        def inspect(node):
+            if isinstance(node, tirx.BufferStore):
+                if any(node.buffer.data.same_as(data) for data in protected + [output.data, weights.data]):
+                    safe[0] = False
+            elif isinstance(node, tirx.Call):
+                name = getattr(node.op, "name", "")
+                if name == "tirx.call_extern":
+                    if not (isinstance(node.args[0], tirx.StringImm)
+                            and node.args[0].value in ("ctx.task_begin", "ctx.task_end")):
+                        safe[0] = False
+                elif name == DMA_COPY:
+                    destination = _dst_buffer(node)
+                    if (_int(node.args[6]) != 0 or destination is None
+                            or any(destination.data.same_as(data) for data in protected + [output.data, weights.data])):
+                        safe[0] = False
+                elif name != "tirx.address_of":
+                    safe[0] = False
+
+        post_order_visit(tail, inspect)
+        if not safe[0]:
+            return loop
+        wide_weights = tirx.decl_buffer([weights.shape[0] * 2, weights.shape[1]], weights.dtype,
+                                        weights.name, data=weights.data, scope=weights.scope())
+        wide_output = tirx.decl_buffer([output.shape[0] * 2, output.shape[1]], output.dtype,
+                                       output.name, data=output.data, scope=output.scope())
+        self.widened[hash(weights.data)] = wide_weights
+        self.widened[hash(output.data)] = wide_output
+
+        def rebase(stmt, value):
+            parity = (value - loop.min) % 2
+            stmt = _subst(stmt, loop.loop_var, value)
+            stmt = _Rebase(weights.data, wide_weights, weights.shape[0], parity)(stmt)
+            return _Rebase(output.data, wide_output, output.shape[0], parity)(stmt)
+
+        def prepare(value):
+            return rebase(_seq(groups[0][0]), value)
+
+        def submit(value):
+            group = list(groups[1][0])
+            group[groups[1][1]] = tirx.Evaluate(tirx.Call(gemm.dtype, gemm.op,
+                                                         list(gemm.args) + [tirx.IntImm("int32", 1)]))
+            return rebase(_seq(group), value)
+
+        following = loop.loop_var + 1
+        valid = following < loop.min + loop.extent
+        wait = tirx.Evaluate(tirx.call_intrin("handle", tirx.op.Op.get("tl.intel_npu_dpu_wait")))
+        body = _seq([tirx.IfThenElse(valid, prepare(following), None), wait,
+                     tirx.IfThenElse(valid, submit(following), None), rebase(tail, loop.loop_var)])
+        self.done += 1
+        return _seq([prepare(loop.min), submit(loop.min),
+                     tirx.For(loop.loop_var, loop.min, loop.extent, loop.kind, body, loop.thread_binding,
+                               loop.annotations, loop.step)])
+
+
+def PlanIntelNpuDpuOverlap():
+    def transform(func: tirx.PrimFunc, mod, ctx):
+        if not bool(ctx.config.get("tl.intel_npu.dpu_overlap", False)):
+            return func
+        planner = _DpuPlanner(func)
+        return func.with_body(planner.widen_allocations(planner.body(func.body)))
+
+    return prim_func_pass(transform, opt_level=0, name="tl.PlanIntelNpuDpuOverlap")
+
+
 def PlanIntelNpuPrefetch():
     def transform(func: tirx.PrimFunc, mod, ctx):
         if func.attrs is None or "target" not in func.attrs or func.attrs["target"].kind.name != "intel_npu":

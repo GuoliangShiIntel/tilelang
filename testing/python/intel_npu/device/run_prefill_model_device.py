@@ -145,6 +145,7 @@ def main(argv):
     YW, OW = max(NIN_pad, NQKV_pad), max(VC, KO)
 
     cfg = {"tl.intel_npu.scoped_cmx": "--no-scoped-cmx" not in argv,
+            "tl.intel_npu.dpu_overlap": "--dpu-overlap" in argv,
             "tl.intel_npu.prefetch": "--no-prefetch" not in argv,
             "tl.intel_npu.multicast": "--shared-projections" in argv,
             "tl.intel_npu.multicast_overlap": "--overlap" in argv}
@@ -170,6 +171,7 @@ def main(argv):
             + ("_overlap" if "--overlap" in argv else "")
             + ("_moeslots" if "--moe-slots" in argv else "")
             + ("_sharedexpert" if "--shared-expert" in argv else "")
+            + ("_dpuov" if "--dpu-overlap" in argv else "")
             + (f"_db{DB}" if DB != 4 else "")
             + (f"_t{TILES}" if TILES != 3 else "")
             + ("_sm" if "--shave-major" in argv else "")
@@ -179,6 +181,8 @@ def main(argv):
             + ("_skip_" + "_".join(sorted(skip)) if skip else "")
             + ("_noscope" if "--no-scoped-cmx" in argv else ""))
     source = low.source
+    if "--dpu-overlap" in argv:
+        name = name.replace("_sharedproj_overlap_moeslots_sharedexpert", "_spov_ms_se")
     if "--phases" in argv:
         # instrumentation is opt-in: it costs ~5% (npu_rt_device.hpp's TL_NPU_PHASE_PROF), so the default
         # build is the one every latency number comes from

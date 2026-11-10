@@ -1170,17 +1170,8 @@ def make_moe_expert_prefill(
                         for j in T.serial(DB):
                             perf_begin("ddeq")
                             if not skip_dequant:
-                                T.call_extern(
-                                    "handle",
-                                    "tl_npu_dequant_i4_gm",
-                                    T.address_of(wd_cmx[0, 0]),
-                                    T.address_of(wqd_cmx[j * BND, 0]),
-                                    T.address_of(wsd_all[0, ((nb * shaves + shave) * DB + j) * BND]),
-                                    BND,
-                                    I,
-                                    G,
-                                    H,
-                                )
+                                T.dequant_i4_gm(wd_cmx, wqd_cmx, wsd_all, G, packed_row=j * BND,
+                                               scales_col=((nb * shaves + shave) * DB + j) * BND)
                             perf_end()
                             perf_begin("dgem")
                             T.gemm(h_cmx, wd_cmx, yd_cmx, transpose_B=True, clear_accum=True)

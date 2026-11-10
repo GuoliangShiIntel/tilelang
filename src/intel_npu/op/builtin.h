@@ -41,6 +41,7 @@ static constexpr const char *kIntelNpuScopedCmx = "tl.intel_npu.scoped_cmx";
 // Pass config: compiler-derived one-iteration DMA prefetch (default true);
 // false is the paired A/B control.
 static constexpr const char *kIntelNpuPrefetch = "tl.intel_npu.prefetch";
+static constexpr const char *kIntelNpuDpuOverlap = "tl.intel_npu.dpu_overlap";
 static constexpr const char *kIntelNpuMulticast = "tl.intel_npu.multicast";
 static constexpr const char *kIntelNpuMulticastOverlap =
     "tl.intel_npu.multicast_overlap";
@@ -83,6 +84,8 @@ TVM_DLL const Op &intel_npu_dma_wait();
  * kIntelNpuDpuMpe).
  */
 TVM_DLL const Op &intel_npu_dpu_matmul();
+TVM_DLL const Op &intel_npu_dpu_wait();
+TVM_DLL const Op &intel_npu_dequant_i4_gm();
 
 /*!
  * \brief A DDR tensor at a run-time address: `intel_npu_ddr_ptr(addr_int64,

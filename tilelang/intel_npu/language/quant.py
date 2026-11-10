@@ -15,11 +15,33 @@ from __future__ import annotations
 from tvm import tirx
 from tvm.tirx import Buffer
 
-__all__ = ["gemm_i4", "gemm_i8"]
+__all__ = ["gemm_i4", "gemm_i8", "dequant_i4_gm"]
 
 
 def _addr(buf: Buffer, idx=None):
     return tirx.address_of(tirx.BufferLoad(buf, idx if idx is not None else [0] * len(buf.shape)))
+
+
+def dequant_i4_gm(out: Buffer, packed: Buffer, scales: Buffer, group: int = 128,
+                  packed_row=0, scales_col=0):
+    """Expand packed int4 CMX rows using group-major fp16 scales; retain explicit IR dependencies."""
+    rows, width = (int(dim) for dim in out.shape)
+    group = int(group)
+    if out.dtype != "float16" or packed.dtype != "uint8" or scales.dtype != "float16":
+        raise ValueError("intel_npu: dequant_i4_gm requires fp16 output/scales and uint8 packed weights")
+    if (group <= 0 or width % group or int(packed.shape[1]) != width // 2
+            or int(scales.shape[0]) != width // group or int(packed.shape[0]) < rows
+            or int(scales.shape[1]) < rows):
+        raise ValueError("intel_npu: dequant_i4_gm has incompatible weight/scale shapes")
+    if isinstance(packed_row, int) and not 0 <= packed_row <= int(packed.shape[0]) - rows:
+        raise ValueError("intel_npu: dequant_i4_gm packed row offset is out of bounds")
+    if isinstance(scales_col, int) and not 0 <= scales_col <= int(scales.shape[1]) - rows:
+        raise ValueError("intel_npu: dequant_i4_gm scale column offset is out of bounds")
+    if any(buf.scope() not in ("local", "shared", "shared.dyn") for buf in (out, packed, scales)):
+        raise ValueError("intel_npu: dequant_i4_gm operands must live in CMX")
+    return tirx.call_intrin("handle", tirx.op.Op.get("tl.intel_npu_dequant_i4_gm"), _addr(out),
+                           _addr(packed, [packed_row, 0]), _addr(scales, [0, scales_col]),
+                           rows, width, group, int(scales.shape[1]))
 
 
 def _gemm_q(op_name: str, bytes_per_k: float, a: Buffer, wq: Buffer, s: Buffer | None, out: Buffer, group: int, row0, rows,

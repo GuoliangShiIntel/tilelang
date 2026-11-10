@@ -385,6 +385,13 @@ public:
     }
   }
 
+  void dpu_matmul_start(half *out, const half *a, const half *bt, std::uint32_t M,
+                         std::uint32_t N, std::uint32_t K, std::uint32_t spatialX = 0,
+                         std::int32_t mpe = -1) {
+    dpu_matmul(out, a, bt, M, N, K, spatialX, mpe);
+  }
+  void dpu_matmul_wait() {}
+
   // The device's merged-FC quantised GEMV, with its rounding points: each (row,
   // group) partial product is scaled by 1/16 and rounded to fp16 by the DPU's
   // ODU, the SHAVE sums partial x scale in fp32, x16, fp16. `defer` is a device

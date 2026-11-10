@@ -154,6 +154,13 @@ public:
               srcStride);
   }
 
+  void dpu_matmul_start(half *out, const half *a, const half *bt, std::uint32_t M,
+                         std::uint32_t N, std::uint32_t K, std::uint32_t spatialX = 0,
+                         std::int32_t mpe = -1) {
+    dpu_matmul(out, a, bt, M, N, K, spatialX, mpe);
+  }
+  void dpu_matmul_wait() {}
+
   // ---- DPU
   // --------------------------------------------------------------------------------------------------
   __attribute__((noinline)) void dpu_matmul(half *out, const half *a,

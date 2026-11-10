@@ -4,6 +4,37 @@ Status: plan, 2026-11-06. Branch `feat/intel-npu-backend`. Living document: ever
 its outcome in place when it closes (date, commit, evidence path). Decisions that change get a dated
 amendment, not a silent edit.
 
+## 2026-11-10: Experimental typed dequant / DPU overlap
+
+Retained at the user's request as a reusable capability, not a successful speed optimisation.
+`T.dequant_i4_gm` exposes typed CMX dependencies; the existing prefetch module's
+`PlanIntelNpuDpuOverlap` can derive a twin-weight/twin-output submit-ahead schedule from a serial
+dequant/GEMM/copy loop. No model-specific emitter or explicit start/wait is added to the kernel DSL.
+The runtime's existing asynchronous DPU API is reused; host simulation and the alternate FRT adapter
+provide synchronous fallbacks (FRT device execution was not tested). The pass is deliberately narrow:
+one candidate per function, static compact private buffers, no escaping reads, no input/index mutation
+or unknown side effects. Unsafe patterns remain unchanged. CMX is checked after widening; there is
+no automatic cost ranking or budget fallback. `tl.intel_npu.dpu_overlap` defaults false.
+
+Current down shape M=32/N=64/K=512 adds 136 KiB CMX/tile; the two-layer clean code grows
+168816 -> 172784 B. Default-off model sources remain identical. Prediction of 5-12 ms canary benefit
+was not supported: clean TURBO, cold, median of three oracle trials 266.729 -> 267.500 ms, both
+3/3 PASS worst rel 3.85e-2. E2E on the same deterministic 1K prompt, UNPROFILED TURBO cold,
+one launch per arm: TTFT 5.96 -> 5.96 s, prefill 5853 -> 5850 ms, same 8 tokens. This is a tie,
+not evidence of a stable improvement. Sources: baseline `38f3d22247c6`, candidate `6c28a30e110e`;
+short saved golden `d56670ad19e6` passes 1/1 x 8/8, worst logits error 0.318. SDK `daf6c05`.
+
+Full canary task capture `tl_prefill_model_l2_n1152_h2048_s1536_bn128_bn232_mbe32_spov_ms_se_dpuov_prof_tasks.json`
+under `testing/python/intel_npu/device/evidence/`, source `40cdfa26614e`: 428366 records, dropped=0,
+six workers. Submit wrappers shorten but DPU work is unchanged and full-phase latency does not fall;
+the available overlap window is small relative to preparation/scheduling costs. Instrumented times
+are observability only. Full-model TOPS is not measured. Regression gate: 219 tests passed, including
+independent odd/even/single-trip numerical tests and dependency/group/offset negative controls.
+
+Experiment with `--dpu-overlap` on the model canary, or `--prefill-dpu-overlap` added to the existing
+E2E slot-major/shared-expert flags. Do not enable by default without a new same-condition A/B.
+Formatting checks remain deferred; no npu_dsl parity claim is made.
+
 ## 2026-11-10: Separate dense shared expert
 
 Starting point `c7b3f03a`. The reference `npu_dsl/lib/moe.py::moe_prefill` runs the shared expert as

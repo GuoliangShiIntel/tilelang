@@ -136,9 +136,12 @@ def _host_arrays(layers):
 
 
 def _run(layers, h, pos0=0, n=N, shared_projections=False, expert_block=MBe, moe_slot_output=False,
-         separate_shared_expert=False):
-    with tvm.transform.PassContext(config={"tl.intel_npu.multicast": shared_projections}):
+         separate_shared_expert=False, dpu_overlap=False):
+    with tvm.transform.PassContext(config={"tl.intel_npu.multicast": shared_projections,
+                                           "tl.intel_npu.dpu_overlap": dpu_overlap}):
         low = lowering.lower(_kernel(shared_projections, expert_block, moe_slot_output, separate_shared_expert))
+    if dpu_overlap:
+        assert "ctx.dpu_matmul_start(" in low.source
     if shared_projections:
         assert "ctx.dma_load_multicast(" in low.source
     lib = host_sim.build(low.source, "prefill_model")
@@ -265,13 +268,13 @@ def test_model_projection_overlap_under_readonly_kind_table():
 
 
 @needs_cxx
-@pytest.mark.parametrize("separate_shared_expert", [False, True])
-def test_slot_outputs_preserve_live_model_state(separate_shared_expert):
+@pytest.mark.parametrize("separate_shared_expert,dpu_overlap", [(False, False), (True, False), (True, True)])
+def test_slot_outputs_preserve_live_model_state(separate_shared_expert, dpu_overlap):
     layers = _layers(seed=7)
     h = np.random.default_rng(7).normal(size=(N, H)).astype(np.float32)
     expected = _run(layers, h, n=N - TB, shared_projections=True, expert_block=32)
     actual = _run(layers, h, n=N - TB, shared_projections=True, expert_block=32, moe_slot_output=True,
-                  separate_shared_expert=separate_shared_expert)
+                  separate_shared_expert=separate_shared_expert, dpu_overlap=dpu_overlap)
     for got, ref in zip(actual[:3], expected[:3]):
         assert np.isfinite(got).all()
         error = np.abs(got.astype(np.float32) - ref.astype(np.float32)).max()
