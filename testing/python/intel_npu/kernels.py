@@ -1936,8 +1936,8 @@ def make_gdn_scan_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
         on = T.alloc_local((C, DV), T.float16)
         dS = T.alloc_local((DK, DV), T.float16)
         gc = T.alloc_local((C,), T.float32)
-        la = T.alloc_local((C,), T.float32)
-        ac = T.alloc_local((C,), T.float32)
+        la = T.alloc_local((C,), T.float16)   # the tri solve runs in fp16: its operands and its result are fp16
+        ac = T.alloc_local((C,), T.float16)
         xr = T.alloc_local((DV,), T.float32)
         lq = T.alloc_local((FL,), T.float32)
         lk = T.alloc_local((FL,), T.float32)
@@ -1972,6 +1972,7 @@ def make_gdn_scan_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
                     for t in T.serial(C):
                         st[0] = st[0] + T.if_then_else(t < tb, gbv[t, 0], T.float32(0))
                         gc[t] = st[0]
+                    perf_begin("srow")
                     for t in T.serial(C):
                         if t < tb:
                             st[2] = gbv[t, 1]                           # beta
@@ -2003,59 +2004,70 @@ def make_gdn_scan_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
                             for d0 in T.serial(DV // HL):
                                 for v in T.vectorized(HL):
                                     vb[t, d0 * HL + v] = T.float16(0)
+                    perf_end()
                     # D: the whole row vectorised, then the strictly-upper part zeroed. exp overflows to inf
                     # above the diagonal and is overwritten there; a per-lane select does not vectorise.
+                    perf_begin("sdm")
                     for i in T.serial(C):
                         for j0 in T.serial(C // FL):
                             for v in T.vectorized(FL):
                                 dm[i, j0 * FL + v] = T.cast(T.exp(gc[i] - gc[j0 * FL + v]), T.float16)
                         for j in T.serial(i + 1, C):
                             dm[i, j] = T.float16(0)
+                    perf_end()
                     # --- products: [beta k k^T; s q k^T], and the three transposes -----------------------
                     T.gemm(kq, khb, ap, transpose_B=True, clear_accum=True)
                     T.gemm(eye, vb, vbT, transpose_B=True, clear_accum=True)
                     T.gemm(eye, kg, kgT, transpose_B=True, clear_accum=True)
                     T.gemm(eye, kd, kdT, transpose_B=True, clear_accum=True)
                     # --- T = (I + strictly_lower(A . D))^-1 by forward substitution ----------------------
+                    perf_begin("stri")
                     for j0 in T.serial(C // HL):
                         for v in T.vectorized(HL):
                             tri[0, j0 * HL + v] = T.float16(0)
                     for i in T.serial(1, C):
-                        for j0 in T.serial(C // FL):
-                            for v in T.vectorized(FL):
-                                la[j0 * FL + v] = T.float32(0) - (T.cast(ap[i, j0 * FL + v], T.float32)
-                                                                  * T.cast(dm[i, j0 * FL + v], T.float32))
+                        # fp16 end to end on HL lanes: `ap` and `dm` are already fp16, so the fp32 form paid two
+                        # conversions and twice the vector ops for a value that is written back to fp16 `tri`
+                        # anyway. npu_dsl's gdn_chunk_tri is half32 throughout for the same reason.
+                        for j0 in T.serial(C // HL):
+                            for v in T.vectorized(HL):
+                                la[j0 * HL + v] = T.float16(0) - (ap[i, j0 * HL + v] * dm[i, j0 * HL + v])
                         for j in T.serial(i, C):
-                            la[j] = T.float32(0)        # row i is strictly lower; column i on is not its own
-                        for j0 in T.serial(C // FL):
-                            for v in T.vectorized(FL):
-                                ac[j0 * FL + v] = la[j0 * FL + v]
+                            la[j] = T.float16(0)        # row i is strictly lower; column i on is not its own
+                        for j0 in T.serial(C // HL):
+                            for v in T.vectorized(HL):
+                                ac[j0 * HL + v] = la[j0 * HL + v]
                         for m in T.serial(i):
-                            st[5] = la[m]
-                            for j0 in T.serial(C // FL):
-                                for v in T.vectorized(FL):
-                                    ac[j0 * FL + v] = ac[j0 * FL + v] + T.cast(tri[m, j0 * FL + v],
-                                                                               T.float32) * st[5]
-                        for j0 in T.serial(C // FL):
-                            for v in T.vectorized(FL):
-                                tri[i, j0 * FL + v] = T.cast(ac[j0 * FL + v], T.float16)
+                            eh[0] = la[m]
+                            for j0 in T.serial(C // HL):
+                                for v in T.vectorized(HL):
+                                    ac[j0 * HL + v] = ac[j0 * HL + v] + tri[m, j0 * HL + v] * eh[0]
+                        for j0 in T.serial(C // HL):
+                            for v in T.vectorized(HL):
+                                tri[i, j0 * HL + v] = ac[j0 * HL + v]
                     for i in T.serial(C):
                         tri[i, i] = T.float16(1)
+                    perf_end()
+                    perf_begin("spm")
                     for i in T.serial(C):
                         for j0 in T.serial(C // HL):
                             for v in T.vectorized(HL):
                                 pm[i, j0 * HL + v] = ap[C + i, j0 * HL + v] * dm[i, j0 * HL + v]
+                    perf_end()
                     # --- v_new, the output halves and the state increment --------------------------------
                     T.gemm(vbT, tri, uT, transpose_B=True, clear_accum=True)
                     T.gemm(tri, kgT, W, transpose_B=True, clear_accum=True)
                     T.gemm(ST, W, vpT, transpose_B=True, clear_accum=True)
                     T.gemm(qg, ST, qi, transpose_B=True, clear_accum=True)
+                    perf_begin("svn")
                     for i in T.serial(DV):
                         for j0 in T.serial(C // HL):
                             for v in T.vectorized(HL):
                                 vnT[i, j0 * HL + v] = uT[i, j0 * HL + v] - vpT[i, j0 * HL + v]
+                    perf_end()
                     T.gemm(pm, vnT, o1, transpose_B=True, clear_accum=True)
                     T.gemm(kdT, vnT, dS, transpose_B=True, clear_accum=True)
+                    perf_begin("sst")
                     st[6] = T.exp(gc[C - 1])
                     for d in T.serial(DK):
                         for c0 in T.serial(DV // FL):
@@ -2063,8 +2075,10 @@ def make_gdn_scan_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
                                 Sf[d, c0 * FL + v] = (Sf[d, c0 * FL + v] * st[6]
                                                       + T.cast(dS[d, c0 * FL + v], T.float32))
                                 S16[d, c0 * FL + v] = T.cast(Sf[d, c0 * FL + v], T.float16)
+                    perf_end()
                     T.gemm(eye, S16, ST, transpose_B=True, clear_accum=True)
                     # --- gated RMSNorm, with the q pre-scale divided back out ----------------------------
+                    perf_begin("snrm")
                     for i in T.serial(C):
                         for v in T.vectorized(FL):
                             ls[v] = T.float32(0)
@@ -2083,6 +2097,7 @@ def make_gdn_scan_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
                                     xr[c0 * FL + v] * st[7] * T.cast(gn[0, c0 * FL + v], T.float32)
                                     * T.cast(zb[i, c0 * FL + v], T.float32)
                                     / (T.float32(1) + T.cast(eh[v], T.float32)), T.float16)
+                    perf_end()
                     T.copy(on, Out[ci * C, h * DV])
                 T.copy(Sf, Ssm[h, 0, 0])
 
@@ -2233,9 +2248,13 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
                              # `prefill_ba_block`), so the in_proj output is exactly what `pack_gdn` packs
     NP = -(-N // TB) * TB
     NT = NP // TB
-    ITEMS = KH + VH
+    # the work unit is a channel SLICE, not a head: a k-head carries two (q and k) and a v-head one, so dealing
+    # heads blocked gave workers 0-1 sixteen slices each and workers 2-5 eight. Slices are equal-cost, and with
+    # DK == DV their channel base is just s * DK -- monotonic, so a worker's run of slices is still a CONTIGUOUS
+    # channel range, which is what keeps this off the interleaved-write defect `make_dma_page_probe` chases.
+    SLICES = 2 * KH + VH
     workers = tiles * shaves
-    PER = -(-ITEMS // workers)
+    PER = -(-SLICES // workers)
     FL, HL = 16, 32
 
     @T.macro
@@ -2285,64 +2304,58 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
         T.copy(ALog[0, 0], al)
         T.copy(DtBias[0, 0], db)
         T.sync_threads()
-        for it in T.serial(T.ceildiv(ITEMS, workers)):
+        for it in T.serial(T.ceildiv(SLICES, workers)):
             wid = (shave * tiles + tile) if item_worker == "shave" else worker
-            hb = (wid * PER + it) if blocked_items else (it * workers + worker)
-            if hb < ITEMS:
-                # channel base of this item: k-heads take q then k, v-heads take their v slice
-                for part in T.serial(2):
-                    if hb >= KH and part == 1:
-                        st[0] = T.float32(0)        # a v-head has one channel slice, not two
+            s = (wid * PER + it) if blocked_items else (it * workers + wid)
+            if s < SLICES:
+                st[1] = T.float32(0)
+                cb = s * DK          # q slices, then k slices, then v slices: one contiguous run per worker
+                T.copy(ConvState[0, cb], win)
+                T.copy(ConvW[0, cb], cw)
+                for tb in T.serial(NT):
+                    T.copy(Y[tb * TB, cb], xb)
+                    for r in T.serial(TB):
+                        for c0 in T.serial(DK // FL):
+                            for v in T.vectorized(FL):
+                                acc[v] = (T.cast(win[0, c0 * FL + v], T.float32) * T.cast(cw[0, c0 * FL + v], T.float32)
+                                          + T.cast(win[1, c0 * FL + v], T.float32) * T.cast(cw[1, c0 * FL + v], T.float32)
+                                          + T.cast(win[2, c0 * FL + v], T.float32) * T.cast(cw[2, c0 * FL + v], T.float32)
+                                          + T.cast(xb[r, c0 * FL + v], T.float32) * T.cast(cw[3, c0 * FL + v], T.float32))
+                                eh[v] = T.exp(T.cast(T.float32(0) - acc[v], T.float16))
+                                cv[r, c0 * FL + v] = acc[v] / (T.float32(1) + T.cast(eh[v], T.float32))
+                                win[0, c0 * FL + v] = win[1, c0 * FL + v]
+                                win[1, c0 * FL + v] = win[2, c0 * FL + v]
+                                win[2, c0 * FL + v] = xb[r, c0 * FL + v]
+                        if tb * TB + r == nt[0, 0] - 1:
+                            for c0 in T.serial(DK // HL):
+                                for v in T.vectorized(HL):
+                                    keep[0, c0 * HL + v] = win[0, c0 * HL + v]
+                                    keep[1, c0 * HL + v] = win[1, c0 * HL + v]
+                                    keep[2, c0 * HL + v] = win[2, c0 * HL + v]
+                    # l2 norm per token, then the slice's destination
+                    for r in T.serial(TB):
+                        for v in T.vectorized(FL):
+                            ls[v] = T.float32(0)
+                        for c0 in T.serial(DK // FL):
+                            for v in T.vectorized(FL):
+                                ls[v] = ls[v] + cv[r, c0 * FL + v] * cv[r, c0 * FL + v]
+                        st[2] = T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL])
+                        st[3] = T.float32(1) / T.sqrt(st[2] + T.float32(1e-6))
+                        st[3] = st[3] * T.if_then_else(s < KH, T.float32(1.0 / (DK ** 0.5)), T.float32(1))
+                        st[4] = T.if_then_else(tb * TB + r < nt[0, 0], T.float32(1), T.float32(0))
+                        for c0 in T.serial(DK // FL):
+                            for v in T.vectorized(FL):
+                                ob[r, c0 * FL + v] = T.if_then_else(
+                                    s < 2 * KH, cv[r, c0 * FL + v] * st[3], cv[r, c0 * FL + v]) * st[4]
+                    if s < 2 * KH:
+                        T.copy(ob, QKo[s % KH, tb * TB, (s // KH) * DK])
                     else:
-                        st[1] = T.float32(0)
-                        cb = T.if_then_else(hb < KH, hb * DK + part * QK, 2 * QK + (hb - KH) * DV)
-                        T.copy(ConvState[0, cb], win)
-                        T.copy(ConvW[0, cb], cw)
-                        for tb in T.serial(NT):
-                            T.copy(Y[tb * TB, cb], xb)
-                            for r in T.serial(TB):
-                                for c0 in T.serial(DK // FL):
-                                    for v in T.vectorized(FL):
-                                        acc[v] = (T.cast(win[0, c0 * FL + v], T.float32) * T.cast(cw[0, c0 * FL + v], T.float32)
-                                                  + T.cast(win[1, c0 * FL + v], T.float32) * T.cast(cw[1, c0 * FL + v], T.float32)
-                                                  + T.cast(win[2, c0 * FL + v], T.float32) * T.cast(cw[2, c0 * FL + v], T.float32)
-                                                  + T.cast(xb[r, c0 * FL + v], T.float32) * T.cast(cw[3, c0 * FL + v], T.float32))
-                                        eh[v] = T.exp(T.cast(T.float32(0) - acc[v], T.float16))
-                                        cv[r, c0 * FL + v] = acc[v] / (T.float32(1) + T.cast(eh[v], T.float32))
-                                        win[0, c0 * FL + v] = win[1, c0 * FL + v]
-                                        win[1, c0 * FL + v] = win[2, c0 * FL + v]
-                                        win[2, c0 * FL + v] = xb[r, c0 * FL + v]
-                                if tb * TB + r == nt[0, 0] - 1:
-                                    for c0 in T.serial(DK // HL):
-                                        for v in T.vectorized(HL):
-                                            keep[0, c0 * HL + v] = win[0, c0 * HL + v]
-                                            keep[1, c0 * HL + v] = win[1, c0 * HL + v]
-                                            keep[2, c0 * HL + v] = win[2, c0 * HL + v]
-                            # l2 norm per token, then the slice's destination
-                            for r in T.serial(TB):
+                        for r in T.serial(TB):
+                            for c0 in T.serial(DV // FL):
                                 for v in T.vectorized(FL):
-                                    ls[v] = T.float32(0)
-                                for c0 in T.serial(DK // FL):
-                                    for v in T.vectorized(FL):
-                                        ls[v] = ls[v] + cv[r, c0 * FL + v] * cv[r, c0 * FL + v]
-                                st[2] = T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL])
-                                st[3] = T.float32(1) / T.sqrt(st[2] + T.float32(1e-6))
-                                if hb < KH and part == 0:
-                                    st[3] = st[3] * T.float32(1.0 / (DK ** 0.5))
-                                st[4] = T.if_then_else(tb * TB + r < nt[0, 0], T.float32(1), T.float32(0))
-                                for c0 in T.serial(DK // FL):
-                                    for v in T.vectorized(FL):
-                                        ob[r, c0 * FL + v] = T.if_then_else(
-                                            hb < KH, cv[r, c0 * FL + v] * st[3], cv[r, c0 * FL + v]) * st[4]
-                            if hb < KH:
-                                T.copy(ob, QKo[hb, tb * TB, part * DK])
-                            else:
-                                for r in T.serial(TB):
-                                    for c0 in T.serial(DV // FL):
-                                        for v in T.vectorized(FL):
-                                            zb[r, c0 * FL + v] = T.cast(ob[r, c0 * FL + v], T.float16)
-                                T.copy(zb, Vo[hb - KH, tb * TB, 0])
-                        T.copy(keep, CsOut[0, cb])
+                                    zb[r, c0 * FL + v] = T.cast(ob[r, c0 * FL + v], T.float16)
+                        T.copy(zb, Vo[s - 2 * KH, tb * TB, 0])
+                T.copy(keep, CsOut[0, cb])
         T.sync_grid()
         # z, beta and g: one v-head per item, read straight out of the projection row
         for it in T.serial(T.ceildiv(VH, workers)):
