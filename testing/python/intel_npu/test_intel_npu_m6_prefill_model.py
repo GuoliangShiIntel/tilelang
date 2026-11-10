@@ -59,11 +59,11 @@ def _has_host_cxx() -> bool:
 needs_cxx = pytest.mark.skipif(not _has_host_cxx(), reason="no host clang++ for the simulation")
 
 
-def _kernel(shared_projections=False, expert_block=MBe):
+def _kernel(shared_projections=False, expert_block=MBe, moe_slot_output=False):
     return make_prefill_model(L=L, N=N, H=H, KH=KH, VH=VH, DK=DK, DV=DV, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX,
                               I=I, E=E, TOPK=TOPK, G=G, TB=TB, C=C, TBq=TBq, TBF=TBF, BKV=BKV, BN1=BN1, BN2=BN2,
                               MB=MB, BM=BM, BNR=BNR, MBe=expert_block, BNG=BNG, BND=BND, tiles=TILES, shaves=SHAVES,
-                              KVL=KVL, shared_projections=shared_projections)
+                              KVL=KVL, shared_projections=shared_projections, moe_slot_output=moe_slot_output)
 
 
 def _layers(seed=0):
@@ -134,9 +134,9 @@ def _host_arrays(layers):
     return rows, keep
 
 
-def _run(layers, h, pos0=0, n=N, shared_projections=False, expert_block=MBe):
+def _run(layers, h, pos0=0, n=N, shared_projections=False, expert_block=MBe, moe_slot_output=False):
     with tvm.transform.PassContext(config={"tl.intel_npu.multicast": shared_projections}):
-        low = lowering.lower(_kernel(shared_projections, expert_block))
+        low = lowering.lower(_kernel(shared_projections, expert_block, moe_slot_output))
     if shared_projections:
         assert "ctx.dma_load_multicast(" in low.source
     lib = host_sim.build(low.source, "prefill_model")
@@ -166,7 +166,8 @@ def _run(layers, h, pos0=0, n=N, shared_projections=False, expert_block=MBe):
               "Logits": np.zeros((N, RR), np.float16), "Ids": np.zeros((N, TOPK), np.int32),
               "Wts": np.zeros((N, 16), np.float32), "Cnt": np.zeros((E + 1,), np.int32),
               "Off": np.zeros((E + 2,), np.int32), "Slot": np.zeros((SLOTS,), np.int32),
-              "PartE": np.zeros((TILES, N, H), np.float32), "MoeOut": np.zeros((N, H), np.float32)}
+              "PartE": np.full((SLOTS, H), np.nan, np.float16) if moe_slot_output else np.zeros((TILES, N, H), np.float32),
+              "MoeOut": np.zeros((N, H), np.float32)}
     host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, arrays), tiles=TILES, shaves=SHAVES))
     return hio, kc, vt, rows, keep
 
@@ -258,6 +259,26 @@ def test_model_projection_overlap_under_readonly_kind_table():
         low = lowering.lower(_kernel(shared_projections=True))
     assert low.source.count("ctx.ring_begin(") == 2
     assert low.source.count("ownership-preserving") >= 2
+
+
+@needs_cxx
+def test_slot_outputs_preserve_live_model_state():
+    layers = _layers(seed=7)
+    h = np.random.default_rng(7).normal(size=(N, H)).astype(np.float32)
+    expected = _run(layers, h, n=N - TB, shared_projections=True, expert_block=32)
+    actual = _run(layers, h, n=N - TB, shared_projections=True, expert_block=32, moe_slot_output=True)
+    for got, ref in zip(actual[:3], expected[:3]):
+        assert np.isfinite(got).all()
+        error = np.abs(got.astype(np.float32) - ref.astype(np.float32)).max()
+        assert error / max(float(np.abs(ref).max()), 1e-6) < 1e-3
+    for li, layer in enumerate(layers):
+        if layer["kind"] == "gdn":
+            for name in ("S0", "S1"):
+                got, ref = actual[3][li][name], expected[3][li][name]
+                assert np.isfinite(got).all()
+                error = np.abs(got.astype(np.float32) - ref.astype(np.float32)).max()
+                assert error / max(float(np.abs(ref).max()), 1e-6) < 1e-3
+    assert np.array_equal(actual[0][N - TB:], h[N - TB:])
 
 
 @needs_cxx

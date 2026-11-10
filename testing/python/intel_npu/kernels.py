@@ -1005,6 +1005,7 @@ def make_moe_expert_prefill(
     DB: int = 4,
     as_block: bool = False,
     probe_skip: str | None = None,
+    slot_output: bool = False,
 ):
     """P2b: the grouped expert FFN for `N` prompt tokens, over P2a's grouping.
 
@@ -1029,6 +1030,9 @@ def make_moe_expert_prefill(
     `tl_npu_dequant_i4_gm`, which keeps the VPUX assembly by transposing a chunk's scales into a stack buffer
     first, so the layout costs the scales only -- 1/64 of the bytes at G = 128.
 
+    `slot_output`: `Part` is fp16 `[N*(TOPK+1), H]` in expert-sorted order, followed by one inverse-indexed
+    weighted combine. The default retains fp32 `[tiles, N, H]` partials. Slot mode requires MB % shaves == 0.
+
     `probe_skip='dequant'`: MEASUREMENT ARM ONLY -- the weights are still read from DDR and the gemms still run,
     but the int4 rows are not expanded (the output is wrong by design). The difference is the dequant's share."""
     FL, HL = 16, 32
@@ -1040,11 +1044,15 @@ def make_moe_expert_prefill(
     assert H % G == 0 and I % G == 0 and (2 * I) % BNG == 0 and H % BND == 0
     assert H % HL == 0 and I % HL == 0 and MB * BNG <= 8192 and MB * BND <= 8192
     assert I % (shaves * HL) == 0 and N % shaves == 0
+    if slot_output:
+        assert MB % shaves == 0, "slot-output token rows must divide over the tile's SHAVEs"
     # down chunks per DMA: at BND = 64 a job is 16 KiB and 70% of it is the 1.55 us per-job fixed cost, and the
     # PACKED buffer is 8x smaller than wd_cmx, so DMA granularity is cheap to decouple from compute granularity.
     # `DB` is an upper bound: it also sizes wqd_cmx, so a large chunk costs CMX the big prompt chunks need.
     DB = next(d for d in (DB, 4, 2, 1) if d <= DB and CD % (d * shaves) == 0)
     EPT = -(-(E + 1) // tiles)  # experts per TILE: the tile's SHAVEs cooperate on one expert
+    part_shape = (SLOTS, H) if slot_output else (tiles, N, H)
+    part_dtype = T.float16 if slot_output else T.float32
 
     @T.macro
     def expert_phase(X, WguQ, WguS, WdQ, WdS, Wts, Off, Slot, Part, Out, tile, shave):
@@ -1083,13 +1091,15 @@ def make_moe_expert_prefill(
         seen = T.alloc_shared((N,), T.int32)  # per token: has an expert of this TILE written its partial yet?
         T.copy(Off[0], off_cmx)
         T.copy(Slot[0], slot_cmx)
-        T.copy(Wts[0, 0], wts_cmx)
+        if not slot_output:
+            T.copy(Wts[0, 0], wts_cmx)
         for c0 in T.serial(H // FL):
             for v in T.vectorized(FL):
                 zr[0, c0 * FL + v] = T.float32(0)
-        for t in T.serial(N):
-            if t % shaves == shave:
-                seen[t] = 0
+        if not slot_output:
+            for t in T.serial(N):
+                if t % shaves == shave:
+                    seen[t] = 0
         T.sync_threads()
         for ei in T.serial(EPT):
             e = ei * tiles + tile
@@ -1170,31 +1180,53 @@ def make_moe_expert_prefill(
                     # one read-modify-write of the whole row per live token: the chunk-wise form cost CD of
                     # them, and at BND = 64 those are 256-byte DDR jobs whose count dominated the phase
                     perf_begin("accm")
-                    for i in T.serial(MB):
-                        if i % shaves == shave and off_cmx[e] + c * MB + i < off_cmx[e + 1]:
-                            # hoisted: the weight was read INSIDE the vectorised loop, so two indirections and a
-                            # div/mod ran once per element -- H times per token -- instead of once per token
-                            tk[0] = slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1)
-                            aw[0] = wts_cmx[tk[0], slot_cmx[off_cmx[e] + c * MB + i] % (TOPK + 1)]
-                            # the first touch of a row stores, so the partial never has to be zeroed up front
-                            if seen[tk[0]] == 0:
-                                seen[tk[0]] = 1
+                    if slot_output:
+                        row0 = shave * (MB // shaves)
+                        rows = T.min(MB // shaves, T.max(0, off_cmx[e + 1] - off_cmx[e] - c * MB - row0))
+                        if rows > 0:
+                            T.copy(yo[row0:row0 + rows, 0:H],
+                                   Part[off_cmx[e] + c * MB + row0:off_cmx[e] + c * MB + row0 + rows, 0:H])
+                    else:
+                        for i in T.serial(MB):
+                            if i % shaves == shave and off_cmx[e] + c * MB + i < off_cmx[e + 1]:
+                                tk[0] = slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1)
+                                aw[0] = wts_cmx[tk[0], slot_cmx[off_cmx[e] + c * MB + i] % (TOPK + 1)]
+                                if seen[tk[0]] == 0:
+                                    seen[tk[0]] = 1
+                                    for c0 in T.serial(H // FL):
+                                        for v in T.vectorized(FL):
+                                            pw[0, c0 * FL + v] = T.float32(0)
+                                else:
+                                    T.copy(Part[tile, tk[0], 0], pw)
                                 for c0 in T.serial(H // FL):
                                     for v in T.vectorized(FL):
-                                        pw[0, c0 * FL + v] = T.float32(0)
-                            else:
-                                T.copy(Part[tile, tk[0], 0], pw)
-                            for c0 in T.serial(H // FL):
-                                for v in T.vectorized(FL):
-                                    pw[0, c0 * FL + v] = pw[0, c0 * FL + v] + aw[0] * T.cast(yo[i, c0 * FL + v], T.float32)
-                            T.copy(pw, Part[tile, tk[0], 0])
+                                        pw[0, c0 * FL + v] = pw[0, c0 * FL + v] + aw[0] * T.cast(yo[i, c0 * FL + v], T.float32)
+                                T.copy(pw, Part[tile, tk[0], 0])
                     perf_end()
                     T.sync_threads()
         T.sync_threads()
-        for t in T.serial(N):  # only the tokens no expert of this tile saw still need zeros
-            if t % shaves == shave and seen[t] == 0:
-                T.copy(zr, Part[tile, t, 0])
+        if not slot_output:
+            for t in T.serial(N):
+                if t % shaves == shave and seen[t] == 0:
+                    T.copy(zr, Part[tile, t, 0])
         T.sync_grid()
+        if slot_output:
+            inverse = T.alloc_shared((SLOTS,), T.int32)
+            slot_row = T.alloc_local((1, H), T.float16)
+            combine_slots = T.alloc_shared((SLOTS,), T.int32)
+            combine_wts = T.alloc_shared((N, 16), T.float32)
+            entries = T.alloc_shared((1,), T.int32)
+            T.copy(Slot[0], combine_slots)
+            T.copy(Wts[0, 0], combine_wts)
+            T.copy(Off[E + 1:E + 2], entries)
+            for entry in T.serial(SLOTS):
+                if entry % shaves == shave:
+                    inverse[entry] = -1
+            T.sync_threads()
+            for entry in T.serial(entries[0]):
+                if entry % shaves == shave:
+                    inverse[combine_slots[entry]] = entry
+            T.sync_threads()
         # --- combine: the tokens dealt over the workers, the tiles' partials summed -------------------
         for it in T.serial(T.ceildiv(N, workers)):
             t = it * workers + worker
@@ -1202,11 +1234,21 @@ def make_moe_expert_prefill(
                 for c0 in T.serial(H // FL):
                     for v in T.vectorized(FL):
                         pw[0, c0 * FL + v] = T.float32(0)
-                for w in T.serial(tiles):
-                    T.copy(Part[w, t, 0], pa)  # a DDR row is a DMA into CMX, never a vector load
-                    for c0 in T.serial(H // FL):
-                        for v in T.vectorized(FL):
-                            pw[0, c0 * FL + v] = pw[0, c0 * FL + v] + pa[0, c0 * FL + v]
+                if slot_output:
+                    for choice in T.serial(TOPK + 1):
+                        if inverse[t * (TOPK + 1) + choice] >= 0:
+                            T.copy(Part[inverse[t * (TOPK + 1) + choice], 0], slot_row)
+                            aw[0] = combine_wts[t, choice]
+                            for c0 in T.serial(H // FL):
+                                for v in T.vectorized(FL):
+                                    pw[0, c0 * FL + v] = (pw[0, c0 * FL + v]
+                                        + aw[0] * T.cast(slot_row[0, c0 * FL + v], T.float32))
+                else:
+                    for w in T.serial(tiles):
+                        T.copy(Part[w, t, 0], pa)
+                        for c0 in T.serial(H // FL):
+                            for v in T.vectorized(FL):
+                                pw[0, c0 * FL + v] = pw[0, c0 * FL + v] + pa[0, c0 * FL + v]
                 T.copy(pw, Out[t, 0])
 
     if as_block:
@@ -1222,7 +1264,7 @@ def make_moe_expert_prefill(
         Wts: T.Tensor((N, 16), T.float32),
         Off: T.Tensor((E + 2,), T.int32),
         Slot: T.Tensor((SLOTS,), T.int32),
-        Part: T.Tensor((tiles, N, H), T.float32),
+        Part: T.Tensor(part_shape, part_dtype),
         Out: T.Tensor((N, H), T.float32),
     ):
         with T.Kernel(tiles, threads=shaves) as tile:
@@ -5193,6 +5235,7 @@ def make_prefill_model(
     conv_item_worker: str = "tile",
     HW: int | None = None,
     shared_projections: bool = False,
+    moe_slot_output: bool = False,
 ):
     """P5: a whole PREFILL chunk of `N` prompt tokens through `L` layers in ONE launch -- the prefill counterpart
     of `make_decode_model`. A device-side loop over the layers, `Kind[li, 0]` selecting the Gated DeltaNet or the
@@ -5258,9 +5301,12 @@ def make_prefill_model(
     o_proj, _ = make_proj_prefill(NP=NP, M=H, K=KO, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True, scales_gm=True)
     route_phase, rs = make_moe_route_prefill(N=NP, H=H, E=E, TOPK=TOPK, BM=BM, BNR=BNR, tiles=tiles, shaves=shaves, as_block=True)
     expert_phase, _ = make_moe_expert_prefill(
-        N=NP, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MBe, BNG=BNG, BND=BND, DB=DB, tiles=tiles, shaves=shaves, as_block=True
+        N=NP, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MBe, BNG=BNG, BND=BND, DB=DB, tiles=tiles, shaves=shaves,
+        as_block=True, slot_output=moe_slot_output
     )
     RR, SLOTS = rs["RR"], rs["SLOTS"]
+    part_shape = (SLOTS, H) if moe_slot_output else (tiles, NP, H)
+    part_dtype = T.float16 if moe_slot_output else T.float32
     KGH, KGI = H // G, I // G
     FL = 16
     assert H % FL == 0 and NP % workers == 0
@@ -5310,7 +5356,7 @@ def make_prefill_model(
         Cnt: T.Tensor((E + 1,), T.int32),
         Off: T.Tensor((E + 2,), T.int32),
         Slot: T.Tensor((SLOTS,), T.int32),
-        PartE: T.Tensor((tiles, NP, H), T.float32),
+        PartE: T.Tensor(part_shape, part_dtype),
         MoeOut: T.Tensor((NP, H), T.float32),
     ):
         with T.Kernel(tiles, threads=shaves) as tile:

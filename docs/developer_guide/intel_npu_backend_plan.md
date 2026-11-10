@@ -4,6 +4,77 @@ Status: plan, 2026-11-06. Branch `feat/intel-npu-backend`. Living document: ever
 its outcome in place when it closes (date, commit, evidence path). Decisions that change get a dated
 amendment, not a silent edit.
 
+## 2026-11-10: MoE slot-major outputs and dynamic-row DMA
+
+Starting point: E2E integration `86f9eafd`; the whole two-layer 1K capture attributed 53.4% to mexp,
+with accm 35.5 ms/worker (116.96 us/call). This named site includes DDR DMA, not only SHAVE arithmetic.
+The reference difference is in `npu_dsl/lib/moe.py` and `lib/expert_ffn.py`: expert-sorted fp16 output
+slots, then inverse-indexed weighted combine, rather than repeated fp32 per-tile partial updates.
+No numerical npu_dsl phase comparison is claimed without a matched reference run.
+
+One change: opt-in `make_moe_expert_prefill(slot_output=True)` writes contiguous expert-output rows
+as fp16 and combines them once per token in fp32. GEMM/dequant geometry and calls are unchanged.
+The shared expert remains a grouped item; the reference's separate shared-expert GEMM and its
+double-buffered shared-weight compute schedule are not implemented by this change.
+
+New generic compiler capability: 2-D `T.copy` accepts a symbolic row count, with width and strides
+still static. GEMM remains static-shape; dynamic width is rejected. Shared-CMX loads with dynamic
+rows have one tile issuer and a tile rendezvous. No emitter recognizes MoE names. Tests cover a
+separate renamed row-copy kernel at 0/partial/full rows, local/shared destinations, sentinel output
+preservation and a dynamic-width negative control. Slot output also refuses MBe not divisible by
+the SHAVEs per tile. The implementation uses only existing DMA intrinsics/runtime support.
+
+Scratch contract: old `[tiles,N,H]` fp32 versus new `[N*(TOPK+1),H]` fp16. At capacity N=1152,
+H=2048, tiles=3 and TOPK=8 this grows DDR scratch from 27 to 40.5 MiB. It reduces traffic/jobs, not
+scratch capacity. Expert and combine routing tables have separate CMX lifetimes; otherwise sharing
+them across the grid rendezvous hoisted the tables and the CMX gate rejected the layer. The combine
+reloads small tables instead. Inverse mapping is built only over valid entries; unused prompt capacity
+has sentinel -1 and cannot read stale slots. Reduction order changes, but slot storage adds no rounding:
+the DPU outputs were already fp16.
+
+Prediction: remove most accm RMW job costs, with 20-30 ms net improvement in the two-layer canary after
+paying the new gather/combine. This is a DMA job-latency prediction, not a SHAVE hot-loop rewrite.
+The old segment does about 16 token RMWs per SHAVE at MBe=32; the new segment issues one contiguous
+half-block store. Same-condition clean canary (TURBO, no profiling/instrumentation, cold, 3 independent
+oracle trials): median 303.443 -> 279.754 ms, 7.8% less; both 3/3 PASS. Sources `adad5174261b` and
+`852472f5b952`. Measured improvement 23.689 ms falls within the prediction.
+
+Full-task capture source `ccf63df3745c`, 434648 records, dropped=0, all six workers. Compared with
+the previous capture at unchanged shape: mexp 177230 -> 150263 us/worker, accm 35478 -> 1045,
+accm per call 116.96 -> 3.44 us, DMA stores 3864 -> 639 calls/worker. DPU remains 7280 calls/worker;
+gdeq/ddeq remain 2426/4853 calls. Gdeq is now 21.5 ms/worker, gather 14.6 ms and ddeq 11.9 ms.
+Instrumentation is observability only and never supplies the E2E latency number.
+
+Real 40-layer checkpoint, identical deterministic 1024-token prompt from the preceding section,
+capacity 1152, 1023 tokens prefilled, same BN1=128/BN2=32/MB=16/MBe=32 and unchanged decode:
+
+| Arm | Prefill source SHA256 | Clean prefill | TTFT |
+|---|---|---|---|
+| fp32 tile partial baseline | `76eea14af93f` | 6551 ms | 6.67 s |
+| fp16 slots | `9e62c869ca47` | 5996 ms | 6.11 s |
+
+UNPROFILED TURBO cold, one timed launch per arm, no warmup, build/upload excluded: 8.4% TTFT
+reduction in this single paired observation, not repeated E2E medians. Both arms generate the same
+8 tokens. Saved short-prompt golden passes 2/2 trials x 8/8, worst logits error 0.318; source
+`3d12c2e376a0`. The 2-layer long-prompt chained oracle passes 3/3, worst rel 3.85e-2. Host tests check
+expert-isolation and zero-weight controls for both layouts, NaN-initialized scratch, partial prompts,
+residual/KV/conv/SSM state and unchanged dead tokens. Final regression gate: 203 tests passed.
+SDK remains `daf6c05`; weights/pack bytes and decode source `2c88462809d8` are unchanged.
+
+```powershell
+python testing/python/intel_npu/e2e/decode.py --ckpt D:\models\qwen38-w4a16 --pack-dir D:\models\qwen38_tlpack --prefill 1024 --prefill-overlap --prefill-bn1 128 --prefill-mbe 32 --prefill-moe-slots --new 8
+python testing/python/intel_npu/e2e/decode.py --ckpt D:\models\qwen38-w4a16 --pack-dir D:\models\qwen38_tlpack --prefill 192 --prefill-overlap --prefill-bn1 128 --prefill-mbe 32 --prefill-moe-slots --golden D:\models\qwen38_golden\intro.pt --new 8 --trials 2
+python testing/python/intel_npu/device/run_prefill_model_device.py --kinds gdn,attn --n 1024 --trials 3 --bn1 128 --bn2 32 --mbe 32 --shared-projections --overlap --moe-slots
+python testing/python/intel_npu/device/run_prefill_model_device.py --kinds gdn,attn --n 1024 --trials 1 --bn1 128 --bn2 32 --mbe 32 --shared-projections --overlap --moe-slots --phases
+```
+
+As before, the first command uses the default short prompt; add the deterministic 1K `--ids` from
+the E2E recipe below for the exact measured input. Trace:
+`testing/python/intel_npu/device/evidence/tl_prefill_model_l2_n1152_h2048_s1536_bn128_bn232_mbe32_sharedproj_overlap_moeslots_prof_tasks.json`.
+It covers the whole two-layer canary, not all 40 checkpoint layers. Full-model TOPS is not measured;
+old toolkit async-ring traces remain inadmissible. New options default false; no performance parity
+claim is made. Formatting checks remain deferred at the user's request.
+
 ## 2026-11-10: Real-checkpoint E2E integration
 
 The standalone mechanism baseline is committed at `30d59e3d`. Formatting checks are deferred at the

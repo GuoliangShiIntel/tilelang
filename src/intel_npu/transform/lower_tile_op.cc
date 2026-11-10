@@ -38,6 +38,7 @@ struct RegionInfo {
   ffi::Array<PrimExpr> indices;
   std::vector<int64_t> extents; // leading unit extents dropped
   std::vector<int64_t> full_extents;
+  PrimExpr dynamic_rows;
 };
 
 bool IsDdr(const Buffer &buf) {
@@ -50,7 +51,7 @@ bool IsCmx(const Buffer &buf) {
   return scope == "shared" || scope == "shared.dyn" || scope == "local";
 }
 
-RegionInfo ParseRegion(const PrimExpr &e, const char *what) {
+RegionInfo ParseRegion(const PrimExpr &e, const char *what, bool allow_dynamic_rows = false) {
   const auto *call = e.as<CallNode>();
   if (call == nullptr || !call->op.same_as(tl::region())) {
     TVM_FFI_THROW(ValueError)
@@ -64,6 +65,11 @@ RegionInfo ParseRegion(const PrimExpr &e, const char *what) {
   for (size_t i = 2; i < call->args.size(); ++i) {
     const auto *imm = call->args[i].as<IntImmNode>();
     if (imm == nullptr) {
+      if (allow_dynamic_rows && i + 2 == call->args.size()) {
+        info.dynamic_rows = call->args[i];
+        info.full_extents.push_back(-1);
+        continue;
+      }
       TVM_FFI_THROW(ValueError)
           << "intel_npu: " << what << " on " << info.buffer->name
           << " has a non-constant extent " << call->args[i]
@@ -139,8 +145,8 @@ public:
 
 private:
   Stmt LowerCopy(const CallNode *call) {
-    RegionInfo src = ParseRegion(call->args[0], "copy source");
-    RegionInfo dst = ParseRegion(call->args[1], "copy destination");
+    RegionInfo src = ParseRegion(call->args[0], "copy source", true);
+    RegionInfo dst = ParseRegion(call->args[1], "copy destination", true);
     if (src.extents != dst.extents) {
       TVM_FFI_THROW(ValueError)
           << "intel_npu: copy " << src.buffer->name << " -> " << dst.buffer->name
@@ -151,6 +157,13 @@ private:
           << "intel_npu: copy " << src.buffer->name << " -> " << dst.buffer->name
           << " is " << src.extents.size()
           << "-D; the DMA lowering takes 1-D or 2-D row-major regions (Phase 1)";
+    }
+    if (src.dynamic_rows.defined()) {
+      arith::Analyzer analyzer;
+      if (!dst.dynamic_rows.defined() ||
+          !analyzer.CanProveEqual(src.dynamic_rows, dst.dynamic_rows)) {
+        TVM_FFI_THROW(ValueError) << "intel_npu: copy dynamic row counts differ";
+      }
     }
     if (src.buffer->dtype != dst.buffer->dtype) {
       TVM_FFI_THROW(ValueError)
@@ -170,13 +183,15 @@ private:
           << "): Phase 1 lowers DDR<->CMX only";
     }
     const int64_t elem_bytes = src.buffer->dtype.bytes();
-    const int64_t rows = src.extents.size() == 2 ? src.extents[0] : 1;
+    const PrimExpr rows = src.dynamic_rows.defined()
+                  ? cast(DataType::Int(32), src.dynamic_rows)
+                  : PrimExpr(IntImm(DataType::Int(32), src.extents.size() == 2 ? src.extents[0] : 1));
     const int64_t width = src.extents.back() * elem_bytes;
     const int64_t src_stride = RowStrideElems(src) * elem_bytes;
     const int64_t dst_stride = RowStrideElems(dst) * elem_bytes;
     auto i32 = [](int64_t v) { return IntImm(DataType::Int(32), v); };
     return Evaluate(Call(DataType::Handle(), intel_npu_dma_copy(),
-                         {AddressOf(dst), AddressOf(src), i32(width), i32(rows),
+                         {AddressOf(dst), AddressOf(src), i32(width), rows,
                           i32(dst_stride), i32(src_stride), i32(to_cmx)}));
   }
 

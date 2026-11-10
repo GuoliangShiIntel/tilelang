@@ -16,13 +16,14 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import tvm
 
 import tilelang
+import tvm
 import tilelang.intel_npu.language as T
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_sim  # noqa: E402
+import lowering  # noqa: E402
 from kernels import make_gemm, make_gemm_ksplit  # noqa: E402
 
 
@@ -53,6 +54,47 @@ def test_gemm_source_has_dma_and_dpu_calls():
     assert "ctx.dpu_matmul(" in src and ", 64, 64, 512, 0, -1);" in src
     # C block: 64 rows of 64 halves = 128 B into rows of 256 halves = 512 B
     assert "ctx.dma_store(" in src and ", 128, 64, 512, 128);" in src
+
+
+@needs_cxx
+@pytest.mark.parametrize("count", [0, 3, 8])
+@pytest.mark.parametrize("shared", [False, True])
+def test_dynamic_dma_rows_preserve_unwritten_output(count, shared):
+    @T.prim_func
+    def row_copy(A: T.Tensor((8, 64), T.float16), Limit: T.Tensor((1,), T.int32),
+                 B: T.Tensor((9, 64), T.float16)):
+        with T.Kernel(1, threads=1):
+            if shared:
+                scratch = T.alloc_shared((8, 64), T.float16)
+            else:
+                scratch = T.alloc_local((8, 64), T.float16)
+            count_cmx = T.alloc_local((1,), T.int32)
+            T.copy(Limit, count_cmx)
+            rows = T.max(0, T.min(8, count_cmx[0]))
+            T.copy(A[0:rows, 0:64], scratch[0:rows, 0:64])
+            T.copy(scratch[0:rows, 0:64], B[1:1 + rows, 0:64])
+
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off"}):
+        low = lowering.lower(row_copy)
+    source = np.arange(512, dtype=np.float16).reshape(8, 64)
+    output = np.full((9, 64), -123, np.float16)
+    arrays = lowering.order_arrays(low, {"A": source, "Limit": np.array([count], np.int32), "B": output})
+    lib = host_sim.build(low.source, "dynamic_dma_rows")
+    host_sim.check_status(host_sim.run(lib, arrays, tiles=1, shaves=1))
+    expected = np.full_like(output, -123)
+    expected[1:1 + count] = source[:count]
+    np.testing.assert_array_equal(output, expected)
+
+
+def test_dynamic_dma_width_is_still_refused():
+    @T.prim_func
+    def width_copy(A: T.Tensor((8, 64), T.float16), Limit: T.Tensor((1,), T.int32)):
+        with T.Kernel(1, threads=1):
+            scratch = T.alloc_local((8, 64), T.float16)
+            T.copy(A[0:8, 0:Limit[0]], scratch[0:8, 0:Limit[0]])
+
+    with pytest.raises(ValueError, match="non-constant extent"):
+        _source(width_copy)
 
 
 def _run_gemm(M, N, K, BM, BN, tiles, shaves, perturb=False):

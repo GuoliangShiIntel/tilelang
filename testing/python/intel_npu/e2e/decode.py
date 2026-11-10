@@ -81,7 +81,8 @@ class DeviceModel:
     def __init__(self, ck: Checkpoint, pack_dir: Path, layers: int, smax: int, build: bool, single: bool = True, log=print,
                  layer_ids: list[int] | None = None, chunked: bool = False, prefill: int = 0,
                  prefill_ls: list[int] | None = None, prefill_shared: bool = False, prefill_overlap: bool = False,
-                 prefill_bn1: int | None = None, prefill_mb: int | None = None, prefill_mbe: int | None = None):
+                 prefill_bn1: int | None = None, prefill_mb: int | None = None, prefill_mbe: int | None = None,
+                 prefill_moe_slots: bool = False):
         self.ck, self.c, self.log = ck, ck.cfg, log
         c = self.c
         self.layer_ids = list(layer_ids) if layer_ids is not None else list(range(layers))   # checkpoint layers, in run order
@@ -90,6 +91,7 @@ class DeviceModel:
         self.smax = smax
         self.single = single
         self.prefill_n = prefill
+        self.prefill_moe_slots = prefill_moe_slots
         prefill_shared = prefill_shared or prefill_overlap
         pgeom = dict(PREFILL_GEOM)
         if prefill_bn1 is not None:
@@ -170,12 +172,14 @@ class DeviceModel:
                         L=pl, N=ps["NP"], H=c.hidden, KH=c.lin_kh, VH=c.lin_vh, DK=c.lin_dk, DV=c.lin_dv,
                         NH=c.n_heads, NKV=c.n_kv, D=c.head_dim, ROT=c.rot_dim, SMAX=smax, I=c.moe_inter,
                         E=c.n_experts, TOPK=c.top_k, G=ck.group, tiles=TILES, shaves=SHAVES, eps=c.eps,
-                        KVL=kvl, skip=pskip, HW=hw_g, shared_projections=prefill_shared, **pgeom)
+                        KVL=kvl, skip=pskip, HW=hw_g, shared_projections=prefill_shared,
+                        moe_slot_output=prefill_moe_slots, **pgeom)
                     names[f"prefill{pl}"] = (f"tl_e2e_prefill_l{pl}_n{ps['NP']}_h{c.hidden}_s{smax}"
                                              + (f"_bn{pgeom['BN1']}_mb{pgeom['MB']}" if prefill_shared or prefill_bn1 is not None or prefill_mb is not None else "")
                                              + ("_sharedproj" if prefill_shared else "")
                                              + ("_overlap" if prefill_overlap else "")
                                              + (f"_mbe{prefill_mbe}" if prefill_mbe is not None else "")
+                                             + ("_moeslots" if prefill_moe_slots else "")
                                              + ("_skip_" + "_".join(sorted(pskip)) if pskip else ""))
         else:
             kernels = {
@@ -332,7 +336,9 @@ class DeviceModel:
                            ("P_Os", NP * ps["OW"] * 2), ("P_Mix", NP * H * 2),
                            ("P_Logits", NP * ps["RR"] * 2), ("P_Ids", NP * c.top_k * 4), ("P_Wts", NP * 16 * 4),
                            ("P_Cnt", (c.n_experts + 1) * 4), ("P_Off", (c.n_experts + 2) * 4),
-                           ("P_Slot", ps["SLOTS"] * 4), ("P_PartE", TILES * NP * H * 4), ("P_MoeOut", NP * H * 4)):
+                           ("P_Slot", ps["SLOTS"] * 4),
+                           ("P_PartE", ps["SLOTS"] * H * 2 if self.prefill_moe_slots else TILES * NP * H * 4),
+                           ("P_MoeOut", NP * H * 4)):
             s.alloc(nm, nbytes)
 
     def _alloc_prefill(self):
@@ -552,6 +558,7 @@ def main(argv):
     ap.add_argument("--prefill-bn1", type=int, default=None)
     ap.add_argument("--prefill-mb", type=int, default=None)
     ap.add_argument("--prefill-mbe", type=int, default=None)
+    ap.add_argument("--prefill-moe-slots", action="store_true")
     ap.add_argument("--prefill-sweep", default=None, metavar="L1,L2,...",
                     help="layer counts to launch prefill at, ascending, from ONE session: the kernels are built in "
                          "one pass and share the weight upload, so a bisect point costs a launch instead of a "
@@ -591,7 +598,8 @@ def main(argv):
                     prefill=a.prefill if not a.per_layer else 0,
                     prefill_ls=[int(x) for x in a.prefill_sweep.split(",")] if a.prefill_sweep else None,
                     prefill_shared=a.prefill_shared, prefill_overlap=a.prefill_overlap,
-                    prefill_bn1=a.prefill_bn1, prefill_mb=a.prefill_mb, prefill_mbe=a.prefill_mbe)
+                    prefill_bn1=a.prefill_bn1, prefill_mb=a.prefill_mb, prefill_mbe=a.prefill_mbe,
+                    prefill_moe_slots=a.prefill_moe_slots)
     if a.chunked:
         print(f"chunks: {len(m.chunks)} launches per token: " + " ".join("/".join(str(i) for i in ch) for ch in m.chunks))
     try:

@@ -65,16 +65,19 @@ def _problem(seed: int = 0):
     return dict(x=x, gu_int=gu_int, gu_s=gu_s, d_int=d_int, d_s=d_s, wts=r["wts"], off=r["off"], slot=r["slot"])
 
 
-def _sim(p):
+def _sim(p, slot_output=False):
     low = _lower(make_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MB, BNG=BNG, BND=BND,
-                                         tiles=TILES, shaves=SHAVES))
+                                         tiles=TILES, shaves=SHAVES,
+                                         **({"slot_output": True} if slot_output else {})))
     lib = host_sim.build(low.source, "tl_moe_expert_sim")
     out = np.zeros((N, H), np.float32)
     arrays = dict(X=p["x"],
                   WguQ=pack_int4(p["gu_int"].reshape(-1, H)), WguS=gm_scales(p["gu_s"].reshape(-1, H // G)),
                   WdQ=pack_int4(p["d_int"].reshape(-1, I)), WdS=gm_scales(p["d_s"].reshape(-1, I // G)),
                   Wts=p["wts"].astype(np.float32), Off=p["off"].astype(np.int32),
-                  Slot=p["slot"].astype(np.int32), Part=np.zeros((TILES, N, H), np.float32), Out=out)
+                  Slot=p["slot"].astype(np.int32),
+                  Part=np.full((SLOTS, H), np.nan, np.float16) if slot_output else np.zeros((TILES, N, H), np.float32),
+                  Out=out)
     host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, arrays), TILES, SHAVES))
     return out
 
@@ -91,37 +94,46 @@ def test_lowers_with_a_dequant_per_weight_chunk_and_no_merged_fc():
 
 
 @needs_cxx
-def test_matches_the_oracle():
+@pytest.mark.parametrize("slot_output", [False, True])
+def test_matches_the_oracle(slot_output):
     p = _problem()
     ref = moe_expert_prefill_reference(p["x"], p["gu_int"], p["gu_s"], p["d_int"], p["d_s"],
                                        p["wts"], p["off"], p["slot"], TOPK=TOPK, G=G)
-    got = _sim(p)
+    got = _sim(p, slot_output=slot_output)
     rel = np.abs(got - ref).max() / np.abs(ref).max()
     assert rel < REL, f"rel {rel:.3e}"
 
 
+def test_slot_output_refuses_uneven_shave_rows():
+    with pytest.raises(AssertionError, match="slot-output token rows must divide"):
+        make_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=3,
+                               BNG=BNG, BND=BND, tiles=TILES, shaves=SHAVES, slot_output=True)
+
+
 @needs_cxx
-def test_perturbing_one_expert_moves_only_its_tokens():
+@pytest.mark.parametrize("slot_output", [False, True])
+def test_perturbing_one_expert_moves_only_its_tokens(slot_output):
     """What "grouped by expert" means: a per-token loop would pass the oracle test too, this one it would not."""
     p = _problem()
-    base = _sim(p)
+    base = _sim(p, slot_output=slot_output)
     victim = int(np.argmax(np.diff(p["off"][:E + 1])))        # the routed expert with the most tokens
     touched = {int(p["slot"][s]) // (TOPK + 1) for s in range(int(p["off"][victim]), int(p["off"][victim + 1]))}
     assert 0 < len(touched) < N, "the probe needs an expert that some but not all tokens use"
     p["d_int"][victim] = np.clip(p["d_int"][victim].astype(np.int16) + 3, -8, 7).astype(np.int8)
-    got = _sim(p)
+    got = _sim(p, slot_output=slot_output)
     moved = {t for t in range(N) if np.abs(got[t] - base[t]).max() > 1e-3}
     assert moved == touched, f"expert {victim}: tokens {sorted(moved)} moved, expected {sorted(touched)}"
 
 
 @needs_cxx
-def test_a_zeroed_choice_weight_drops_that_contribution():
+@pytest.mark.parametrize("slot_output", [False, True])
+def test_a_zeroed_choice_weight_drops_that_contribution(slot_output):
     p = _problem()
-    base = _sim(p)
+    base = _sim(p, slot_output=slot_output)
     t0, k0 = int(p["slot"][0]) // (TOPK + 1), int(p["slot"][0]) % (TOPK + 1)
     p["wts"] = p["wts"].copy()
     p["wts"][t0, k0] = 0.0
-    got = _sim(p)
+    got = _sim(p, slot_output=slot_output)
     assert np.abs(got[t0] - base[t0]).max() > 1e-3, "zeroing a choice's weight changed nothing"
     others = [t for t in range(N) if t != t0]
     assert np.abs(got[others] - base[others]).max() < 1e-3, "zeroing one token's weight moved another token"

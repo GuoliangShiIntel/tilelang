@@ -450,6 +450,13 @@ def PlanIntelNpuDistribution():
                 shave_branch[-1] = True
                 notes.append(f"{dst.buffer.name}: filled under a SHAVE-dependent branch, tile sync after the branch")
                 return None
+            if not isinstance(args[3], tirx.IntImm):
+                if _uses(args[3], launch.shave_var):
+                    raise ValueError("intel_npu: shared DMA row count must be uniform within the tile")
+                fill = tirx.IfThenElse(launch.shave_var == 0, stmt, None)
+                notes.append(f"{dst.buffer.name}: dynamic resident rows filled by SHAVE 0, tile sync after")
+                return tirx.SeqStmt(([_storage_sync_shared()] if loop_depth[0] > 0 else [])
+                                   + [fill, _storage_sync_shared()])
             rows = _const(args[3])
             spt = launch.shaves
             tx = launch.shave_var
