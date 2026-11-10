@@ -913,6 +913,8 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
         pw = T.alloc_local((1, H), T.float32)
         pa = T.alloc_local((1, H), T.float32)
         zr = T.alloc_local((1, H), T.float32)
+        tk = T.alloc_local((2,), T.int32)      # the live token's row, read once per token rather than per element
+        aw = T.alloc_local((2,), T.float32)    # and its routing weight
         seen = T.alloc_shared((N,), T.int32)       # per token: has an expert of this TILE written its partial yet?
         T.copy(Off[0], off_cmx)
         T.copy(Slot[0], slot_cmx)
@@ -989,21 +991,23 @@ def make_moe_expert_prefill(N: int = 32, H: int = 256, I: int = 128, E: int = 16
                     perf_begin("accm")
                     for i in T.serial(MB):
                         if i % shaves == shave and off_cmx[e] + c * MB + i < off_cmx[e + 1]:
+                            # hoisted: the weight was read INSIDE the vectorised loop, so two indirections and a
+                            # div/mod ran once per element -- H times per token -- instead of once per token
+                            tk[0] = slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1)
+                            aw[0] = wts_cmx[tk[0], slot_cmx[off_cmx[e] + c * MB + i] % (TOPK + 1)]
                             # the first touch of a row stores, so the partial never has to be zeroed up front
-                            if seen[slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1)] == 0:
-                                seen[slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1)] = 1
+                            if seen[tk[0]] == 0:
+                                seen[tk[0]] = 1
                                 for c0 in T.serial(H // FL):
                                     for v in T.vectorized(FL):
                                         pw[0, c0 * FL + v] = T.float32(0)
                             else:
-                                T.copy(Part[tile, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), 0], pw)
+                                T.copy(Part[tile, tk[0], 0], pw)
                             for c0 in T.serial(H // FL):
                                 for v in T.vectorized(FL):
                                     pw[0, c0 * FL + v] = (pw[0, c0 * FL + v]
-                                                          + wts_cmx[slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1),
-                                                                    slot_cmx[off_cmx[e] + c * MB + i] % (TOPK + 1)]
-                                                          * T.cast(yo[i, c0 * FL + v], T.float32))
-                            T.copy(pw, Part[tile, slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), 0])
+                                                          + aw[0] * T.cast(yo[i, c0 * FL + v], T.float32))
+                            T.copy(pw, Part[tile, tk[0], 0])
                     perf_end()
                     T.sync_threads()
         T.sync_threads()
@@ -2037,6 +2041,13 @@ def make_gdn_scan_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
                         for j0 in T.serial(C // HL):
                             for v in T.vectorized(HL):
                                 ac[j0 * HL + v] = la[j0 * HL + v]
+                        # ONE accumulator, and not for want of trying. npu_dsl's gdn_chunk_tri uses FOUR to break
+                        # this FMA dependency chain; ported here it measured 419.652 -> 427.565 ms in fp32 and
+                        # 401.395 -> 413.139 ms in fp16, so the dtype was not what made the difference. Its four
+                        # live in `half32 a0[NB]` C++ LOCALS -- registers. A T.alloc_local array indexed in a loop
+                        # is CMX through a pointer and moviCompile will not promote it, so every FMA pays a load
+                        # and a store and the extra traffic outweighs the parallelism. Needs register-resident
+                        # accumulators in the DSL, not a different accumulator count.
                         for m in T.serial(i):
                             eh[0] = la[m]
                             for j0 in T.serial(C // HL):
