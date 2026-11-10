@@ -98,14 +98,19 @@ def test_dynamic_dma_width_is_still_refused():
 
 
 @needs_cxx
-@pytest.mark.parametrize("interleave", [False, True])
-def test_pure_gather_loop_batches_without_changing_results(interleave):
+@pytest.mark.parametrize("shared, interleave", [(False, False), (False, True), (True, False)])
+def test_pure_gather_loop_batches_without_changing_results(shared, interleave):
+    shaves = 2 if shared else 1
+
     @T.prim_func
     def gather_rows(A: T.Tensor((6, 64), T.float16), Index: T.Tensor((6,), T.int32),
                     B: T.Tensor((6, 64), T.float16)):
-        with T.Kernel(1, threads=1):
+        with T.Kernel(1, threads=shaves):
             positions = T.alloc_local((6,), T.int32)
-            gathered = T.alloc_local((6, 64), T.float16)
+            if shared:
+                gathered = T.alloc_shared((6, 64), T.float16)
+            else:
+                gathered = T.alloc_local((6, 64), T.float16)
             T.copy(Index, positions)
             for row in T.serial(6):
                 T.copy(A[positions[row], 0:64], gathered[row, 0:64])
@@ -121,7 +126,7 @@ def test_pure_gather_loop_batches_without_changing_results(interleave):
     output = np.full_like(source, np.nan)
     lib = host_sim.build(low.source, "batch_gather_rows")
     arrays = lowering.order_arrays(low, {"A": source, "Index": order, "B": output})
-    host_sim.check_status(host_sim.run(lib, arrays, tiles=1, shaves=1))
+    host_sim.check_status(host_sim.run(lib, arrays, tiles=1, shaves=shaves))
     expected = source[order].copy()
     if interleave:
         expected[:, 0] += np.float16(1)

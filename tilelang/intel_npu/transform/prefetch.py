@@ -473,7 +473,7 @@ def PlanIntelNpuDmaBatch():
                 return None
             dst = _dst_buffer(fill)
             source = fill.args[1]
-            if dst is None or dst.scope() != "local" or len(dst.shape) != 2 or not _is_compact(dst):
+            if dst is None or dst.scope() not in ("local", "shared") or len(dst.shape) != 2 or not _is_compact(dst):
                 return None
             if not (isinstance(source, tirx.Call) and source.args and isinstance(source.args[0], tirx.BufferLoad)):
                 return None
