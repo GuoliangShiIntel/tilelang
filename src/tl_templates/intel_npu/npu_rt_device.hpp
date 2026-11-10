@@ -448,6 +448,7 @@ public:
   TL_NPU_HW_CALL void dpu_matmul(half *out, const half *a, const half *bt, std::uint32_t M,
                   std::uint32_t N, std::uint32_t K, std::uint32_t spatialX = 0,
                   std::int32_t mpe = -1) {
+    dpu_matmul_wait();   // the pending workload owns the descriptor set dpu_prepare would re-prepare
     if (!dpu_prepare(M, N, K, spatialX, mpe))
       return;
     // No barriers on a synchronous workload (a ring use may have set them).
@@ -456,6 +457,35 @@ public:
     ++dpuStarts_;
     mm_->run(out, const_cast<half *>(a), const_cast<half *>(bt));
     TL_NPU_COMPILER_BARRIER();
+    dpu_account();
+  }
+
+  // The same workload split in two, so the SHAVE can work while the DPU runs (npu_dsl's expert FFN
+  // dequantises the next weight tile during the current tile's matmul; with the synchronous form the DPU sat
+  // at 4% busy through the MoE phase). ONE workload in flight: a second start waits for the first, because
+  // the descriptor set it would re-prepare is the one still in use.
+  TL_NPU_HW_CALL void dpu_matmul_start(half *out, const half *a, const half *bt, std::uint32_t M,
+                                       std::uint32_t N, std::uint32_t K, std::uint32_t spatialX = 0,
+                                       std::int32_t mpe = -1) {
+    dpu_matmul_wait();
+    if (!dpu_prepare(M, N, K, spatialX, mpe))
+      return;
+    mm_->setConsumerBarriers(0, 0);
+    mm_->setProducerBarriers(0, 0);
+    ++dpuStarts_;
+    mm_->start(out, const_cast<half *>(a), const_cast<half *>(bt));
+    TL_NPU_COMPILER_BARRIER();
+    dpuPend_ = mm_;
+  }
+
+  TL_NPU_HW_CALL void dpu_matmul_wait() {
+    if (dpuPend_ == nullptr)
+      return;
+    const std::uint32_t t0 = perf_ticks();
+    dpuPend_->wait();
+    TL_NPU_COMPILER_BARRIER();   // the output's loads stay after the wait
+    dpuPend_ = nullptr;
+    ringTicks_[kTickDpuWait] += perf_ticks() - t0;
     dpu_account();
   }
 
@@ -494,6 +524,7 @@ public:
   // scratch `part` is double-buffered for it; `qg_flush()` runs a pending reduction (before any read of `out`: the
   // codegen emits it where the author's statements read the output, and the sync / finish paths call it).
   TL_NPU_HW_CALL void qg_flush() {
+    dpu_matmul_wait();   // an asynchronous fp16 workload is pending here for the same reason
     if (i4Pend_.out != nullptr) {
       q_reduce(i4Pend_.out, i4Pend_.part, i4Pend_.sT, i4Pend_.sRow, i4Pend_.M, i4Pend_.N, i4Pend_.ng, i4Pend_.inv);
       i4Pend_.out = nullptr;
@@ -1602,6 +1633,7 @@ private:
   std::uint32_t dpuStamp_{0};
   std::uint32_t dpuStarts_{0};
   DpuMatMul *mm_{nullptr};                           // the set of the last prepared shape
+  DpuMatMul *dpuPend_{nullptr};                      // a workload started and not yet waited for
   DpuMatMul::DescriptorsBuffer *dpuDesc_{nullptr};
   // Mixed-mode (fp16 x int4 weights) set for dpu_matmul_i4g, allocated on first use.
   static constexpr float kI4PartScale = 1.0f / 16.0f;  // PPE multiplier keeping the group partials in fp16 range

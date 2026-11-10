@@ -124,6 +124,8 @@ def main(argv):
     n, pos0 = arg(argv, "--n", 192), arg(argv, "--pos0", 0)
     trials = arg(argv, "--trials", 3)
     BN1 = BN2 = arg(argv, "--bn", 32)
+    global MBe
+    MBe = arg(argv, "--mbe", MBe)
     SMAX = arg(argv, "--smax", 1536)
     skip = frozenset(x for x in (argv[argv.index("--skip") + 1].split(",") if "--skip" in argv else []) if x)
     L = len(kinds)
@@ -148,6 +150,7 @@ def main(argv):
                                                 conv_blocked="--roundrobin" not in argv,
                                                 conv_item_worker="shave" if "--shave-major" in argv else "tile"))
     name = (f"tl_prefill_model_l{L}_n{NP}_h{H}_s{SMAX}_bn{BN1}"
+            + (f"_mbe{MBe}" if MBe != 16 else "")
             + (f"_t{TILES}" if TILES != 3 else "")
             + ("_sm" if "--shave-major" in argv else "")
             + ("_rr" if "--roundrobin" in argv else "")
