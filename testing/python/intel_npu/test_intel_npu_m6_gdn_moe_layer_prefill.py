@@ -21,7 +21,7 @@ import host_sim  # noqa: E402
 import lowering  # noqa: E402
 from kernels import (gdn_moe_layer_prefill_reference, gm_scales, make_gdn_moe_layer_prefill,  # noqa: E402
                      make_moe_route_prefill, pack_int4)
-from test_intel_npu_scoped_cmx import allocations_inside_loops  # noqa: E402
+from test_intel_npu_scoped_cmx import allocations_inside_loops, unseparated_scope_siblings  # noqa: E402
 
 TILES, SHAVES = 2, 2
 N, H, KH, VH, DK, DV, G = 64, 256, 4, 8, 64, 64, 128
@@ -120,7 +120,8 @@ def test_the_layer_does_not_reintroduce_question_10():
     # depth, not membership: question 10's defect was the GDN scan's `xr` at depth 3, re-allocated 1152 times a
     # worker. The expert phase's buffers sit at depth 1, which is the form P3 earned 12/12 device trials in, and
     # pinning them at kernel level instead costs the layer more CMX than it has.
-    assert max((d for _, d in allocations_inside_loops(src)), default=0) <= 1
+    assert unseparated_scope_siblings(src) == []
+    assert max((d for _, d in allocations_inside_loops(src)), default=0) <= 2
     # nine phases, each dealt differently, so eight boundaries at least
     assert src.count("ctx.sync_grid();") >= 8
     assert "ctx.alloc" in src   # control: the needle the first assertion looks for is present at all

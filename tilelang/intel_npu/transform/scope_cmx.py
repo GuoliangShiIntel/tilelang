@@ -5,10 +5,15 @@ another share CMX through the runtime's scoped bump allocator (codegen brackets 
 Runs after LowerOpaqueBlock, on flat `AllocBuffer` statements. Two moves:
 
 1. **Phases.** Within any block body (the kernel's root sequence, a loop body, a scope), the statements between
-   consecutive grid barriers (`T.sync_grid()` / `tvm_storage_sync("global")`) are phases. An allocation declared in
-   that block and used by exactly one phase moves into it, and the phase becomes a `lexical_alloc_scope` block.
-   PlanAndUpdateBufferAllocationLocation (run just before) already sank allocations into loop bodies; this is the
-   same idea for the straight-line phases of a megakernel, which have no block of their own in TIR.
+   consecutive RENDEZVOUS points are phases: a grid barrier (`T.sync_grid()`) or a TILE sync
+   (`T.sync_threads()`). An allocation declared in that block and used by exactly one phase moves into it, and
+   the phase becomes a `lexical_alloc_scope` block. PlanAndUpdateBufferAllocationLocation (run just before)
+   already sank allocations into loop bodies; this is the same idea for the straight-line phases of a megakernel,
+   which have no block of their own in TIR.
+   The rendezvous is what makes the sharing sound, and it is the condition npu_dsl's `plan_cmx` checks by name
+   (`_separated_by_rendezvous`): the tile's SHAVEs are not in lockstep, so one may reuse bytes the other is still
+   reading unless a barrier separates the two live ranges BOTH ways round -- between them, and across the
+   enclosing loop's back edge. Phases split this way satisfy both, since each ends at a sync.
 2. **Uniformity.** An allocation under a condition that depends on the SHAVE index is hoisted to the enclosing
    uniform block: every SHAVE of a tile must run the same allocation sequence, or shared buffers get different
    addresses on the two SHAVEs (the ring slots, the x row). Tile-dependent conditions are fine: a tile's SHAVEs
@@ -18,9 +23,10 @@ Runs after LowerOpaqueBlock, on flat `AllocBuffer` statements. Two moves:
    the peak over that loop is the same either way -- while the runtime re-runs mark / alloc / restore once per
    iteration for an address that never changes. That cost correctness, not just time: the GDN prefill scan had
    one 512 B scratch buffer sunk into a per-row loop (1152 allocations per worker) and was intermittently wrong
-   on 2+ tiles, 4/12 trials clean at 3 x 2, 12/12 once it stayed put (plan question 10). The price is that two
-   SIBLING loops with different buffers no longer share those bytes, so the peak becomes their sum;
-   CheckIntelNpuBudgets prices the result and refuses a kernel that stops fitting.
+   on 2+ tiles, 4/12 trials clean at 3 x 2, 12/12 once it stayed put (plan question 10). Two SIBLING loops with
+   different buffers therefore land side by side in the parent block rather than sharing bytes -- unless a
+   rendezvous separates them, in which case rule 1 puts each in its own phase scope. That is what the MoE
+   expert's gate/up and down weight tiles rely on.
 """
 
 from __future__ import annotations
@@ -44,6 +50,27 @@ def _is_sync_grid(stmt) -> bool:
     if name == "tir.tvm_storage_sync" and len(call.args) == 1 and isinstance(call.args[0], tirx.StringImm):
         return call.args[0].value == "global"
     return False
+
+
+def _storage_sync_scope(stmt):
+    """The scope string of a `tvm_storage_sync` statement, else None. The op is registered under both the `tir.`
+    and the `tirx.` prefix depending on how it was built (`T.sync_threads` emits the latter)."""
+    if not (isinstance(stmt, tirx.Evaluate) and isinstance(stmt.value, tirx.Call)):
+        return None
+    call = stmt.value
+    if getattr(call.op, "name", "").split(".")[-1] != "tvm_storage_sync" or not call.args:
+        return None
+    return call.args[0].value if isinstance(call.args[0], tirx.StringImm) else None
+
+
+def _is_sync_tile(stmt) -> bool:
+    return _storage_sync_scope(stmt) in ("shared", "shared.dyn")
+
+
+def _is_phase_split(stmt) -> bool:
+    """A rendezvous every SHAVE of the tile passes, so the phases either side may share CMX bytes: the grid
+    barrier, and the TILE sync -- which is what separates an expert's gate/up weights from its down weights."""
+    return _is_sync_grid(stmt) or _is_sync_tile(stmt)
 
 
 def _shave_var(func: tirx.PrimFunc):
@@ -205,10 +232,23 @@ class _Scoper:
         for s in items:
             flat.extend(self.flatten(s))
         items = flat
-        # phases of this block, split by grid barriers
+        # Grid barriers first; a block with none falls back to its TILE syncs. The order matters and is not a
+        # preference: an allocation moves only when ONE phase uses it, so splitting finer can scope FEWER of them
+        # and push the rest back to the block head, where they are summed. Measured on the n=1024 prefill model:
+        # splitting on both at once took the peak from 1634944 B to 2016640 B.
+        out = self._phase_scope(items, _is_sync_grid)
+        if out is None and not any(_has_ring(s) for s in items):
+            # a ring's slots and its use loop are addressed by use parity, so its block keeps its allocations
+            # where LowerIntelNpuPipelined put them (the same reason _hoist_from_loop leaves ring loops alone)
+            out = self._phase_scope(items, _is_sync_tile, need_two_owners=True)
+        return out if out is not None else (_seq(items) if items else stmt)
+
+    def _phase_scope(self, items: list, is_split, need_two_owners: bool = False):
+        """Put each allocation used by exactly one of `items`' phases into that phase's `lexical_alloc_scope`.
+        None when `is_split` finds no boundary, so the caller can try a coarser rendezvous."""
         phases, cur = [], []
         for s in items:
-            if _is_sync_grid(s):
+            if is_split(s):
                 phases.append(cur)
                 phases.append([s])
                 cur = []
@@ -216,7 +256,7 @@ class _Scoper:
                 cur.append(s)
         phases.append(cur)
         if len(phases) == 1:
-            return _seq(items) if items else stmt
+            return None
         # DDR views (`T.ddr_view`: a Bind of a ddr_ptr call and its DeclBuffer) go to the block's head: a phase
         # becomes its own C++ block, and a view declared inside one would be out of scope for the next. Their
         # values read only kernel parameters and loop variables, all defined at the block's start.
@@ -240,6 +280,10 @@ class _Scoper:
             where = [i for i, u in enumerate(uses) if key in u]
             if len(where) == 1:
                 home[id(a)] = where[0]
+        if need_two_owners and len({i for i in home.values()}) < 2:
+            # nothing to overlap, so scoping would move allocations INTO a loop body for no CMX at all -- and that
+            # is the state question 10 was about. Only pay it where two groups actually share the bytes.
+            return None
         out = []
         for i, ph in enumerate(phases):
             moved = [a for a in allocs if home.get(id(a)) == i]

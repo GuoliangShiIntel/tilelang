@@ -180,10 +180,14 @@ def _oracle(layers, h, pos0=0, n=N):
 
 def test_the_model_does_not_reintroduce_question_10():
     src = lowering.lower(_kernel()).source
-    from test_intel_npu_scoped_cmx import allocations_inside_loops
+    from test_intel_npu_scoped_cmx import allocations_inside_loops, unseparated_scope_siblings
     # the layer loop puts every phase one level deeper than the layer kernels; the expert phase's own buffers are
-    # the depth-1 form P2b earned its device trials in, so the bar is the layer loop plus that
-    assert max((d for _, d in allocations_inside_loops(src)), default=0) <= 2
+    # the depth-1 form P2b earned its device trials in, so the bar is the layer loop plus that. The expert's
+    # gate/up and down weight tiles then take one more level, because ScopeIntelNpuCmx overlaps their bytes --
+    # which is sound only because a tile sync separates the two scopes, and THAT is what gets asserted. Depth
+    # alone cannot tell the two apart. Device: 12/12 at 3 x 2, n=1024 MBe=32 BNG=64, 377.163 ms.
+    assert unseparated_scope_siblings(src) == []
+    assert max((d for _, d in allocations_inside_loops(src)), default=0) <= 3
     assert src.count("ctx.sync_grid();") >= 10
     # the caches are kernel parameters; only the weights come from the table (question 8)
     assert "KcAll" in src and "VtAll" in src

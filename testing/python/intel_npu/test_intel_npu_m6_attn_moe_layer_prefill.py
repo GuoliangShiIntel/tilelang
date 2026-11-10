@@ -21,7 +21,7 @@ import host_sim  # noqa: E402
 import lowering  # noqa: E402
 from kernels import (attn_moe_layer_prefill_reference, gm_scales, make_attn_moe_layer_prefill,  # noqa: E402
                      make_moe_route_prefill, pack_int4, rope_cos_sin)
-from test_intel_npu_scoped_cmx import allocations_inside_loops  # noqa: E402
+from test_intel_npu_scoped_cmx import allocations_inside_loops, unseparated_scope_siblings  # noqa: E402
 
 TILES, SHAVES = 2, 2
 N, H, NH, NKV, D, ROT, SMAX, G = 32, 256, 4, 2, 32, 16, 128, 128
@@ -117,7 +117,8 @@ def test_the_layer_does_not_reintroduce_question_10():
     src = lowering.lower(_kernel()).source
     # depth, not membership, for the reason the GDN+MoE layer's test gives: the expert phase's buffers sit at
     # depth 1, which is the form P2b earned its device trials in
-    assert max((d for _, d in allocations_inside_loops(src)), default=0) <= 1
+    assert unseparated_scope_siblings(src) == []
+    assert max((d for _, d in allocations_inside_loops(src)), default=0) <= 2
     assert src.count("ctx.sync_grid();") >= 8   # ten phases, each dealt differently
     assert "ctx.alloc" in src      # control: the needle the first assertion looks for is present at all
     assert "ddr_view" not in src   # the caches stay kernel parameters (question 8)

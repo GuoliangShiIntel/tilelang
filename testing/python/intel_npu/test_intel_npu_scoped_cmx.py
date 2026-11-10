@@ -201,6 +201,67 @@ def allocations_inside_loops(src: str) -> list[tuple[str, int]]:
     return out
 
 
+def unseparated_scope_siblings(src: str) -> list[tuple[str, int]]:
+    """(buffer, line) for every CMX scope block inside a loop that reuses the bytes of an earlier sibling scope
+    with no rendezvous between them.
+
+    Two sibling scopes share CMX -- CheckIntelNpuBudgets charges the heavier, not the sum -- and the tile's two
+    SHAVEs are not in lockstep, so one may hand its bytes to the next block while the other still reads them.
+    A `ctx.sync_tile()` (or `ctx.sync_grid()`) between them is what makes the reuse sound; npu_dsl's `plan_cmx`
+    checks the same condition by name (`_separated_by_rendezvous`). This is the invariant question 10's bare
+    depth bound was standing in for: depth alone cannot tell a sound reuse from an unsound one."""
+    out, depth, loops = [], 0, []
+    opened = {}        # brace depth -> the buffer named by the scope block opened there
+    pending = {}       # brace depth -> a scope closed here and no rendezvous since
+    lines = src.splitlines()
+    for i, ln in enumerate(lines):
+        st = ln.strip()
+        if re.search(r"ctx\.sync_tile\(\)|ctx\.sync_grid\(\)", st):
+            pending = {d: v for d, v in pending.items() if d < depth}
+        m = re.search(r"ctx\.alloc(?:_shared)?<", st)
+        if m and depth in opened and opened[depth] is None:
+            nm = re.search(r"__restrict (\w+)", st)
+            opened[depth] = nm.group(1) if nm else "?"
+            if loops and pending.get(depth):
+                out.append((opened[depth], i + 1))
+        if st == "{" or st.endswith("{"):
+            depth += 1
+            nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            opened[depth] = None if "npu::Ctx::CmxScope" in nxt else "-"
+            if st.startswith("for ("):
+                loops.append(depth - 1)
+        if st.startswith("}"):
+            if opened.get(depth) not in (None, "-"):
+                pending[depth] = True
+            opened.pop(depth, None)
+            depth -= 1
+            while loops and depth <= loops[-1]:
+                loops.pop()
+    return out
+
+
+def test_unseparated_scope_siblings_detects_an_unsound_reuse():
+    """The positive control for `unseparated_scope_siblings`: a zero from it must mean the source is sound, not
+    that the detector cannot see. Two sibling scopes inside a loop with a sync between them are fine; the same
+    pair with the sync removed is the unsound reuse, and it must be named."""
+    def src(sep):
+        return ("for (int32_t c = 0; c < 4; ++c) {\n"
+                "  {\n"
+                "    npu::Ctx::CmxScope cmx_scope_1(ctx);\n"
+                "    half* __restrict a_cmx = ctx.alloc<half>(64);\n"
+                "  }\n"
+                + ("  ctx.sync_tile();\n" if sep else "")
+                + "  {\n"
+                "    npu::Ctx::CmxScope cmx_scope_2(ctx);\n"
+                "    half* __restrict b_cmx = ctx.alloc<half>(64);\n"
+                "  }\n"
+                "}\n")
+
+    assert unseparated_scope_siblings(src(True)) == []
+    bad = unseparated_scope_siblings(src(False))
+    assert [b for b, _ in bad] == ["b_cmx"], f"the detector missed the unseparated reuse: {bad}"
+
+
 def test_the_kernels_that_allocate_inside_a_loop_are_the_ones_we_know_about():
     """Question 10's exposure list, pinned. A kernel that starts allocating inside a loop either stops doing it or
     is added here with a reason -- it cannot arrive unnoticed, which is how P3 shipped a kernel that was wrong two
