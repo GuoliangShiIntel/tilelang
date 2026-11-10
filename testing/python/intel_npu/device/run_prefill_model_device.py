@@ -158,7 +158,8 @@ def main(argv):
                                                 conv_blocked="--roundrobin" not in argv,
                                                 conv_item_worker="shave" if "--shave-major" in argv else "tile",
                                                 shared_projections="--shared-projections" in argv,
-                                                moe_slot_output="--moe-slots" in argv))
+                                                moe_slot_output="--moe-slots" in argv,
+                                                separate_shared_expert="--shared-expert" in argv))
     print(f"lower {time.time() - t_low:.0f} s")
     name = (f"tl_prefill_model_l{L}_n{NP}_h{H}_s{SMAX}_bn{BN1}"
             + (f"_bn2{BN2}" if BN2 != BN1 else "")
@@ -168,6 +169,7 @@ def main(argv):
             + ("_sharedproj" if "--shared-projections" in argv else "")
             + ("_overlap" if "--overlap" in argv else "")
             + ("_moeslots" if "--moe-slots" in argv else "")
+            + ("_sharedexpert" if "--shared-expert" in argv else "")
             + (f"_db{DB}" if DB != 4 else "")
             + (f"_t{TILES}" if TILES != 3 else "")
             + ("_sm" if "--shave-major" in argv else "")
@@ -251,7 +253,8 @@ def main(argv):
                        ("Mix", NP * H * 2), ("Logits", NP * RR * 2), ("Ids", NP * TOPK * 4),
                        ("Wts", NP * 16 * 4), ("Cnt", (E + 1) * 4), ("Off", (E + 2) * 4), ("Slot", SLOTS * 4),
                        ("PartE", SLOTS * H * 2 if "--moe-slots" in argv else TILES * NP * H * 4),
-                       ("MoeOut", NP * H * 4), ("Hio", NP * H * 4)):
+                       ("MoeOut", NP * H * 4), ("Hio", NP * H * 4),
+                       ("SharedGu", NP * 2 * I * 2), ("SharedAct", NP * I * 2)):
         s.alloc(nm, nbytes)
     bufs = [n for n in low.param_names]
 

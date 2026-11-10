@@ -65,10 +65,11 @@ def _problem(seed: int = 0):
     return dict(x=x, gu_int=gu_int, gu_s=gu_s, d_int=d_int, d_s=d_s, wts=r["wts"], off=r["off"], slot=r["slot"])
 
 
-def _sim(p, slot_output=False):
+def _sim(p, slot_output=False, separate_shared=False):
     low = _lower(make_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MB, BNG=BNG, BND=BND,
                                          tiles=TILES, shaves=SHAVES,
-                                         **({"slot_output": True} if slot_output else {})))
+                                         **({"slot_output": True} if slot_output else {}),
+                                         **({"separate_shared": True} if separate_shared else {})))
     lib = host_sim.build(low.source, "tl_moe_expert_sim")
     out = np.zeros((N, H), np.float32)
     arrays = dict(X=p["x"],
@@ -77,7 +78,8 @@ def _sim(p, slot_output=False):
                   Wts=p["wts"].astype(np.float32), Off=p["off"].astype(np.int32),
                   Slot=p["slot"].astype(np.int32),
                   Part=np.full((SLOTS, H), np.nan, np.float16) if slot_output else np.zeros((TILES, N, H), np.float32),
-                  Out=out)
+                  Out=out, SharedGu=np.full((N, 2 * I), np.nan, np.float16),
+                  SharedAct=np.full((N, I), np.nan, np.float16))
     host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, arrays), TILES, SHAVES))
     return out
 
@@ -111,29 +113,57 @@ def test_slot_output_refuses_uneven_shave_rows():
 
 
 @needs_cxx
-@pytest.mark.parametrize("slot_output", [False, True])
-def test_perturbing_one_expert_moves_only_its_tokens(slot_output):
+def test_separate_shared_matches_grouped_output():
+    problem = _problem(seed=9)
+    expected = _sim(problem, slot_output=True)
+    actual = _sim(problem, slot_output=True, separate_shared=True)
+    assert np.isfinite(actual).all()
+    assert np.abs(actual - expected).max() / max(float(np.abs(expected).max()), 1e-6) < 1e-3
+
+
+def test_separate_shared_requires_slots_and_complete_blocks():
+    kwargs = dict(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MB, BNG=BNG, BND=BND,
+                  tiles=TILES, shaves=SHAVES, separate_shared=True)
+    with pytest.raises(AssertionError, match="requires slot-major output"):
+        make_moe_expert_prefill(**kwargs)
+    kwargs["N"] = N + 2
+    with pytest.raises(AssertionError, match="requires complete token blocks"):
+        make_moe_expert_prefill(**kwargs, slot_output=True)
+
+
+@needs_cxx
+@pytest.mark.parametrize("slot_output,separate_shared", [(False, False), (True, False), (True, True)])
+def test_perturbing_one_expert_moves_only_its_tokens(slot_output, separate_shared):
     """What "grouped by expert" means: a per-token loop would pass the oracle test too, this one it would not."""
     p = _problem()
-    base = _sim(p, slot_output=slot_output)
+    base = _sim(p, slot_output=slot_output, separate_shared=separate_shared)
     victim = int(np.argmax(np.diff(p["off"][:E + 1])))        # the routed expert with the most tokens
     touched = {int(p["slot"][s]) // (TOPK + 1) for s in range(int(p["off"][victim]), int(p["off"][victim + 1]))}
     assert 0 < len(touched) < N, "the probe needs an expert that some but not all tokens use"
     p["d_int"][victim] = np.clip(p["d_int"][victim].astype(np.int16) + 3, -8, 7).astype(np.int8)
-    got = _sim(p, slot_output=slot_output)
+    got = _sim(p, slot_output=slot_output, separate_shared=separate_shared)
     moved = {t for t in range(N) if np.abs(got[t] - base[t]).max() > 1e-3}
     assert moved == touched, f"expert {victim}: tokens {sorted(moved)} moved, expected {sorted(touched)}"
 
 
 @needs_cxx
-@pytest.mark.parametrize("slot_output", [False, True])
-def test_a_zeroed_choice_weight_drops_that_contribution(slot_output):
+@pytest.mark.parametrize("slot_output,separate_shared", [(False, False), (True, False), (True, True)])
+def test_a_zeroed_choice_weight_drops_that_contribution(slot_output, separate_shared):
     p = _problem()
-    base = _sim(p, slot_output=slot_output)
+    base = _sim(p, slot_output=slot_output, separate_shared=separate_shared)
     t0, k0 = int(p["slot"][0]) // (TOPK + 1), int(p["slot"][0]) % (TOPK + 1)
     p["wts"] = p["wts"].copy()
     p["wts"][t0, k0] = 0.0
-    got = _sim(p, slot_output=slot_output)
+    got = _sim(p, slot_output=slot_output, separate_shared=separate_shared)
     assert np.abs(got[t0] - base[t0]).max() > 1e-3, "zeroing a choice's weight changed nothing"
     others = [t for t in range(N) if t != t0]
     assert np.abs(got[others] - base[others]).max() < 1e-3, "zeroing one token's weight moved another token"
+
+
+@needs_cxx
+def test_perturbing_shared_expert_moves_all_tokens():
+    problem = _problem(seed=17)
+    expected = _sim(problem, slot_output=True, separate_shared=True)
+    problem["d_int"][E] = np.clip(problem["d_int"][E].astype(np.int16) + 3, -8, 7).astype(np.int8)
+    actual = _sim(problem, slot_output=True, separate_shared=True)
+    assert set(np.flatnonzero(np.max(np.abs(actual - expected), axis=1) > 1e-3)) == set(range(N))

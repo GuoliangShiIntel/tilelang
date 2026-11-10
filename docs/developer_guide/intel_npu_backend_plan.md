@@ -4,6 +4,70 @@ Status: plan, 2026-11-06. Branch `feat/intel-npu-backend`. Living document: ever
 its outcome in place when it closes (date, commit, evidence path). Decisions that change get a dated
 amendment, not a silent edit.
 
+## 2026-11-10: Separate dense shared expert
+
+Starting point `c7b3f03a`. The reference `npu_dsl/lib/moe.py::moe_prefill` runs the shared expert as
+dense gate/up, activation and down phases, separately from routed experts. Our grouped expert loop
+still assigned the shared expert to one tile and reloaded/dequantised its weights for every token block.
+This iteration changes only that scheduling choice, not routing, weight format, GEMM tile sizes or combine.
+No matched numerical npu_dsl benchmark is claimed.
+
+Opt-in `make_moe_expert_prefill(separate_shared=True)` composes the existing projections and a batch
+SwiGLU phase, then runs the original grouped path for routed experts only. Each dense weight-row tile
+remains resident while traversing all token blocks. The down projection writes at `Off[E]`, preserving
+the sorted shared slots and the existing weighted combine. Projection support is reusable:
+`weight_row_offset` selects a fixed prefix in packed weights/scales, and `output_row_base=True`
+returns a macro accepting a runtime output-row origin. A separate shifted projection test checks both
+offsets and preserves sentinel rows without using MoE. There is no new emitter or compiler pass.
+
+Contracts: separate shared expert requires slot-major output and complete dense token blocks. Default
+flags preserve the previous path and generated baseline sources. Extra DDR scratch at capacity 1152,
+intermediate width 512 is 2.25 MiB gate/up plus 1.125 MiB activation, reused across all layers. Packed
+weights and the 17.91 GB upload are unchanged. Shared weights are still SHAVE-private row tiles; this
+does not implement the reference's shared-weight double-buffered routed-expert pipeline.
+
+Prediction: 12-25 ms less for the two-layer canary by removing repeated shared-expert dequant/dispatch.
+Same-shape clean TURBO, unprofiled and uninstrumented, 3 independent oracle trials: median
+279.157 -> 269.372 ms, 3.5% less; both 3/3 PASS, worst rel 3.85e-2. Sources `852472f5b952` and
+`d3f786e6b42f`. The 9.785 ms gain is below the initial prediction: that model overestimated critical-path
+savings from dequant counts and omitted dense intermediate stores. It is not a calibrated speedup model.
+
+Complete task attribution (observability only), source `f6ee3b6c8b58`: 428366 records, dropped=0,
+six workers. Mexp span 150263 -> 135845 us/worker, barrier 19159 -> 8291 us/worker; grouped gdeq
+about 2426 -> 2234 calls/worker and ddeq 4853 -> 4469, replaced by 16 dense pdeq calls/worker.
+Total mexp DPU count remains 7280 calls/worker, not less computation. Dense intermediates increase
+mexp DMA store jobs from 639 to 1203 calls/worker. Reduced tile waiting supports the load-balance
+explanation; dequant/gather remain the next hot sites. The trace covers the whole two-layer canary,
+not all 40 checkpoint layers, and is not the source of latency claims.
+
+Real-checkpoint E2E, 40/40 layers, same deterministic 1024-token input from the recipe below, capacity
+1152, 1023 tokens prefilled. BN1=128/BN2=32/MB=16/MBe=32 and decode stay unchanged:
+
+| Arm | Prefill source SHA256 | Clean prefill | TTFT |
+|---|---|---|---|
+| shared still grouped | `9e62c869ca47` | 6025 ms | 6.14 s |
+| separate dense shared expert | `38f3d22247c6` | 5875 ms | 5.99 s |
+
+UNPROFILED TURBO cold, no warmup, one timed launch per arm, build/upload excluded: 2.4% less TTFT
+in this single paired observation, not repeated E2E medians. Both arms generate the same 8 tokens.
+Saved short-prompt golden passes 2/2 trials x 8/8, worst logits error 0.318; source `0153fd30e667`.
+Host tests cover partial capacity, residual/KV/conv/SSM state, routed-expert isolation, zero weights,
+shared-expert perturbation affecting all tokens, and unsupported configurations. Final gate: 210 tests
+passed. SDK `daf6c05`, decode `2c88462809d8`; formatting checks remain deferred.
+
+For the measured 1K input add the deterministic `--ids` from the E2E recipe below; `--prefill 1024`
+alone changes capacity, not prompt length.
+
+```powershell
+python testing/python/intel_npu/e2e/decode.py --ckpt D:\models\qwen38-w4a16 --pack-dir D:\models\qwen38_tlpack --prefill 1024 --prefill-overlap --prefill-bn1 128 --prefill-mbe 32 --prefill-moe-slots --prefill-shared-expert --new 8
+python testing/python/intel_npu/e2e/decode.py --ckpt D:\models\qwen38-w4a16 --pack-dir D:\models\qwen38_tlpack --prefill 192 --prefill-overlap --prefill-bn1 128 --prefill-mbe 32 --prefill-moe-slots --prefill-shared-expert --golden D:\models\qwen38_golden\intro.pt --new 8 --trials 2
+python testing/python/intel_npu/device/run_prefill_model_device.py --kinds gdn,attn --n 1024 --trials 3 --bn1 128 --bn2 32 --mbe 32 --shared-projections --overlap --moe-slots --shared-expert
+```
+
+Add `--phases` to the canary for full-task capture:
+`testing/python/intel_npu/device/evidence/tl_prefill_model_l2_n1152_h2048_s1536_bn128_bn232_mbe32_sharedproj_overlap_moeslots_sharedexpert_prof_tasks.json`.
+Full-model TOPS is not measured; no npu_dsl parity claim is made.
+
 ## 2026-11-10: MoE slot-major outputs and dynamic-row DMA
 
 Starting point: E2E integration `86f9eafd`; the whole two-layer 1K capture attributed 53.4% to mexp,

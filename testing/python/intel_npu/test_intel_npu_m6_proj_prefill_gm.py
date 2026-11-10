@@ -21,6 +21,7 @@ import pytest
 
 import tilelang  # noqa: F401
 import tvm
+import tilelang.intel_npu.language as T
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_sim  # noqa: E402
@@ -122,6 +123,32 @@ def test_shared_weight_overlap_stays_after_weight_preparation():
     assert low.source.index("tl_npu_dequant_i4_gm(") < low.source.index("ctx.ring_begin(")
     assert "ownership-preserving" in low.source
     assert "hoisted over it" not in low.source
+
+
+@needs_cxx
+def test_projection_weight_and_output_row_offsets():
+    offset, prefix = 32, 8
+    phase, _ = make_proj_prefill(NP=NP, M=M, K=K, BN=BN, MB=MB, G=G, tiles=TILES,
+                                 shaves=SHAVES, scales_gm=True, as_block=True,
+                                 weight_row_offset=offset, output_row_base=True)
+
+    @T.prim_func
+    def shifted(X: T.Tensor((NP, K), T.float16), Wq: T.Tensor((M + offset, K // 2), T.uint8),
+                S: T.Tensor((KG, M + offset), T.float16), Yout: T.Tensor((NP + prefix, M), T.float16)):
+        with T.Kernel(TILES, threads=SHAVES) as tile:
+            phase(X, Wq, S, Yout, tile, T.get_thread_binding(), prefix)
+
+    x, _, wq, scales = _problem(seed=9)
+    expected = _sim(True, x, wq, np.ascontiguousarray(scales.T))
+    weights = np.pad(wq, ((offset, 0), (0, 0)))
+    padded_scales = np.ascontiguousarray(np.pad(scales.T, ((0, 0), (offset, 0)), constant_values=3))
+    low = lowering.lower(shifted)
+    output = np.full((NP + prefix, M), np.nan, np.float16)
+    arrays = lowering.order_arrays(low, {"X": x, "Wq": weights, "S": padded_scales, "Yout": output})
+    lib = host_sim.build(low.source, "shifted_projection")
+    host_sim.check_status(host_sim.run(lib, arrays, tiles=TILES, shaves=SHAVES))
+    assert np.isnan(output[:prefix]).all()
+    np.testing.assert_array_equal(output[prefix:], expected)
 
 
 @needs_cxx

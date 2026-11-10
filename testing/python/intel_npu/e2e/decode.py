@@ -82,7 +82,7 @@ class DeviceModel:
                  layer_ids: list[int] | None = None, chunked: bool = False, prefill: int = 0,
                  prefill_ls: list[int] | None = None, prefill_shared: bool = False, prefill_overlap: bool = False,
                  prefill_bn1: int | None = None, prefill_mb: int | None = None, prefill_mbe: int | None = None,
-                 prefill_moe_slots: bool = False):
+                 prefill_moe_slots: bool = False, prefill_shared_expert: bool = False):
         self.ck, self.c, self.log = ck, ck.cfg, log
         c = self.c
         self.layer_ids = list(layer_ids) if layer_ids is not None else list(range(layers))   # checkpoint layers, in run order
@@ -92,6 +92,7 @@ class DeviceModel:
         self.single = single
         self.prefill_n = prefill
         self.prefill_moe_slots = prefill_moe_slots
+        self.prefill_shared_expert = prefill_shared_expert
         prefill_shared = prefill_shared or prefill_overlap
         pgeom = dict(PREFILL_GEOM)
         if prefill_bn1 is not None:
@@ -173,13 +174,14 @@ class DeviceModel:
                         NH=c.n_heads, NKV=c.n_kv, D=c.head_dim, ROT=c.rot_dim, SMAX=smax, I=c.moe_inter,
                         E=c.n_experts, TOPK=c.top_k, G=ck.group, tiles=TILES, shaves=SHAVES, eps=c.eps,
                         KVL=kvl, skip=pskip, HW=hw_g, shared_projections=prefill_shared,
-                        moe_slot_output=prefill_moe_slots, **pgeom)
+                        moe_slot_output=prefill_moe_slots, separate_shared_expert=prefill_shared_expert, **pgeom)
                     names[f"prefill{pl}"] = (f"tl_e2e_prefill_l{pl}_n{ps['NP']}_h{c.hidden}_s{smax}"
                                              + (f"_bn{pgeom['BN1']}_mb{pgeom['MB']}" if prefill_shared or prefill_bn1 is not None or prefill_mb is not None else "")
                                              + ("_sharedproj" if prefill_shared else "")
                                              + ("_overlap" if prefill_overlap else "")
                                              + (f"_mbe{prefill_mbe}" if prefill_mbe is not None else "")
                                              + ("_moeslots" if prefill_moe_slots else "")
+                                             + ("_sharedexpert" if prefill_shared_expert else "")
                                              + ("_skip_" + "_".join(sorted(pskip)) if pskip else ""))
         else:
             kernels = {
@@ -328,6 +330,9 @@ class DeviceModel:
         """The prefill kernel's DDR scratch. Called before the weights: see `_upload_all`."""
         c, s, ps = self.c, self.s, self.ps
         NP, H = ps["NP"], c.hidden
+        if self.prefill_shared_expert:
+            s.alloc("P_SharedGu", NP * 2 * c.moe_inter * 2)
+            s.alloc("P_SharedAct", NP * c.moe_inter * 2)
         for nm, nbytes in (("P_Hio", NP * H * 4), ("P_Pos", 4), ("P_Nt", 4), ("P_CosSin", NP * 2 * c.rot_dim * 4),
                            ("P_Xs", NP * H * 2), ("P_Ys", NP * ps["YW"] * 2), ("P_BAs", NP * 2 * c.lin_vh * 2),
                            ("P_QKs", c.lin_kh * NP * 2 * c.lin_dk * 4), ("P_Vs", c.lin_vh * NP * c.lin_dv * 2),
@@ -371,7 +376,7 @@ class DeviceModel:
                  KcAll="KcAll0", VtAll="VtAll0", Xs="P_Xs", Ys="P_Ys", BAs="P_BAs", QKs="P_QKs", Vs="P_Vs",
                  Gbs="P_Gbs", Zs="P_Zs", Q="P_Q", Gate="P_Gate", Os="P_Os", Mix="P_Mix", Logits="P_Logits",
                  Ids="P_Ids", Wts="P_Wts", Cnt="P_Cnt", Off="P_Off", Slot="P_Slot", PartE="P_PartE",
-                 MoeOut="P_MoeOut")
+                 MoeOut="P_MoeOut", SharedGu="P_SharedGu", SharedAct="P_SharedAct")
         return [m[n] for n in self.low[alias].param_names]
 
     def prefill(self, ids: list[int], L: int | None = None) -> float:
@@ -559,6 +564,7 @@ def main(argv):
     ap.add_argument("--prefill-mb", type=int, default=None)
     ap.add_argument("--prefill-mbe", type=int, default=None)
     ap.add_argument("--prefill-moe-slots", action="store_true")
+    ap.add_argument("--prefill-shared-expert", action="store_true")
     ap.add_argument("--prefill-sweep", default=None, metavar="L1,L2,...",
                     help="layer counts to launch prefill at, ascending, from ONE session: the kernels are built in "
                          "one pass and share the weight upload, so a bisect point costs a launch instead of a "
@@ -599,7 +605,7 @@ def main(argv):
                     prefill_ls=[int(x) for x in a.prefill_sweep.split(",")] if a.prefill_sweep else None,
                     prefill_shared=a.prefill_shared, prefill_overlap=a.prefill_overlap,
                     prefill_bn1=a.prefill_bn1, prefill_mb=a.prefill_mb, prefill_mbe=a.prefill_mbe,
-                    prefill_moe_slots=a.prefill_moe_slots)
+                    prefill_moe_slots=a.prefill_moe_slots, prefill_shared_expert=a.prefill_shared_expert)
     if a.chunked:
         print(f"chunks: {len(m.chunks)} launches per token: " + " ".join("/".join(str(i) for i in ch) for ch in m.chunks))
     try:
