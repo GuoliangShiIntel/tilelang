@@ -1,7 +1,8 @@
 """Packs a checkpoint's layers into the decode kernels' parameter arrays (kernels.pack_gdn / pack_attn / pack_moe /
 pack_head), cached as .npy files per layer under a pack directory so a model loads in seconds after the first time.
 
-The kernel geometry (chunk rows) is the factories' default; `GEOM` pins it and the cache key carries it.
+The layout is packed values plus a separate group-major scale tensor, which prefill reads too, so `GEOM` now only
+decides the row PADDING, not the bytes: a sweep over chunk rows no longer invalidates the 17.91 GB of weights.
 """
 
 import json
@@ -19,13 +20,20 @@ from checkpoint import Checkpoint, layer_prefix  # noqa: E402
 
 TILES, SHAVES = 3, 2
 GEOM = dict(gdn_BN1=128, gdn_BN2=64, attn_BN1=128, attn_BN2=64, moe_BNR=16, moe_BNG=128, moe_BND=256, head_BN=128)
-GEOM_TAG = "g1"
-if __import__("os").environ.get("TL_NPU_GEOM"):   # sweeps: "moe_BNG=256,moe_BND=512"; the cache key follows the geometry
+# Only these reach the packed BYTES, and only as the row padding. The rest are pure scheduling now that the scales
+# have left the weight tensor, so a chunk-size sweep (the usual one: moe_BNG / moe_BND) reuses the cache instead of
+# re-packing 17.91 GB at ~8 s a layer. `test_intel_npu_e2e_pack_geometry` holds this set to the bytes.
+PAD_KEYS = ("gdn_BN1", "gdn_BN2", "attn_BN2", "moe_BNR", "head_BN")
+_GEOM_DEFAULTS = dict(GEOM)
+GEOM_TAG = "g2"   # g1 was the chunk-block layout; a g1 cache is not readable by these kernels
+if __import__("os").environ.get("TL_NPU_GEOM"):   # sweeps: "moe_BNG=256,moe_BND=512"
     for _kv in __import__("os").environ["TL_NPU_GEOM"].split(","):
         _k, _v = _kv.split("=")
         assert _k in GEOM, _k
         GEOM[_k] = int(_v)
-    GEOM_TAG = "g_" + "_".join(f"{k[:1]}{k.split('_')[1]}{v}" for k, v in sorted(GEOM.items()))
+    _diff = {k: GEOM[k] for k in PAD_KEYS if GEOM[k] != _GEOM_DEFAULTS[k]}
+    if _diff:
+        GEOM_TAG += "_" + "_".join(f"{k}{v}" for k, v in sorted(_diff.items()))
 
 
 def pack_gdn_layer(ck: Checkpoint, i: int) -> dict:
@@ -114,8 +122,14 @@ def cached_paths(pack_dir: Path, key: str, fn, log=print) -> dict:
         tmp.replace(manifest)
         log(f"packed {key} in {time.time() - t0:.0f} s ({sum(a.nbytes for a in arrays.values()) / 1e6:.0f} MB)")
         del arrays
-    names = json.loads(manifest.read_text(encoding="utf-8"))["arrays"]
-    return {n: d / f"{n}.npy" for n in names}
+    m = json.loads(manifest.read_text(encoding="utf-8"))
+    if "geom" not in m:   # a manifest with no geometry cannot be checked, so it is refused rather than trusted
+        raise RuntimeError(f"{d}: manifest records no geometry; delete the directory and repack")
+    stale = {k: (m["geom"].get(k), GEOM[k]) for k in PAD_KEYS if m["geom"].get(k) != GEOM[k]}
+    if stale:   # the key dropped a value that does reach the bytes: refuse rather than serve the wrong padding
+        raise RuntimeError(f"{d}: cached under a different padding geometry {stale} (cached, wanted); "
+                           f"PAD_KEYS and GEOM_TAG disagree -- delete the directory or fix the key")
+    return {n: d / f"{n}.npy" for n in m["arrays"]}
 
 
 def cached(pack_dir: Path, key: str, fn, log=print) -> dict:

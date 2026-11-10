@@ -93,7 +93,8 @@ def main(argv):
     ref_logits = router.astype(np.float32) @ x.astype(np.float32).reshape(-1)
     dev_order = np.argsort(-dev_logits[:E], kind="stable")[:TOPK]
     kind = runner.condition(res, profile is not None)
-    weight_bytes = packed["Wr"].nbytes + (TOPK + 1) * (packed["WguP"].nbytes + packed["WdP"].nbytes) // (E + 1)
+    weight_bytes = packed["Wr"].nbytes + (TOPK + 1) * (packed["WguQ"].nbytes + packed["WguS"].nbytes
+                                                       + packed["WdQ"].nbytes + packed["WdS"].nbytes) // (E + 1)
     idu_us = [float(res.status[t * SHAVES:(t + 1) * SHAVES, 5].astype(np.int64).sum()) / PERF_CLK_MHZ for t in range(TILES)]
     print(f"device: kernel-only {res.median_kernel_ms:.3f} ms (host wall {res.median_ms:.3f} ms) [{kind}]; "
           f"max |out - ref| = {err:.4f} over a MoE contribution of {scale:.3f} (rel {rel:.2e}) -> {verdict}; "

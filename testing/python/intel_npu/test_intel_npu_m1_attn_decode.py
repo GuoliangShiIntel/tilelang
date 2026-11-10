@@ -70,8 +70,10 @@ def attn_problem(seed, pos, H, NH, NKV, D, ROT, SMAX, G, **_):
 def attn_arrays(p, packed, H, NH, NKV, D, tiles=TILES, BN2=64, **_):
     """The kernel's parameter arrays (caches copied: the kernel appends in place)."""
     sz = attn_sizes(H, NH, NKV, D, tiles=tiles, BN2=BN2)
-    return dict(X=p["x"], Res=p["res"], WqkvP=packed["WqkvP"], QNormW=p["qnorm_w"], KNormW=p["knorm_w"], CosSin=p["cos_sin"],
-                Pos=np.array([[p["pos"]]], np.int32), Kc=p["kc"].copy(), Vt=p["vt"].copy(), WoP=packed["WoP"],
+    return dict(X=p["x"], Res=p["res"], WqkvQ=packed["WqkvQ"], WqkvS=packed["WqkvS"], QNormW=p["qnorm_w"],
+                KNormW=p["knorm_w"], CosSin=p["cos_sin"],
+                Pos=np.array([[p["pos"]]], np.int32), Kc=p["kc"].copy(), Vt=p["vt"].copy(), WoQ=packed["WoQ"],
+                WoS=packed["WoS"],
                 Y=np.zeros((1, sz["NQKV"]), np.float16), QN=np.zeros((NKV, sz["GQ"], D), np.float16),
                 Part=np.zeros((NKV, sz["GQ"], tiles, sz["PW"]), np.float32), O=np.zeros((1, sz["KO"]), np.float16),
                 Out=np.zeros((1, sz["NOUT_pad"]), np.float16))
@@ -79,9 +81,12 @@ def attn_arrays(p, packed, H, NH, NKV, D, tiles=TILES, BN2=64, **_):
 
 def test_qwen36_shape_lowers_to_split_kv_rings_hoisted_over_the_groups():
     src = _lower(make_attn_decode()).source
-    # qkv: 9216 rows = 3 tiles x 24 chunks of 128 (no padding), local ring; o_proj 2048 -> 2112, K 4096
-    assert "ctx.ring_begin((&(w1_cmx[0])), 135168, 4, 24, 0, 0, 2, 0, 1);" in src
-    assert "ctx.ring_begin((&(w2_cmx[0])), 135168, 2, 11, 0, 0, -1, 0, 1);" in src
+    # qkv: 9216 rows = 3 tiles x 24 chunks of 128 (no padding), local ring; o_proj 2048 -> 2112, K 4096. Each
+    # weight ring is paired with a ring of the chunk's group-major scales on the other DMA port.
+    assert "ctx.ring_begin((&(w1_cmx[0])), 131072, 4, 24, 0, 0, 2, 0, 1);" in src
+    assert "ctx.ring_begin((&(s1_cmx[0])), 4096, 4, 24, 0, 0, 3, 0, 1);" in src
+    assert "ctx.ring_begin((&(w2_cmx[0])), 131072, 2, 11, 0, 0, 0, 0, 1);" in src
+    assert "ctx.ring_begin((&(s2_cmx[0])), 4096, 2, 11, 0, 0, 1, 0, 1);" in src
     # K and Vt: split local streams, with a per-tile chunk count derived from the runtime position.
     assert "k_cmx: SEGMENTED (streamed, each tile fills its own slot)" in src
     assert "ring over kv hoisted over g" not in src

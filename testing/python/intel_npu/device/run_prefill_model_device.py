@@ -42,7 +42,7 @@ BM, BNR, MBe, BNG, BND = 64, 16, 16, 64, 64
 GQ, KO = NH // NKV, NH * D
 QK, VC = KH * DK, VH * DV
 CONV = 2 * QK + VC
-NIN = CONV + VC + 2 * VH
+NIN = CONV + VC
 NQKV = NH * 2 * D + 2 * NKV * D
 KGH, KGI = H // G, I // G
 THETA = 1e6
@@ -69,6 +69,7 @@ def layer_weights(kind: str, kv: int, seed: int) -> dict:
         NIN_pad = p["NIN_pad"] = -(-NIN // BN1) * BN1
         p.update(win_int=rng.integers(-8, 8, (NIN_pad, H), dtype=np.int8),
                  win_s=(rng.standard_normal((NIN_pad, H // G), np.float32) * 0.02).astype(np.float16),
+                 wba=(rng.standard_normal((2 * VH, H), np.float32) * 0.05).astype(np.float16),
                  conv_w=(rng.standard_normal((4, CONV), np.float32) * 0.3).astype(np.float16),
                  conv_state=(rng.standard_normal((3, CONV), np.float32) * 0.3).astype(np.float16),
                  a_log=(rng.standard_normal((1, VH), np.float32) * 0.2).astype(np.float32),
@@ -103,6 +104,7 @@ def table_arrays(p: dict, RR: int, zero_out: bool = False) -> dict:
         wos = np.zeros_like(p["wout_s"]) if zero_out else p["wout_s"]
         a.update({"W0": pack_int4(p["win_int"]), "W1": gm_scales(p["win_s"]), "W2": p["conv_w"], "W3": p["a_log"],
                   "W4": p["dt_bias"], "W5": p["gnorm"], "W6": pack_int4(wout), "W7": gm_scales(wos),
+                  "W8": p["wba"],
                   "S0": p["conv_state"], "S1": p["ssm"]})
     else:
         wo = np.zeros_like(p["wo_int"]) if zero_out else p["wo_int"]
@@ -206,7 +208,8 @@ def main(argv):
     s.upload("Nt", np.array([[n]], np.int32))
     s.upload("CosSin", cs)
     for nm, nbytes in (("KcAll", KVL * NKV * SMAX * D * 2), ("VtAll", KVL * NKV * D * SMAX * 2),
-                       ("Xs", NP * H * 2), ("Ys", NP * YW * 2), ("QKs", KH * NP * 2 * DK * 4),
+                       ("Xs", NP * H * 2), ("Ys", NP * YW * 2), ("BAs", NP * 2 * VH * 2),
+                       ("QKs", KH * NP * 2 * DK * 4),
                        ("Vs", VH * NP * DV * 2), ("Gbs", VH * NP * 2 * 4), ("Zs", VH * NP * DV * 2),
                        ("Q", NKV * NP * GQ * D * 2), ("Gate", NP * KO * 2), ("Os", NP * OW * 2),
                        ("Mix", NP * H * 2), ("Logits", NP * RR * 2), ("Ids", NP * TOPK * 4),
@@ -220,7 +223,7 @@ def main(argv):
         s.upload("Hio", h0)
         s.zero("KcAll")
         s.zero("VtAll")
-        for nm in ("QKs", "Vs", "Gbs", "Zs", "Xs", "Ys", "Os", "Mix"):
+        for nm in ("QKs", "Vs", "Gbs", "Zs", "Xs", "Ys", "BAs", "Os", "Mix"):
             s.zero(nm)      # a Session buffer persists across launches: stale scratch reads as written output
         for li, p in enumerate(layers):
             if p["kind"] == "gdn":
@@ -303,8 +306,9 @@ def main(argv):
             hf = h0.astype(np.float32)
             x = hf / np.sqrt((hf * hf).mean(-1, keepdims=True) + 1e-6) * (1.0 + p["in_norm"].astype(np.float32).reshape(1, -1))
             y = proj_prefill_reference(x.astype(np.float16), p["win_int"], p["win_s"], G).astype(np.float16)
+            ba = x.astype(np.float16).astype(np.float32) @ p["wba"].astype(np.float32).T
             qk_ref, _, _, _, cs_ref = gdn_conv_prefill_reference(y, p["conv_w"], p["conv_state"], p["a_log"],
-                                                                 p["dt_bias"], n, KH, VH, DK, DV)
+                                                                 p["dt_bias"], n, KH, VH, DK, DV, ba=ba)
             qk = s.download("QKs", np.float32, (KH, NP, 2 * DK))
             cs = s.download(f"L{li}_S0", np.float16, (3, CONV)).astype(np.float32)
             # upstream first: if the norm or the projection is wrong, every head is wrong for free

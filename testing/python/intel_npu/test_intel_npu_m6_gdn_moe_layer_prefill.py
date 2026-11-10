@@ -30,7 +30,7 @@ TB, C, BN1, BN2, MB = 32, 32, 16, 16, 16
 BM, BNR, MBe, BNG, BND = 32, 16, 16, 64, 64
 QK, VC = KH * DK, VH * DV
 CONV = 2 * QK + VC
-NIN = CONV + VC + 2 * VH
+NIN = CONV + VC
 NIN_pad = -(-NIN // BN1) * BN1
 KGH, KGI = H // G, I // G
 _, _RS = make_moe_route_prefill(N=N, H=H, E=E, TOPK=TOPK, BM=BM, BNR=BNR, tiles=TILES, shaves=SHAVES, as_block=True)
@@ -64,6 +64,7 @@ def _weights(seed=0):
         post=(rng.standard_normal((1, H), np.float32) * 0.1).astype(np.float16),
         wi=rng.integers(-8, 8, (NIN_pad, H), dtype=np.int8),
         ws=(rng.standard_normal((NIN_pad, H // G), np.float32) * 0.02).astype(np.float16),
+        wba=(rng.standard_normal((2 * VH, H), np.float32) * 0.05).astype(np.float16),
         wo=rng.integers(-8, 8, (H, VC), dtype=np.int8),
         wos=(rng.standard_normal((H, VC // G), np.float32) * 0.02).astype(np.float16),
         cw=(rng.standard_normal((4, CONV), np.float32) * 0.3).astype(np.float16),
@@ -88,12 +89,14 @@ def _run(p, n=N):
     wr_pad = np.zeros((RR, H), np.float16)
     wr_pad[:E + 1] = p["wr"]
     arrays = {"Hio": hio, "InNorm": p["inn"], "PostNorm": p["post"],
-              "WinQ": pack_int4(p["wi"]), "WinS": gm_scales(p["ws"]), "ConvW": p["cw"], "ConvState": p["cs"],
+              "WinQ": pack_int4(p["wi"]), "WinS": gm_scales(p["ws"]), "Wba": p["wba"],
+              "ConvW": p["cw"], "ConvState": p["cs"],
               "ALog": p["al"], "DtBias": p["db"], "GNorm": p["gn"], "Nt": np.array([[n]], np.int32), "Ssm": sm,
               "WoutQ": pack_int4(p["wo"]), "WoutS": gm_scales(p["wos"]), "Wr": wr_pad,
               "WguQ": pack_int4(p["gu_int"].reshape(-1, H)), "WguS": gm_scales(p["gu_s"].reshape(-1, KGH)),
               "WdQ": pack_int4(p["d_int"].reshape(-1, I)), "WdS": gm_scales(p["d_s"].reshape(-1, KGI)),
               "Xs": np.zeros((N, H), np.float16), "Ys": np.zeros((N, NIN_pad), np.float16),
+              "BAs": np.zeros((N, 2 * VH), np.float16),
               "QKs": np.zeros((KH, N, 2 * DK), np.float32), "Vs": np.zeros((VH, N, DV), np.float16),
               "Gbs": np.zeros((VH, N, 2), np.float32), "Zs": np.zeros((VH, N, DV), np.float16),
               "Os": np.zeros((N, VC), np.float16), "Mix": np.zeros((N, H), np.float16), "CsOut": cso,
@@ -109,7 +112,7 @@ def _oracle(p, n=N):
     return gdn_moe_layer_prefill_reference(p["h"], p["inn"], p["post"], p["wi"], p["ws"], p["cw"], p["cs"],
                                            p["al"], p["db"], p["gn"], p["wo"], p["wos"], p["ssm"], p["wr"],
                                            p["gu_int"], p["gu_s"], p["d_int"], p["d_s"],
-                                           n=n, KH=KH, VH=VH, DK=DK, DV=DV, E=E, TOPK=TOPK, G=G)
+                                           n=n, KH=KH, VH=VH, DK=DK, DV=DV, E=E, TOPK=TOPK, G=G, wba=p["wba"])
 
 
 def test_the_layer_does_not_reintroduce_question_10():

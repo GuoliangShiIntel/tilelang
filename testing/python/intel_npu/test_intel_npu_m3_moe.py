@@ -78,12 +78,16 @@ def test_qwen36_shape_lowers_to_indirect_split_rings_hoisted_over_the_items():
     assert "wr_cmx: SEGMENTED resident" in src
     assert "x_cmx: tile-invariant resident, 1 row(s) filled by SHAVE 0" in src   # x16 is built from it in CMX
     # the two expert rings: tile-split streams the SHAVE reads (LOCAL: no barrier ids), each hoisted over the item
-    # loop with the fill ahead reading the chunk's own item
+    # loop with the fill ahead reading the chunk's own item. The scales are a separate tensor now (shared with
+    # prefill), but they do NOT get a ring: the tile's three experts' scales are fetched resident before the item
+    # loop, so the weight rings keep their one begin/end and never drain at an expert boundary.
     assert "wq_cmx: SEGMENTED (streamed, each tile fills its own slot)" in src
     assert "wqd_cmx: SEGMENTED (streamed, each tile fills its own slot)" in src
+    assert "wsg_all: SEGMENTED resident" in src    # fetched once before the items, then read in place by the DPU
+    assert "wsd_all: SEGMENTED resident" in src
     assert src.count("ring over n hoisted over j (3 iterations: one begin/end, fills read the iteration)") == 2
     assert "ring: local (no ids); ring_1: local (no ids)" in src
-    assert src.count("ctx.ring_begin(") == 2
+    assert src.count("ctx.ring_begin(") == 2   # the two weight rings, and no ring for the scales
     assert src.count("ctx.sync_grid();") == 2
 
 

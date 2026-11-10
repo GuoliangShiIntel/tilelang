@@ -81,8 +81,10 @@ def gdn_ref(p, KH, VH, DK, **_):
 def gdn_arrays(p, packed, H, KH, VH, DK, tiles=TILES, shaves=SHAVES, BN1=64, BN2=64, **_):
     """The kernel's parameter arrays (states copied: the kernel updates them in place)."""
     sz = gdn_sizes(H, KH, VH, DK, tiles=tiles, shaves=shaves, BN1=BN1, BN2=BN2)
-    arrays = dict(X=p["x"], Res=p["res"], WinP=packed["WinP"], Wba=packed["Wba"], ConvW=p["conv_w"], ALog=p["a_log"], DtBias=p["dt_bias"],
-                  GNorm=p["g_norm"], ConvState=p["conv_state"].copy(), Ssm=p["ssm"].copy(), WoutP=packed["WoutP"],
+    arrays = dict(X=p["x"], Res=p["res"], WinQ=packed["WinQ"], WinS=packed["WinS"], Wba=packed["Wba"], ConvW=p["conv_w"],
+                  ALog=p["a_log"], DtBias=p["dt_bias"],
+                  GNorm=p["g_norm"], ConvState=p["conv_state"].copy(), Ssm=p["ssm"].copy(), WoutQ=packed["WoutQ"],
+                  WoutS=packed["WoutS"],
                   Y=np.zeros((1, sz["YLEN"]), np.float16), BA=np.zeros((1, sz["BA_LEN"]), np.float16), CV=np.zeros((1, sz["CVLEN"]), np.float16),
                   O=np.zeros((1, sz["OPAD"]), np.float16), Out=np.zeros((1, sz["NOUT_pad"]), np.float16))
     return arrays
@@ -90,16 +92,19 @@ def gdn_arrays(p, packed, H, KH, VH, DK, tiles=TILES, shaves=SHAVES, BN1=64, BN2
 
 def test_qwen36_shape_lowers_to_two_local_gemv_rings_and_a_vector_scan():
     src = _lower(make_gdn_decode()).source
-    # in_proj: 12288 rows = 3 tiles x 32 chunks of 128 (+4 scale rows), two slots per SHAVE, local; b | a: 64 fp16
-    # rows dealt 11 per worker as fp32 lane dot products
-    assert "ctx.ring_begin((&(w1_cmx[0])), 135168, 4, 32, 0, 0, 2, 0, 1);" in src
+    # in_proj: 12288 rows = 3 tiles x 32 chunks of 128, two slots per SHAVE, local; the chunk's group-major scales
+    # are a SECOND ring of the same shape on the other DMA port; b | a: 64 fp16 rows dealt 11 per worker as fp32
+    # lane dot products
+    assert "ctx.ring_begin((&(w1_cmx[0])), 131072, 4, 32, 0, 0, 2, 0, 1);" in src
+    assert "ctx.ring_begin((&(s1_cmx[0])), 4096, 4, 32, 0, 0, 3, 0, 1);" in src
     assert "ctx.dma_load((&(wba_cmx[0])), (&(Wba[((tile * 45056) + (shave * 22528))])), 4096, 11, 4096, 4096);" in src
     assert "y1_cmx[r] = ((half)tl_npu_vsum(" in src
-    assert "ctx.dpu_matmul_i4g((&(y1_cmx[(sub * 64)])), (&(x_cmx[0])), (&(w1_cmx[((((u & 1) * 270336) + (shave * 135168)) + (sub * 65536))]))" in src
-    # out_proj: 2048 rows padded to 2112 = 3 x 11 chunks of 64 (+2 scale rows), K 4096 -> 32 groups, 32-row workloads;
-    # one slot per SHAVE (the budget), so the lone depth-1 stream is split in two halves over the ports
-    assert "ctx.ring_begin((&(w2_cmx[0])), 135168, 2, 11, 0, 0, -1, 0, 1);" in src
-    # the workload itself: M = 1 row, 32 weight rows, K = 4096, group 128, scales 64 rows into the chunk block.
+    assert "ctx.dpu_matmul_i4g((&(y1_cmx[(sub * 64)])), (&(x_cmx[0])), (&(w1_cmx[((((u & 1) * 262144) + (shave * 131072)) + (sub * 65536))]))" in src
+    # out_proj: 2048 rows padded to 2112 = 3 x 11 chunks of 64, K 4096 -> 32 groups, 32-row workloads;
+    # one slot per SHAVE (the budget), the weights and their scales on the two ports
+    assert "ctx.ring_begin((&(w2_cmx[0])), 131072, 2, 11, 0, 0, 0, 0, 1);" in src
+    assert "ctx.ring_begin((&(s2_cmx[0])), 4096, 2, 11, 0, 0, 1, 0, 1);" in src
+    # the workload itself: M = 1 row, 32 weight rows, K = 4096, group 128, the chunk's 64 scale columns.
     # Anchored on the call and left open at the end: a later argument (the deferred-reduction flag) must not break it.
     assert re.search(r"ctx\.dpu_matmul_i4g\(\(&\(y2_cmx\[[^\]]*\]\)\).*, 1, 32, 4096, 128, 64\b", src)
     assert not re.search(r"ctx\.dpu_matmul_i4g\(\(&\(y2_cmx\[[^\]]*\]\)\).*, 1, 64, 4096, 128, 64\b", src)   # control

@@ -32,7 +32,7 @@ TILES, SHAVES = 3, 2
 KH, VH, DK, DV = 16, 32, 128, 128
 QK, VC = KH * DK, VH * DV
 CONV = 2 * QK + VC
-NIN = CONV + VC + 2 * VH
+NIN = CONV + VC
 
 
 def arg(argv, name, default):
@@ -43,11 +43,13 @@ def problem(n, NP, seed=0):
     rng = np.random.default_rng(seed)
     y = (rng.standard_normal((NP, NIN), np.float32) * 0.5).astype(np.float16)
     y[n:] = 0
+    ba = (rng.standard_normal((NP, 2 * VH), np.float32) * 0.5).astype(np.float16)
+    ba[n:] = 0
     conv_w = (rng.standard_normal((4, CONV), np.float32) * 0.3).astype(np.float16)
     cs = (rng.standard_normal((3, CONV), np.float32) * 0.3).astype(np.float16)
     a_log = (rng.standard_normal((1, VH), np.float32) * 0.2).astype(np.float32)
     dt_bias = (rng.standard_normal((1, VH), np.float32) * 0.2).astype(np.float32)
-    return y, conv_w, cs, a_log, dt_bias
+    return y, ba, conv_w, cs, a_log, dt_bias
 
 
 def main(argv):
@@ -68,13 +70,14 @@ def main(argv):
         db = runner.build(low.source, name)
         print(f"build {time.time() - t0:.0f} s")
 
-    y, cw, cs, al, dbias = problem(n, NP)
+    y, ba, cw, cs, al, dbias = problem(n, NP)
 
     def run(y_in):
         out = dict(QKo=np.zeros((KH, NP, 2 * DK), np.float32), Vo=np.zeros((VH, NP, DV), np.float16),
                    Gb=np.zeros((VH, NP, 2), np.float32), Zo=np.zeros((VH, NP, DV), np.float16),
                    CsOut=np.zeros((3, CONV), np.float16))
-        arrays = {"Y": ("in", y_in), "ConvW": ("in", cw), "ConvState": ("in", cs), "ALog": ("in", al),
+        arrays = {"Y": ("in", y_in), "Ba": ("in", ba), "ConvW": ("in", cw), "ConvState": ("in", cs),
+                  "ALog": ("in", al),
                   "DtBias": ("in", dbias), "Nt": ("in", np.array([[n]], np.int32)),
                   **{k: ("out", v) for k, v in out.items()}}
         r = runner.run(db, lowering.order_arrays(low, arrays), TILES, SHAVES, HERE / "run_gdn_conv_prefill",
@@ -83,7 +86,7 @@ def main(argv):
         return out, r
 
     ref = dict(zip(("QKo", "Vo", "Gb", "Zo", "CsOut"),
-                   gdn_conv_prefill_reference(y, cw, cs, al, dbias, n, KH, VH, DK, DV)))
+                   gdn_conv_prefill_reference(y, cw, cs, al, dbias, n, KH, VH, DK, DV, ba=ba)))
     ref["QKo"] = ref["QKo"].reshape(KH, NP, 2 * DK)
     good, worst, first, res = 0, 0.0, None, None
     for _ in range(trials):
@@ -128,7 +131,7 @@ def main(argv):
             "Ssm": ("inout", sm), "Out": ("out", out)}), TILES, SHAVES, HERE / "run_gdn_conv_prefill",
             repeat=3, warmup=3, timeout_s=600)
         runner.check_status(r.status)
-        qk, v, gb, z, _ = gdn_conv_prefill_reference(y, cw, cs, al, dbias, n, KH, VH, DK, DV)
+        qk, v, gb, z, _ = gdn_conv_prefill_reference(y, cw, cs, al, dbias, n, KH, VH, DK, DV, ba=ba)
         oracle, _ = gdn_scan_prefill_reference(qk, v, gb, z, gnorm, ssm, n)
         rel = float(np.abs(out.astype(np.float32)[:n] - oracle[:n]).max() / np.abs(oracle[:n]).max())
         print(f"chain conv -> scan: {'PASS' if rel < 5e-2 else 'FAIL'} rel {rel:.2e}; "
@@ -142,13 +145,14 @@ def main(argv):
         flow = lowering.lower(make_gdn_mixer_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, TB=TB, C=C,
                                                      tiles=TILES, shaves=SHAVES))
         fdb = runner.build(flow.source, f"tl_gdn_mixer_prefill_n{NP}_tb{TB}_c{C}")
-        oracle = gdn_scan_prefill_reference(*gdn_conv_prefill_reference(y, cw, cs, al, dbias, n, KH, VH, DK, DV)[:4],
+        oracle = gdn_scan_prefill_reference(*gdn_conv_prefill_reference(y, cw, cs, al, dbias, n, KH, VH, DK, DV,
+                                                                        ba=ba)[:4],
                                             gnorm, ssm, n)[0]
         goodf, worstf, rf = 0, 0.0, None
         for _ in range(trials):
             out, sm = np.zeros((NP, VC), np.float16), ssm.copy()
             rf = runner.run(fdb, lowering.order_arrays(flow, {
-                "Y": ("in", y), "ConvW": ("in", cw), "ConvState": ("in", cs), "ALog": ("in", al),
+                "Y": ("in", y), "Ba": ("in", ba), "ConvW": ("in", cw), "ConvState": ("in", cs), "ALog": ("in", al),
                 "DtBias": ("in", dbias), "GNorm": ("in", gnorm), "Nt": ("in", np.array([[n]], np.int32)),
                 "Ssm": ("inout", sm), "QKs": ("out", np.zeros((KH, NP, 2 * DK), np.float32)),
                 "Vs": ("out", np.zeros((VH, NP, DV), np.float16)), "Gbs": ("out", np.zeros((VH, NP, 2), np.float32)),

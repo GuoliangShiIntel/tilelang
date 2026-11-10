@@ -36,7 +36,7 @@ TB, C, MB = 32, 64, 16
 BM, BNR, MBe, BNG, BND = 64, 16, 16, 64, 64
 QK, VC = KH * DK, VH * DV
 CONV = 2 * QK + VC
-NIN = CONV + VC + 2 * VH
+NIN = CONV + VC
 KGH, KGI = H // G, I // G
 WORKERS = TILES * SHAVES
 
@@ -74,6 +74,7 @@ def main(argv):
     post = (rng.standard_normal((1, H), np.float32) * 0.1).astype(np.float16)
     wi = rng.integers(-8, 8, (NIN_pad, H), dtype=np.int8)
     ws = (rng.standard_normal((NIN_pad, H // G), np.float32) * 0.02).astype(np.float16)
+    wba = (rng.standard_normal((2 * VH, H), np.float32) * 0.05).astype(np.float16)
     wo = rng.integers(-8, 8, (H, VC), dtype=np.int8)
     wos = (rng.standard_normal((H, VC // G), np.float32) * 0.02).astype(np.float16)
     cw = (rng.standard_normal((4, CONV), np.float32) * 0.3).astype(np.float16)
@@ -93,13 +94,14 @@ def main(argv):
     def run(wo_in, wos_in, d_in, ds_in):
         hio, sm = h.copy(), ssm.copy()
         arrays = {"Hio": ("inout", hio), "InNorm": ("in", inn), "PostNorm": ("in", post),
-                  "WinQ": ("in", pack_int4(wi)), "WinS": ("in", gm_scales(ws)),
+                  "WinQ": ("in", pack_int4(wi)), "WinS": ("in", gm_scales(ws)), "Wba": ("in", wba),
                   "ConvW": ("in", cw), "ConvState": ("in", cs), "ALog": ("in", al), "DtBias": ("in", dbias),
                   "GNorm": ("in", gn), "Nt": ("in", np.array([[n]], np.int32)), "Ssm": ("inout", sm),
                   "WoutQ": ("in", pack_int4(wo_in)), "WoutS": ("in", gm_scales(wos_in)), "Wr": ("in", wr_pad),
                   "WguQ": ("in", pack_int4(gu_int.reshape(-1, H))), "WguS": ("in", gm_scales(gu_s.reshape(-1, KGH))),
                   "WdQ": ("in", pack_int4(d_in.reshape(-1, I))), "WdS": ("in", gm_scales(ds_in.reshape(-1, KGI))),
                   "Xs": ("out", np.zeros((NP, H), np.float16)), "Ys": ("out", np.zeros((NP, NIN_pad), np.float16)),
+                  "BAs": ("out", np.zeros((NP, 2 * VH), np.float16)),
                   "QKs": ("out", np.zeros((KH, NP, 2 * DK), np.float32)),
                   "Vs": ("out", np.zeros((VH, NP, DV), np.float16)),
                   "Gbs": ("out", np.zeros((VH, NP, 2), np.float32)),
@@ -120,7 +122,7 @@ def main(argv):
 
     ref, _, ssm_ref = gdn_moe_layer_prefill_reference(h, inn, post, wi, ws, cw, cs, al, dbias, gn, wo, wos, ssm,
                                                       wr, gu_int, gu_s, d_int, d_s, n=n, KH=KH, VH=VH, DK=DK,
-                                                      DV=DV, E=E, TOPK=TOPK, G=G)
+                                                      DV=DV, E=E, TOPK=TOPK, G=G, wba=wba)
     good, worst, res = 0, 0.0, None
     for _ in range(trials):
         hio, sm, r = run(wo, wos, d_int, d_s)

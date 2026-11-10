@@ -420,10 +420,10 @@ def make_moe_decode(H: int = 2048, I: int = 512, E: int = 256, TOPK: int = 8, G:
       out = res + sum_k wts[k] * down_e(silu(gate_e(x)) * up_e(x)) + sigmoid(l[E]) * down_E(silu(gate_E(x)) * up_E(x))
 
     Packing (the host's job, `pack_moe`): the shared expert is expert E of the same int4 g128 tensors; each
-    projection is stored as CHUNK BLOCKS, one DMA each: BN packed weight rows then the chunk's group-major fp16
-    scales [K/G, BN] in whole rows (`WguP[(E + 1) * CG * (BNG + SRG), H / 2]`, `WdP[(E + 1) * CD * (BND + SRD), I / 2]`;
-    the DPU path reads the scales in place, and one job per chunk instead of two halves the engine's fixed
-    per-job cost); the router's E + 1 fp16 rows padded with zeros to RR = a multiple of tiles x shaves x BNR. Phases:
+    projection is the packed values `[N, K/2]` and a SEPARATE group-major fp16 scale tensor `[K/G, N]`, which the
+    DPU path reads in place. The chunk size is a scheduling choice and stays out of the files: re-tiling must not
+    mean re-packing the 17.91 GB of weights a prompt already moves, and prefill reads the same two tensors.
+    The router's E + 1 fp16 rows are padded with zeros to RR = a multiple of tiles x shaves x BNR. Phases:
       1. router: x (padded to 16 rows for the DPU) resident on every tile; the router rows split over the tiles
          and streamed (SEGMENTED ring, fp16 gemm, submit-ahead); logits land in DDR, then T.sync_grid();
       2. routing: every tile reads the logits and SHAVE 0 picks the top-k (lowest id on a tie) and the
@@ -452,14 +452,13 @@ def make_moe_decode(H: int = 2048, I: int = 512, E: int = 256, TOPK: int = 8, G:
     CG, CD = (2 * I) // BNG, H // BND   # gate/up and down chunks per item
     HG, IG = H // G, I // G
     MR = 16                           # the router gemm's M: x padded to the DPU's row granule
-    SRG, SRD = moe_scale_rows(H, I, G, BNG, BND)   # rows of the chunk block holding the scales
-    BG, BD = BNG + SRG, BND + SRD                  # rows per chunk block
     moe_phases = moe_block(H=H, I=I, E=E, TOPK=TOPK, G=G, tiles=tiles, shaves=shaves, num_stages=num_stages, BNR=BNR,
                            BNG=BNG, BND=BND, RG=RG, RD=RD, pipelined=pipelined, probe_skip_dpu=probe_skip_dpu)
 
     @T.prim_func
     def moe(X: T.Tensor((1, H), T.float16), Wr: T.Tensor((RR, H), T.float16),
-            WguP: T.Tensor(((E + 1) * CG * BG, H // 2), T.uint8), WdP: T.Tensor(((E + 1) * CD * BD, I // 2), T.uint8),
+            WguQ: T.Tensor(((E + 1) * 2 * I, H // 2), T.uint8), WguS: T.Tensor((HG, (E + 1) * 2 * I), T.float16),
+            WdQ: T.Tensor(((E + 1) * H, I // 2), T.uint8), WdS: T.Tensor((IG, (E + 1) * H), T.float16),
             Res: T.Tensor((1, H), T.float16), Logits: T.Tensor((MR, RR), T.float16),
             Part: T.Tensor((tiles, H), T.float32), Out: T.Tensor((1, H), T.float16)):
         with T.Kernel(tiles, threads=shaves) as tile:
@@ -469,7 +468,7 @@ def make_moe_decode(H: int = 2048, I: int = 512, E: int = 256, TOPK: int = 8, G:
             res_cmx = T.alloc_shared((1, H), T.float16)
             out_cmx = T.alloc_shared((1, H), T.float16)
             T.copy(X[0, 0], x_cmx)
-            moe_phases(x_cmx, Wr, WguP, WdP, Logits, Part, tile, shave)
+            moe_phases(x_cmx, Wr, WguQ, WguS, WdQ, WdS, Logits, Part, tile, shave)
             # --- 4. combine on tile 0 ---------------------------------------------------------------------
             if tile == 0:
                 T.copy(Part, p_cmx)
@@ -489,10 +488,10 @@ def make_moe_decode(H: int = 2048, I: int = 512, E: int = 256, TOPK: int = 8, G:
 def moe_block(H: int, I: int, E: int, TOPK: int, G: int, tiles: int, shaves: int, num_stages: int = 4, BNR: int = 16,
               BNG: int = 128, BND: int = 256, RG: int = 64, RD: int = 256, pipelined: bool = True, probe_skip_dpu: bool = False,
               num_stages_g: int | None = None, defer_gu: bool = False):
-    """The MoE layer's phases 1-3 as a `T.macro` (make_moe_decode's docstring): `moe_phases(x_cmx, Wr, WguP, WdP,
-    Logits, Part, tile, shave)` takes the normed token in tile-shared CMX (`x_cmx` fp16 [1, H]) and leaves every tile's
-    fp32 partial of the MoE output in `Part[tile]` behind a grid barrier; the caller combines (the standalone kernel on
-    tile 0 with the residual, a layer kernel into its fp32 residual stream on every tile)."""
+    """The MoE layer's phases 1-3 as a `T.macro` (make_moe_decode's docstring): `moe_phases(x_cmx, Wr, WguQ, WguS,
+    WdQ, WdS, Logits, Part, tile, shave)` takes the normed token in tile-shared CMX (`x_cmx` fp16 [1, H]) and leaves
+    every tile's fp32 partial of the MoE output in `Part[tile]` behind a grid barrier; the caller combines (the
+    standalone kernel on tile 0 with the residual, a layer kernel into its fp32 residual stream on every tile)."""
     items = TOPK + 1
     assert items % tiles == 0 and H % G == 0 and I % G == 0 and (2 * I) % BNG == 0 and H % BND == 0
     assert BNG % RG == 0 and BND % RD == 0 and RG * (H // G) <= 1024 and RD * (I // G) <= 1024
@@ -513,11 +512,10 @@ def moe_block(H: int, I: int, E: int, TOPK: int, G: int, tiles: int, shaves: int
     # (workload, defer its reduction into the next workload's DPU time): all but the last. Measured -11 us/layer for
     # 2 x RG x H/G x 2 B of CMX (the part double buffer), which the GDN + MoE layer kernel cannot spare: opt-in.
     GU_SUBS = [(sub, defer_gu and sub < BNG // RG - 1) for sub in range(BNG // RG)]
-    SRG, SRD = moe_scale_rows(H, I, G, BNG, BND)
-    BG, BD = BNG + SRG, BND + SRD
+    HG, IG = H // G, I // G
 
     @T.macro
-    def moe_phases(x_cmx, Wr, WguP, WdP, Logits, Part, tile, shave):
+    def moe_phases(x_cmx, Wr, WguQ, WguS, WdQ, WdS, Logits, Part, tile, shave):
         x16 = T.alloc_shared((MR, H), T.float16)
         wr_cmx = T.alloc_shared((RRT, H), T.float16)
         yr_cmx = T.alloc_local((MR, RRT), T.float16)
@@ -527,11 +525,16 @@ def moe_block(H: int, I: int, E: int, TOPK: int, G: int, tiles: int, shaves: int
         pick = T.alloc_local((16,), T.float32)
         best = T.alloc_local((2,), T.float32)
         mx = T.alloc_local((2 * FL,), T.float16)
-        wq_cmx = T.alloc_shared((BG, H // 2), T.uint8)
+        wq_cmx = T.alloc_shared((BNG, H // 2), T.uint8)
         y_cmx = T.alloc_local((1, BNG), T.float16)
         gu_cmx = T.alloc_shared((1, 2 * I), T.float16)
         h_cmx = T.alloc_shared((1, I), T.float16)
-        wqd_cmx = T.alloc_shared((BD, I // 2), T.uint8)
+        wqd_cmx = T.alloc_shared((BND, I // 2), T.uint8)
+        # the tile's IPT experts' scales in ONE DMA each, before the item loop: per chunk they would be CG + CD
+        # extra jobs of 4 KiB (the engine's fixed cost per job, not the bytes), and per ITEM they would need a
+        # barrier inside the loop, which drains the weight ring the item loop exists to keep full
+        wsg_all = T.alloc_shared((HG, IPT * 2 * I), T.float16)
+        wsd_all = T.alloc_shared((IG, IPT * H), T.float16)
         yd_cmx = T.alloc_local((1, BND), T.float16)
         ye_cmx = T.alloc_shared((1, H), T.float16)
         acc = T.alloc_shared((1, H), T.float32)
@@ -602,15 +605,20 @@ def moe_block(H: int, I: int, E: int, TOPK: int, G: int, tiles: int, shaves: int
         T.sync_threads()
         # --- 3. experts: IPT items per tile -----------------------------------------------------------
         for j in T.serial(IPT):
+            T.copy(WguS[0, ids[tile * IPT + j] * 2 * I], wsg_all[0:HG, j * 2 * I:(j + 1) * 2 * I])
+            T.copy(WdS[0, ids[tile * IPT + j] * H], wsd_all[0:IG, j * H:(j + 1) * H])
+        T.sync_threads()
+        for j in T.serial(IPT):
             perf_begin("gupr")
             for n in (T.Pipelined(CG, num_stages=NSG) if pipelined else T.serial(CG)):
-                T.copy(WguP[(ids[tile * IPT + j] * CG + n) * BG, 0], wq_cmx)
+                T.copy(WguQ[ids[tile * IPT + j] * 2 * I + n * BNG, 0], wq_cmx)
                 if probe_skip_dpu:
                     y_cmx[0, 0] = T.cast(wq_cmx[0, 0], T.float16)   # keep the slot read (the ring needs a reader)
                 else:
                     for sub, dfr in GU_SUBS:   # Python-level: `defer` is a compile-time flag
                         # all but the chunk's last workload defer their reduction into the next workload's DPU time
-                        T.gemm_i4(x_cmx, wq_cmx, None, y_cmx, group=G, row0=sub * RG, rows=RG, scales_row=BNG, defer=dfr)
+                        T.gemm_i4(x_cmx, wq_cmx, wsg_all, y_cmx, group=G, row0=sub * RG, rows=RG, scales_major="group",
+                                  scales_at=(0, j * 2 * I + n * BNG), defer=dfr)
                 for c0 in T.serial(BNG // HL):
                     for v in T.vectorized(HL):
                         gu_cmx[0, n * BNG + c0 * HL + v] = y_cmx[0, c0 * HL + v]
@@ -628,12 +636,13 @@ def moe_block(H: int, I: int, E: int, TOPK: int, G: int, tiles: int, shaves: int
             T.sync_threads()
             perf_begin("down")
             for n in (T.Pipelined(CD, num_stages=num_stages) if pipelined else T.serial(CD)):
-                T.copy(WdP[(ids[tile * IPT + j] * CD + n) * BD, 0], wqd_cmx)
+                T.copy(WdQ[ids[tile * IPT + j] * H + n * BND, 0], wqd_cmx)
                 if probe_skip_dpu:
                     yd_cmx[0, 0] = T.cast(wqd_cmx[0, 0], T.float16)
                 else:
                     for sub in T.serial(BND // RD):
-                        T.gemm_i4(h_cmx, wqd_cmx, None, yd_cmx, group=G, row0=sub * RD, rows=RD, scales_row=BND)
+                        T.gemm_i4(h_cmx, wqd_cmx, wsd_all, yd_cmx, group=G, row0=sub * RD, rows=RD,
+                                  scales_major="group", scales_at=(0, j * H + n * BND))
                 for c0 in T.serial(BND // HL):
                     for v in T.vectorized(HL):
                         ye_cmx[0, n * BND + c0 * HL + v] = yd_cmx[0, c0 * HL + v]   # idempotent: the serial form runs every chunk on both SHAVEs
@@ -1038,46 +1047,25 @@ def moe_expert_prefill_reference(x, gu_int, gu_scales, d_int, d_scales, wts, off
     return out
 
 
-def moe_scale_rows(H: int, I: int, G: int, BNG: int, BND: int):
-    """Rows of a chunk block that hold the chunk's group-major fp16 scales, for the gate/up and down projections."""
-    HG, IG = H // G, I // G
-    assert (HG * BNG * 2) % (H // 2) == 0 and (IG * BND * 2) % (I // 2) == 0, "scales must fill whole weight rows"
-    return HG * BNG * 2 // (H // 2), IG * BND * 2 // (I // 2)
-
-
-def pack_chunk_blocks(w_int: "np.ndarray", scales: "np.ndarray", BN: int):
-    """[N, K] int4 values and [N, K/G] scales -> the chunk blocks of `T.gemm_i4(..., scales_row=BN)`: for each
-    chunk of BN rows, the packed weight rows then the chunk's group-major scales [K/G, BN] as whole uint8 rows.
-    Returns uint8 [N/BN x (BN + SR), K/2]."""
-    import numpy as np
-    N, K = w_int.shape
-    ng = scales.shape[1]
-    assert N % BN == 0 and (ng * BN * 2) % (K // 2) == 0
-    SR = ng * BN * 2 // (K // 2)
-    wq = pack_int4(w_int)
-    blocks = []
-    for n0 in range(0, N, BN):
-        sT = np.ascontiguousarray(scales[n0:n0 + BN].astype(np.float16).T)   # [ng, BN]
-        blocks.append(np.concatenate([wq[n0:n0 + BN], sT.view(np.uint8).reshape(SR, K // 2)], axis=0))
-    return np.concatenate(blocks, axis=0)
-
-
 def pack_moe(router: "np.ndarray", gu_int: "np.ndarray", gu_scales: "np.ndarray", d_int: "np.ndarray",
              d_scales: "np.ndarray", tiles: int = 3, shaves: int = 2, BNR: int = 16, BNG: int = 128, BND: int = 256,
              G: int = 128):
     """The kernel's weight layout from per-expert arrays (the shared expert LAST, as expert E): router fp16
     [E + 1, H] (row E the shared gate) padded with zero rows to RR; gu_int int8 [E + 1, 2I, H] in [-8, 7] and its
     scales [E + 1, 2I, H / G]; d_int [E + 1, H, I] and scales [E + 1, H, I / G]. Returns the kernel's arrays: the
-    router and the two projections as chunk blocks (`pack_chunk_blocks`, BNG / BND rows per chunk)."""
+    router, and each projection as packed values plus a separate group-major scale tensor (`pack_int4` /
+    `gm_scales`). BNG / BND no longer reach the layout -- the chunk size is a scheduling choice."""
     import numpy as np
     R, H = router.shape
     per_round = tiles * shaves * BNR
     RR = ((R + per_round - 1) // per_round) * per_round
     wr = np.zeros((RR, H), np.float16)
     wr[:R] = router
-    gu = np.concatenate([pack_chunk_blocks(gu_int[e], gu_scales[e], BNG) for e in range(gu_int.shape[0])], axis=0)
-    d = np.concatenate([pack_chunk_blocks(d_int[e], d_scales[e], BND) for e in range(d_int.shape[0])], axis=0)
-    return dict(Wr=wr, WguP=gu, WdP=d)
+    gu_q = np.concatenate([pack_int4(gu_int[e]) for e in range(gu_int.shape[0])], axis=0)
+    gu_s = gm_scales(np.concatenate([gu_scales[e] for e in range(gu_int.shape[0])], axis=0).astype(np.float16))
+    d_q = np.concatenate([pack_int4(d_int[e]) for e in range(d_int.shape[0])], axis=0)
+    d_s = gm_scales(np.concatenate([d_scales[e] for e in range(d_int.shape[0])], axis=0).astype(np.float16))
+    return dict(Wr=wr, WguQ=gu_q, WguS=gu_s, WdQ=d_q, WdS=d_s)
 
 
 def moe_reference(x: "np.ndarray", router: "np.ndarray", gu_int, gu_scales, d_int, d_scales, res, topk: int, G: int):
@@ -1133,16 +1121,17 @@ def make_gdn_decode(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV
     gdn_mixer, sz = gdn_block(H=H, KH=KH, VH=VH, DK=DK, DV=DV, G=G, tiles=tiles, shaves=shaves, num_stages=num_stages,
                               num_stages2=num_stages2, BN1=BN1, R1=R1, BN2=BN2, R2=R2, CB=CB, eps=eps, pipelined=pipelined,
                               probe_skip=probe_skip, res_add=True)
-    CONV, NIN_pad, NOUT_pad, BR1, BR2, VC = sz["CONV"], sz["NIN_pad"], sz["NOUT_pad"], sz["BR1"], sz["BR2"], sz["VC"]
+    CONV, NIN_pad, NOUT_pad, HG1, KG2, VC = sz["CONV"], sz["NIN_pad"], sz["NOUT_pad"], sz["HG1"], sz["KG2"], sz["VC"]
     WBA_pad, YLEN, BA_LEN, CVLEN, OPAD = sz["WBA_pad"], sz["YLEN"], sz["BA_LEN"], sz["CVLEN"], sz["OPAD"]
 
     @T.prim_func
     def gdn(X: T.Tensor((1, H), T.float16), Res: T.Tensor((1, H), T.float16),
-            WinP: T.Tensor(((NIN_pad // BN1) * BR1, H // 2), T.uint8), Wba: T.Tensor((WBA_pad, H), T.float16),
+            WinQ: T.Tensor((NIN_pad, H // 2), T.uint8), WinS: T.Tensor((HG1, NIN_pad), T.float16),
+            Wba: T.Tensor((WBA_pad, H), T.float16),
             ConvW: T.Tensor((4, CONV), T.float16),
             ALog: T.Tensor((1, VH), T.float32), DtBias: T.Tensor((1, VH), T.float32), GNorm: T.Tensor((1, DV), T.float16),
             ConvState: T.Tensor((3, CONV), T.float16), Ssm: T.Tensor((VH, DK, DV), T.float32),
-            WoutP: T.Tensor(((NOUT_pad // BN2) * BR2, VC // 2), T.uint8),
+            WoutQ: T.Tensor((NOUT_pad, VC // 2), T.uint8), WoutS: T.Tensor((KG2, NOUT_pad), T.float16),
             Y: T.Tensor((1, YLEN), T.float16), BA: T.Tensor((1, BA_LEN), T.float16), CV: T.Tensor((1, CVLEN), T.float16),
             O: T.Tensor((1, OPAD), T.float16),
             Out: T.Tensor((1, NOUT_pad), T.float16)):
@@ -1150,7 +1139,8 @@ def make_gdn_decode(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV
             shave = T.get_thread_binding()
             x_cmx = T.alloc_shared((1, H), T.float16)
             T.copy(X[0, 0], x_cmx)
-            gdn_mixer(x_cmx, WinP, Wba, ConvW, ALog, DtBias, GNorm, ConvState, Ssm, WoutP, Y, BA, CV, O, Res, Out, tile, shave)
+            gdn_mixer(x_cmx, WinQ, WinS, Wba, ConvW, ALog, DtBias, GNorm, ConvState, Ssm, WoutQ, WoutS, Y, BA, CV, O,
+                      Res, Out, tile, shave)
 
     return gdn
 
@@ -1158,8 +1148,9 @@ def make_gdn_decode(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV
 def gdn_block(H: int, KH: int, VH: int, DK: int, DV: int, G: int, tiles: int, shaves: int, num_stages: int = 4,
               num_stages2: int = 2, BN1: int = 128, R1: int = 64, BN2: int = 64, R2: int = 32, CB: int = 512, eps: float = 1e-6,
               pipelined: bool = True, probe_skip: str | None = None, res_add: bool = True):
-    """The Gated DeltaNet mixer as a `T.macro` (make_gdn_decode's docstring): `gdn_mixer(x_cmx, WinP, Wba, ConvW, ALog,
-    DtBias, GNorm, ConvState, Ssm, WoutP, Y, BA, CV, O, Res, Out, tile, shave)` takes the normed token in tile-shared CMX
+    """The Gated DeltaNet mixer as a `T.macro` (make_gdn_decode's docstring): `gdn_mixer(x_cmx, WinQ, WinS, Wba, ConvW,
+    ALog, DtBias, GNorm, ConvState, Ssm, WoutQ, WoutS, Y, BA, CV, O, Res, Out, tile, shave)` takes the normed token in
+    tile-shared CMX
     and writes the mixer output (+ Res when `res_add`) to Out, every tile its third of the rows. Returns (macro, sizes)."""
     assert DK == DV and VH % KH == 0 and H % G == 0 and CB % 16 == 0
     REP = VH // KH
@@ -1172,9 +1163,6 @@ def gdn_block(H: int, KH: int, VH: int, DK: int, DV: int, G: int, tiles: int, sh
     C1, C2 = NIN_pad // (BN1 * tiles), NOUT_pad // (BN2 * tiles)
     HG1, KG2 = H // G, VC // G
     assert R1 * HG1 <= 1024 and R2 * KG2 <= 1024 and BN1 % R1 == 0 and BN2 % R2 == 0
-    assert (HG1 * BN1 * 2) % (H // 2) == 0 and (KG2 * BN2 * 2) % (VC // 2) == 0
-    SR1, SR2 = HG1 * BN1 * 2 // (H // 2), KG2 * BN2 * 2 // (VC // 2)
-    BR1, BR2 = BN1 + SR1, BN2 + SR2
     workers = tiles * shaves
     RBA = -(-2 * VH // workers)                # b / a rows per worker
     assert RBA <= BN1
@@ -1188,7 +1176,7 @@ def gdn_block(H: int, KH: int, VH: int, DK: int, DV: int, G: int, tiles: int, sh
     OPAD = workers * HPW * DV
     YLEN = max(NIN_pad, ZOFF + OPAD)          # the last worker's z rows reach past VH heads (skipped, but in bounds)
     CVLEN = max(CONV, 2 * QK + OPAD)
-    sizes = dict(CONV=CONV, NIN_pad=NIN_pad, NOUT_pad=NOUT_pad, BR1=BR1, BR2=BR2, VC=VC, WBA_pad=WBA_pad, YLEN=YLEN,
+    sizes = dict(CONV=CONV, NIN_pad=NIN_pad, NOUT_pad=NOUT_pad, HG1=HG1, KG2=KG2, VC=VC, WBA_pad=WBA_pad, YLEN=YLEN,
                  BA_LEN=BA_LEN, CVLEN=CVLEN, OPAD=OPAD)
     FL = 16                                   # fp32 lanes
     assert DV % FL == 0
@@ -1292,9 +1280,11 @@ def gdn_block(H: int, KH: int, VH: int, DK: int, DV: int, G: int, tiles: int, sh
                     * T.cast(z_cmx[0, j * DV + v0 * FL + v], T.float32) / (T.float32(1) + T.cast(eh[v], T.float32)), T.float16)
 
     @T.macro
-    def gdn_mixer(x_cmx, WinP, Wba, ConvW, ALog, DtBias, GNorm, ConvState, Ssm, WoutP, Y, BA, CV, O, Res, Out, tile, shave):
+    def gdn_mixer(x_cmx, WinQ, WinS, Wba, ConvW, ALog, DtBias, GNorm, ConvState, Ssm, WoutQ, WoutS, Y, BA, CV, O, Res,
+                  Out, tile, shave):
             worker = tile * shaves + shave
-            w1_cmx = T.alloc_shared((BR1, H // 2), T.uint8)
+            w1_cmx = T.alloc_shared((BN1, H // 2), T.uint8)
+            s1_cmx = T.alloc_shared((HG1, BN1), T.float16)
             y1_cmx = T.alloc_local((1, BN1), T.float16)
             wba_cmx = T.alloc_local((RBA, H), T.float16)
             cs_cmx = T.alloc_local((3, CB), T.float16)
@@ -1332,16 +1322,18 @@ def gdn_block(H: int, KH: int, VH: int, DK: int, DV: int, G: int, tiles: int, sh
             on_cmx = T.alloc_local((1, HPW * DV), T.float16)
             o_cmx = T.alloc_shared((1, VC), T.float16)
             res_cmx = T.alloc_shared((1, NOUT_pad), T.float16)
-            w2_cmx = T.alloc_shared((BR2, VC // 2), T.uint8)
+            w2_cmx = T.alloc_shared((BN2, VC // 2), T.uint8)
+            s2_cmx = T.alloc_shared((KG2, BN2), T.float16)
             y2_cmx = T.alloc_local((1, BN2), T.float16)
             # --- A. in_proj GEMV: rows [q | k | v | z | pad] split over the tiles; b | a on the SHAVE ------------
             for n in (T.Pipelined(C1, num_stages=num_stages) if pipelined else T.serial(C1)):
-                T.copy(WinP[(tile * C1 + n) * BR1, 0], w1_cmx)
+                T.copy(WinQ[(tile * C1 + n) * BN1, 0], w1_cmx)
+                T.copy(WinS[0, (tile * C1 + n) * BN1], s1_cmx)
                 if skip_gemv:
                     y1_cmx[0, 0] = T.cast(w1_cmx[0, 0], T.float16)
                 else:
                     for sub in T.serial(BN1 // R1):
-                        T.gemm_i4(x_cmx, w1_cmx, None, y1_cmx, group=G, row0=sub * R1, rows=R1, scales_row=BN1)
+                        T.gemm_i4(x_cmx, w1_cmx, s1_cmx, y1_cmx, group=G, row0=sub * R1, rows=R1, scales_major="group")
                 T.copy(y1_cmx, Y[0, (tile * C1 + n) * BN1])
             T.copy(Wba[worker * RBA, 0], wba_cmx)
             for r in T.serial(RBA):
@@ -1406,9 +1398,10 @@ def gdn_block(H: int, KH: int, VH: int, DK: int, DV: int, G: int, tiles: int, sh
                 T.copy(Res[0:1, 0:H], res_cmx[0:1, 0:H])
             T.copy(O[0, 0], o_cmx)
             for n in (T.Pipelined(C2, num_stages=num_stages2) if pipelined else T.serial(C2)):
-                T.copy(WoutP[(tile * C2 + n) * BR2, 0], w2_cmx)
+                T.copy(WoutQ[(tile * C2 + n) * BN2, 0], w2_cmx)
+                T.copy(WoutS[0, (tile * C2 + n) * BN2], s2_cmx)
                 for sub in T.serial(BN2 // R2):
-                    T.gemm_i4(o_cmx, w2_cmx, None, y2_cmx, group=G, row0=sub * R2, rows=R2, scales_row=BN2)
+                    T.gemm_i4(o_cmx, w2_cmx, s2_cmx, y2_cmx, group=G, row0=sub * R2, rows=R2, scales_major="group")
                 if res_add:
                     for c in T.serial(BN2):
                         y2_cmx[0, c] = T.cast(T.cast(y2_cmx[0, c], T.float32)
@@ -1419,7 +1412,7 @@ def gdn_block(H: int, KH: int, VH: int, DK: int, DV: int, G: int, tiles: int, sh
 
 
 def gdn_sizes(H: int, KH: int, VH: int, DK: int, tiles: int = 3, shaves: int = 2, BN1: int = 128, BN2: int = 64, **_):
-    """make_gdn_decode's scratch and output sizes: dict(YLEN, BA_LEN, CVLEN, OPAD, NOUT_pad, WBA_pad)."""
+    """make_gdn_decode's scratch and output sizes: dict(YLEN, BA_LEN, CVLEN, OPAD, NOUT_pad, WBA_pad, NIN_pad)."""
     DV = DK
     QK, VC = KH * DK, VH * DV
     CONV = 2 * QK + VC
@@ -1432,14 +1425,17 @@ def gdn_sizes(H: int, KH: int, VH: int, DK: int, tiles: int = 3, shaves: int = 2
     OPAD = workers * HPW * DV
     WBA_pad = workers * (-(-2 * VH // workers))
     return dict(YLEN=max(NIN_pad, CONV + OPAD), BA_LEN=max(WBA_pad, VH + workers * HPW), CVLEN=max(CONV, 2 * QK + OPAD),
-                OPAD=OPAD, NOUT_pad=NOUT_pad, WBA_pad=WBA_pad)
+                OPAD=OPAD, NOUT_pad=NOUT_pad, WBA_pad=WBA_pad, NIN_pad=NIN_pad)
 
 
 def pack_gdn(win_int, win_scales, wout_int, wout_scales, wba=None, tiles: int = 3, shaves: int = 2, BN1: int = 128, BN2: int = 64):
     """make_gdn_decode's weights from the in_proj rows (int4 values [NIN, H] in [-8, 7] with scales [NIN, H/G], rows
-    [q | k | v | z]) and the out_proj ([H, VC] with [H, VC/G]): zero-padded to the tile multiple, then chunk
-    blocks of BN1 / BN2 rows (`pack_chunk_blocks`); `wba` [2 VH, H] (b rows then a rows, any float dtype) -> fp16 rows
-    zero-padded to the worker multiple."""
+    [q | k | v | z]) and the out_proj ([H, VC] with [H, VC/G]): zero-padded to the tile multiple, then the packed
+    values and group-major scales as two tensors; `wba` [2 VH, H] (b rows then a rows, any float dtype) -> fp16 rows
+    zero-padded to the worker multiple.
+
+    BN1 / BN2 only decide the padding here, not the layout: the chunk size is a scheduling choice and re-tiling
+    must not mean re-packing 17.91 GB."""
     import numpy as np
 
     def padded(w, s, BN):
@@ -1448,9 +1444,11 @@ def pack_gdn(win_int, win_scales, wout_int, wout_scales, wba=None, tiles: int = 
         sp = np.zeros((n_pad, s.shape[1]), np.float16)
         wp[: w.shape[0]] = w
         sp[: s.shape[0]] = s
-        return pack_chunk_blocks(wp, sp, BN)
+        return pack_int4(wp), gm_scales(sp)
 
-    out = dict(WinP=padded(win_int, win_scales, BN1), WoutP=padded(wout_int, wout_scales, BN2))
+    wi, si = padded(win_int, win_scales, BN1)
+    wo, so = padded(wout_int, wout_scales, BN2)
+    out = dict(WinQ=wi, WinS=si, WoutQ=wo, WoutS=so)
     if wba is not None:
         rows = -(-wba.shape[0] // (tiles * shaves)) * tiles * shaves
         w = np.zeros((rows, wba.shape[1]), np.float16)
@@ -1532,14 +1530,15 @@ def make_attn_decode(H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, RO
     attn_mixer, sz = attn_block(H=H, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX, G=G, tiles=tiles, shaves=shaves, BN1=BN1, R1=R1,
                                 BN2=BN2, R2=R2, BKV=BKV, num_stages=num_stages, num_stages2=num_stages2, kv_stages=kv_stages,
                                 eps=eps, pipelined=pipelined, res_add=True)
-    NQKV, NOUT_pad, BR1, BR2, KO, GQ, PW = sz["NQKV"], sz["NOUT_pad"], sz["BR1"], sz["BR2"], sz["KO"], sz["GQ"], sz["PW"]
+    NQKV, NOUT_pad, HG1, KG2, KO, GQ, PW = sz["NQKV"], sz["NOUT_pad"], sz["HG1"], sz["KG2"], sz["KO"], sz["GQ"], sz["PW"]
 
     @T.prim_func
     def attn(X: T.Tensor((1, H), T.float16), Res: T.Tensor((1, H), T.float16),
-             WqkvP: T.Tensor(((NQKV // BN1) * BR1, H // 2), T.uint8), QNormW: T.Tensor((1, D), T.float16),
+             WqkvQ: T.Tensor((NQKV, H // 2), T.uint8), WqkvS: T.Tensor((HG1, NQKV), T.float16),
+             QNormW: T.Tensor((1, D), T.float16),
              KNormW: T.Tensor((1, D), T.float16), CosSin: T.Tensor((2, ROT), T.float32), Pos: T.Tensor((1, 1), T.int32),
              Kc: T.Tensor((NKV, SMAX, D), T.float16), Vt: T.Tensor((NKV, D, SMAX), T.float16),
-             WoP: T.Tensor(((NOUT_pad // BN2) * BR2, KO // 2), T.uint8),
+             WoQ: T.Tensor((NOUT_pad, KO // 2), T.uint8), WoS: T.Tensor((KG2, NOUT_pad), T.float16),
              Y: T.Tensor((1, NQKV), T.float16), QN: T.Tensor((NKV, GQ, D), T.float16),
              Part: T.Tensor((NKV, GQ, tiles, PW), T.float32), O: T.Tensor((1, KO), T.float16),
              Out: T.Tensor((1, NOUT_pad), T.float16)):
@@ -1547,7 +1546,8 @@ def make_attn_decode(H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, RO
             shave = T.get_thread_binding()
             x_cmx = T.alloc_shared((1, H), T.float16)
             T.copy(X[0, 0], x_cmx)
-            attn_mixer(x_cmx, WqkvP, QNormW, KNormW, CosSin, Pos, Kc, Vt, WoP, Y, QN, Part, O, Res, Out, tile, shave, Pos, 0)
+            attn_mixer(x_cmx, WqkvQ, WqkvS, QNormW, KNormW, CosSin, Pos, Kc, Vt, WoQ, WoS, Y, QN, Part, O, Res, Out,
+                       tile, shave, Pos, 0)
 
     return attn
 
@@ -1556,8 +1556,9 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
                R1: int = 64, BN2: int = 64, R2: int = 32, BKV: int = 128, num_stages: int = 4, num_stages2: int = 2,
                kv_stages: int = 2, eps: float = 1e-6, pipelined: bool = True, res_add: bool = True, stages: str = "ABCDE",
                gemv_pipelined: bool = True, kv4: bool = False):
-    """The full-attention mixer as a `T.macro` (make_attn_decode's docstring): `attn_mixer(x_cmx, WqkvP, QNormW, KNormW,
-    CosSin, Pos, Kc, Vt, WoP, Y, QN, Part, O, Res, Out, tile, shave, KvSlot, kvi)` takes the normed token in tile-shared CMX and writes
+    """The full-attention mixer as a `T.macro` (make_attn_decode's docstring): `attn_mixer(x_cmx, WqkvQ, WqkvS, QNormW,
+    KNormW, CosSin, Pos, Kc, Vt, WoQ, WoS, Y, QN, Part, O, Res, Out, tile, shave, KvSlot, kvi)` takes the normed token in
+    tile-shared CMX and writes
     the mixer output (+ Res when `res_add`) to Out, every tile its third of the rows. `kv4`: Kc / Vt carry a leading layer
     axis indexed by `KvSlot[kvi, 1]` -- one cache per attention layer of the launch, reached as a kernel parameter rather
     than through a table address (a DDR store whose base is a `T.ddr_view` AND whose offset is a runtime value loses the
@@ -1574,8 +1575,6 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
     KO = NH * D                                 # o_proj K
     HG1, KG2 = H // G, KO // G
     assert R1 * HG1 <= 1024 and R2 * KG2 <= 1024 and BN1 % R1 == 0 and BN2 % R2 == 0
-    assert (HG1 * BN1 * 2) % (H // 2) == 0 and (KG2 * BN2 * 2) % (KO // 2) == 0
-    BR1, BR2 = BN1 + HG1 * BN1 * 2 // (H // 2), BN2 + KG2 * BN2 * 2 // (KO // 2)
     workers = tiles * shaves
     NIT = NH + NKV
     CPT = SMAX // (tiles * BKV)                 # key chunks per tile per group
@@ -1584,12 +1583,14 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
     PW = D + FL                                 # partial row: O then m, l
     scale = 1.0 / (D ** 0.5)
     HR = ROT // 2
-    sizes = dict(NQKV=NQKV, NOUT_pad=NOUT_pad, BR1=BR1, BR2=BR2, KO=KO, GQ=GQ, PW=PW)
+    sizes = dict(NQKV=NQKV, NOUT_pad=NOUT_pad, HG1=HG1, KG2=KG2, KO=KO, GQ=GQ, PW=PW)
 
     @T.macro
-    def attn_mixer(x_cmx, WqkvP, QNormW, KNormW, CosSin, Pos, Kc, Vt, WoP, Y, QN, Part, O, Res, Out, tile, shave, KvSlot, kvi):
+    def attn_mixer(x_cmx, WqkvQ, WqkvS, QNormW, KNormW, CosSin, Pos, Kc, Vt, WoQ, WoS, Y, QN, Part, O, Res, Out, tile,
+                   shave, KvSlot, kvi):
             worker = tile * shaves + shave
-            w1_cmx = T.alloc_shared((BR1, H // 2), T.uint8)
+            w1_cmx = T.alloc_shared((BN1, H // 2), T.uint8)
+            s1_cmx = T.alloc_shared((HG1, BN1), T.float16)
             y1_cmx = T.alloc_local((1, BN1), T.float16)
             pos_cmx = T.alloc_shared((1, 1), T.int32)
             cs_cmx = T.alloc_shared((2, ROT), T.float32)
@@ -1620,14 +1621,16 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
             oh = T.alloc_local((1, D), T.float16)
             o_cmx = T.alloc_shared((1, KO), T.float16)
             res_cmx = T.alloc_shared((1, NOUT_pad), T.float16)
-            w2_cmx = T.alloc_shared((BR2, KO // 2), T.uint8)
+            w2_cmx = T.alloc_shared((BN2, KO // 2), T.uint8)
+            s2_cmx = T.alloc_shared((KG2, BN2), T.float16)
             y2_cmx = T.alloc_local((1, BN2), T.float16)
             # --- A. qkv GEMV -----------------------------------------------------------------------------------------
             if "A" in stages:
               for n in (T.Pipelined(C1, num_stages=num_stages) if (pipelined and gemv_pipelined) else T.serial(C1)):
-                T.copy(WqkvP[(tile * C1 + n) * BR1, 0], w1_cmx)
+                T.copy(WqkvQ[(tile * C1 + n) * BN1, 0], w1_cmx)
+                T.copy(WqkvS[0, (tile * C1 + n) * BN1], s1_cmx)
                 for sub in T.serial(BN1 // R1):
-                    T.gemm_i4(x_cmx, w1_cmx, None, y1_cmx, group=G, row0=sub * R1, rows=R1, scales_row=BN1)
+                    T.gemm_i4(x_cmx, w1_cmx, s1_cmx, y1_cmx, group=G, row0=sub * R1, rows=R1, scales_major="group")
                 T.copy(y1_cmx, Y[0, (tile * C1 + n) * BN1])
             T.sync_grid()
             # --- B. norms, RoPE, cache append: NH q heads then NKV kv heads, dealt over the workers ------------------
@@ -1799,9 +1802,10 @@ def attn_block(H: int, NH: int, NKV: int, D: int, ROT: int, SMAX: int, G: int, t
             T.copy(O[0, 0], o_cmx)
             if "E" in stages:
               for n in (T.Pipelined(C2, num_stages=num_stages2) if (pipelined and gemv_pipelined) else T.serial(C2)):
-                T.copy(WoP[(tile * C2 + n) * BR2, 0], w2_cmx)
+                T.copy(WoQ[(tile * C2 + n) * BN2, 0], w2_cmx)
+                T.copy(WoS[0, (tile * C2 + n) * BN2], s2_cmx)
                 for sub in T.serial(BN2 // R2):
-                    T.gemm_i4(o_cmx, w2_cmx, None, y2_cmx, group=G, row0=sub * R2, rows=R2, scales_row=BN2)
+                    T.gemm_i4(o_cmx, w2_cmx, s2_cmx, y2_cmx, group=G, row0=sub * R2, rows=R2, scales_major="group")
                 if res_add:
                     for c in T.serial(BN2):
                         y2_cmx[0, c] = T.cast(T.cast(y2_cmx[0, c], T.float32)
@@ -1818,15 +1822,16 @@ def attn_sizes(H: int, NH: int, NKV: int, D: int, tiles: int = 3, BN2: int = 64,
 
 
 def pack_attn(wqkv_int, wqkv_scales, wo_int, wo_scales, tiles: int = 3, BN1: int = 128, BN2: int = 64):
-    """make_attn_decode's weights: the qkv rows ([per q-head q | gate] x NH, k, v; int4 values with scales) as chunk
-    blocks of BN1 rows, the o_proj rows zero-padded to the tile multiple as chunk blocks of BN2 rows."""
+    """make_attn_decode's weights: the qkv rows ([per q-head q | gate] x NH, k, v; int4 values with scales) and the
+    o_proj rows zero-padded to the tile multiple, each as packed values plus a group-major scale tensor."""
     import numpy as np
     n_pad = -(-wo_int.shape[0] // (BN2 * tiles)) * BN2 * tiles
     wo = np.zeros((n_pad, wo_int.shape[1]), np.int8)
     so = np.zeros((n_pad, wo_scales.shape[1]), np.float16)
     wo[: wo_int.shape[0]] = wo_int
     so[: wo_scales.shape[0]] = wo_scales
-    return dict(WqkvP=pack_chunk_blocks(wqkv_int, wqkv_scales, BN1), WoP=pack_chunk_blocks(wo, so, BN2))
+    return dict(WqkvQ=pack_int4(wqkv_int), WqkvS=gm_scales(wqkv_scales.astype(np.float16)),
+                WoQ=pack_int4(wo), WoS=gm_scales(so))
 
 
 def rope_cos_sin(pos: int, ROT: int, theta: float):
@@ -2107,13 +2112,17 @@ def gdn_scan_prefill_reference(qk, v, gb, z, gnorm, ssm, n: int, eps: float = 1e
     return out, s.astype(np.float32)
 
 
-def gdn_conv_prefill_reference(y, conv_w, conv_state, a_log, dt_bias, n: int, KH: int, VH: int, DK: int, DV: int):
+def gdn_conv_prefill_reference(y, conv_w, conv_state, a_log, dt_bias, n: int, KH: int, VH: int, DK: int, DV: int,
+                               ba=None):
     """numpy oracle of make_gdn_conv_prefill (fp32): the GDN prefill phase BETWEEN the input projection and the
     chunked scan. Returns exactly what `make_gdn_scan_prefill` consumes -- (qk, v, gb, z, new conv_state) -- so the
     two compose. Semantics are `gdn_reference`'s, run over `n` tokens instead of one: a causal conv1d of width 4 with
     SiLU over the CONV channels (the state is the 3 tokens before this chunk, time-major, oldest first), then q and k
     l2-normalised per k-head with q carrying the `1/sqrt(DK)` of attention, beta = sigmoid(b) and
-    g = -exp(a_log) softplus(a + dt_bias) per v-head, and z passed through unconvolved."""
+    g = -exp(a_log) softplus(a + dt_bias) per v-head, and z passed through unconvolved.
+
+    `ba` [NP, 2 VH]: the gate projections, which the checkpoint keeps outside the quantised in_proj. None takes
+    them from the trailing columns of `y`, the layout the synthetic device-runner weights use."""
     import numpy as np
     QK, VC = KH * DK, VH * DV
     CONV = 2 * QK + VC
@@ -2131,15 +2140,50 @@ def gdn_conv_prefill_reference(y, conv_w, conv_state, a_log, dt_bias, n: int, KH
     qk[:, :, 0], qk[:, :, 1] = q.transpose(1, 0, 2), k.transpose(1, 0, 2)
     v = conv[:, 2 * QK:].reshape(NP, VH, DV).transpose(1, 0, 2).astype(np.float16)
     z = y[:, CONV:CONV + VC].astype(np.float32).reshape(NP, VH, DV).transpose(1, 0, 2).astype(np.float16)
-    b = y[:, CONV + VC:CONV + VC + VH].astype(np.float32)
-    a = y[:, CONV + VC + VH:CONV + VC + 2 * VH].astype(np.float32)
+    bb = y[:, CONV + VC:CONV + VC + VH].astype(np.float32) if ba is None else ba[:, :VH].astype(np.float32)
+    a = (y[:, CONV + VC + VH:CONV + VC + 2 * VH].astype(np.float32) if ba is None
+         else ba[:, VH:2 * VH].astype(np.float32))
     gb = np.zeros((VH, NP, 2), np.float32)
     gb[:, :, 0] = (-np.exp(a_log.astype(np.float32).reshape(1, VH)) * np.logaddexp(0, a + dt_bias.astype(np.float32).reshape(1, VH))).T
-    gb[:, :, 1] = (1.0 / (1.0 + np.exp(-b))).T
+    gb[:, :, 1] = (1.0 / (1.0 + np.exp(-bb))).T
     # rows past the live tokens contribute nothing downstream; the state is the last three LIVE rows
     qk[:, n:], v[:, n:], z[:, n:], gb[:, n:] = 0, 0, 0, 0
     new_cs = seq[n:n + 3].astype(np.float16)
     return qk, v, gb, z, new_cs
+
+
+def prefill_ba_block(H: int, VH: int, NP: int, MB: int, tiles: int, shaves: int):
+    """`BAs[NP, 2 VH] = Xs[NP, H] . Wba[2 VH, H]^T`, fp16 on the DPU.
+
+    The checkpoint keeps the two Gated DeltaNet gate projections OUTSIDE the quantised in_proj -- bf16 rows that
+    `pack_gdn` emits as `Wba` -- which is why decode computes them with per-row SHAVE dot products instead of
+    reading them out of the projection output. Prefill has NP tokens, so the same thing is an ordinary small gemm.
+    Writing it the other way (expecting b | a as columns of the in_proj output) is what made the first E2E prefill
+    read 12352 columns of a 12288-column tensor and return NaN."""
+    RB = 16                      # the DPU's output granule; 2 VH = 64 is four chunks
+    NCH = (2 * VH) // RB
+    workers = tiles * shaves
+    assert (2 * VH) % RB == 0 and NP % MB == 0
+
+    @T.macro
+    def ba_phase(Xs, Wba, BAs, tile, shave):
+        worker = tile * shaves + shave
+        w = T.alloc_local((RB, H), T.float16)
+        x = T.alloc_local((MB, H), T.float16)
+        y = T.alloc_local((MB, RB), T.float16)
+        w[0, 0] = T.float16(0)     # pins the scope at kernel level (question 10)
+        x[0, 0] = T.float16(0)
+        y[0, 0] = T.float16(0)
+        for it in T.serial(T.ceildiv(NCH, workers)):
+            n = it * workers + worker
+            if n < NCH:
+                T.copy(Wba[n * RB, 0], w)
+                for b in T.serial(NP // MB):
+                    T.copy(Xs[b * MB, 0], x)
+                    T.gemm(x, w, y, transpose_B=True, clear_accum=True)
+                    T.copy(y, BAs[b * MB, n * RB])
+
+    return ba_phase
 
 
 def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 128, DV: int = 128, TB: int = 32,
@@ -2172,7 +2216,8 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
     assert DK == DV and VH % KH == 0 and DK % 32 == 0 and TB % 16 == 0
     QK, VC = KH * DK, VH * DV
     CONV = 2 * QK + VC
-    NIN = CONV + VC + 2 * VH
+    NIN = CONV + VC          # b | a are NOT here: the checkpoint keeps them in a separate fp16 `Wba` (see
+                             # `prefill_ba_block`), so the in_proj output is exactly what `pack_gdn` packs
     NP = -(-N // TB) * TB
     NT = NP // TB
     ITEMS = KH + VH
@@ -2181,7 +2226,7 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
     FL, HL = 16, 32
 
     @T.macro
-    def conv_phase(Y, ConvW, ConvState, ALog, DtBias, Nt, QKo, Vo, Gb, Zo, CsOut, tile, shave, bufs=None):
+    def conv_phase(Y, Ba, ConvW, ConvState, ALog, DtBias, Nt, QKo, Vo, Gb, Zo, CsOut, tile, shave, bufs=None):
         """The phase as a macro so P4 can put it in a layer launch; `make_gdn_conv_prefill` is the
         standalone wrapper. `tile` and `shave` come from the caller's launch.
 
@@ -2298,8 +2343,8 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
                             for v in T.vectorized(FL):
                                 zb[r, c0 * FL + v] = T.cast(T.cast(zb[r, c0 * FL + v], T.float32) * st[5], T.float16)
                     T.copy(zb, Zo[h, tb * TB, 0])
-                    T.copy(Y[tb * TB, CONV + VC + h], bb)
-                    T.copy(Y[tb * TB, CONV + VC + VH + h], aa)
+                    T.copy(Ba[tb * TB, h], bb)
+                    T.copy(Ba[tb * TB, VH + h], aa)
                     for r in T.serial(TB):
                         st[6] = T.if_then_else(tb * TB + r < nt[0, 0], T.float32(1), T.float32(0))
                         gbb[r, 1] = st[6] / (T.float32(1) + T.exp(T.float32(0) - T.cast(bb[r, 0], T.float32)))
@@ -2311,13 +2356,14 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
         return conv_phase, dict(NP=NP, NIN=NIN, CONV=CONV, QK=QK, VC=VC)
 
     @T.prim_func
-    def gdn_conv(Y: T.Tensor((NP, NIN), T.float16), ConvW: T.Tensor((4, CONV), T.float16),                 ConvState: T.Tensor((3, CONV), T.float16), ALog: T.Tensor((1, VH), T.float32),
+    def gdn_conv(Y: T.Tensor((NP, NIN), T.float16), Ba: T.Tensor((NP, 2 * VH), T.float16),
+                 ConvW: T.Tensor((4, CONV), T.float16),                 ConvState: T.Tensor((3, CONV), T.float16), ALog: T.Tensor((1, VH), T.float32),
                  DtBias: T.Tensor((1, VH), T.float32), Nt: T.Tensor((1, 1), T.int32),
                  QKo: T.Tensor((KH, NP, 2 * DK), T.float32), Vo: T.Tensor((VH, NP, DV), T.float16),
                  Gb: T.Tensor((VH, NP, 2), T.float32), Zo: T.Tensor((VH, NP, DV), T.float16),
                  CsOut: T.Tensor((3, CONV), T.float16)):
         with T.Kernel(tiles, threads=shaves) as tile:
-            conv_phase(Y, ConvW, ConvState, ALog, DtBias, Nt, QKo, Vo, Gb, Zo, CsOut,
+            conv_phase(Y, Ba, ConvW, ConvState, ALog, DtBias, Nt, QKo, Vo, Gb, Zo, CsOut,
                        tile, T.get_thread_binding())
 
     return gdn_conv
@@ -2340,13 +2386,14 @@ def make_gdn_mixer_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 1
                                           as_block=True)
     QK, VC = KH * DK, VH * DV
     CONV = 2 * QK + VC
-    NIN = CONV + VC + 2 * VH
+    NIN = CONV + VC
     step = TB * C // math.gcd(TB, C)
     NP = -(-N // step) * step
     assert NP == -(-N // TB) * TB == -(-N // C) * C, "one token count must serve both phases"
 
     @T.prim_func
-    def gdn_mixer_prefill(Y: T.Tensor((NP, NIN), T.float16), ConvW: T.Tensor((4, CONV), T.float16),
+    def gdn_mixer_prefill(Y: T.Tensor((NP, NIN), T.float16), Ba: T.Tensor((NP, 2 * VH), T.float16),
+                          ConvW: T.Tensor((4, CONV), T.float16),
                           ConvState: T.Tensor((3, CONV), T.float16), ALog: T.Tensor((1, VH), T.float32),
                           DtBias: T.Tensor((1, VH), T.float32), GNorm: T.Tensor((1, DV), T.float16),
                           Nt: T.Tensor((1, 1), T.int32), Ssm: T.Tensor((VH, DK, DV), T.float32),
@@ -2355,7 +2402,7 @@ def make_gdn_mixer_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 1
                           CsOut: T.Tensor((3, CONV), T.float16), Out: T.Tensor((NP, VC), T.float16)):
         with T.Kernel(tiles, threads=shaves) as tile:
             shave = T.get_thread_binding()
-            conv_phase(Y, ConvW, ConvState, ALog, DtBias, Nt, QKs, Vs, Gbs, Zs, CsOut, tile, shave)
+            conv_phase(Y, Ba, ConvW, ConvState, ALog, DtBias, Nt, QKs, Vs, Gbs, Zs, CsOut, tile, shave)
             T.sync_grid()
             scan_phase(QKs, Vs, Gbs, Zs, GNorm, Nt, Ssm, Out, tile, shave)
 
@@ -2486,7 +2533,7 @@ def make_gdn_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: int = 
                                           as_block=True)
     QK, VC = KH * DK, VH * DV
     CONV = 2 * QK + VC
-    NIN = CONV + VC + 2 * VH
+    NIN = CONV + VC
     step = TB * C // math.gcd(TB, C)
     NP = -(-N // step) * step
     NIN_pad = -(-NIN // BN1) * BN1
@@ -2498,16 +2545,19 @@ def make_gdn_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: int = 
     FL = 16
     assert H % FL == 0 and NP % workers == 0
     norm_tokens = prefill_norm_block(H, NP, workers, eps, FL)
+    ba_phase = prefill_ba_block(H, VH, NP, MB, tiles, shaves)
 
     @T.prim_func
     def gdn_layer_prefill(Hio: T.Tensor((NP, H), T.float32), InNorm: T.Tensor((1, H), T.float16),
                           WinQ: T.Tensor((NIN_pad, H // 2), T.uint8), WinS: T.Tensor((H // G, NIN_pad), T.float16),
+                          Wba: T.Tensor((2 * VH, H), T.float16),
                           ConvW: T.Tensor((4, CONV), T.float16), ConvState: T.Tensor((3, CONV), T.float16),
                           ALog: T.Tensor((1, VH), T.float32), DtBias: T.Tensor((1, VH), T.float32),
                           GNorm: T.Tensor((1, DV), T.float16), Nt: T.Tensor((1, 1), T.int32),
                           Ssm: T.Tensor((VH, DK, DV), T.float32),
                           WoutQ: T.Tensor((H, VC // 2), T.uint8), WoutS: T.Tensor((VC // G, H), T.float16),
                           Xs: T.Tensor((NP, H), T.float16), Ys: T.Tensor((NP, NIN_pad), T.float16),
+                          BAs: T.Tensor((NP, 2 * VH), T.float16),
                           QKs: T.Tensor((KH, NP, 2 * DK), T.float32), Vs: T.Tensor((VH, NP, DV), T.float16),
                           Gbs: T.Tensor((VH, NP, 2), T.float32), Zs: T.Tensor((VH, NP, DV), T.float16),
                           Os: T.Tensor((NP, VC), T.float16), Mix: T.Tensor((NP, H), T.float16),
@@ -2529,8 +2579,9 @@ def make_gdn_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: int = 
             norm_tokens(Hio, InNorm, Xs, nw, hrow, xrow, ls, st, worker)
             T.sync_grid()
             in_proj(Xs, WinQ, WinS, Ys, tile, shave)
+            ba_phase(Xs, Wba, BAs, tile, shave)
             T.sync_grid()
-            conv_phase(Ys, ConvW, ConvState, ALog, DtBias, Nt, QKs, Vs, Gbs, Zs, CsOut, tile, shave)
+            conv_phase(Ys, BAs, ConvW, ConvState, ALog, DtBias, Nt, QKs, Vs, Gbs, Zs, CsOut, tile, shave)
             T.sync_grid()
             scan_phase(QKs, Vs, Gbs, Zs, GNorm, Nt, Ssm, Os, tile, shave)
             T.sync_grid()
@@ -2551,16 +2602,17 @@ def make_gdn_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: int = 
 
 def gdn_layer_prefill_reference(h, in_norm, win_int, win_scales, conv_w, conv_state, a_log, dt_bias, gnorm,
                                 wout_int, wout_scales, ssm, n: int, KH: int, VH: int, DK: int, DV: int, G: int,
-                                eps: float = 1e-6):
+                                eps: float = 1e-6, wba=None):
     """numpy oracle of make_gdn_layer_prefill (fp32), built from the phase oracles so the layer's claim is that
     they compose: norm -> in_proj -> conv -> scan -> out_proj -> residual. Returns (h after the layer, conv state,
-    ssm)."""
+    ssm). `wba` [2 VH, H]: the gate projections the checkpoint keeps outside the quantised in_proj."""
     import numpy as np
     hf = h.astype(np.float32)
     x = hf / np.sqrt((hf * hf).mean(-1, keepdims=True) + eps) * (1.0 + in_norm.astype(np.float32).reshape(1, -1))
     y = proj_prefill_reference(x.astype(np.float16), win_int, win_scales, G)
+    ba = None if wba is None else (x.astype(np.float16).astype(np.float32) @ wba.astype(np.float32).T)
     qk, v, gb, z, new_cs = gdn_conv_prefill_reference(y.astype(np.float16), conv_w, conv_state, a_log, dt_bias,
-                                                      n, KH, VH, DK, DV)
+                                                      n, KH, VH, DK, DV, ba=ba)
     o, new_ssm = gdn_scan_prefill_reference(qk, v, gb, z, gnorm, ssm, n)
     mix = proj_prefill_reference(o.astype(np.float16), wout_int, wout_scales, G)
     out = hf.copy()
@@ -2588,7 +2640,7 @@ def make_gdn_moe_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: in
                                           as_block=True)
     QK, VC = KH * DK, VH * DV
     CONV = 2 * QK + VC
-    NIN = CONV + VC + 2 * VH
+    NIN = CONV + VC
     step = TB * C // math.gcd(TB, C)
     NP = -(-N // step) * step
     NIN_pad = -(-NIN // BN1) * BN1
@@ -2606,11 +2658,13 @@ def make_gdn_moe_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: in
     FL = 16
     assert H % FL == 0 and NP % workers == 0
     norm_tokens = prefill_norm_block(H, NP, workers, eps, FL)
+    ba_phase = prefill_ba_block(H, VH, NP, MB, tiles, shaves)
 
     @T.prim_func
     def gdn_moe_layer(Hio: T.Tensor((NP, H), T.float32), InNorm: T.Tensor((1, H), T.float16),
                       PostNorm: T.Tensor((1, H), T.float16),
                       WinQ: T.Tensor((NIN_pad, H // 2), T.uint8), WinS: T.Tensor((H // G, NIN_pad), T.float16),
+                      Wba: T.Tensor((2 * VH, H), T.float16),
                       ConvW: T.Tensor((4, CONV), T.float16), ConvState: T.Tensor((3, CONV), T.float16),
                       ALog: T.Tensor((1, VH), T.float32), DtBias: T.Tensor((1, VH), T.float32),
                       GNorm: T.Tensor((1, DV), T.float16), Nt: T.Tensor((1, 1), T.int32),
@@ -2621,6 +2675,7 @@ def make_gdn_moe_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: in
                       WguS: T.Tensor((KGH, (E + 1) * 2 * I), T.float16),
                       WdQ: T.Tensor(((E + 1) * H, I // 2), T.uint8), WdS: T.Tensor((KGI, (E + 1) * H), T.float16),
                       Xs: T.Tensor((NP, H), T.float16), Ys: T.Tensor((NP, NIN_pad), T.float16),
+                      BAs: T.Tensor((NP, 2 * VH), T.float16),
                       QKs: T.Tensor((KH, NP, 2 * DK), T.float32), Vs: T.Tensor((VH, NP, DV), T.float16),
                       Gbs: T.Tensor((VH, NP, 2), T.float32), Zs: T.Tensor((VH, NP, DV), T.float16),
                       Os: T.Tensor((NP, VC), T.float16), Mix: T.Tensor((NP, H), T.float16),
@@ -2649,8 +2704,9 @@ def make_gdn_moe_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: in
             norm_tokens(Hio, InNorm, Xs, nw, hrow, xrow, ls, st, worker)
             T.sync_grid()
             in_proj(Xs, WinQ, WinS, Ys, tile, shave)
+            ba_phase(Xs, Wba, BAs, tile, shave)
             T.sync_grid()
-            conv_phase(Ys, ConvW, ConvState, ALog, DtBias, Nt, QKs, Vs, Gbs, Zs, CsOut, tile, shave)
+            conv_phase(Ys, BAs, ConvW, ConvState, ALog, DtBias, Nt, QKs, Vs, Gbs, Zs, CsOut, tile, shave)
             T.sync_grid()
             scan_phase(QKs, Vs, Gbs, Zs, GNorm, Nt, Ssm, Os, tile, shave)
             T.sync_grid()
@@ -2686,13 +2742,13 @@ def make_gdn_moe_layer_prefill(N: int = 128, H: int = 2048, KH: int = 16, VH: in
 def gdn_moe_layer_prefill_reference(h, in_norm, post_norm, win_int, win_scales, conv_w, conv_state, a_log, dt_bias,
                                     gnorm, wout_int, wout_scales, ssm, router, gu_int, gu_scales, d_int, d_scales,
                                     n: int, KH: int, VH: int, DK: int, DV: int, E: int, TOPK: int, G: int,
-                                    eps: float = 1e-6):
+                                    eps: float = 1e-6, wba=None):
     """numpy oracle of make_gdn_moe_layer_prefill (fp32), built from the phase oracles: the mixer half, then the
     post norm, P2a's routing and P2b's grouped expert FFN, summed back into the stream."""
     import numpy as np
     out, new_cs, new_ssm = gdn_layer_prefill_reference(h, in_norm, win_int, win_scales, conv_w, conv_state, a_log,
                                                        dt_bias, gnorm, wout_int, wout_scales, ssm, n, KH, VH, DK,
-                                                       DV, G, eps)
+                                                       DV, G, eps, wba=wba)
     x = out / np.sqrt((out * out).mean(-1, keepdims=True) + eps) * (1.0 + post_norm.astype(np.float32).reshape(1, -1))
     x16 = x.astype(np.float16)
     r = moe_route_prefill_reference(x16, router, E=E, TOPK=TOPK)
@@ -3406,9 +3462,9 @@ def make_head(H: int = 2048, V: int = 248320, G: int = 128, tiles: int = 3, shav
     """M5 decode head in ONE launch: logits = rmsnorm_zc(h) . dequant_i8(Wlm)^T over the vocabulary, greedy argmax.
 
       x = h rsqrt(mean h^2 + eps) (1 + w)                 (every tile, SHAVE 0; the final norm)
-      logits[v] = x . Wlm[v]                              (int8 g128 rows as chunk blocks, split over the tiles, a
-                                                           local ring per SHAVE; the lm_head is the largest decode
-                                                           weight: V x H bytes)
+      logits[v] = x . Wlm[v]                              (int8 g128 rows with a separate group-major scale tensor,
+                                                           split over the tiles, a local ring per SHAVE; the lm_head
+                                                           is the largest decode weight: V x H bytes)
       tok = argmax_v logits[v]                            (per SHAVE on the fly: a lane max per chunk, the index scan
                                                            only when the chunk beats the running max; the six partials
                                                            meet in DDR and worker 0 picks the lowest index on a tie)
@@ -3422,20 +3478,29 @@ def make_head(H: int = 2048, V: int = 248320, G: int = 128, tiles: int = 3, shav
     V_pad = -(-V // (BN * tiles * shaves)) * BN * tiles * shaves
     C = V_pad // (BN * tiles)
     CS = C // shaves
-    assert (ng * BN * 2) % H == 0
-    BR = BN + ng * BN * 2 // H
+    # the scales a BLOCK of chunks at a time: per chunk they would be C extra DMA jobs a tile, and the engine's
+    # fixed cost per job (not the 4 KiB) is what the lm_head feels at 648 chunks. The lm_head's scales are stored
+    # CHUNK-BLOCKED -- `[V_pad / BN x K/G, BN]`, each chunk's [K/G, BN] contiguous -- so a block is ONE contiguous
+    # burst; a column window of a flat `[K/G, V_pad]` would be K/G lines of BN halves at the vocabulary's stride,
+    # and that strided read cost the WEIGHT stream 6.8 GB/s, far more than the scale bytes. Only this 8 MB tensor
+    # carries BN; the 517 MB of weights stays a plain `[V_pad, H]`.
+    # The buffer is per-SHAVE so a block needs no tile sync, which would drain the weight ring.
+    SB = max(d for d in range(1, C + 1) if C % d == 0 and (H // G) * d * BN * 2 <= 16 * 1024)
+    NBLK = C // SB
     workers = tiles * shaves
     HL, FL = 32, 16
     PW = 32
 
     @T.macro
-    def consume(x_cmx, w_cmx, y_cmx, yl, mx, st, bi, tile, n):
-        """One chunk after its fill: the BN / R merged-FC workloads, the pad mask, the running max, the logits row."""
+    def consume(x_cmx, w_cmx, s_cmx, y_cmx, yl, mx, st, bi, tile, n, cn):
+        """One chunk after its fill: the BN / R merged-FC workloads, the pad mask, the running max, the logits row.
+        `n` is the chunk inside the scales block (its column there), `cn` the chunk inside the tile."""
         for sub in T.serial(BN // R):
-            T.gemm_i8(x_cmx, w_cmx, None, y_cmx, group=G, row0=sub * R, rows=R, scales_row=BN)
-        if (tile * C + n) * BN + BN > V:
+            T.gemm_i8(x_cmx, w_cmx, s_cmx, y_cmx, group=G, row0=sub * R, rows=R, scales_major="group",
+                      scales_at=(n * ng, 0))
+        if (tile * C + cn) * BN + BN > V:   # the tail chunk's columns past V, masked before the max
             for c in T.serial(BN):
-                if (tile * C + n) * BN + c >= V:
+                if (tile * C + cn) * BN + c >= V:
                     y_cmx[0, c] = T.float16(-65504)
         for v in T.vectorized(HL):
             mx[v] = y_cmx[0, v]
@@ -3447,17 +3512,18 @@ def make_head(H: int = 2048, V: int = 248320, G: int = 128, tiles: int = 3, shav
             for c in T.serial(BN):
                 if T.cast(y_cmx[0, c], T.float32) > st[0]:
                     st[0] = T.cast(y_cmx[0, c], T.float32)
-                    bi[0] = (tile * C + n) * BN + c
+                    bi[0] = (tile * C + cn) * BN + c
         for j0 in T.serial(BN // HL):
             for v in T.vectorized(HL):
-                yl[n // shaves, j0 * HL + v] = y_cmx[0, j0 * HL + v]
+                yl[cn // shaves, j0 * HL + v] = y_cmx[0, j0 * HL + v]
 
     @T.macro
-    def head_phases(x_cmx, WlmP, Logits, Part, Tok, tile, shave):
+    def head_phases(x_cmx, WlmQ, WlmS, Logits, Part, Tok, tile, shave):
         """Phases B and C over the normed token `x_cmx` (shared fp16 [1, H]): the vocabulary GEMV with the running
         argmax, the partials, the grid barrier, worker 0's pick into Tok."""
         worker = tile * shaves + shave
-        w_cmx = T.alloc_shared((BR, H), T.int8)
+        w_cmx = T.alloc_shared((BN, H), T.int8)
+        s_cmx = T.alloc_local((SB * ng, BN), T.float16)
         y_cmx = T.alloc_local((1, BN), T.float16)
         yl = T.alloc_local((CS, BN), T.float16)
         st = T.alloc_local((4,), T.float32)
@@ -3470,14 +3536,20 @@ def make_head(H: int = 2048, V: int = 248320, G: int = 128, tiles: int = 3, shav
         st[0] = T.float32(-3e38)
         bi[0] = 0
         if pipelined:
-            for n in T.Pipelined(C, num_stages=num_stages):
-                T.copy(WlmP[(tile * C + n) * BR, 0], w_cmx)
-                consume(x_cmx, w_cmx, y_cmx, yl, mx, st, bi, tile, n)
+            # the block loop stays SERIAL: making it a second T.Pipelined nests one ring inside another, and the
+            # inner ring's slot rotation moves s_cmx under the addresses `scales_at` computed -- it hangs the device
+            for b in T.serial(NBLK):
+                T.copy(WlmS[(tile * C + b * SB) * ng, 0], s_cmx)
+                for n in T.Pipelined(SB, num_stages=num_stages):
+                    T.copy(WlmQ[(tile * C + b * SB + n) * BN, 0], w_cmx)
+                    consume(x_cmx, w_cmx, s_cmx, y_cmx, yl, mx, st, bi, tile, n, b * SB + n)
         else:
-            for n in T.serial(C):
-                T.copy(WlmP[(tile * C + n) * BR, 0], w_cmx)
-                if n % shaves == shave:
-                    consume(x_cmx, w_cmx, y_cmx, yl, mx, st, bi, tile, n)
+            for b in T.serial(NBLK):
+                T.copy(WlmS[(tile * C + b * SB) * ng, 0], s_cmx)
+                for n in T.serial(SB):
+                    T.copy(WlmQ[(tile * C + b * SB + n) * BN, 0], w_cmx)
+                    if (b * SB + n) % shaves == shave:
+                        consume(x_cmx, w_cmx, s_cmx, y_cmx, yl, mx, st, bi, tile, n, b * SB + n)
         T.copy(yl, Logits[tile, 0, shave * BN])
         for c in T.serial(PW):
             pw[0, c] = T.float32(0)
@@ -3500,11 +3572,11 @@ def make_head(H: int = 2048, V: int = 248320, G: int = 128, tiles: int = 3, shav
             T.copy(tok_cmx, Tok[0, 0])
 
     if as_block:
-        return head_phases, dict(V_pad=V_pad, C=C, CS=CS, BR=BR, workers=workers, PW=PW)
+        return head_phases, dict(V_pad=V_pad, C=C, CS=CS, ng=ng, workers=workers, PW=PW)
 
     @T.prim_func
     def head(Hs: T.Tensor((1, H), h_dtype), NormW: T.Tensor((1, H), T.float16),
-             WlmP: T.Tensor(((V_pad // BN) * BR, H), T.int8),
+             WlmQ: T.Tensor((V_pad, H), T.int8), WlmS: T.Tensor((V_pad // BN * ng, BN), T.float16),
              Logits: T.Tensor((tiles, CS, shaves * BN), T.float16), Part: T.Tensor((workers, PW), T.float32),
              Tok: T.Tensor((1, 8), T.int32)):
         with T.Kernel(tiles, threads=shaves) as tile:
@@ -3529,35 +3601,26 @@ def make_head(H: int = 2048, V: int = 248320, G: int = 128, tiles: int = 3, shav
                         x_cmx[0, d0 * FL + v] = T.cast(T.cast(h_cmx[0, d0 * FL + v], T.float32) * st[0]
                                                        * (T.float32(1) + T.cast(nw_cmx[0, d0 * FL + v], T.float32)), T.float16)
             T.sync_threads()
-            head_phases(x_cmx, WlmP, Logits, Part, Tok, tile, shave)
+            head_phases(x_cmx, WlmQ, WlmS, Logits, Part, Tok, tile, shave)
 
     return head
 
 
 def head_sizes(H: int, V: int, G: int = 128, tiles: int = 3, shaves: int = 2, BN: int = 128, **_):
-    """make_head's padded vocabulary and block geometry: dict(V_pad, C, CS, BR, workers)."""
+    """make_head's padded vocabulary and block geometry: dict(V_pad, C, CS, ng, workers)."""
     V_pad = -(-V // (BN * tiles * shaves)) * BN * tiles * shaves
     C = V_pad // (BN * tiles)
-    return dict(V_pad=V_pad, C=C, CS=C // shaves, BR=BN + (H // G) * BN * 2 // H, workers=tiles * shaves)
-
-
-def pack_chunk_blocks_i8(w_int: "np.ndarray", scales: "np.ndarray", BN: int):
-    """`pack_chunk_blocks` for int8 weights (`T.gemm_i8(..., scales_row=BN)`): [N, K] int8 and [N, K/G] scales ->
-    int8 [N/BN x (BN + SR), K], each chunk's rows then its group-major fp16 scales [K/G, BN] in whole rows."""
-    import numpy as np
-    N, K = w_int.shape
-    ng = scales.shape[1]
-    assert N % BN == 0 and (ng * BN * 2) % K == 0
-    SR = ng * BN * 2 // K
-    blocks = []
-    for n0 in range(0, N, BN):
-        sT = np.ascontiguousarray(scales[n0:n0 + BN].astype(np.float16).T)   # [ng, BN]
-        blocks.append(np.concatenate([w_int[n0:n0 + BN].astype(np.int8), sT.view(np.int8).reshape(SR, K)], axis=0))
-    return np.concatenate(blocks, axis=0)
+    return dict(V_pad=V_pad, C=C, CS=C // shaves, ng=H // G, workers=tiles * shaves)
 
 
 def pack_head(wlm_int, wlm_scales, tiles: int = 3, shaves: int = 2, BN: int = 128):
-    """make_head's lm_head: int8 rows zero-padded to the V_pad multiple, as chunk blocks of BN rows."""
+    """make_head's lm_head: int8 rows zero-padded to the V_pad multiple, plus CHUNK-BLOCKED group-major scales
+    `[V_pad / BN x K/G, BN]` -- each chunk's `[K/G, BN]` contiguous, so a run of chunks is one DMA burst.
+
+    The head is the one place the scales carry BN. At 648 chunks a tile, a column window of a flat `[K/G, V_pad]`
+    is K/G lines of BN halves at the vocabulary's stride, and that strided read slowed the WEIGHT stream from
+    58.9 to 52.1 GB/s -- far more than the scale bytes themselves. The 517 MB of weights stays BN-free; only this
+    8 MB tensor is re-packed when BN changes (and `head_BN` is in `pack.PAD_KEYS` for exactly that reason)."""
     import numpy as np
     V, H = wlm_int.shape
     V_pad = head_sizes(H, V, tiles=tiles, shaves=shaves, BN=BN)["V_pad"]
@@ -3565,7 +3628,8 @@ def pack_head(wlm_int, wlm_scales, tiles: int = 3, shaves: int = 2, BN: int = 12
     s = np.zeros((V_pad, wlm_scales.shape[1]), np.float16)
     w[:V] = wlm_int
     s[:V] = wlm_scales
-    return dict(WlmP=pack_chunk_blocks_i8(w, s, BN))
+    blocks = [np.ascontiguousarray(s[n0:n0 + BN].T) for n0 in range(0, V_pad, BN)]
+    return dict(WlmQ=w, WlmS=np.concatenate(blocks, axis=0))
 
 
 def head_reference(h, norm_w, wlm_int, wlm_scales, G: int, eps: float = 1e-6, block: int = 8192):
@@ -3722,23 +3786,25 @@ def make_gdn_layer(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV:
     moe_phases = moe_block(H=H, I=I, E=E, TOPK=TOPK, G=G, tiles=tiles, shaves=shaves, pipelined=pipelined, **mk)
     rmsnorm_zc, add_rows, add_parts = norm_block(H, shaves, eps)
     BN1, BN2 = (gdn_kw or {}).get("BN1", 128), (gdn_kw or {}).get("BN2", 64)
-    CONV, NIN_pad, NOUT_pad, BR1, BR2, VC = gs["CONV"], gs["NIN_pad"], gs["NOUT_pad"], gs["BR1"], gs["BR2"], gs["VC"]
+    CONV, NIN_pad, NOUT_pad, HG1, KG2, VC = gs["CONV"], gs["NIN_pad"], gs["NOUT_pad"], gs["HG1"], gs["KG2"], gs["VC"]
     WBA_pad, YLEN, BA_LEN, CVLEN, OPAD = gs["WBA_pad"], gs["YLEN"], gs["BA_LEN"], gs["CVLEN"], gs["OPAD"]
     per_round = tiles * shaves * mk["BNR"]
     RR = -(-(E + 1) // per_round) * per_round
     CG, CD = (2 * I) // mk["BNG"], H // mk["BND"]
-    SRG, SRD = moe_scale_rows(H, I, G, mk["BNG"], mk["BND"])
-    BG, BD = mk["BNG"] + SRG, mk["BND"] + SRD
+    HG, IG = H // G, I // G
     MR = 16
 
     @T.prim_func
     def gdn_layer(Hio: T.Tensor((1, H), T.float32), InNorm: T.Tensor((1, H), T.float16), PostNorm: T.Tensor((1, H), T.float16),
-                  WinP: T.Tensor(((NIN_pad // BN1) * BR1, H // 2), T.uint8), Wba: T.Tensor((WBA_pad, H), T.float16),
+                  WinQ: T.Tensor((NIN_pad, H // 2), T.uint8), WinS: T.Tensor((HG1, NIN_pad), T.float16),
+                  Wba: T.Tensor((WBA_pad, H), T.float16),
                   ConvW: T.Tensor((4, CONV), T.float16), ALog: T.Tensor((1, VH), T.float32), DtBias: T.Tensor((1, VH), T.float32),
                   GNorm: T.Tensor((1, DV), T.float16), ConvState: T.Tensor((3, CONV), T.float16),
-                  Ssm: T.Tensor((VH, DK, DV), T.float32), WoutP: T.Tensor(((NOUT_pad // BN2) * BR2, VC // 2), T.uint8),
-                  Wr: T.Tensor((RR, H), T.float16), WguP: T.Tensor(((E + 1) * CG * BG, H // 2), T.uint8),
-                  WdP: T.Tensor(((E + 1) * CD * BD, I // 2), T.uint8),
+                  Ssm: T.Tensor((VH, DK, DV), T.float32),
+                  WoutQ: T.Tensor((NOUT_pad, VC // 2), T.uint8), WoutS: T.Tensor((KG2, NOUT_pad), T.float16),
+                  Wr: T.Tensor((RR, H), T.float16),
+                  WguQ: T.Tensor(((E + 1) * 2 * I, H // 2), T.uint8), WguS: T.Tensor((HG, (E + 1) * 2 * I), T.float16),
+                  WdQ: T.Tensor(((E + 1) * H, I // 2), T.uint8), WdS: T.Tensor((IG, (E + 1) * H), T.float16),
                   Y: T.Tensor((1, YLEN), T.float16), BA: T.Tensor((1, BA_LEN), T.float16), CV: T.Tensor((1, CVLEN), T.float16),
                   O: T.Tensor((1, OPAD), T.float16), Mix: T.Tensor((1, NOUT_pad), T.float16),
                   Logits: T.Tensor((MR, RR), T.float16), PartM: T.Tensor((tiles, H), T.float32)):
@@ -3752,13 +3818,14 @@ def make_gdn_layer(H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV:
             T.copy(Hio[0, 0], h32)
             T.copy(InNorm[0, 0], nw_cmx)
             rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
-            gdn_mixer(x_cmx, WinP, Wba, ConvW, ALog, DtBias, GNorm, ConvState, Ssm, WoutP, Y, BA, CV, O, Mix, Mix, tile, shave)
+            gdn_mixer(x_cmx, WinQ, WinS, Wba, ConvW, ALog, DtBias, GNorm, ConvState, Ssm, WoutQ, WoutS, Y, BA, CV, O,
+                      Mix, Mix, tile, shave)
             T.sync_grid()
             T.copy(Mix[0:1, 0:H], mix_cmx[0:1, 0:H])
             add_rows(h32, mix_cmx, shave)
             T.copy(PostNorm[0, 0], nw_cmx)
             rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
-            moe_phases(x_cmx, Wr, WguP, WdP, Logits, PartM, tile, shave)
+            moe_phases(x_cmx, Wr, WguQ, WguS, WdQ, WdS, Logits, PartM, tile, shave)
             T.copy(PartM[0, 0], p_cmx)
             add_parts(h32, p_cmx, tiles, shave)
             if tile == 0:
@@ -3780,22 +3847,23 @@ def make_attn_layer(H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, ROT
     moe_phases = moe_block(H=H, I=I, E=E, TOPK=TOPK, G=G, tiles=tiles, shaves=shaves, pipelined=pipelined, **mk)
     rmsnorm_zc, add_rows, add_parts = norm_block(H, shaves, eps)
     BN1, BN2 = (attn_kw or {}).get("BN1", 128), (attn_kw or {}).get("BN2", 64)
-    NQKV, NOUT_pad, BR1, BR2, KO, GQ, PW = asz["NQKV"], asz["NOUT_pad"], asz["BR1"], asz["BR2"], asz["KO"], asz["GQ"], asz["PW"]
+    NQKV, NOUT_pad, HG1, KG2, KO, GQ, PW = asz["NQKV"], asz["NOUT_pad"], asz["HG1"], asz["KG2"], asz["KO"], asz["GQ"], asz["PW"]
     per_round = tiles * shaves * mk["BNR"]
     RR = -(-(E + 1) // per_round) * per_round
     CG, CD = (2 * I) // mk["BNG"], H // mk["BND"]
-    SRG, SRD = moe_scale_rows(H, I, G, mk["BNG"], mk["BND"])
-    BG, BD = mk["BNG"] + SRG, mk["BND"] + SRD
+    HG, IG = H // G, I // G
     MR = 16
 
     @T.prim_func
     def attn_layer(Hio: T.Tensor((1, H), T.float32), InNorm: T.Tensor((1, H), T.float16), PostNorm: T.Tensor((1, H), T.float16),
-                   WqkvP: T.Tensor(((NQKV // BN1) * BR1, H // 2), T.uint8), QNormW: T.Tensor((1, D), T.float16),
+                   WqkvQ: T.Tensor((NQKV, H // 2), T.uint8), WqkvS: T.Tensor((HG1, NQKV), T.float16),
+                   QNormW: T.Tensor((1, D), T.float16),
                    KNormW: T.Tensor((1, D), T.float16), CosSin: T.Tensor((2, ROT), T.float32), Pos: T.Tensor((1, 1), T.int32),
                    Kc: T.Tensor((NKV, SMAX, D), T.float16), Vt: T.Tensor((NKV, D, SMAX), T.float16),
-                   WoP: T.Tensor(((NOUT_pad // BN2) * BR2, KO // 2), T.uint8),
-                   Wr: T.Tensor((RR, H), T.float16), WguP: T.Tensor(((E + 1) * CG * BG, H // 2), T.uint8),
-                   WdP: T.Tensor(((E + 1) * CD * BD, I // 2), T.uint8),
+                   WoQ: T.Tensor((NOUT_pad, KO // 2), T.uint8), WoS: T.Tensor((KG2, NOUT_pad), T.float16),
+                   Wr: T.Tensor((RR, H), T.float16),
+                   WguQ: T.Tensor(((E + 1) * 2 * I, H // 2), T.uint8), WguS: T.Tensor((HG, (E + 1) * 2 * I), T.float16),
+                   WdQ: T.Tensor(((E + 1) * H, I // 2), T.uint8), WdS: T.Tensor((IG, (E + 1) * H), T.float16),
                    Y: T.Tensor((1, NQKV), T.float16), QN: T.Tensor((NKV, GQ, D), T.float16),
                    PartA: T.Tensor((NKV, GQ, tiles, PW), T.float32), O: T.Tensor((1, KO), T.float16),
                    Mix: T.Tensor((1, NOUT_pad), T.float16), Logits: T.Tensor((MR, RR), T.float16),
@@ -3810,13 +3878,14 @@ def make_attn_layer(H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, ROT
             T.copy(Hio[0, 0], h32)
             T.copy(InNorm[0, 0], nw_cmx)
             rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
-            attn_mixer(x_cmx, WqkvP, QNormW, KNormW, CosSin, Pos, Kc, Vt, WoP, Y, QN, PartA, O, Mix, Mix, tile, shave, Pos, 0)
+            attn_mixer(x_cmx, WqkvQ, WqkvS, QNormW, KNormW, CosSin, Pos, Kc, Vt, WoQ, WoS, Y, QN, PartA, O, Mix, Mix,
+                       tile, shave, Pos, 0)
             T.sync_grid()
             T.copy(Mix[0:1, 0:H], mix_cmx[0:1, 0:H])
             add_rows(h32, mix_cmx, shave)
             T.copy(PostNorm[0, 0], nw_cmx)
             rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
-            moe_phases(x_cmx, Wr, WguP, WdP, Logits, PartM, tile, shave)
+            moe_phases(x_cmx, Wr, WguQ, WguS, WdQ, WdS, Logits, PartM, tile, shave)
             T.copy(PartM[0, 0], p_cmx)
             add_parts(h32, p_cmx, tiles, shave)
             if tile == 0:
@@ -3828,11 +3897,13 @@ def make_attn_layer(H: int = 2048, NH: int = 16, NKV: int = 2, D: int = 256, ROT
 
 # Layer table columns (`make_decode_model`): one int64 device address per column, filled by the host from
 # `Session.address`; a column a layer kind does not use holds 0.
-TABLE_COLS = ["InNorm", "PostNorm", "W0", "W1", "W2", "W3", "W4", "W5", "W6", "W7", "Wr", "WguP", "WdP", "S0", "S1", "pad"]
-GDN_TABLE = dict(W0="WinP", W1="Wba", W2="ConvW", W3="ALog", W4="DtBias", W5="GNorm", W6="WoutP", S0="ConvState", S1="Ssm")
+TABLE_COLS = ["InNorm", "PostNorm", "W0", "W1", "W2", "W3", "W4", "W5", "W6", "W7", "W8", "Wr", "WguQ", "WguS",
+              "WdQ", "WdS", "S0", "S1"]
+GDN_TABLE = dict(W0="WinQ", W1="WinS", W2="Wba", W3="ConvW", W4="ALog", W5="DtBias", W6="GNorm", W7="WoutQ",
+                 W8="WoutS", S0="ConvState", S1="Ssm")
 # The attention KV cache is a kernel parameter (`KcAll` / `VtAll`), not a table address: see `attn_block`'s `kv4`.
 # `Kind[li]` is (kind, kv_slot, 0, 0): kv_slot is the layer's index among the launch's attention layers.
-ATTN_TABLE = dict(W0="WqkvP", W1="QNormW", W2="KNormW", W3="WoP")
+ATTN_TABLE = dict(W0="WqkvQ", W1="WqkvS", W2="QNormW", W3="KNormW", W4="WoQ", W5="WoS")
 
 
 def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int = 128, DV: int = 128, NH: int = 16, NKV: int = 2,
@@ -3868,14 +3939,13 @@ def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int
     BN1g, BN2g = (gdn_kw or {}).get("BN1", 128), (gdn_kw or {}).get("BN2", 64)
     BN1a, BN2a = (attn_kw or {}).get("BN1", 128), (attn_kw or {}).get("BN2", 64)
     BNh = (head_kw or {}).get("BN", 128)
-    CONV, NIN_pad, NOUTg, BR1g, BR2g, VC = gs["CONV"], gs["NIN_pad"], gs["NOUT_pad"], gs["BR1"], gs["BR2"], gs["VC"]
+    CONV, NIN_pad, NOUTg, HG1g, KG2g, VC = gs["CONV"], gs["NIN_pad"], gs["NOUT_pad"], gs["HG1"], gs["KG2"], gs["VC"]
     WBA_pad, YLEN, BA_LEN, CVLEN, OPADg = gs["WBA_pad"], gs["YLEN"], gs["BA_LEN"], gs["CVLEN"], gs["OPAD"]
-    NQKV, NOUTa, BR1a, BR2a, KO, GQ, PWa = asz["NQKV"], asz["NOUT_pad"], asz["BR1"], asz["BR2"], asz["KO"], asz["GQ"], asz["PW"]
+    NQKV, NOUTa, HG1a, KG2a, KO, GQ, PWa = asz["NQKV"], asz["NOUT_pad"], asz["HG1"], asz["KG2"], asz["KO"], asz["GQ"], asz["PW"]
     per_round = tiles * shaves * mk["BNR"]
     RR = -(-(E + 1) // per_round) * per_round
     CG, CD = (2 * I) // mk["BNG"], H // mk["BND"]
-    SRG, SRD = moe_scale_rows(H, I, G, mk["BNG"], mk["BND"])
-    BG, BD = mk["BNG"] + SRG, mk["BND"] + SRD
+    HG, IG = H // G, I // G
     MR = 16
     NCOL = len(TABLE_COLS)
     col = {n: i for i, n in enumerate(TABLE_COLS)}
@@ -3890,7 +3960,8 @@ def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int
               YA: T.Tensor((1, NQKV), T.float16), QN: T.Tensor((NKV, GQ, D), T.float16),
               PartA: T.Tensor((NKV, GQ, tiles, PWa), T.float32), OA: T.Tensor((1, KO), T.float16), MixA: T.Tensor((1, NOUTa), T.float16),
               Logits: T.Tensor((MR, RR), T.float16), PartM: T.Tensor((tiles, H), T.float32),
-              NormW: T.Tensor((1, H), T.float16), WlmP: T.Tensor(((hs["V_pad"] // BNh) * hs["BR"], H), T.int8),
+              NormW: T.Tensor((1, H), T.float16), WlmQ: T.Tensor((hs["V_pad"], H), T.int8),
+              WlmS: T.Tensor((hs["V_pad"] // BNh * hs["ng"], BNh), T.float16),
               HLogits: T.Tensor((tiles, hs["CS"], shaves * BNh), T.float16), HPart: T.Tensor((hs["workers"], hs["PW"]), T.float32),
               Tok: T.Tensor((1, 8), T.int32)):
         with T.Kernel(tiles, threads=shaves) as tile:
@@ -3905,25 +3976,30 @@ def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int
                 InNorm = T.ddr_view(Table[li, col["InNorm"]], (1, H), T.float16)
                 PostNorm = T.ddr_view(Table[li, col["PostNorm"]], (1, H), T.float16)
                 Wr = T.ddr_view(Table[li, col["Wr"]], (RR, H), T.float16)
-                WguP = T.ddr_view(Table[li, col["WguP"]], ((E + 1) * CG * BG, H // 2), T.uint8)
-                WdP = T.ddr_view(Table[li, col["WdP"]], ((E + 1) * CD * BD, I // 2), T.uint8)
+                WguQ = T.ddr_view(Table[li, col["WguQ"]], ((E + 1) * 2 * I, H // 2), T.uint8)
+                WguS = T.ddr_view(Table[li, col["WguS"]], (HG, (E + 1) * 2 * I), T.float16)
+                WdQ = T.ddr_view(Table[li, col["WdQ"]], ((E + 1) * H, I // 2), T.uint8)
+                WdS = T.ddr_view(Table[li, col["WdS"]], (IG, (E + 1) * H), T.float16)
                 perf_begin("lhed")
                 T.copy(InNorm[0, 0], nw_cmx)
                 if "norm" not in skip:
                     rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
                 perf_end()
                 if Kind[li, 0] == 0:
-                    WinP = T.ddr_view(Table[li, col["W0"]], ((NIN_pad // BN1g) * BR1g, H // 2), T.uint8)
-                    Wba = T.ddr_view(Table[li, col["W1"]], (WBA_pad, H), T.float16)
-                    ConvW = T.ddr_view(Table[li, col["W2"]], (4, CONV), T.float16)
-                    ALog = T.ddr_view(Table[li, col["W3"]], (1, VH), T.float32)
-                    DtBias = T.ddr_view(Table[li, col["W4"]], (1, VH), T.float32)
-                    GNorm = T.ddr_view(Table[li, col["W5"]], (1, DV), T.float16)
-                    WoutP = T.ddr_view(Table[li, col["W6"]], ((NOUTg // BN2g) * BR2g, VC // 2), T.uint8)
+                    WinQ = T.ddr_view(Table[li, col["W0"]], (NIN_pad, H // 2), T.uint8)
+                    WinS = T.ddr_view(Table[li, col["W1"]], (HG1g, NIN_pad), T.float16)
+                    Wba = T.ddr_view(Table[li, col["W2"]], (WBA_pad, H), T.float16)
+                    ConvW = T.ddr_view(Table[li, col["W3"]], (4, CONV), T.float16)
+                    ALog = T.ddr_view(Table[li, col["W4"]], (1, VH), T.float32)
+                    DtBias = T.ddr_view(Table[li, col["W5"]], (1, VH), T.float32)
+                    GNorm = T.ddr_view(Table[li, col["W6"]], (1, DV), T.float16)
+                    WoutQ = T.ddr_view(Table[li, col["W7"]], (NOUTg, VC // 2), T.uint8)
+                    WoutS = T.ddr_view(Table[li, col["W8"]], (KG2g, NOUTg), T.float16)
                     ConvState = T.ddr_view(Table[li, col["S0"]], (3, CONV), T.float16)
                     Ssm = T.ddr_view(Table[li, col["S1"]], (VH, DK, DV), T.float32)
                     if "gdn" not in skip:
-                        gdn_mixer(x_cmx, WinP, Wba, ConvW, ALog, DtBias, GNorm, ConvState, Ssm, WoutP, Y, BA, CV, O, Mix, Mix, tile, shave)
+                        gdn_mixer(x_cmx, WinQ, WinS, Wba, ConvW, ALog, DtBias, GNorm, ConvState, Ssm, WoutQ, WoutS,
+                                  Y, BA, CV, O, Mix, Mix, tile, shave)
                         perf_begin("mixh")
                         T.sync_grid()
                         T.copy(Mix[0:1, 0:H], mix_cmx[0:1, 0:H])
@@ -3934,13 +4010,15 @@ def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int
                                 mix_cmx[0, c] = x_cmx[0, c]
                         T.sync_threads()
                 else:
-                    WqkvP = T.ddr_view(Table[li, col["W0"]], ((NQKV // BN1a) * BR1a, H // 2), T.uint8)
-                    QNormW = T.ddr_view(Table[li, col["W1"]], (1, D), T.float16)
-                    KNormW = T.ddr_view(Table[li, col["W2"]], (1, D), T.float16)
-                    WoP = T.ddr_view(Table[li, col["W3"]], ((NOUTa // BN2a) * BR2a, KO // 2), T.uint8)
+                    WqkvQ = T.ddr_view(Table[li, col["W0"]], (NQKV, H // 2), T.uint8)
+                    WqkvS = T.ddr_view(Table[li, col["W1"]], (HG1a, NQKV), T.float16)
+                    QNormW = T.ddr_view(Table[li, col["W2"]], (1, D), T.float16)
+                    KNormW = T.ddr_view(Table[li, col["W3"]], (1, D), T.float16)
+                    WoQ = T.ddr_view(Table[li, col["W4"]], (NOUTa, KO // 2), T.uint8)
+                    WoS = T.ddr_view(Table[li, col["W5"]], (KG2a, NOUTa), T.float16)
                     if "attn" not in skip:
-                        attn_mixer(x_cmx, WqkvP, QNormW, KNormW, CosSin, Pos, KcAll, VtAll, WoP, YA, QN, PartA, OA, MixA, MixA,
-                                   tile, shave, Kind, li)
+                        attn_mixer(x_cmx, WqkvQ, WqkvS, QNormW, KNormW, CosSin, Pos, KcAll, VtAll, WoQ, WoS, YA, QN,
+                                   PartA, OA, MixA, MixA, tile, shave, Kind, li)
                         T.sync_grid()
                         T.copy(MixA[0:1, 0:H], mix_cmx[0:1, 0:H])
                     else:
@@ -3955,7 +4033,7 @@ def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int
                     rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
                 perf_end()
                 if "moe" not in skip:
-                    moe_phases(x_cmx, Wr, WguP, WdP, Logits, PartM, tile, shave)
+                    moe_phases(x_cmx, Wr, WguQ, WguS, WdQ, WdS, Logits, PartM, tile, shave)
                     perf_begin("lprt")
                     T.copy(PartM[0, 0], p_cmx)
                     add_parts(h32, p_cmx, tiles, shave)
@@ -3965,7 +4043,7 @@ def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int
             T.copy(NormW[0, 0], nw_cmx)
             rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
             if "head" not in skip:
-                head_phases(x_cmx, WlmP, HLogits, HPart, Tok, tile, shave)
+                head_phases(x_cmx, WlmQ, WlmS, HLogits, HPart, Tok, tile, shave)
             if tile == 0:
                 if shave == 0:
                     T.copy(h32, Hio[0, 0])
@@ -3973,12 +4051,12 @@ def make_decode_model(L: int, H: int = 2048, KH: int = 16, VH: int = 32, DK: int
     return model
 
 
-# Layer table columns for `make_prefill_model`. Prefill's projections are `make_proj_prefill`'s -- raw packed int4
-# plus ROW-MAJOR scales, two addresses each -- not decode's chunk blocks, so the table is not decode's.
+# Layer table columns for `make_prefill_model`. Prefill and decode read the SAME weight tensors (packed values
+# plus group-major scales); the two tables differ only in which of them a layer kind needs.
 PREFILL_TABLE_COLS = ["InNorm", "PostNorm", "W0", "W1", "W2", "W3", "W4", "W5", "W6", "W7",
-                      "Wr", "WguQ", "WguS", "WdQ", "WdS", "S0", "S1", "pad"]
+                      "Wr", "WguQ", "WguS", "WdQ", "WdS", "S0", "S1", "W8"]
 GDN_PREFILL_TABLE = dict(W0="WinQ", W1="WinS", W2="ConvW", W3="ALog", W4="DtBias", W5="GNorm", W6="WoutQ",
-                         W7="WoutS", S0="ConvState", S1="Ssm")
+                         W7="WoutS", W8="Wba", S0="ConvState", S1="Ssm")
 # As in decode, the KV cache is a kernel parameter (`KcAll` / `VtAll`) and NOT a table address (question 8);
 # `Kind[li]` is (kind, kv_slot, 0, 0).
 ATTN_PREFILL_TABLE = dict(W0="WqkvQ", W1="WqkvS", W2="QNormW", W3="KNormW", W4="WoQ", W5="WoS")
@@ -3990,7 +4068,8 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
                        TBq: int = 8, TBF: int = 16, BKV: int = 128, BN1: int = 32, BN2: int = 32, MB: int = 16,
                        BM: int = 64, BNR: int = 16, MBe: int = 16, BNG: int = 64, BND: int = 64, tiles: int = 3,
                        shaves: int = 2, eps: float = 1e-6, KVL: int | None = None, skip: frozenset = frozenset(),
-                       unroll_layers: bool = False, conv_blocked: bool = True, conv_item_worker: str = "tile"):
+                       unroll_layers: bool = False, conv_blocked: bool = True, conv_item_worker: str = "tile",
+                       HW: int | None = None):
     """P5: a whole PREFILL chunk of `N` prompt tokens through `L` layers in ONE launch -- the prefill counterpart
     of `make_decode_model`. A device-side loop over the layers, `Kind[li, 0]` selecting the Gated DeltaNet or the
     full-attention mixer, every layer's weights reached through `Table[li, :]` (`PREFILL_TABLE_COLS`), the residual
@@ -4008,11 +4087,17 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
     The head is NOT here: it is wanted on the last token of the last chunk only, so the driver launches the
     standalone `make_head` kernel on `Hio[nt - 1]` instead of this kernel carrying 8.8 ms of lm_head per chunk.
 
-    `skip` (diagnostic only) leaves out whole stages: any of "gdn", "attn", "moe", "norm"."""
+    `skip` (diagnostic only) leaves out whole stages: any of "gdn", "attn", "moe", "norm".
+
+    `HW` is the ROW COUNT the out projections were PACKED with. The packer pads a projection's rows to the
+    DECODE kernel's `BN2 * tiles`, so `WoutS`/`WoS` can be wider than `H`; the scale view must carry that pitch
+    or every group after the first is read from the wrong column. Only the first `H` rows are computed."""
     GQ, KO = NH // NKV, NH * D
     QK, VC = KH * DK, VH * DV
     CONV = 2 * QK + VC
-    NIN = CONV + VC + 2 * VH
+    NIN = CONV + VC
+    HW = H if HW is None else HW
+    assert HW >= H, f"packed out-proj rows {HW} < H {H}"
     workers = tiles * shaves
     step = 1
     for k in (TB, C, TBq, TBF, workers, BM):
@@ -4046,6 +4131,7 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
     FL = 16
     assert H % FL == 0 and NP % workers == 0
     norm_tokens = prefill_norm_block(H, NP, workers, eps, FL)
+    ba_phase = prefill_ba_block(H, VH, NP, MB, tiles, shaves)
     NCOL = len(PREFILL_TABLE_COLS)
     col = {n: i for i, n in enumerate(PREFILL_TABLE_COLS)}
     KVL = L if KVL is None else KVL
@@ -4070,6 +4156,7 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
                       KcAll: T.Tensor((KVL, NKV, SMAX, D), T.float16),
                       VtAll: T.Tensor((KVL, NKV, D, SMAX), T.float16),
                       Xs: T.Tensor((NP, H), T.float16), Ys: T.Tensor((NP, YW), T.float16),
+                      BAs: T.Tensor((NP, 2 * VH), T.float16),
                       QKs: T.Tensor((KH, NP, 2 * DK), T.float32), Vs: T.Tensor((VH, NP, DV), T.float16),
                       Gbs: T.Tensor((VH, NP, 2), T.float32), Zs: T.Tensor((VH, NP, DV), T.float16),
                       Q: T.Tensor((NKV, NP, GQ, D), T.float16), Gate: T.Tensor((NP, KO), T.float16),
@@ -4140,14 +4227,16 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
                     ALog = T.ddr_view(Table[li, col["W3"]], (1, VH), T.float32)
                     DtBias = T.ddr_view(Table[li, col["W4"]], (1, VH), T.float32)
                     GNorm = T.ddr_view(Table[li, col["W5"]], (1, DV), T.float16)
-                    WoutQ = T.ddr_view(Table[li, col["W6"]], (H, VC // 2), T.uint8)
-                    WoutS = T.ddr_view(Table[li, col["W7"]], (VC // G, H), T.float16)
+                    WoutQ = T.ddr_view(Table[li, col["W6"]], (HW, VC // 2), T.uint8)
+                    WoutS = T.ddr_view(Table[li, col["W7"]], (VC // G, HW), T.float16)
+                    Wba = T.ddr_view(Table[li, col["W8"]], (2 * VH, H), T.float16)
                     ConvState = T.ddr_view(Table[li, col["S0"]], (3, CONV), T.float16)
                     Ssm = T.ddr_view(Table[li, col["S1"]], (VH, DK, DV), T.float32)
                     if "gdn" not in skip:
                         in_proj(Xs, WinQ, WinS, Ys, tile, shave)
+                        ba_phase(Xs, Wba, BAs, tile, shave)
                         T.sync_grid()
-                        conv_phase(Ys, ConvW, ConvState, ALog, DtBias, Nt, QKs, Vs, Gbs, Zs, ConvState, tile,
+                        conv_phase(Ys, BAs, ConvW, ConvState, ALog, DtBias, Nt, QKs, Vs, Gbs, Zs, ConvState, tile,
                                    shave, cbuf)
                         T.sync_grid()
                         scan_phase(QKs, Vs, Gbs, Zs, GNorm, Nt, Ssm, Os, tile, shave)
@@ -4160,8 +4249,8 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
                     WqkvS = T.ddr_view(Table[li, col["W1"]], (H // G, NQKV_pad), T.float16)
                     QNormW = T.ddr_view(Table[li, col["W2"]], (1, D), T.float16)
                     KNormW = T.ddr_view(Table[li, col["W3"]], (1, D), T.float16)
-                    WoQ = T.ddr_view(Table[li, col["W4"]], (H, KO // 2), T.uint8)
-                    WoS = T.ddr_view(Table[li, col["W5"]], (KO // G, H), T.float16)
+                    WoQ = T.ddr_view(Table[li, col["W4"]], (HW, KO // 2), T.uint8)
+                    WoS = T.ddr_view(Table[li, col["W5"]], (KO // G, HW), T.float16)
                     if "attn" not in skip:
                         qkv_proj(Xs, WqkvQ, WqkvS, Ys, tile, shave)
                         T.sync_grid()
@@ -4217,7 +4306,7 @@ def prefill_model_reference(layers: list, h, cos_sin, pos0: int, n: int, NH: int
                 out, p["in_norm"], p["post_norm"], p["win_int"], p["win_s"], p["conv_w"], p["conv_state"],
                 p["a_log"], p["dt_bias"], p["gnorm"], p["wout_int"], p["wout_s"], p["ssm"], p["wr"],
                 p["gu_int"], p["gu_s"], p["d_int"], p["d_s"], n=n, KH=KH, VH=VH, DK=DK, DV=DV, E=E, TOPK=TOPK,
-                G=G, eps=eps)
+                G=G, eps=eps, wba=p.get("wba"))
         else:
             k = p["kv"]
             out, kc[k], vt[k] = attn_moe_layer_prefill_reference(

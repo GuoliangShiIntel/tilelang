@@ -85,7 +85,7 @@ def main(argv):
     k_err = float(np.abs(arrays["Kc"][:, pos].astype(np.float32) - ref_kc[:, pos].astype(np.float32)).max())
     v_err = float(np.abs(arrays["Vt"][:, :, pos].astype(np.float32) - ref_vt[:, :, pos].astype(np.float32)).max())
     kind = runner.condition(res, profile is not None)
-    weight_bytes = packed["WqkvP"].nbytes + packed["WoP"].nbytes
+    weight_bytes = packed["WqkvQ"].nbytes + packed["WqkvS"].nbytes + packed["WoQ"].nbytes + packed["WoS"].nbytes
     kv_bytes = 2 * SHAPE["NKV"] * SMAX * SHAPE["D"] * 2
     idu_us = [float(res.status[t * SHAVES:(t + 1) * SHAVES, 5].astype(np.int64).sum()) / PERF_CLK_MHZ for t in range(TILES)]
     print(f"device: kernel-only {res.median_kernel_ms:.3f} ms (host wall {res.median_ms:.3f} ms) [{kind}]; "

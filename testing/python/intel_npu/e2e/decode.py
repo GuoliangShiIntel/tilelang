@@ -3,11 +3,17 @@
 table of device addresses, the fp32 residual stream in CMX for the whole step, final norm + lm_head + argmax at the end).
 `--per-layer`: one launch per fused layer (`make_gdn_layer` / `make_attn_layer`) and one for the head (the A/B baseline).
 Weights and states are resident in one `npu_run --session`; the host uploads the embedding row, launches, and reads the
-token back. The prompt is run token by token through the same decode kernels (correct, slow: prefill kernels are a later
-milestone).
+token back.
+
+`--prefill [N]`: the prompt goes through `kernels.make_prefill_model` in chunks of N tokens (one launch a chunk, all
+40 layers) instead of token by token through the decode kernels. Both paths read the SAME weight tensors -- packed
+values plus group-major scales -- and write the same KV cache, conv state and SSM state, so decode continues from
+where prefill stopped; that shared layout is what makes one 17.91 GB upload serve both. Without the flag the prompt
+is replayed through decode, which is correct but is not prefill and must not be quoted as TTFT.
 
     python testing/python/intel_npu/e2e/decode.py --ckpt D:\\models\\... --pack-dir D:\\models\\..._tlpack
-        [--layers N] [--prompt "text" | --ids 1,2,3] [--new 16] [--smax 1536] [--golden golden.npz] [--no-build] [--per-layer]
+        [--prefill 192] [--layers N] [--prompt "text" | --ids 1,2,3] [--new 16] [--smax 1536] [--golden golden.npz]
+        [--no-build] [--per-layer]
 
 --golden FILE: the fp32 reference's saved answer for the same prompt (`e2e/reference_golden.py`, run separately: the
 reference and 18 GB of pinned weights do not fit one 32 GB box together); the hidden state after every layer of the
@@ -33,18 +39,48 @@ sys.path.insert(0, str(HERE))
 import tilelang  # noqa: E402,F401
 import lowering  # noqa: E402
 import runner  # noqa: E402
-from kernels import (ATTN_TABLE, GDN_TABLE, TABLE_COLS, attn_sizes, gdn_sizes, head_sizes, make_attn_layer, make_decode_model,  # noqa: E402
-                     make_gdn_layer, make_head, rope_cos_sin)
+from kernels import (ATTN_PREFILL_TABLE, ATTN_TABLE, GDN_PREFILL_TABLE, GDN_TABLE, PREFILL_TABLE_COLS,  # noqa: E402
+                     TABLE_COLS, attn_sizes, gdn_sizes, head_sizes, make_attn_layer, make_decode_model,
+                     make_gdn_layer, make_head, make_prefill_model, rope_cos_sin)
 import tilelang.intel_npu.language as T  # noqa: E402
 from checkpoint import Checkpoint, LM  # noqa: E402
 import pack  # noqa: E402
 
 TILES, SHAVES = 3, 2
 
+# `make_prefill_model`'s block geometry. Only the token count N reaches a buffer SHAPE; the rest are scheduling,
+# and none of them reach the packed weights any more (pack.PAD_KEYS), so a sweep here costs a rebuild, not a repack.
+PREFILL_GEOM = dict(TB=32, C=64, TBq=8, TBF=16, BKV=128, BN1=32, BN2=32, MB=16, BM=64, BNR=16, MBe=16,
+                    BNG=64, BND=64)
+
+
+def prefill_sizes(c, n: int, G: dict) -> dict:
+    """The padded token count and every scratch extent `make_prefill_model` declares, derived the same way the
+    kernel derives them -- a mismatch here is a DDR read past a buffer, which hangs the device rather than
+    failing."""
+    import math
+    workers = TILES * SHAVES
+    step = 1
+    for k in (G["TB"], G["C"], G["TBq"], G["TBF"], workers, G["BM"]):
+        step = step * k // math.gcd(step, k)
+    NP = -(-n // step) * step
+    QK, VC = c.lin_kh * c.lin_dk, c.lin_vh * c.lin_dv
+    CONV = 2 * QK + VC
+    NIN = CONV + VC
+    NIN_pad = -(-NIN // G["BN1"]) * G["BN1"]
+    NQKV = c.n_heads * 2 * c.head_dim + 2 * c.n_kv * c.head_dim
+    NQKV_pad = -(-NQKV // G["BN1"]) * G["BN1"]
+    KO = c.n_heads * c.head_dim
+    per_round = workers * G["BNR"]
+    RR = -(-(c.n_experts + 1) // per_round) * per_round
+    return dict(NP=NP, YW=max(NIN_pad, NQKV_pad), OW=max(VC, KO), KO=KO, RR=RR, NIN=NIN, NQKV=NQKV,
+                SLOTS=NP * (c.top_k + 1), GQ=c.n_heads // c.n_kv, VC=VC, CONV=CONV)
+
 
 class DeviceModel:
     def __init__(self, ck: Checkpoint, pack_dir: Path, layers: int, smax: int, build: bool, single: bool = True, log=print,
-                 layer_ids: list[int] | None = None, chunked: bool = False):
+                 layer_ids: list[int] | None = None, chunked: bool = False, prefill: int = 0,
+                 prefill_ls: list[int] | None = None):
         self.ck, self.c, self.log = ck, ck.cfg, log
         c = self.c
         self.layer_ids = list(layer_ids) if layer_ids is not None else list(range(layers))   # checkpoint layers, in run order
@@ -52,6 +88,7 @@ class DeviceModel:
         self.L = layers
         self.smax = smax
         self.single = single
+        self.prefill_n = prefill
         # launch units: the whole model, or (chunked) runs of up to 3 GDN layers and single attention layers, the head in the last
         self.chunks = self._chunks() if (single and chunked) else [self.layer_ids]
         G = pack.GEOM
@@ -85,6 +122,48 @@ class DeviceModel:
                                                               stages=os.environ.get("TL_NPU_DBG_ATTN_STAGES", "ABCDE")), moe_kw=moe_kw,
                                                  head_kw=dict(BN=G["head_BN"]))
                 names[key] = f"tl_e2e_{key}_h{c.hidden}_s{smax}"
+            if self.prefill_n:
+                # the prompt through the PREFILL kernels instead of token by token through decode. It reads the
+                # same weight tensors decode already uploaded -- that is what the shared group-major scale layout
+                # bought -- and writes the same KV cache, conv state and SSM state, so decode continues from it.
+                assert len(self.chunks) == 1, "--prefill needs the whole model in one launch unit (not --chunked)"
+                ps = prefill_sizes(c, self.prefill_n, PREFILL_GEOM)
+                self.ps = ps
+                # a sweep builds one kernel per layer count in THIS pass: they then share the build, the 17.91 GB
+                # upload and the session, so a bisect point costs a launch instead of ~100 s of fixed overhead
+                self.prefill_ls = sorted(prefill_ls) if prefill_ls else [layers]
+                assert max(self.prefill_ls) <= layers
+                pskip = frozenset(x for x in os.environ.get("TL_NPU_PREFILL_SKIP", "").split(",") if x)
+                # the out projections were PACKED at the DECODE geometry, so their rows are padded to that
+                # kernel's BN2 * tiles and the scales tensor is wider than H. Prefill must read them with the
+                # packer's pitch, not its own.
+                hw_g = gdn_sizes(c.hidden, c.lin_kh, c.lin_vh, c.lin_dk, tiles=TILES, shaves=SHAVES,
+                                 BN1=pack.GEOM["gdn_BN1"], BN2=pack.GEOM["gdn_BN2"])["NOUT_pad"]
+                hw_a = attn_sizes(c.hidden, c.n_heads, c.n_kv, c.head_dim, tiles=TILES,
+                                  BN2=pack.GEOM["attn_BN2"])["NOUT_pad"]
+                assert hw_g == hw_a, (f"the two mixers' out projections were packed to different row counts "
+                                      f"(gdn {hw_g}, attn {hw_a}); the prefill kernel carries one pitch")
+                # the IN projections carry no such knob: prefill derives its own pad, so if the packer's differs
+                # the group-major scales are read from the wrong column and the layer silently returns NaN.
+                gsz_p = gdn_sizes(c.hidden, c.lin_kh, c.lin_vh, c.lin_dk, tiles=TILES, shaves=SHAVES,
+                                  BN1=pack.GEOM["gdn_BN1"], BN2=pack.GEOM["gdn_BN2"])
+                asz_p = attn_sizes(c.hidden, c.n_heads, c.n_kv, c.head_dim, tiles=TILES,
+                                   BN2=pack.GEOM["attn_BN2"])
+                assert gsz_p["NIN_pad"] == -(-ps["NIN"] // PREFILL_GEOM["BN1"]) * PREFILL_GEOM["BN1"], (
+                    f"in_proj packed to {gsz_p['NIN_pad']} rows; prefill reads "
+                    f"{-(-ps['NIN'] // PREFILL_GEOM['BN1']) * PREFILL_GEOM['BN1']}")
+                assert asz_p["NQKV"] == -(-ps["NQKV"] // PREFILL_GEOM["BN1"]) * PREFILL_GEOM["BN1"], (
+                    f"qkv_proj packed to {asz_p['NQKV']} rows; prefill reads "
+                    f"{-(-ps['NQKV'] // PREFILL_GEOM['BN1']) * PREFILL_GEOM['BN1']}")
+                for pl in self.prefill_ls:
+                    kvl = max(1, sum(1 for i in self.layer_ids[:pl] if c.layer_types[i] != "linear_attention"))
+                    kernels[f"prefill{pl}"] = make_prefill_model(
+                        L=pl, N=ps["NP"], H=c.hidden, KH=c.lin_kh, VH=c.lin_vh, DK=c.lin_dk, DV=c.lin_dv,
+                        NH=c.n_heads, NKV=c.n_kv, D=c.head_dim, ROT=c.rot_dim, SMAX=smax, I=c.moe_inter,
+                        E=c.n_experts, TOPK=c.top_k, G=ck.group, tiles=TILES, shaves=SHAVES, eps=c.eps,
+                        KVL=kvl, skip=pskip, HW=hw_g, **PREFILL_GEOM)
+                    names[f"prefill{pl}"] = (f"tl_e2e_prefill_l{pl}_n{ps['NP']}_h{c.hidden}_s{smax}"
+                                             + ("_skip_" + "_".join(sorted(pskip)) if pskip else ""))
         else:
             kernels = {
                 "gdn": make_gdn_layer(H=c.hidden, KH=c.lin_kh, VH=c.lin_vh, DK=c.lin_dk, DV=c.lin_dv, I=c.moe_inter, E=c.n_experts,
@@ -158,6 +237,20 @@ class DeviceModel:
         H = c.hidden
         t0 = time.perf_counter()
         total = 0
+        # diagnostic: a dead buffer allocated FIRST, pushing every weight to a higher device address. Prefill
+        # faults at a layer count whose CUMULATIVE upload crosses 4 GiB, so padding is what separates "too many
+        # layers" from "a weight above 2^32".
+        pad_gb = float(os.environ.get("TL_NPU_PAD_GB", "0"))
+        if pad_gb:
+            s.alloc("PAD", int(pad_gb * (1 << 30)))
+            self.log(f"pad: {pad_gb} GiB before the weights")
+        # The prefill scratch goes FIRST, with decode's, because the 17.91 GB of weights follows and anything
+        # allocated after it lands above 4 GiB. A prefill whose scratch sits there faults the device
+        # (ZE_RESULT_ERROR_DEVICE_LOST): measured sharply -- 9 layers with a 0.2 GiB pad keeps the scratch at
+        # 4.12 GB and returns, 0.4 GiB puts it at 4.32 GB and faults. Decode never hit it because its own scratch
+        # was always allocated before the weights.
+        if self.prefill_n:
+            self._alloc_prefill_scratch()
         s.upload("Hio", np.zeros((1, H), np.float32))
         s.upload("Pos", np.zeros((1, 1), np.int32))
         s.upload("CosSin", np.zeros((2, c.rot_dim), np.float32))
@@ -199,11 +292,91 @@ class DeviceModel:
         s.alloc("M_Logits", 16 * self._router_rows() * 2)
         head = pack.cached_paths(self.pack_dir, pack.head_key(), lambda: pack.pack_head_weights(self.ck), log=self.log)
         self.final_norm = np.load(head["final_norm"])
-        total += s.upload_npy("H_WlmP", head["WlmP"])
+        total += s.upload_npy("H_WlmQ", head["WlmQ"])
+        total += s.upload_npy("H_WlmS", head["WlmS"])
         s.upload("H_NormW", self.final_norm.astype(np.float16).reshape(1, H))
         self.log(f"uploaded {self.L} layers + head: {total / 1e9:.2f} GB in {time.perf_counter() - t0:.0f} s")
         if self.single:
             self._upload_table()
+        if self.prefill_n:
+            self._alloc_prefill()
+
+    def _alloc_prefill_scratch(self):
+        """The prefill kernel's DDR scratch. Called before the weights: see `_upload_all`."""
+        c, s, ps = self.c, self.s, self.ps
+        NP, H = ps["NP"], c.hidden
+        for nm, nbytes in (("P_Hio", NP * H * 4), ("P_Pos", 4), ("P_Nt", 4), ("P_CosSin", NP * 2 * c.rot_dim * 4),
+                           ("P_Xs", NP * H * 2), ("P_Ys", NP * ps["YW"] * 2), ("P_BAs", NP * 2 * c.lin_vh * 2),
+                           ("P_QKs", c.lin_kh * NP * 2 * c.lin_dk * 4), ("P_Vs", c.lin_vh * NP * c.lin_dv * 2),
+                           ("P_Gbs", c.lin_vh * NP * 2 * 4), ("P_Zs", c.lin_vh * NP * c.lin_dv * 2),
+                           ("P_Q", c.n_kv * NP * ps["GQ"] * c.head_dim * 2), ("P_Gate", NP * ps["KO"] * 2),
+                           ("P_Os", NP * ps["OW"] * 2), ("P_Mix", NP * H * 2),
+                           ("P_Logits", NP * ps["RR"] * 2), ("P_Ids", NP * c.top_k * 4), ("P_Wts", NP * 16 * 4),
+                           ("P_Cnt", (c.n_experts + 1) * 4), ("P_Off", (c.n_experts + 2) * 4),
+                           ("P_Slot", ps["SLOTS"] * 4), ("P_PartE", TILES * NP * H * 4), ("P_MoeOut", NP * H * 4)):
+            s.alloc(nm, nbytes)
+
+    def _alloc_prefill(self):
+        """The prefill kernel's layer table. Weights, conv state, SSM and the KV cache are the buffers decode
+        already has: the two tables name the same allocations, in each kernel's own column order."""
+        c, s, ps = self.c, self.s, self.ps
+        col = {n: i for i, n in enumerate(PREFILL_TABLE_COLS)}
+        table = np.zeros((self.L, len(PREFILL_TABLE_COLS)), np.int64)
+        kind = np.zeros((self.L, 4), np.int32)
+        kv_slot = 0
+        for r, i in enumerate(self.layer_ids):
+            gdn = c.layer_types[i] == "linear_attention"
+            kind[r, 0] = 0 if gdn else 1
+            if not gdn:
+                kind[r, 1] = kv_slot      # the same slot numbering decode's table uses: both walk layers in order
+                kv_slot += 1
+            names = dict(InNorm=f"L{i}_in_norm", PostNorm=f"L{i}_post_norm", Wr=f"L{i}_Wr",
+                         WguQ=f"L{i}_WguQ", WguS=f"L{i}_WguS", WdQ=f"L{i}_WdQ", WdS=f"L{i}_WdS")
+            for k, v in (GDN_PREFILL_TABLE if gdn else ATTN_PREFILL_TABLE).items():
+                names[k] = f"L{i}_{v}"
+            for k, n in names.items():
+                table[r, col[k]] = s.address(n)
+        assert (table[:, [col["InNorm"], col["PostNorm"], col["Wr"]]] != 0).all()
+        s.upload("P_Kind", kind)
+        s.upload("P_Table", table)
+        self.log(f"prefill: {ps['NP']} tokens a launch, {self.L} rows x {len(PREFILL_TABLE_COLS)} addresses")
+
+    def _prefill_bufs(self, alias: str):
+        m = dict(Hio="P_Hio", Pos="P_Pos", Nt="P_Nt", CosSin="P_CosSin", Kind="P_Kind", Table="P_Table",
+                 KcAll="KcAll0", VtAll="VtAll0", Xs="P_Xs", Ys="P_Ys", BAs="P_BAs", QKs="P_QKs", Vs="P_Vs",
+                 Gbs="P_Gbs", Zs="P_Zs", Q="P_Q", Gate="P_Gate", Os="P_Os", Mix="P_Mix", Logits="P_Logits",
+                 Ids="P_Ids", Wts="P_Wts", Cnt="P_Cnt", Off="P_Off", Slot="P_Slot", PartE="P_PartE",
+                 MoeOut="P_MoeOut")
+        return [m[n] for n in self.low[alias].param_names]
+
+    def prefill(self, ids: list[int], L: int | None = None) -> float:
+        """Runs `ids` through the prefill kernels in chunks of NP, advancing `self.pos`. Returns the device
+        kernel-only milliseconds. `L` picks a kernel of the sweep; a kernel built for L reads the first L rows of
+        the one shared table, so every layer count runs off the same upload."""
+        import torch
+        c, s, ps = self.c, self.s, self.ps
+        alias = f"prefill{self.prefill_ls[-1] if L is None else L}"
+        NP, H = ps["NP"], c.hidden
+        dev_ms = 0.0
+        for c0 in range(0, len(ids), NP):
+            blk = ids[c0:c0 + NP]
+            h = np.zeros((NP, H), np.float32)
+            for j, t in enumerate(blk):
+                h[j] = self.embed[t].to(torch.float32).numpy()
+            s.upload("P_Hio", h)
+            s.upload("P_Pos", np.array([[self.pos]], np.int32))
+            s.upload("P_Nt", np.array([[len(blk)]], np.int32))
+            s.upload("P_CosSin", np.stack([rope_cos_sin(self.pos + t, c.rot_dim, c.rope_theta).reshape(-1)
+                                           for t in range(NP)]).astype(np.float32))
+            _, km = s.launch(alias, *self._prefill_bufs(alias))
+            dev_ms += km
+            if os.environ.get("TL_NPU_PREFILL_DBG") == "1":
+                hio = s.download("P_Hio", np.float32, (NP, H))
+                live = hio[:len(blk)]
+                print(f"  prefill out: live rows absmax {np.abs(live).max():.3e}, nan {int(np.isnan(live).sum())}, "
+                      f"inf {int(np.isinf(live).sum())}; row0[:4] {np.round(live[0, :4], 3)}", file=sys.stderr)
+            self.pos += len(blk)
+        return dev_ms
 
     def _upload_table(self):
         """Kind[L, 4] and Table[L, len(TABLE_COLS)]: the device addresses of every layer's weights and states, in the
@@ -220,7 +393,8 @@ class DeviceModel:
                 if not gdn:
                     kind[r, 1] = kv_slot   # the layer's slot in KcAll / VtAll
                     kv_slot += 1
-                names = dict(InNorm=f"L{i}_in_norm", PostNorm=f"L{i}_post_norm", Wr=f"L{i}_Wr", WguP=f"L{i}_WguP", WdP=f"L{i}_WdP")
+                names = dict(InNorm=f"L{i}_in_norm", PostNorm=f"L{i}_post_norm", Wr=f"L{i}_Wr",
+                             WguQ=f"L{i}_WguQ", WguS=f"L{i}_WguS", WdQ=f"L{i}_WdQ", WdS=f"L{i}_WdS")
                 for k, v in (GDN_TABLE if gdn else ATTN_TABLE).items():
                     names[k] = f"L{i}_{v}"
                 for k, n in names.items():
@@ -253,24 +427,29 @@ class DeviceModel:
     def _bufs(self, kind, i):
         """Buffer names in the kernel's device parameter order."""
         if kind == "gdn":
-            m = dict(Hio="Hio", InNorm=f"L{i}_in_norm", PostNorm=f"L{i}_post_norm", WinP=f"L{i}_WinP", Wba=f"L{i}_Wba", ConvW=f"L{i}_ConvW",
+            m = dict(Hio="Hio", InNorm=f"L{i}_in_norm", PostNorm=f"L{i}_post_norm", WinQ=f"L{i}_WinQ", WinS=f"L{i}_WinS",
+                     Wba=f"L{i}_Wba", ConvW=f"L{i}_ConvW",
                      ALog=f"L{i}_ALog", DtBias=f"L{i}_DtBias", GNorm=f"L{i}_GNorm", ConvState=f"L{i}_ConvState", Ssm=f"L{i}_Ssm",
-                     WoutP=f"L{i}_WoutP", Wr=f"L{i}_Wr", WguP=f"L{i}_WguP", WdP=f"L{i}_WdP", Y="G_Y", BA="G_BA", CV="G_CV", O="G_O",
+                     WoutQ=f"L{i}_WoutQ", WoutS=f"L{i}_WoutS", Wr=f"L{i}_Wr", WguQ=f"L{i}_WguQ", WguS=f"L{i}_WguS",
+                     WdQ=f"L{i}_WdQ", WdS=f"L{i}_WdS", Y="G_Y", BA="G_BA", CV="G_CV", O="G_O",
                      Mix="G_Mix", Logits="M_Logits", PartM="M_Part")
         elif kind == "attn":
-            m = dict(Hio="Hio", InNorm=f"L{i}_in_norm", PostNorm=f"L{i}_post_norm", WqkvP=f"L{i}_WqkvP", QNormW=f"L{i}_QNormW",
-                     KNormW=f"L{i}_KNormW", CosSin="CosSin", Pos="Pos", Kc=f"L{i}_Kc", Vt=f"L{i}_Vt", WoP=f"L{i}_WoP", Wr=f"L{i}_Wr",
-                     WguP=f"L{i}_WguP", WdP=f"L{i}_WdP", Y="A_Y", QN="A_QN", PartA="A_Part", O="A_O", Mix="A_Mix", Logits="M_Logits",
+            m = dict(Hio="Hio", InNorm=f"L{i}_in_norm", PostNorm=f"L{i}_post_norm", WqkvQ=f"L{i}_WqkvQ",
+                     WqkvS=f"L{i}_WqkvS", QNormW=f"L{i}_QNormW",
+                     KNormW=f"L{i}_KNormW", CosSin="CosSin", Pos="Pos", Kc=f"L{i}_Kc", Vt=f"L{i}_Vt",
+                     WoQ=f"L{i}_WoQ", WoS=f"L{i}_WoS", Wr=f"L{i}_Wr",
+                     WguQ=f"L{i}_WguQ", WguS=f"L{i}_WguS", WdQ=f"L{i}_WdQ", WdS=f"L{i}_WdS",
+                     Y="A_Y", QN="A_QN", PartA="A_Part", O="A_O", Mix="A_Mix", Logits="M_Logits",
                      PartM="M_Part")
         else:
-            m = dict(Hs="Hio", NormW="H_NormW", WlmP="H_WlmP", Logits="H_Logits", Part="H_Part", Tok="H_Tok")
+            m = dict(Hs="Hio", NormW="H_NormW", WlmQ="H_WlmQ", WlmS="H_WlmS", Logits="H_Logits", Part="H_Part", Tok="H_Tok")
         return [m[n] for n in self.low[kind].param_names]
 
     def _model_bufs(self, ci: int = 0):
         m = dict(Hio="Hio", Pos="Pos", CosSin="CosSin", Kind=f"Kind{ci}", Table=f"Table{ci}", KcAll=f"KcAll{ci}", VtAll=f"VtAll{ci}",
                  Y="G_Y", BA="G_BA", CV="G_CV", O="G_O", Mix="G_Mix",
                  YA="A_Y", QN="A_QN", PartA="A_Part", OA="A_O", MixA="A_Mix", Logits="M_Logits", PartM="M_Part", NormW="H_NormW",
-                 WlmP="H_WlmP", HLogits="H_Logits", HPart="H_Part", Tok="H_Tok")
+                 WlmQ="H_WlmQ", WlmS="H_WlmS", HLogits="H_Logits", HPart="H_Part", Tok="H_Tok")
         return [m[n] for n in self.low[self._chunk_kernel(ci)].param_names]
 
     def step(self, token: int, trace: list | None = None) -> tuple[int, dict]:
@@ -343,6 +522,16 @@ def main(argv):
     ap.add_argument("--chunked", action="store_true",
                     help="one launch per run of up to 3 GDN layers and per attention layer (head in the last): the A/B "
                          "baseline for the single-launch model")
+    ap.add_argument("--prefill", type=int, nargs="?", const=192, default=0, metavar="N",
+                    help="run the prompt through make_prefill_model in chunks of N tokens (default 192) instead of "
+                         "token by token through the decode kernels; this is what TTFT should measure")
+    ap.add_argument("--prefill-only", action="store_true",
+                    help="stop after the prefill launches, before any decode step: the prefill bisect, which must "
+                         "not depend on the decode path (a partial --layers / --layer-ids set hangs decode)")
+    ap.add_argument("--prefill-sweep", default=None, metavar="L1,L2,...",
+                    help="layer counts to launch prefill at, ascending, from ONE session: the kernels are built in "
+                         "one pass and share the weight upload, so a bisect point costs a launch instead of a "
+                         "rebuild. A hang ends the session, so the sweep stops there and names the layer count")
     a = ap.parse_args(argv)
     if not a.ckpt or not a.pack_dir:
         print("--ckpt and --pack-dir (or TL_NPU_CKPT / TL_NPU_PACK_DIR) are required")
@@ -365,11 +554,22 @@ def main(argv):
     mode = "one launch per layer" if a.per_layer else ("one launch per chunk" if a.chunked else "one launch per token")
     print(f"prompt: {len(ids)} tokens; layers {layers} of {ck.cfg.layers}; new {a.new}; {mode}")
     m = DeviceModel(ck, Path(a.pack_dir), layers, a.smax, build=not a.no_build, single=not a.per_layer,
-                    layer_ids=[int(x) for x in a.layer_ids.split(",")] if a.layer_ids else None, chunked=a.chunked)
+                    layer_ids=[int(x) for x in a.layer_ids.split(",")] if a.layer_ids else None, chunked=a.chunked,
+                    prefill=a.prefill if not a.per_layer else 0,
+                    prefill_ls=[int(x) for x in a.prefill_sweep.split(",")] if a.prefill_sweep else None)
     if a.chunked:
         print(f"chunks: {len(m.chunks)} launches per token: " + " ".join("/".join(str(i) for i in ch) for ch in m.chunks))
     try:
         m.reset_state()
+        if a.prefill_sweep:
+            for pl in m.prefill_ls:
+                m.reset_state()
+                t0 = time.perf_counter()
+                km = m.prefill(ids[:-1], L=pl)
+                print(f"  L={pl:3d}: returned, {km:7.1f} ms device, {time.perf_counter() - t0:.1f} s wall",
+                      flush=True)
+            print(f"prefill sweep: every layer count in {m.prefill_ls} returned")
+            return 0
         if gold is not None:
             t0 = time.perf_counter()
             dev_trace = [] if a.per_layer else None
@@ -420,9 +620,23 @@ def main(argv):
             return 0 if clean == a.trials else 1
         # free generation
         out, times = [], []
-        for t in ids[:-1]:
-            m.step(t)
+        t_pre = time.perf_counter()
+        pre_ms = 0.0
+        if m.prefill_n:
+            # the prompt through the prefill kernels, all but its last token; the last one goes through decode so
+            # that the first output token comes out of the same path every later token does
+            if len(ids) > 1:
+                pre_ms = m.prefill(ids[:-1])
+            if a.prefill_only:
+                print(f"prefill only: {len(ids) - 1} tokens through {m.L} layers in "
+                      f"{-(-(len(ids) - 1) // m.ps['NP'])} launch(es), {pre_ms:.1f} ms device [UNPROFILED, "
+                      f"{'TURBO' if m.s.turbo else 'NO TURBO'}] -> the prefill kernels returned")
+                return 0
+        else:
+            for t in ids[:-1]:
+                m.step(t)
         nxt, ms = m.step(ids[-1])
+        ttft = time.perf_counter() - t_pre      # prompt through the model plus the first token
         for _ in range(a.new):
             out.append(nxt)
             times.append(ms)
@@ -431,6 +645,14 @@ def main(argv):
             nxt, ms = m.step(nxt)
         print("output:", tok.decode(out))
         print("ids:", ",".join(map(str, out)))
+        if m.prefill_n:
+            print(f"TTFT: {ttft:.2f} s for {len(ids)} prompt tokens + the first output "
+                  f"({1e3 * ttft / len(ids):.0f} ms per prompt token; prefill kernels {pre_ms:.0f} ms device for "
+                  f"{len(ids) - 1} tokens = {pre_ms / max(1, len(ids) - 1):.1f} ms/token, plus one decode step)")
+        else:
+            # the prompt replayed through the DECODE kernels, one token per step: an upper bound, not prefill's number
+            print(f"TTFT: {ttft:.2f} s for {len(ids)} prompt tokens + the first output "
+                  f"({1e3 * ttft / len(ids):.0f} ms per prompt token, decode kernels -- pass --prefill for the real one)")
         if times:
             dev = sorted(sum(v for k, v in t.items() if k != "host_wall") for t in times)
             wall = sorted(t["host_wall"] for t in times)

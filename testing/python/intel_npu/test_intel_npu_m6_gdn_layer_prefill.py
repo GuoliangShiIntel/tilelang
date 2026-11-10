@@ -26,7 +26,7 @@ N, H, KH, VH, DK, DV, G = 64, 256, 4, 8, 64, 64, 128
 TB, C, BN1, BN2, MB = 32, 32, 64, 64, 32
 QK, VC = KH * DK, VH * DV
 CONV = 2 * QK + VC
-NIN = CONV + VC + 2 * VH
+NIN = CONV + VC
 NIN_pad = -(-NIN // BN1) * BN1
 REL = 5e-2
 
@@ -48,6 +48,7 @@ def _weights(seed=0):
     inn = (rng.standard_normal((1, H), np.float32) * 0.1).astype(np.float16)
     wi = rng.integers(-8, 8, (NIN_pad, H), dtype=np.int8)
     ws = (rng.standard_normal((NIN_pad, H // G), np.float32) * 0.02).astype(np.float16)
+    wba = (rng.standard_normal((2 * VH, H), np.float32) * 0.05).astype(np.float16)
     wo = rng.integers(-8, 8, (H, VC), dtype=np.int8)
     wos = (rng.standard_normal((H, VC // G), np.float32) * 0.02).astype(np.float16)
     cw = (rng.standard_normal((4, CONV), np.float32) * 0.3).astype(np.float16)
@@ -56,18 +57,20 @@ def _weights(seed=0):
     db = (rng.standard_normal((1, VH), np.float32) * 0.2).astype(np.float32)
     gn = (1.0 + rng.standard_normal((1, DV), np.float32) * 0.1).astype(np.float16)
     ssm = (rng.standard_normal((VH, DK, DV), np.float32) * 0.05).astype(np.float32)
-    return h, inn, wi, ws, wo, wos, cw, cs, al, db, gn, ssm
+    return h, inn, wi, ws, wo, wos, cw, cs, al, db, gn, ssm, wba
 
 
-def _run(h, inn, wi, ws, wo, wos, cw, cs, al, db, gn, ssm, n=N):
+def _run(h, inn, wi, ws, wo, wos, cw, cs, al, db, gn, ssm, wba, n=N):
     low = lowering.lower(make_gdn_layer_prefill(N=N, H=H, KH=KH, VH=VH, DK=DK, DV=DV, G=G, TB=TB, C=C,
                                                 BN1=BN1, BN2=BN2, MB=MB, tiles=TILES, shaves=SHAVES))
     lib = host_sim.build(low.source, "gdn_layer_prefill")
     hio, sm, cso = h.copy(), ssm.copy(), np.zeros((3, CONV), np.float16)
-    arrays = {"Hio": hio, "InNorm": inn, "WinQ": pack_int4(wi), "WinS": gm_scales(ws), "ConvW": cw, "ConvState": cs,
+    arrays = {"Hio": hio, "InNorm": inn, "WinQ": pack_int4(wi), "WinS": gm_scales(ws), "Wba": wba,
+              "ConvW": cw, "ConvState": cs,
               "ALog": al, "DtBias": db, "GNorm": gn, "Nt": np.array([[n]], np.int32), "Ssm": sm,
               "WoutQ": pack_int4(wo), "WoutS": gm_scales(wos),
               "Xs": np.zeros((N, H), np.float16), "Ys": np.zeros((N, NIN_pad), np.float16),
+              "BAs": np.zeros((N, 2 * VH), np.float16),
               "QKs": np.zeros((KH, N, 2 * DK), np.float32), "Vs": np.zeros((VH, N, DV), np.float16),
               "Gbs": np.zeros((VH, N, 2), np.float32), "Zs": np.zeros((VH, N, DV), np.float16),
               "Os": np.zeros((N, VC), np.float16), "Mix": np.zeros((N, H), np.float16), "CsOut": cso}
@@ -88,7 +91,7 @@ def test_matches_the_composed_oracle():
     w = _weights()
     hio, sm, cso = _run(*w)
     ref, cs_ref, ssm_ref = gdn_layer_prefill_reference(w[0], w[1], w[2], w[3], w[6], w[7], w[8], w[9], w[10],
-                                                       w[4], w[5], w[11], N, KH, VH, DK, DV, G)
+                                                       w[4], w[5], w[11], N, KH, VH, DK, DV, G, wba=w[12])
     assert np.abs(hio - ref).max() / np.abs(ref).max() < REL
     assert np.abs(sm - ssm_ref).max() / np.abs(ssm_ref).max() < REL
     # not bit-exact here, unlike the standalone conv test: inside the layer the conv's input is the fp16 gemm
@@ -103,15 +106,15 @@ def test_the_residual_is_added_not_replaced():
     """Zero every projection and the layer must hand its input straight back. A layer that wrote the mixer output
     over the stream instead of adding to it passes the oracle test (the oracle would be wrong the same way) but
     fails this one."""
-    h, inn, wi, ws, wo, wos, cw, cs, al, db, gn, ssm = _weights()
-    hio, _, _ = _run(h, inn, wi, ws, np.zeros_like(wo), np.zeros_like(wos), cw, cs, al, db, gn, ssm)
+    h, inn, wi, ws, wo, wos, cw, cs, al, db, gn, ssm, wba = _weights()
+    hio, _, _ = _run(h, inn, wi, ws, np.zeros_like(wo), np.zeros_like(wos), cw, cs, al, db, gn, ssm, wba)
     assert np.abs(hio - h).max() == 0, "with a zero out_proj the layer must be the identity on the stream"
 
 
 @needs_cxx
 def test_a_short_prompt_leaves_the_dead_tokens_alone():
     n = 50
-    h, inn, wi, ws, wo, wos, cw, cs, al, db, gn, ssm = _weights()
-    hio, _, _ = _run(h, inn, wi, ws, wo, wos, cw, cs, al, db, gn, ssm, n=n)
+    h, inn, wi, ws, wo, wos, cw, cs, al, db, gn, ssm, wba = _weights()
+    hio, _, _ = _run(h, inn, wi, ws, wo, wos, cw, cs, al, db, gn, ssm, wba, n=n)
     assert np.abs(hio[n:] - h[n:]).max() == 0, "tokens past the live count were written"
     assert np.abs(hio[:n] - h[:n]).max() > 0

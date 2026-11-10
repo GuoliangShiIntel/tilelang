@@ -80,7 +80,7 @@ def main(argv):
     pad_ok = bool(np.all(arrays["Logits"].reshape(-1)[V:] == np.float16(-65504)))
     verdict = "PASS" if (rel < 2e-2 and tok == tok_own and pad_ok and (tok == tok_ref or top2[1] - top2[0] <= 2 * err)) else "FAIL"
     kind = runner.condition(res, profile is not None)
-    weight_bytes = packed["WlmP"].nbytes
+    weight_bytes = packed["WlmQ"].nbytes + packed["WlmS"].nbytes
     idu_us = [float(res.status[t * SHAVES:(t + 1) * SHAVES, 5].astype(np.int64).sum()) / PERF_CLK_MHZ for t in range(TILES)]
     print(f"device: kernel-only {res.median_kernel_ms:.3f} ms (host wall {res.median_ms:.3f} ms) [{kind}]; "
           f"max |logits - ref| = {err:.4f} over {scale:.3f} (rel {rel:.2e}); token {tok} (own argmax {tok_own}, oracle {tok_ref}, "

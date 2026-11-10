@@ -56,7 +56,7 @@ def head_problem(seed, H, V, G, **_):
 
 def head_arrays(p, packed, H, V, tiles=TILES, shaves=SHAVES, BN=128, **_):
     sz = head_sizes(H, V, tiles=tiles, shaves=shaves, BN=BN)
-    return dict(Hs=p["h"], NormW=p["norm_w"], WlmP=packed["WlmP"],
+    return dict(Hs=p["h"], NormW=p["norm_w"], WlmQ=packed["WlmQ"], WlmS=packed["WlmS"],
                 Logits=np.zeros((tiles, sz["CS"], shaves * BN), np.float16),
                 Part=np.zeros((sz["workers"], 32), np.float32), Tok=np.full((1, 8), -1, np.int32))
 
@@ -64,9 +64,16 @@ def head_arrays(p, packed, H, V, tiles=TILES, shaves=SHAVES, BN=128, **_):
 def test_qwen36_shape_lowers_to_one_local_int8_ring_with_masked_tail():
     src = _lower(make_head()).source
     sz = head_sizes(2048, 248320)
-    assert sz["V_pad"] == 248832 and sz["C"] == 648 and sz["CS"] == 324 and sz["BR"] == 130
-    assert "ctx.ring_begin((&(w_cmx[0])), 266240, 4, 648, 0, 0, 2, 0, 1);" in src     # local ring, int8 rows + 2 scale rows
+    assert sz["V_pad"] == 248832 and sz["C"] == 648 and sz["CS"] == 324 and sz["ng"] == 16
+    # ONE ring, for the weights. The scales are not streamed per chunk: a block of SB chunks is loaded into a
+    # per-SHAVE buffer and read in place, so the ring keeps its single begin/end across all 648 chunks.
+    assert "ctx.ring_begin((&(w_cmx[0])), 262144, 4, 648, 0, 0, 2, 0, 1);" in src
+    assert src.count("ctx.ring_begin(") == 1
     assert "w_cmx: SEGMENTED (streamed, each tile fills its own slot)" in src
+    assert "s_cmx" not in src.split("ring_begin(", 1)[0]          # the scales buffer is not a ring's stream
+    # the block's scales are ONE CONTIGUOUS burst (width == stride): a column window of a flat [K/G, V_pad] would
+    # be K/G short lines at the vocabulary's stride, and that cost the weight stream 58.9 -> 52.1 GB/s
+    assert "ctx.dma_load((&(s_cmx[0])), (&(WlmS[((tile * 1327104) + (b * 8192))])), 256, 64, 256, 256);" in src
     assert "ctx.dpu_matmul_i8g(" in src and "= (half)-6.550400e+04f;" in src
     assert "tl_npu_vmax(mx)" in src and "tl_npu_vsum(ls)" in src
     # each SHAVE's 324 chunk rows of 256 B land 512 B apart (the other SHAVE's chunks interleave)

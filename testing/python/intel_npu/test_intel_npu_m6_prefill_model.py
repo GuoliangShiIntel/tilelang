@@ -35,7 +35,7 @@ KVL = sum(1 for k in KINDS if k == "attn")
 GQ, KO = NH // NKV, NH * D
 QK, VC = KH * DK, VH * DV
 CONV = 2 * QK + VC
-NIN = CONV + VC + 2 * VH
+NIN = CONV + VC
 NIN_pad = -(-NIN // BN1) * BN1
 NQKV = NH * 2 * D + 2 * NKV * D
 NQKV_pad = -(-NQKV // BN1) * BN1
@@ -82,6 +82,7 @@ def _layers(seed=0):
         if kind == "gdn":
             p.update(win_int=rng.integers(-8, 8, (NIN_pad, H), dtype=np.int8),
                      win_s=(rng.standard_normal((NIN_pad, H // G), np.float32) * 0.02).astype(np.float16),
+                     wba=(rng.standard_normal((2 * VH, H), np.float32) * 0.05).astype(np.float16),
                      conv_w=(rng.standard_normal((4, CONV), np.float32) * 0.3).astype(np.float16),
                      conv_state=(rng.standard_normal((3, CONV), np.float32) * 0.3).astype(np.float16),
                      a_log=(rng.standard_normal((1, VH), np.float32) * 0.2).astype(np.float32),
@@ -121,7 +122,7 @@ def _host_arrays(layers):
         if p["kind"] == "gdn":
             a.update({"W0": pack_int4(p["win_int"]), "W1": gm_scales(p["win_s"]), "W2": p["conv_w"],
                       "W3": p["a_log"], "W4": p["dt_bias"], "W5": p["gnorm"], "W6": pack_int4(p["wout_int"]),
-                      "W7": gm_scales(p["wout_s"]),
+                      "W7": gm_scales(p["wout_s"]), "W8": p["wba"],
                       "S0": p["conv_state"].copy(), "S1": p["ssm"].copy()})
         else:
             a.update({"W0": pack_int4(p["wqkv_int"]), "W1": gm_scales(p["wqkv_s"]), "W2": p["qnorm"],
@@ -153,6 +154,7 @@ def _run(layers, h, pos0=0, n=N):
     arrays = {"Hio": hio, "Pos": np.array([[pos0]], np.int32), "Nt": np.array([[n]], np.int32),
               "CosSin": _cos_sin(pos0), "Kind": kind, "Table": table, "KcAll": kc, "VtAll": vt,
               "Xs": np.zeros((N, H), np.float16), "Ys": np.zeros((N, YW), np.float16),
+              "BAs": np.zeros((N, 2 * VH), np.float16),
               "QKs": np.zeros((KH, N, 2 * DK), np.float32), "Vs": np.zeros((VH, N, DV), np.float16),
               "Gbs": np.zeros((VH, N, 2), np.float32), "Zs": np.zeros((VH, N, DV), np.float16),
               "Q": np.zeros((NKV, N, GQ, D), np.float16), "Gate": np.zeros((N, KO), np.float16),

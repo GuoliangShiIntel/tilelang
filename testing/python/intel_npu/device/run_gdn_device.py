@@ -91,7 +91,8 @@ def main(argv):
     cs_rel = float(np.abs(arrays["ConvState"].astype(np.float32) - ref_cs.astype(np.float32)).max() / np.abs(ref_cs.astype(np.float32)).max())
     ssm_rel = float(np.abs(arrays["Ssm"] - ref_ssm).max() / np.abs(ref_ssm).max())
     kind = runner.condition(res, profile is not None)
-    weight_bytes = packed["WinP"].nbytes + packed["WoutP"].nbytes + packed["Wba"].nbytes
+    weight_bytes = (packed["WinQ"].nbytes + packed["WinS"].nbytes + packed["WoutQ"].nbytes + packed["WoutS"].nbytes
+                    + packed["Wba"].nbytes)
     state_bytes = 2 * arrays["Ssm"].nbytes + 2 * arrays["ConvState"].nbytes
     idu_us = [float(res.status[t * SHAVES:(t + 1) * SHAVES, 5].astype(np.int64).sum()) / PERF_CLK_MHZ for t in range(TILES)]
     print(f"device: kernel-only {res.median_kernel_ms:.3f} ms (host wall {res.median_ms:.3f} ms) [{kind}]; "
