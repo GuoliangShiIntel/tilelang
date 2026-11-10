@@ -88,7 +88,7 @@ class DeviceModel:
                  prefill_register_tri: bool = False, prefill_gdn_live: bool = False,
                  prefill_moe_reuse_input: bool = False, prefill_phases: Path | None = None,
                  prefill_bn2: int | None = None, prefill_output_block_k: int | None = None,
-                 prefill_output_mb: int | None = None):
+                 prefill_output_mb: int | None = None, prefill_bng: int | None = None):
         self.ck, self.c, self.log = ck, ck.cfg, log
         self.prefill_phases = prefill_phases
         c = self.c
@@ -106,6 +106,8 @@ class DeviceModel:
             pgeom["BN1"] = prefill_bn1
         if prefill_bn2 is not None:
             pgeom["BN2"] = prefill_bn2
+        if prefill_bng is not None:
+            pgeom["BNG"] = prefill_bng
         if prefill_mb is not None:
             pgeom["MB"] = prefill_mb
         if prefill_mbe is not None:
@@ -213,6 +215,8 @@ class DeviceModel:
                         names[f"prefill{pl}"] = (names[f"prefill{pl}"].replace("tl_e2e_prefill", "tl_pf")
                                                  .replace("_rtri_live_reuse", "_trlvru")
                                                  + f"_ob{pgeom['BN2']}_k{prefill_output_block_k or 0}_m{prefill_output_mb or pgeom['MB']}")
+                    if prefill_bng is not None:
+                        names[f"prefill{pl}"] += f"_bg{prefill_bng}"
         else:
             kernels = {
                 "gdn": make_gdn_layer(H=c.hidden, KH=c.lin_kh, VH=c.lin_vh, DK=c.lin_dk, DV=c.lin_dv, I=c.moe_inter, E=c.n_experts,
@@ -628,6 +632,7 @@ def main(argv):
     ap.add_argument("--prefill-bn2", type=int)
     ap.add_argument("--prefill-out-block-k", type=int)
     ap.add_argument("--prefill-out-mb", type=int)
+    ap.add_argument("--prefill-bng", type=int)
     ap.add_argument("--prefill-sweep", default=None, metavar="L1,L2,...",
                     help="layer counts to launch prefill at, ascending, from ONE session: the kernels are built in "
                          "one pass and share the weight upload, so a bisect point costs a launch instead of a "
@@ -676,7 +681,8 @@ def main(argv):
                     prefill_conv_fp16=a.prefill_conv_fp16, prefill_register_tri=a.prefill_register_tri,
                     prefill_gdn_live=a.prefill_gdn_live, prefill_moe_reuse_input=a.prefill_moe_reuse_input,
                     prefill_phases=a.prefill_phases, prefill_bn2=a.prefill_bn2,
-                    prefill_output_block_k=a.prefill_out_block_k, prefill_output_mb=a.prefill_out_mb)
+                    prefill_output_block_k=a.prefill_out_block_k, prefill_output_mb=a.prefill_out_mb,
+                    prefill_bng=a.prefill_bng)
     if a.chunked:
         print(f"chunks: {len(m.chunks)} launches per token: " + " ".join("/".join(str(i) for i in ch) for ch in m.chunks))
     try:

@@ -33,6 +33,26 @@ Every number carries its condition, and two numbers are compared only under the 
 The runner refuses to print a number without `warm`/`cold`; the session prints a null-launch round trip at
 start. If either side of a comparison lacks a field, the comparison is void: re-measure, do not reason.
 
+## Step 0.5: audit the reference path before proposing a change
+
+When a reference implementation is available, this audit is mandatory **before the first performance edit**. A
+phase label, operation name or tile-size constant is not enough to establish that two kernels do the same work.
+
+1. **Identify the exact artifact and selected branch.** Record the generated reference source path and SHA, build
+  configuration, checkpoint/shape/dtype, live versus padded tokens, and the runtime branch actually taken. Read
+  the generated C++ at the measured call site plus its owning DSL/library helper. Generated models often have
+  separate small-expert and large-expert paths; a shared constant may describe only one of them.
+2. **Trace one tile of data and ownership.** For each operand, write its shape, bytes, source/destination layout,
+  owner (tile/SHAVE), chunk extent, and reuse lifetime. Then write the exact order of DMA issue/wait, SHAVE
+  dequant, DPU submit/completion, stores, and rendezvous. Distinguish ping/pong or twin-buffer overlap from
+  serial reuse, and note whether the two SHAVEs submit to one tile-local DPU FIFO.
+3. **Map compiler idioms, not just DSL names.** Check whether the reference uses a synchronous GEMM, async submit,
+  merged FC, DMA prefetch, or explicit double buffering. Search the generated source and the actual emitter/runtime
+  consumer; do not conclude a capability is absent from a high-level helper name or one source snippet.
+4. **Name the falsifiable gap.** State the exact reference behavior TileLang lacks, the nearest IR/runtime boundary
+  that owns it, and one cheap check that can disprove the hypothesis (generated source, task schedule, or a matched
+  narrow A/B). If this evidence is missing, keep the proposed change as a probe, not an optimization claim.
+
 ## Step 1: the attribution table, before any edit
 
 Add `--phases` to the device runner and read the table it prints (`device/task_report.py <phases.bin>
@@ -42,8 +62,9 @@ VPUX's arrangement (`vpux-plugin/guides/how_to_use_profiling.md`) and npu_dsl's 
 reason for it is coverage: **the cost is O(tasks) in DDR, so a 40-layer launch is attributed whole.**
 
 The table is per phase: `dma_load / dma_store / ring / ring_wait / dpu / barrier / shave`, each as
-`us per worker / task count`, plus a second table of the named SHAVE sites with their **per-call** cost —
-which is what tells `gdeq` (int4 dequant, 8.85 us a call) from the `ggem` it feeds (2.58 us).
+`us per worker / task count`, plus named SHAVE sites with their per-call spans. Use sites to locate work, not to
+declare two engines' work serial or comparable. Always include each site's call count and the corresponding DPU
+task count/workload shape; a per-call number without its amount of work is incomplete.
 
 Four things to check before believing it:
 
@@ -51,8 +72,18 @@ Four things to check before believing it:
   a prefix. Truncation is reported, never silent — which is the one thing the toolkit's event profiler gets
   wrong (`Profiler::mark` drops with a bare `return` past 1984 events per SHAVE, no flag).
 * **A `--phases` run is observability.** Take the before / after numbers from the clean build.
-* **DPU extents are derived**, from the hardware profiler's duration counted back from the observation point.
-  The durations are sound; exact placement against a DMA is not.
+* **DPU extents are separate from API-site spans.** For a synchronous DPU call, the SHAVE site may include
+  submit/wait overhead and observation latency. For an async `matmul_start`/`matmul_async`, the site can end at
+  submission while the DPU task executes later. Never compare `gdeq` with an async `ggem` site's duration as if
+  that were GEMM compute time.
+* **Prove overlap from intervals and generated order.** Use the per-task timeline/Perfetto tracks to measure
+  whether a given SHAVE dequant interval intersects a real DPU workload interval, and whether DPU gaps remain.
+  A dequant site being shorter than a GEMM site is neither necessary nor sufficient proof of overlap. The target
+  is to hide dequant behind preceding DPU work without leaving an exposed dequant tail; compare actual work
+  shapes and counts before deciding whether `gdeq < ggem` is a meaningful per-chunk target.
+* **DPU extents are derived** from the hardware profiler's duration counted back from the observation point.
+  Durations are sound; exact placement against a DMA is not. Use task interval overlap only for ordering the
+  instrumented tasks, and reconcile it with the emitted async schedule.
 * **Zero `ring` columns can be correct.** Prefill uses `T.serial` + `T.copy` and has no `T.Pipelined` ring at
   all; its DMA is all `dma_load` / `dma_store`. Rings are the decode path.
 
@@ -84,6 +115,11 @@ For the phase you intend to touch, write down:
 One variable: the algorithm, or the schedule, or the chunk geometry, or a runtime path — not two. Geometry
 changes are checked against the CMX budget on paper first (slots x bytes, both live rings when hoisted over
 the same loop) — the lowering's `CheckIntelNpuBudgets` refusal is the gate, not a surprise.
+
+For schedule or geometry experiments, the control and candidate must differ in that one variable. If adding a
+capability changes which loop is selected, first prove that in generated source and run a matched control with
+the capability enabled but the target loop unchanged. Do not compare a BNG32+async arm with an older BNG64
+synchronous arm and attribute the result to either difference.
 
 ## Step 3: measure under step 0's condition, then reconcile
 
@@ -118,7 +154,8 @@ model that is kept produces the next wasted attempt). A golden failure is a stop
 * `--phases` on a device runner: the per-task records (`TL_NPU_PHASE_PROF=1` into the build, `task_report.py`
   to decode). The default build has none of it; a `--phases` kernel is named `_prof` so the two ELFs never mix.
 * `perf_begin("name")` / `perf_end()` in kernels.py: a named SHAVE site, recorded as its own task under that
-  name, so the table gives its **per-call** cost. These are what separate a dequant from the gemm it feeds.
+  name, so the table gives its per-call span and count. These separate named work from other SHAVE work, but do
+  not by themselves establish overlap or provide DPU execution time for an asynchronous GEMM.
 * `TL_NPU_DUMP_STATUS=1` + `decode.py`: the status record's ring tick counters per SHAVE (words 10-15, 19.2 MHz ticks:
   acquire, order, submit, dpu_wait, free, fill_issue) — the per-chunk protocol split without any instrumentation.
 * `TL_NPU_GEOM="moe_BND=512,..."` (e2e/pack.py): chunk geometry sweeps; the pack cache key follows.
@@ -135,3 +172,13 @@ model that is kept produces the next wasted attempt). A golden failure is a stop
 * 2026-11-07: the GDN scan rewritten on a comment claiming a splat costs ~16 lane copies; the `.s` shows
   `CMU.CP.512.32.R` is one instruction, and the real cost was an unpipelined pass 2. Count the hot loop first.
 * 2026-11-07: a chunk geometry (BNG 256) that exceeds CMX by 360 KB was built before the slots were added up.
+* 2026-11-10: `gdeq` (8.8 us/call) was compared directly with `ggem` (3.8 us/call) in TileLang MoE and read as
+  proof that dequant was both slower and unhidden. That comparison skipped the reference generated path: its
+  large-expert branch double-buffers per-SHAVE gate/up weights and calls `matmul_async`; its <=2-token branch is a
+  separate 32-row path. The TileLang site around a synchronous GEMM and a reference async-submit site do not
+  measure the same interval. Initial BNG32+async E2E at 4.77 s was compared with an older 4.54 s BNG64 arm,
+  which did not isolate the cause. A later same-prompt BNG32 pair measured sync4.79 s vs async4.77 s once; that
+  20 ms difference is within cold-run spread, so there is no stable E2E win. BNG64+async is rejected by the CMX
+  budget. Correction: inspect the selected generated branch, compare actual workload shapes/counts and overlap
+  intervals, then take a one-variable pair. The target is hidden dequant with no DPU bubble, not an unqualified
+  named-site inequality.

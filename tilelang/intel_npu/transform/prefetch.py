@@ -328,6 +328,18 @@ class _DpuPlanner(_Planner):
             return (call is not None and getattr(call.op, "name", "") == "tirx.call_extern"
                     and call.args and isinstance(call.args[0], tirx.StringImm) and call.args[0].value == name)
 
+        def dequant_call(group):
+            call = _call(group[0][group[1]])
+            if call is None:
+                return None, None
+            name = getattr(call.op, "name", "")
+            if name == "tl.intel_npu_dequant_i4_gm":
+                return call, list(call.args)
+            if (name == "tirx.call_extern" and call.args and isinstance(call.args[0], tirx.StringImm)
+                    and call.args[0].value == "tl_npu_dequant_i4_gm"):
+                return call, list(call.args[1:])
+            return None, None
+
         while index < len(items):
             if marker(items[index], "ctx.task_begin"):
                 if index + 2 >= len(items) or not marker(items[index + 2], "ctx.task_end"):
@@ -337,15 +349,37 @@ class _DpuPlanner(_Planner):
             else:
                 groups.append(([items[index]], 0))
                 index += 1
-        if len(groups) != 3:
+        dequant_groups = [(i, g, dequant_call(g)) for i, g in enumerate(groups)
+                  if dequant_call(g)[0] is not None]
+        gemm_groups = [(i, g) for i, g in enumerate(groups)
+                       if _call(g[0][g[1]]) is not None
+                       and getattr(_call(g[0][g[1]]).op, "name", "") == "tl.intel_npu_dpu_matmul"]
+        if len(dequant_groups) != 1 or len(gemm_groups) != 1:
             return loop
-        dequant = _call(groups[0][0][groups[0][1]])
-        gemm = _call(groups[1][0][groups[1][1]])
-        if dequant is None or getattr(dequant.op, "name", "") != "tl.intel_npu_dequant_i4_gm":
+        dequant_index, dequant_group, (dequant, dequant_args) = dequant_groups[0]
+        gemm_index, gemm_group = gemm_groups[0]
+        if gemm_index != dequant_index + 1 or gemm_index + 1 == len(groups):
             return loop
+        gemm = _call(gemm_group[0][gemm_group[1]])
         if gemm is None or getattr(gemm.op, "name", "") != "tl.intel_npu_dpu_matmul" or len(gemm.args) != 8:
             return loop
-        weights = _dst_buffer(dequant)
+        preamble = [stmt for group, _ in groups[:dequant_index] for stmt in group]
+        if any(not (isinstance(address, tirx.Call) and address.args
+                    and isinstance(address.args[0], tirx.BufferLoad)) for address in dequant_args[:3]):
+            return loop
+        packed_buffers = [dequant_args[1].args[0].buffer, dequant_args[2].args[0].buffer]
+        for stmt in preamble:
+            fill = _is_load(stmt)
+            if fill is None:
+                return loop
+            loaded = _dst_buffer(fill)
+            if (loaded is None or loaded.scope() != "local" or not _is_compact(loaded)
+                    or not any(loaded.data.same_as(buf.data) for buf in packed_buffers)
+                    or not _uses_var(fill.args[1], loop.loop_var)
+                    or _refs(self.func.body, loaded.data) != _refs(loop.body, loaded.data)):
+                return loop
+        tail = _seq([stmt for group, _ in groups[gemm_index + 1:] for stmt in group])
+        weights = dequant_args[0].args[0].buffer
         output = _dst_buffer(gemm)
         if weights is None or output is None or not _reads(gemm.args[2], weights.data):
             return loop
@@ -358,21 +392,20 @@ class _DpuPlanner(_Planner):
                 return loop
             if _refs(self.func.body, buffer.data) != _refs(loop.body, buffer.data):
                 return loop
-        if [_int(arg) for arg in dequant.args[3:5]] != [_int(dim) for dim in weights.shape]:
+        if [_int(arg) for arg in dequant_args[3:5]] != [_int(dim) for dim in weights.shape]:
             return loop
         if [_int(arg) for arg in gemm.args[3:5]] != [_int(dim) for dim in output.shape]:
             return loop
-        for call in (dequant, gemm):
-            load = call.args[0].args[0]
+        for address in (dequant_args[0], gemm.args[0]):
+            load = address.args[0]
             if not all(_int(value) == 0 for value in load.indices):
                 return loop
-        if not _uses_var(dequant.args[1], loop.loop_var) and not _uses_var(dequant.args[2], loop.loop_var):
+        if not preamble and not _uses_var(dequant_args[1], loop.loop_var) and not _uses_var(dequant_args[2], loop.loop_var):
             return loop
-        tail = _seq(groups[2][0])
         if not _reads(tail, output.data) or _refs(tail, weights.data):
             return loop
         protected = []
-        for address in list(dequant.args[1:3]) + [gemm.args[1]]:
+        for address in list(dequant_args[1:3]) + [gemm.args[1]]:
             if not (isinstance(address, tirx.Call) and isinstance(address.args[0], tirx.BufferLoad)):
                 return loop
             def protect(node):
@@ -422,12 +455,12 @@ class _DpuPlanner(_Planner):
             return _Rebase(output.data, wide_output, output.shape[0], parity)(stmt)
 
         def prepare(value):
-            return rebase(_seq(groups[0][0]), value)
+            return rebase(_seq(preamble + dequant_group[0]), value)
 
         def submit(value):
-            group = list(groups[1][0])
-            group[groups[1][1]] = tirx.Evaluate(tirx.Call(gemm.dtype, gemm.op,
-                                                         list(gemm.args) + [tirx.IntImm("int32", 1)]))
+            group = list(gemm_group[0])
+            group[gemm_group[1]] = tirx.Evaluate(tirx.Call(gemm.dtype, gemm.op,
+                                                          list(gemm.args) + [tirx.IntImm("int32", 1)]))
             return rebase(_seq(group), value)
 
         following = loop.loop_var + 1

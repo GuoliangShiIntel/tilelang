@@ -1197,8 +1197,9 @@ def make_moe_expert_prefill(
                         T.copy(X[slot_cmx[T.min(off_cmx[e] + c * MB + i, off_cmx[e + 1] - 1)] // (TOPK + 1), 0], x_cmx[i : i + 1, 0:H])
                     perf_end()
                     T.sync_threads()
-                    for n in T.serial(CG):
-                        if n % shaves == shave:
+                    if CG % shaves == 0:
+                        for ni in T.serial(CG // shaves):
+                            n = ni * shaves + shave
                             T.copy(WguQ[e * 2 * I + n * BNG, 0], wq_cmx)
                             T.copy(WguS[0, e * 2 * I + n * BNG], ws_cmx)
                             perf_begin("gdeq")
@@ -1223,6 +1224,33 @@ def make_moe_expert_prefill(
                                 for v in T.vectorized(HL):
                                     gu_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
                             perf_end()
+                    else:
+                        for n in T.serial(CG):
+                            if n % shaves == shave:
+                                T.copy(WguQ[e * 2 * I + n * BNG, 0], wq_cmx)
+                                T.copy(WguS[0, e * 2 * I + n * BNG], ws_cmx)
+                                perf_begin("gdeq")
+                                if not skip_dequant:
+                                    T.call_extern(
+                                        "handle",
+                                        "tl_npu_dequant_i4_gm",
+                                        T.address_of(wg_cmx[0, 0]),
+                                        T.address_of(wq_cmx[0, 0]),
+                                        T.address_of(ws_cmx[0, 0]),
+                                        BNG,
+                                        H,
+                                        G,
+                                        BNG,
+                                    )
+                                perf_end()
+                                perf_begin("ggem")
+                                T.gemm(x_cmx, wg_cmx, y_cmx, transpose_B=True, clear_accum=True)
+                                perf_end()
+                                perf_begin("gcpy")
+                                for i, c0 in T.grid(MB, BNG // HL):
+                                    for v in T.vectorized(HL):
+                                        gu_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
+                                perf_end()
                     T.sync_threads()
                     perf_begin("swig")
                     for i, c0 in T.grid(MB, I // shaves // HL):

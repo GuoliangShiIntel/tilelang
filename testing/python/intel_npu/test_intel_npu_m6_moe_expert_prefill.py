@@ -15,6 +15,7 @@ and the tests pin the property that makes prefill worth doing:
 """
 
 import sys
+import re
 from pathlib import Path
 
 import numpy as np
@@ -107,6 +108,15 @@ def test_compiler_derives_dequant_dpu_overlap():
     assert "ctx.dpu_matmul_wait();" in source
 
 
+def test_moe_extern_gate_up_dequant_is_async_only_when_enabled():
+    func = make_moe_expert_prefill(N=N, H=512, I=128, E=E, TOPK=TOPK, G=G, MB=MB,
+                                   BNG=32, BND=BND, tiles=TILES, shaves=SHAVES)
+    serial = _lower(func).source
+    async_source = _lower(func, dpu_overlap=True).source
+    assert "ctx.dpu_matmul_start(" not in serial
+    assert re.search(r"ctx\.dpu_matmul_start\([^\n]*, 4, 32, 512,", async_source)
+
+
 def _overlap_kernel(chunks=3, rewrite_input=False, escape=False, dependent_index=False):
     @T.prim_func
     def quant_tiles(X: T.Tensor((4, 128), T.float16), Q: T.Tensor((chunks * 16, 64), T.uint8),
@@ -140,6 +150,26 @@ def _overlap_kernel(chunks=3, rewrite_input=False, escape=False, dependent_index
     return quant_tiles
 
 
+def _overlap_kernel_with_weight_loads(chunks=3):
+    @T.prim_func
+    def quant_tiles(X: T.Tensor((4, 128), T.float16), Q: T.Tensor((chunks * 16, 64), T.uint8),
+                    S: T.Tensor((1, chunks * 16), T.float16), Y: T.Tensor((chunks, 4, 16), T.float16)):
+        with T.Kernel(1, threads=1):
+            activation = T.alloc_local((4, 128), T.float16)
+            packed = T.alloc_local((16, 64), T.uint8)
+            scales = T.alloc_local((1, 16), T.float16)
+            weights = T.alloc_local((16, 128), T.float16)
+            result = T.alloc_local((4, 16), T.float16)
+            T.copy(X, activation)
+            for block in T.serial(chunks):
+                T.copy(Q[block * 16, 0], packed)
+                T.copy(S[0, block * 16:block * 16 + 16], scales)
+                T.dequant_i4_gm(weights, packed, scales, 128)
+                T.gemm(activation, weights, result, transpose_B=True, clear_accum=True)
+                T.copy(result, Y[block, 0, 0])
+    return quant_tiles
+
+
 @needs_cxx
 @pytest.mark.parametrize("chunks", [1, 3, 4])
 def test_dpu_overlap_matches_serial_with_odd_and_even_tails(chunks):
@@ -157,6 +187,27 @@ def test_dpu_overlap_matches_serial_with_odd_and_even_tails(chunks):
         host_sim.check_status(host_sim.run(lib, args, tiles=1, shaves=1))
         outputs.append(output)
     assert np.isfinite(outputs[1]).all()
+    np.testing.assert_array_equal(outputs[1], outputs[0])
+
+
+@needs_cxx
+def test_dpu_overlap_with_loop_local_weight_loads_matches_serial():
+    func = _overlap_kernel_with_weight_loads()
+    rng = np.random.default_rng(42)
+    values = rng.integers(-8, 8, size=(3 * 16, 128), dtype=np.int8)
+    arrays = {"X": rng.normal(size=(4, 128)).astype(np.float16), "Q": pack_int4(values),
+              "S": rng.uniform(0.01, 0.1, size=(1, 3 * 16)).astype(np.float16)}
+    outputs = []
+    for enabled in (False, True):
+        with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off",
+                                               "tl.intel_npu.dpu_overlap": enabled,
+                                               "tl.intel_npu.prefetch": False}):
+            low = lowering.lower(func)
+        assert ("ctx.dpu_matmul_start(" in low.source) == enabled
+        output = np.full((3, 4, 16), np.nan, np.float16)
+        lib = host_sim.build(low.source, "dpu_overlap_loop_local_weights")
+        host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, {**arrays, "Y": output}), 1, 1))
+        outputs.append(output)
     np.testing.assert_array_equal(outputs[1], outputs[0])
 
 

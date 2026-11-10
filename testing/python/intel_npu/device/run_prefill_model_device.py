@@ -126,8 +126,10 @@ def main(argv):
     trials = arg(argv, "--trials", 3)
     BN1 = arg(argv, "--bn1", arg(argv, "--bn", 32))
     BN2 = arg(argv, "--bn2", arg(argv, "--bn", 32))
-    global MBe, DB, MB
+    global MBe, DB, MB, BNG, BND
     MBe = arg(argv, "--mbe", MBe)
+    BNG = arg(argv, "--bng", BNG)
+    BND = arg(argv, "--bnd", BND)
     DB = arg(argv, "--db", DB)
     MB = arg(argv, "--mb", MB)       # the projections' token block: sets their DPU workload's M
     SMAX = arg(argv, "--smax", 1536)
@@ -209,6 +211,8 @@ def main(argv):
         name = name.replace("tl_prefill_model", "tl_pf") + "_reuse"
     if "--out-block-k" in argv:
         name = name.replace("tl_prefill_model", "tl_pf") + f"_ok{arg(argv, '--out-block-k', 0)}_om{arg(argv, '--out-mb', MB)}"
+    if "--bng" in argv:
+        name = name.replace("tl_prefill_model", "tl_pf") + f"_bg{BNG}"
     if "--phases" in argv:
         # instrumentation is opt-in: it costs ~5% (npu_rt_device.hpp's TL_NPU_PHASE_PROF), so the default
         # build is the one every latency number comes from
