@@ -377,9 +377,15 @@ int session(const std::string &dir, int tiles, int shaves) {
         it->second->submit(params, stream);
         {
           // Watchdog: a SHAVE that failed (status != 0xFFFFFFFF, != OK) skips its tile peer's sync_tile, which waits
-          // unbounded, so the launch never returns. Dump every worker's status words after 20 s and give up.
+          // unbounded, so the launch never returns. Dump every worker's status words after the limit and give up.
           // The waiter signals a condition variable: the launch returns the moment the stream completes (a 50 ms
           // poll here once cost every 1 ms launch 54 ms of host time and left the device idle, i.e. cold).
+          // TL_NPU_WATCHDOG_S raises the limit: at 20 s a whole-model prefill launch cannot be told from a hang.
+          static const int kWatchdogS = [] {
+            const char *e = std::getenv("TL_NPU_WATCHDOG_S");
+            const int v = e ? std::atoi(e) : 0;
+            return v > 0 ? v : 20;
+          }();
           std::mutex mtx;
           std::condition_variable cv;
           bool done = false;
@@ -392,7 +398,7 @@ int session(const std::string &dir, int tiles, int shaves) {
           bool finished;
           {
             std::unique_lock<std::mutex> lk(mtx);
-            finished = cv.wait_for(lk, std::chrono::seconds(20), [&] { return done; });
+            finished = cv.wait_for(lk, std::chrono::seconds(kWatchdogS), [&] { return done; });
           }
           if (!finished) {
             const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

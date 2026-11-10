@@ -257,6 +257,10 @@ class Session:
         self.sizes: dict[str, int] = {}
         self.launches: list[tuple[str, float, float]] = []   # (alias, host_ms, kernel_ms)
         self._n = 0
+        self._fills = 0
+        self._filled = 0        # bytes spent keeping buffers off a 4 GiB boundary (see `alloc`)
+        self._next = None       # predicted address of the next allocation; resynced from the real one each time
+        self._gran = None
 
     def _cmd(self, line: str) -> str:
         self.proc.stdin.write(line + "\n")
@@ -275,9 +279,35 @@ class Session:
             raise RuntimeError(f"session {line.split()[0]} {line.split()[1] if len(line.split()) > 1 else ''}: {r}{tail}")
         return r
 
+    # A DMA whose buffer STRADDLES a 4 GiB boundary faults the device (ZE_RESULT_ERROR_DEVICE_LOST); a buffer
+    # wholly above one is fine. Measured on the prefill model: 9 layers at pad 0.2 GiB (top 4.12 GB) returns,
+    # pad 0.4 GiB (top 4.32 GB) faults, and 10 layers -- which always faulted -- returns once a 4.5 GiB pad puts
+    # every weight above the line with nothing across it. The big MoE expert tensors (269 MB) hit it first simply
+    # because they are wide enough to land across a boundary.
+    _BOUNDARY = 1 << 32
+
+    @staticmethod
+    def _straddles(addr: int, nbytes: int) -> bool:
+        return nbytes > 0 and addr // Session._BOUNDARY != (addr + nbytes - 1) // Session._BOUNDARY
+
     def alloc(self, name: str, nbytes: int) -> None:
-        self._cmd(f"alloc {name} {int(nbytes)}")
-        self.sizes[name] = int(nbytes)
+        nbytes = int(nbytes)
+        if self._next is not None and self._straddles(self._next, nbytes):
+            fill = (self._next // self._BOUNDARY + 1) * self._BOUNDARY - self._next
+            self._cmd(f"alloc _fill{self._fills} {fill}")
+            self._fills += 1
+            self._filled += fill
+            self._next = None          # resynced from the real address below
+        self._cmd(f"alloc {name} {nbytes}")
+        self.sizes[name] = nbytes
+        addr = int(self._cmd(f"addr {name}").split()[1])
+        # the prediction is only a guess about the allocator; this is the check that the buffer is actually clear
+        assert not self._straddles(addr, nbytes), (
+            f"{name}: {nbytes} B at {addr:#x} straddles a 4 GiB boundary -- the allocator model in Session.alloc "
+            f"is wrong, and a DMA of this buffer would fault the device")
+        if self._gran is None:
+            self._gran = 1 << 12
+        self._next = addr + -(-nbytes // self._gran) * self._gran
 
     def upload(self, name: str, a: np.ndarray, offset: int = 0) -> None:
         """Allocates `name` on first use (exact size), then copies `a` in."""
