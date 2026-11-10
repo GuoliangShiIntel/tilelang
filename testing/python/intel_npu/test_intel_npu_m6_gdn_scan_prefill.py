@@ -55,12 +55,15 @@ def _problem(n, NP, seed=0):
     return qk, v, gb, z, gnorm, ssm
 
 
-def _sim(n, N, qk, v, gb, z, gnorm, ssm, tiles=TILES, shaves=SHAVES, register_tri=False):
+def _sim(n, N, qk, v, gb, z, gnorm, ssm, tiles=TILES, shaves=SHAVES, register_tri=False,
+         live_chunks=False, sentinel=False):
     NP = -(-N // C) * C
     low = lowering.lower(make_gdn_scan_prefill(N=N, KH=KH, VH=VH, DK=DK, DV=DV, C=C, tiles=tiles, shaves=shaves,
-                                               eps=EPS, **({"register_tri": True} if register_tri else {})))
+                                               eps=EPS, register_tri=register_tri, live_chunks=live_chunks))
     lib = host_sim.build(low.source, "gdn_scan_prefill")
     out = np.zeros((NP, VH * DV), np.float16)
+    if sentinel:
+        out.fill(np.nan)
     sm = ssm.copy()
     arrays = {"QK": qk.reshape(KH, qk.shape[1], 2 * DK), "V": v, "Gb": gb, "Z": z, "GNorm": gnorm,
               "Nt": np.array([[n]], np.int32), "Ssm": sm, "Out": out}
@@ -150,6 +153,21 @@ def test_a_perturbed_token_moves_only_later_outputs(register_tri):
     head = slice(3 * DV, 4 * DV)
     assert np.array_equal(base[:40, head], moved[:40, head]), "an earlier token moved: the scan is not causal"
     assert not np.array_equal(base[40:, head], moved[40:, head]), "no later token moved: the state is not carried"
+
+
+@needs_cxx
+@pytest.mark.parametrize("live", [0, 1, 64, 100])
+def test_live_chunks_skip_full_padding_without_stale_outputs(live):
+    capacity = 192
+    inputs = _problem(live, capacity, seed=13)
+    output, state = _sim(live, capacity, *inputs, register_tri=True, live_chunks=True, sentinel=True)
+    assert np.isfinite(output).all() and np.isfinite(state).all()
+    assert np.count_nonzero(output[live:]) == 0
+    reference, reference_state = gdn_scan_prefill_reference(*inputs, live, eps=EPS)
+    assert np.abs(state - reference_state).max() / max(float(np.abs(reference_state).max()), 1e-6) < 5e-2
+    if live:
+        assert (np.abs(output[:live].astype(np.float32) - reference[:live]).max()
+                / max(float(np.abs(reference[:live]).max()), 1e-6)) < 5e-2
 
 
 def test_an_unaligned_chunk_size_is_refused():

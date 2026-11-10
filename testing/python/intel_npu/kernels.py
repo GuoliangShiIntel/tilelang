@@ -2459,6 +2459,7 @@ def make_gdn_scan_prefill(
     eps: float = 1e-6,
     as_block: bool = False,
     register_tri: bool = False,
+    live_chunks: bool = False,
 ):
     """P3: the Gated DeltaNet recurrence over `n` prompt tokens in **CHUNKED** form -- the prefill shape of the
     delta rule that `make_gdn_decode` runs one token at a time. Takes the conv phase's output (q / k l2-normalised
@@ -2597,7 +2598,7 @@ def make_gdn_scan_prefill(
                     for v in T.vectorized(FL):
                         S16[d, c0 * FL + v] = T.cast(Sf[d, c0 * FL + v], T.float16)
                 T.gemm(eye, S16, ST, transpose_B=True, clear_accum=True)
-                for ci in T.serial(NC):
+                for ci in T.serial(T.min(NC, T.ceildiv(T.max(0, nt[0, 0]), C)) if live_chunks else NC):
                     tb = T.max(0, T.min(C, nt[0, 0] - ci * C))
                     T.copy(QK[h // REP, ci * C, 0], qkc)
                     T.copy(V[h, ci * C, 0], vin)
@@ -2735,6 +2736,12 @@ def make_gdn_scan_prefill(
                                 )
                     perf_end()
                     T.copy(on, Out[ci * C, h * DV])
+                if live_chunks:
+                    for row, column in T.grid(C, DV // HL):
+                        for lane in T.vectorized(HL):
+                            on[row, column * HL + lane] = T.float16(0)
+                    for ci in T.serial(T.min(NC, T.ceildiv(T.max(0, nt[0, 0]), C)), NC):
+                        T.copy(on, Out[ci * C, h * DV])
                 T.copy(Sf, Ssm[h, 0, 0])
 
     if as_block:
@@ -2870,6 +2877,7 @@ def make_gdn_conv_prefill(
     item_worker: str = "tile",
     register_conv: bool = False,
     conv_fp16: bool = False,
+    live_chunks: bool = False,
 ):
     """P3b: the Gated DeltaNet PREFILL phase between the input projection and the chunked scan -- a causal conv1d of
     width 4 with SiLU, then the per-head normalisations -- producing exactly what `make_gdn_scan_prefill` consumes.
@@ -3017,7 +3025,11 @@ def make_gdn_conv_prefill(
                 cb = s * DK  # q slices, then k slices, then v slices: one contiguous run per worker
                 T.copy(ConvState[0, cb], win)
                 T.copy(ConvW[0, cb], cw)
-                for tb in T.serial(NT):
+                if live_chunks:
+                    for row, column in T.grid(3, DK // HL):
+                        for lane in T.vectorized(HL):
+                            keep[row, column * HL + lane] = win[row, column * HL + lane]
+                for tb in T.serial(T.min(NT, T.ceildiv(T.max(0, nt[0, 0]), TB)) if live_chunks else NT):
                     T.copy(Y[tb * TB, cb], xb)
                     perf_begin("cvsi")
                     if register_conv:
@@ -3067,13 +3079,23 @@ def make_gdn_conv_prefill(
                                 for v in T.vectorized(FL):
                                     zb[r, c0 * FL + v] = T.cast(ob[r, c0 * FL + v], T.float16)
                         T.copy(zb, Vo[s - 2 * KH, tb * TB, 0])
+                if live_chunks:
+                    for row, column in T.grid(TB, DK // FL):
+                        for lane in T.vectorized(FL):
+                            ob[row, column * FL + lane] = T.float32(0)
+                            zb[row, column * FL + lane] = T.float16(0)
+                    for tb in T.serial(T.min(NT, T.ceildiv(T.max(0, nt[0, 0]), TB)), NT):
+                        if s < 2 * KH:
+                            T.copy(ob, QKo[s % KH, tb * TB, (s // KH) * DK])
+                        else:
+                            T.copy(zb, Vo[s - 2 * KH, tb * TB, 0])
                 T.copy(keep, CsOut[0, cb])
         T.sync_grid()
         # z, beta and g: one v-head per item, read straight out of the projection row
         for it in T.serial(T.ceildiv(VH, workers)):
             h = it * workers + worker
             if h < VH:
-                for tb in T.serial(NT):
+                for tb in T.serial(T.min(NT, T.ceildiv(T.max(0, nt[0, 0]), TB)) if live_chunks else NT):
                     T.copy(Y[tb * TB, CONV + h * DV], zb)
                     for r in T.serial(TB):
                         st[5] = T.if_then_else(tb * TB + r < nt[0, 0], T.float32(1), T.float32(0))
@@ -3089,6 +3111,16 @@ def make_gdn_conv_prefill(
                         st[7] = T.cast(aa[r, 0], T.float32) + db[0, h]
                         gbb[r, 0] = (T.float32(0) - T.exp(al[0, h])) * T.log(T.float32(1) + T.exp(st[7])) * st[6]
                     T.copy(gbb, Gb[h, tb * TB, 0])
+                if live_chunks:
+                    for row, column in T.grid(TB, DV // HL):
+                        for lane in T.vectorized(HL):
+                            zb[row, column * HL + lane] = T.float16(0)
+                    for row in T.serial(TB):
+                        gbb[row, 0] = T.float32(0)
+                        gbb[row, 1] = T.float32(0)
+                    for tb in T.serial(T.min(NT, T.ceildiv(T.max(0, nt[0, 0]), TB)), NT):
+                        T.copy(zb, Zo[h, tb * TB, 0])
+                        T.copy(gbb, Gb[h, tb * TB, 0])
 
     if as_block:
         return conv_phase, dict(NP=NP, NIN=NIN, CONV=CONV, QK=QK, VC=VC)
@@ -5443,6 +5475,7 @@ def make_prefill_model(
     register_conv: bool = False,
     conv_fp16: bool = False,
     register_tri: bool = False,
+    gdn_live_chunks: bool = False,
 ):
     """P5: a whole PREFILL chunk of `N` prompt tokens through `L` layers in ONE launch -- the prefill counterpart
     of `make_decode_model`. A device-side loop over the layers, `Kind[li, 0]` selecting the Gated DeltaNet or the
@@ -5491,9 +5524,10 @@ def make_prefill_model(
         item_worker=conv_item_worker,
         register_conv=register_conv,
         conv_fp16=conv_fp16,
+        live_chunks=gdn_live_chunks,
     )
     scan_phase, _ = make_gdn_scan_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, C=C, tiles=tiles, shaves=shaves,
-                                        eps=eps, as_block=True, register_tri=register_tri)
+                                        eps=eps, as_block=True, register_tri=register_tri, live_chunks=gdn_live_chunks)
     qkv_phase, qs = make_attn_qkv_prefill(
         N=NP, H=H, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX, TB=TBq, tiles=tiles, shaves=shaves, eps=eps, as_block=True, kv4=True
     )

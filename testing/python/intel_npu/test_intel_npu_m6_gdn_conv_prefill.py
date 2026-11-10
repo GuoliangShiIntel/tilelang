@@ -55,15 +55,19 @@ def _problem(n, NP, seed=0):
     return y, ba, conv_w, cs, a_log, dt_bias
 
 
-def _sim(n, N, y, ba, conv_w, cs, a_log, dt_bias, tiles=TILES, shaves=SHAVES, register_conv=False, conv_fp16=False):
+def _sim(n, N, y, ba, conv_w, cs, a_log, dt_bias, tiles=TILES, shaves=SHAVES, register_conv=False, conv_fp16=False,
+         live_chunks=False, sentinel=False):
     NP = -(-N // TB) * TB
     low = lowering.lower(make_gdn_conv_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, TB=TB,
                                                tiles=tiles, shaves=shaves,
-                                               register_conv=register_conv, conv_fp16=conv_fp16))
+                                               register_conv=register_conv, conv_fp16=conv_fp16, live_chunks=live_chunks))
     lib = host_sim.build(low.source, f"gdn_conv_prefill_{NP}_{tiles}x{shaves}")
     out = dict(QKo=np.zeros((KH, NP, 2 * DK), np.float32), Vo=np.zeros((VH, NP, DV), np.float16),
                Gb=np.zeros((VH, NP, 2), np.float32), Zo=np.zeros((VH, NP, DV), np.float16),
                CsOut=np.zeros((3, CONV), np.float16))
+    if sentinel:
+        for value in out.values():
+            value.fill(np.nan)
     arrays = {"Y": y, "Ba": ba, "ConvW": conv_w, "ConvState": cs, "ALog": a_log, "DtBias": dt_bias,
               "Nt": np.array([[n]], np.int32), **out}
     host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, arrays), tiles=tiles, shaves=shaves))
@@ -137,6 +141,22 @@ def test_rows_past_the_live_count_are_zero(register_conv, conv_fp16):
     assert np.abs(got["QKo"][:, n:]).max() == 0 and np.abs(got["Vo"][:, n:]).max() == 0
     assert np.abs(got["Gb"][:, n:]).max() == 0 and np.abs(got["Zo"][:, n:]).max() == 0
     assert np.abs(got["QKo"][:, :n]).max() > 0, "the live rows are not all zero either"
+
+
+@needs_cxx
+@pytest.mark.parametrize("live", [0, 1, 31, 32, 33, 50])
+def test_live_chunks_zero_inactive_capacity_and_preserve_state(live):
+    capacity = 128
+    y, ba, cw, state, al, db = _problem(live, capacity, seed=19)
+    got = _sim(live, capacity, y, ba, cw, state, al, db, conv_fp16=True,
+               live_chunks=True, sentinel=True)
+    for value in got.values():
+        assert np.isfinite(value).all()
+    assert np.count_nonzero(got["QKo"][:, live:]) == 0
+    for name in ("Vo", "Gb", "Zo"):
+        assert np.count_nonzero(got[name][:, live:]) == 0
+    expected_state = gdn_conv_prefill_reference(y, cw, state, al, db, live, KH, VH, DK, DV, ba=ba)[-1]
+    np.testing.assert_array_equal(got["CsOut"], expected_state)
 
 
 @needs_cxx
