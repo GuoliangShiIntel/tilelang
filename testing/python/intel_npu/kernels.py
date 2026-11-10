@@ -2325,6 +2325,7 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
                 T.copy(ConvW[0, cb], cw)
                 for tb in T.serial(NT):
                     T.copy(Y[tb * TB, cb], xb)
+                    perf_begin("cvsi")
                     for r in T.serial(TB):
                         for c0 in T.serial(DK // FL):
                             for v in T.vectorized(FL):
@@ -2343,7 +2344,9 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
                                     keep[0, c0 * HL + v] = win[0, c0 * HL + v]
                                     keep[1, c0 * HL + v] = win[1, c0 * HL + v]
                                     keep[2, c0 * HL + v] = win[2, c0 * HL + v]
+                    perf_end()
                     # l2 norm per token, then the slice's destination
+                    perf_begin("cvnm")
                     for r in T.serial(TB):
                         for v in T.vectorized(FL):
                             ls[v] = T.float32(0)
@@ -2358,6 +2361,7 @@ def make_gdn_conv_prefill(N: int = 128, KH: int = 16, VH: int = 32, DK: int = 12
                             for v in T.vectorized(FL):
                                 ob[r, c0 * FL + v] = T.if_then_else(
                                     s < 2 * KH, cv[r, c0 * FL + v] * st[3], cv[r, c0 * FL + v]) * st[4]
+                    perf_end()
                     if s < 2 * KH:
                         T.copy(ob, QKo[s % KH, tb * TB, (s // KH) * DK])
                     else:
@@ -2491,15 +2495,21 @@ def make_proj_prefill(NP: int = 128, M: int = 1024, K: int = 2048, BN: int = 64,
                 T.copy(Wq[n * BN, 0], wq_cmx)
                 if scales_gm:
                     T.copy(S[0, n * BN], s_cmx)
+                    perf_begin("pdeq")
                     T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(w_cmx[0, 0]),
                                   T.address_of(wq_cmx[0, 0]), T.address_of(s_cmx[0, 0]), BN, K, G)
+                    perf_end()
                 else:
                     T.copy(S[n * BN, 0], s_cmx)
+                    perf_begin("pdeq")
                     T.call_extern("handle", "tl_npu_dequant_i4_block", T.address_of(w_cmx[0, 0]),
                                   T.address_of(wq_cmx[0, 0]), T.address_of(s_cmx[0, 0]), BN, K, G)
+                    perf_end()
                 for b in T.serial(NTB):
                     T.copy(X[b * MB, 0], x_cmx)
+                    perf_begin("pgem")
                     T.gemm(x_cmx, w_cmx, y_cmx, transpose_B=True, clear_accum=True)
+                    perf_end()
                     T.copy(y_cmx, Yout[b * MB, n * BN])
 
     if as_block:
