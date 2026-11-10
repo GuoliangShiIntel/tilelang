@@ -4,6 +4,93 @@ Status: plan, 2026-11-06. Branch `feat/intel-npu-backend`. Living document: ever
 its outcome in place when it closes (date, commit, evidence path). Decisions that change get a dated
 amendment, not a silent edit.
 
+## 2026-11-10: Shared-weight ownership and serial activation multicast
+
+First correctness milestone; not an E2E performance claim. The previous prefetch prototype is committed
+at `86df8e52`. This experiment keeps the old model/projection path unchanged by default.
+
+`make_proj_prefill(..., shared_weights=True)` expresses output-row ownership by tile, dequantisation of
+disjoint weight-row fractions by the tile's SHAVEs into one `shared` weight buffer, and token-block
+ownership by SHAVE. It currently requires complete tile rounds and complete SHAVE token rounds.
+It supports both row-major and group-major scale tables. These are source/IR ownership choices, not
+kernel-name cases in codegen.
+
+With PassContext `tl.intel_npu.multicast=True` (default false), `PlanIntelNpuDistribution` broadcasts a
+local DPU operand loaded from a parameter DDR buffer when its address/geometry is tile-invariant and
+the enclosing serial control flow is provably uniform across workers. Tile 0's matching SHAVE issues
+the DMA; explicit grid rendezvous in the IR protect completion and reuse. SHAVE-private activation
+ownership and loop iteration counts do not change. Tile-dependent sources, tile/SHAVE-dependent
+branches, unknown bound variables, buffer-dependent control, while loops and dynamic DDR views are
+not transformed. Existing `T.Pipelined` rings are unchanged.
+
+Validation:
+
+- Host simulation performs real cross-tile arena writes from tile 0, not independent per-tile loads.
+- Quantised shared/private weight schedules match bit-for-bit for both scale layouts and one/two
+  weight rounds. Independent fp16 projection oracles cover broadcast, split and conditional paths.
+- `NP=192, M=12288, K=2048, BN=128, MB=48` lowers with shared weights and multicast under the default
+  CMX budget; the same geometry with private weights is refused by `CheckIntelNpuBudgets`.
+- Device golden at `192x768x2048`, BN128/MB48, group-major scales, 3 tiles x 2 SHAVEs: PASS
+  (relative error 2.18e-4); a perturbed packed-weight group reports FAIL (relative error 0.155).
+  Kernel source SHA256 `6bec43fc5e28`; SDK `daf6c05`.
+- Separate clean baseline: UNPROFILED TURBO, warmup=10/repeat=10, kernel-only median 0.163 ms,
+  host wall 0.249 ms, 3.70 TOPS (14.7% of 25.13 TOPS dense-fp16 turbo peak). This is not a speedup.
+- PROFILED trace: `testing/python/intel_npu/device/evidence/`
+  `tl_proj_shared_m192_n768_k2048_bn128_mb48_mc1_gm1_trace.json`; SHAVE-track event counts
+  20/20/16/16/16/16 (cap 1984), eight DPU workloads per tile. The timeline reports about 30% DPU
+  busy over the workload span and 14 us/workload. The ping-pong flow checker is not applicable:
+  this path is deliberately synchronous and has no READY/FREE ring.
+
+Reproduce with SDK environment variables set (see section 0):
+
+```powershell
+$env:NPU_PROFILE_FRC_MHZ = '19.2'
+python testing/python/intel_npu/device/run_w4a16_device.py --prefill-shared --scales-gm
+python testing/python/intel_npu/device/run_w4a16_device.py --prefill-shared --scales-gm --negative
+python testing/python/intel_npu/device/run_w4a16_device.py --prefill-shared --scales-gm --profile
+python -m pytest testing/python/intel_npu -q
+```
+
+The opt-in PassContext `tl.intel_npu.multicast_overlap=True` additionally derives a ring from a uniform
+serial load/GEMM/store loop. It proves contiguous token-block traversal and non-overlapping output rows,
+keeps each SHAVE's original token ownership, changes the local activation allocation into shared slots,
+then reuses `LowerIntelNpuPipelined`, `AssignIntelNpuBarriers` and the existing READY/FREE runtime.
+The derived ring is not hoisted across outer-loop weight preparation. The actual CMX/barrier checks
+still apply; this is a conservative candidate transform, not yet a cost-ranked planner or a fallback
+search across multiple candidates. It has no kernel-name dispatch and the DSL does not add `T.Pipelined`.
+
+Same-shape paired clean device experiment (same TURBO, warmup=10/repeat=10): synchronous 0.164 ms,
+automatic ring 0.147 ms kernel-only, about 10.4% less; ring golden PASS rel 2.18e-4 and perturbed weights
+FAIL rel 0.155. Clean ring source SHA256 `121ab0a15e50`; text 55296 B. Ring achieved 4.12 TOPS,
+16.4% of the same 25.13 TOPS turbo peak. This is a standalone projection result, not a model TTFT.
+The prediction was qualitative (less rendezvous and serial DMA; limited by small-shape startup),
+not a calibrated numeric performance model. Whole-launch instrumented attribution supports it:
+
+| Arm | Records / Dropped | DMA load us/worker | Store | DPU | Barrier | Ring / Ring wait |
+|---|---|---|---|---|---|---|
+| synchronous | 152 / 0 | 46 | 12 | 17 | 65 / 12 calls | 0 / 0 |
+| automatic ring | 148 / 0 | 35 | 11 | 17 | 25 / 6 calls | 7 / 2 |
+
+The instrumented times above are observability only. Task traces are
+`device/evidence/tl_proj_shared_m192_n768_k2048_bn128_mb48_mc1_gm1{,_overlap}_prof_tasks.json`
+under `testing/python/intel_npu`; instrumented source SHA256s are `bb68ccf05704` and `f1804f73f62b`.
+Task-record checks observed exactly 4 DPU records per worker (8 per tile) and exactly 4 ring-fill records
+on each tile-0 SHAVE, none on other tiles; the synchronous control has no ring-fill records.
+The old toolkit trace is NOT admissible evidence of the automatic ring: async `start`/watermark-wait
+does not generate its DPU events. Its old `trace_timeline.py --check` reports 0 workloads and FAIL;
+this is not treated as a passing flow check. Use the complete per-task capture for this path.
+
+```powershell
+python testing/python/intel_npu/device/run_w4a16_device.py --prefill-shared --scales-gm --overlap
+python testing/python/intel_npu/device/run_w4a16_device.py --prefill-shared --scales-gm --overlap --negative
+python testing/python/intel_npu/device/run_w4a16_device.py --prefill-shared --scales-gm --phases
+python testing/python/intel_npu/device/run_w4a16_device.py --prefill-shared --scales-gm --overlap --phases
+```
+
+Remaining: CMX-aware fallback/cost-ranked candidate selection, dynamic table-view support, non-divisible
+tails, model-wide integration and same-condition E2E A/B. Both new options default false. No model
+performance parity is claimed. Final regression gate: 188 Intel NPU tests passed.
+
 ## 0. Decision
 
 Build a **pure TileLang target backend** for the Intel NPU5 (PTL), owned entirely by this repo:
@@ -68,16 +155,16 @@ keep going, not about what it has failed to do.
 
 What is given up, stated plainly:
 
-* **Sunk work.** ~13k lines of Python (`fused/`, `lib/`, `frontend/`, `registry.py`) and the three
+- **Sunk work.** ~13k lines of Python (`fused/`, `lib/`, `frontend/`, `registry.py`) and the three
   model sources are not ported; they are read as prior art. Their *rules* (`fused_compiler_rules.md`
   G/Q/T/S/O/P/N/V) and their *pitfalls* (the `enable-new-model` skill's list) are carried over as
   tests in Phases 1-5.
-* **The V1 identity gate** across the migration. Byte-identical output against npu_dsl is not a goal;
+- **The V1 identity gate** across the migration. Byte-identical output against npu_dsl is not a goal;
   device goldens and unprofiled A/Bs against npu_dsl's recorded numbers are the acceptance (Phase 5).
-* **Effort before parity.** Until Phase 5 closes, enabling a new model costs what npu_dsl's *first*
+- **Effort before parity.** Until Phase 5 closes, enabling a new model costs what npu_dsl's *first*
   model cost, not its fourth. The `enable-new-model` procedure itself (model card, reference, golden,
   sim, device, first numbers, offline sweep) is DSL-independent and is reused as written.
-* **Build weight.** A C++ toolchain in the loop; see the Windows notes in section 1.
+- **Build weight.** A C++ toolchain in the loop; see the Windows notes in section 1.
 
 The decision is therefore: pay a bounded rebuild (Phases 0-5) to replace a bespoke compiler that has
 reached the point where its next items (verifiers, typed annotations, a trustworthy cost model, a
@@ -268,7 +355,7 @@ anyway). `AssignBarriers` becomes the one owner of the pool (the 3 sync ids move
 by how much. The two users never share an id; id reuse across phases separated by a `sync_grid` (VPUX's
 graph colouring) is deferred until a kernel needs it. Build order: **A** runtime `Ring` + a hand-written
 kernel verified on the device, **B** the passes emit the same program from the DSL, **C** `check_flow_trace`
-+ TOPS.
+- TOPS.
 
 ## 4. Phases
 
@@ -276,47 +363,47 @@ Each phase has an executable acceptance. A phase closes only when its acceptance
 fail** on a negative fixture and then pass on the real one.
 
 ### Phase 0: scaffold (hardware-free)
-* Package, target kind, manifest, dialect (common only), pipeline items 1-4 and 15, source-only
+- Package, target kind, manifest, dialect (common only), pipeline items 1-4 and 15, source-only
   codegen that emits a `kernel_entry` skeleton for a kernel with no tile ops.
-* Sources are text-only and always compiled; no CMake gate (amended 2026-11-06, see section 2).
-* Acceptance: fresh-process `import tilelang.intel_npu`; `Target("intel_npu -arch=npu5")` and alias
+- Sources are text-only and always compiled; no CMake gate (amended 2026-11-06, see section 2).
+- Acceptance: fresh-process `import tilelang.intel_npu`; `Target("intel_npu -arch=npu5")` and alias
   `"ptl"` resolve; `tilelang.lower(kernel, target="intel_npu")` returns source containing
   `kernel_entry`; a 2-D grid is refused with a message naming `intel_npu`. Negative: a target string
   of another backend returns `None` from the normalizer; the same source assertions fail on the
   `c` backend's output; a tile op is refused by name.
-* Launch binding (decided here): `MaterializeKernelLaunch(lower_grid_binding=True,
+- Launch binding (decided here): `MaterializeKernelLaunch(lower_grid_binding=True,
   lower_thread_binding=True)`, so `blockIdx.x` / `threadIdx.x` reach codegen as `thread_extent`
   scopes and are printed as `npu::tile_id()` / `npu::shave_id()`. `default_threads` is the target's
   `shaves_per_tile`.
 
 ### Phase 1: single-phase GEMM, one tile, sim + device
-* Pipeline items 5, 6, 12 (bump allocation), 13. `npu_rt.hpp` + `npu_rt_host.hpp` with
+- Pipeline items 5, 6, 12 (bump allocation), 13. `npu_rt.hpp` + `npu_rt_host.hpp` with
   `dma_load/store`, `dpu_matmul`, worker dealing.
-* Kernel: `[M,K] x [N,K]^T` fp16, grid persistent over `(M/BM)*(N/BN)` blocks.
-* Acceptance: host sim matches numpy (`rel < 2e-3`); device golden matches; the K-split form is
+- Kernel: `[M,K] x [N,K]^T` fp16, grid persistent over `(M/BM)*(N/BN)` blocks.
+- Acceptance: host sim matches numpy (`rel < 2e-3`); device golden matches; the K-split form is
   refused by name. Negative: perturb one byte of `B` in the sim harness -> FAIL reported.
 
 ### Phase 2: megakernel primitives
-* `T.sync_grid()` -> global rendezvous (item 11); `CheckBudgets` (item 14); `T.serial(waves)` and
+- `T.sync_grid()` -> global rendezvous (item 11); `CheckBudgets` (item 14); `T.serial(waves)` and
   `T.Persistent` dealing over tiles x SHAVEs.
-* Kernel: two phases in one launch, e.g. split-K attention partials -> `sync_grid` -> combine (the
+- Kernel: two phases in one launch, e.g. split-K attention partials -> `sync_grid` -> combine (the
   shape of `examples/deepseek_mla/example_mla_decode_persistent.py`), or rmsnorm -> `sync_grid` ->
   GEMM.
-* Acceptance: one `kernel_entry`, one launch, device golden passes; removing the `sync_grid` from
+- Acceptance: one `kernel_entry`, one launch, device golden passes; removing the `sync_grid` from
   the source makes the device golden FAIL (the negative control that proves the barrier is live).
-* 2b: `DeriveGlobalSync` inserts it automatically; acceptance = identical generated source with and
+- 2b: `DeriveGlobalSync` inserts it automatically; acceptance = identical generated source with and
   without the hand-written `sync_grid`, and a fixture with no cross-phase dependency gets none.
 
 ### Phase 3: multi-tile ping-pong matmul flow
-* Items 7, 8, 9; `PlanCmx` live-range packing; hardware barriers. Target schedule: A split across
+- Items 7, 8, 9; `PlanCmx` live-range packing; hardware barriers. Target schedule: A split across
   tiles and resident; B broadcast (multicast), ping-ponged, each chunk split across both DMA ports;
   DPU FIFO alternated by the two SHAVEs with no sync between them.
-* 3a (closed): `sync_grid` on hardware barriers; see section 8.
-* 3b (closed 2026-11-06; A, B, C): the pipelined flow above, with tile shape, distribution and stencil chosen by
+- 3a (closed): `sync_grid` on hardware barriers; see section 8.
+- 3b (closed 2026-11-06; A, B, C): the pipelined flow above, with tile shape, distribution and stencil chosen by
   the VPUNN-backed passes of section 3.2 (Step 0 cost model and calibration first). Still open after 3b: a
   host-simulation ring so the suite runs the flow without hardware; `DeriveGlobalSync` does not yet see
   `ring_fill` as a DDR read; rounds for a resident operand larger than CMX; TileGemm (the shape search).
-* Acceptance (met, section 8 step C): device trace admissible (per-SHAVE event counts 32-66, cap 1984;
+- Acceptance (met, section 8 step C): device trace admissible (per-SHAVE event counts 32-66, cap 1984;
   `NPU_PROFILE_FRC_MHZ=19.2` exported), the flow checker (`device/trace_timeline.py --check`) exits 0 on
   the flow trace and 1 on a plain GEMM trace, DPU busy % and TOPS at the reference shape reported
   **unprofiled, kernel-only** (NCE_TIME entry/finish stamps in the status record) with the peak basis stated.
@@ -332,28 +419,28 @@ Qwen3.6-35B-A3B, so section 9 lists what the model needs against what this backe
 replace the earlier Phase 4 / Phase 5 text. Every milestone: host sim first, device golden, then kernel-only time
 against npu_dsl's same-shape number (the standing bar: not slower than npu_dsl).
 
-* **M1 full-attention prefill phase** (in progress): the ring generalised to several streamed operands, SHAVE
+- **M1 full-attention prefill phase** (in progress): the ring generalised to several streamed operands, SHAVE
   statements in the body and "the slot's last reader produces FREE"; RMSNorm, RoPE, q/k norm as SHAVE ops;
   fp16 qkv / o_proj. Acceptance: one attention block's prefill, device golden, kernel-only vs npu_dsl.
-* **M2 int4 group-128 weights**: SHAVE dequant feeding the fp16 DPU (prefill) and the SHAVE GEMV (decode, M=1);
+- **M2 int4 group-128 weights**: SHAVE dequant feeding the fp16 DPU (prefill) and the SHAVE GEMV (decode, M=1);
   int8 group-128 for the lm_head. Decides decode TPS.
-* **M3 MoE layer**: top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert
+- **M3 MoE layer**: top-8 softmax router over 256 experts, routed expert FFN (SwiGLU pairs), shared expert
   (sigmoid gate), combine; the routed-work distribution rule (npu_dsl's `e7_24_moe_routed_work.md` is the
   readable precedent).
-* **M4 Gated DeltaNet layer**: causal conv1d and the delta-rule scan (the largest SHAVE op).
-* **M5 one-kernel model**: layer table with a device-side layer loop (`when` on the layer kind), long-prompt chunk
+- **M4 Gated DeltaNet layer**: causal conv1d and the delta-rule scan (the largest SHAVE op).
+- **M5 one-kernel model**: layer table with a device-side layer loop (`when` on the layer kind), long-prompt chunk
   loop, `PlanCmx` live-range packing across phases, barrier id reuse across phases, `.text` budget per kernel;
   one decode kernel and one prefill kernel.
-* **M6 e2e**: reuse npu_dsl's `qwen36_e2e` reference model, pack and golden check (model-side Python, reused
+- **M6 e2e**: reuse npu_dsl's `qwen36_e2e` reference model, pack and golden check (model-side Python, reused
   across models by that skill itself) on this backend's ABI; golden 32/32; `longseq` TTFT / TPS as an interleaved
   A/B against npu_dsl's Qwen3.6 numbers.
 
 Rules carried into M1-M6:
-* **SHAVE algorithms may be ported from npu_dsl's hardware-verified runtime code** (`<user>`, 2026-11-06:
+- **SHAVE algorithms may be ported from npu_dsl's hardware-verified runtime code** (`<user>`, 2026-11-06:
   `kernels_poc/common/fused_ops.hpp` vector loops, dequant, GDN scan), with the origin named at the port;
   the compiler side (IR, passes, emitter) stays pure TileLang. Section 0's "fused_rt not reused" is amended to
   this.
-* **Performance is guaranteed by prune -> measure -> pin, not by a model** (`<user>`'s concern: npu_dsl's
+- **Performance is guaranteed by prune -> measure -> pin, not by a model** (`<user>`'s concern: npu_dsl's
   tiling choices were ad hoc). `TileGemm`: legal candidates (CMX, 8192 points, 16-alignment, the window rule
   (d - 1) x D >= chain) ranked by the composite model `t_chunk = max(DPU = VPUNN x calibration, fill = 4.5 us +
   bytes / 67 GB/s + 2 barrier latencies, SHAVE = measured ns per element)`, top-k built and timed kernel-only
@@ -361,33 +448,33 @@ Rules carried into M1-M6:
   model's regret recorded. A GEMM class may skip the sweep only once the model's first pick has regret <= 3% on
   every shape tried; MoE routed work is swept with representative routing, never random (skill 6b's lesson);
   decode GEMV is SHAVE/bandwidth bound and is measured, not modelled. Whole-model A/B before any pin (skill 6b).
-* Library guard rails from npu_dsl's bring-ups stay as refusals with negative tests: top-k over fewer than 32
+- Library guard rails from npu_dsl's bring-ups stay as refusals with negative tests: top-k over fewer than 32
   experts; an attention key chunk or head dim not a multiple of 32; two layouts for one state key across decode
   and prefill; a multicast round with a load in its epilogue.
-* The execution-backend question (Build/JIT/Runtime over `npu_runtime` versus the runner) is decided at M6.
+- The execution-backend question (Build/JIT/Runtime over `npu_runtime` versus the runner) is decided at M6.
 
 ## 5. Measurement and evidence rules carried over
 
-* A run is either profiled (observability) or unprofiled (timing), never both; every duration says
+- A run is either profiled (observability) or unprofiled (timing), never both; every duration says
   which. `NPU_PROFILE_FRC_MHZ=19.2` for every capture (the runtime's 38.4 default halves durations).
-* A profiled trace reports per-SHAVE event counts; a count at the profiler's cap is SATURATED and
+- A profiled trace reports per-SHAVE event counts; a count at the profiler's cap is SATURATED and
   inadmissible.
-* Every quoted TOPS states ops (`2 M N K`), the unprofiled kernel-only time, and the peak basis.
-* **Every timing runs under `NPU_TURBO=YES`** (the runner's default since 2026-11-07; `TL_NPU_TURBO=0` only
+- Every quoted TOPS states ops (`2 M N K`), the unprofiled kernel-only time, and the peak basis.
+- **Every timing runs under `NPU_TURBO=YES`** (the runner's default since 2026-11-07; `TL_NPU_TURBO=0` only
   for an A/B) and says TURBO / NO TURBO. Without it the DPU and the SHAVE run at about half the clock: every
   number in this plan dated before 2026-11-07 is NO TURBO (log entry of that date).
-* Evidence (traces, logs, generated `.cpp` with sha256 prefix) goes under
+- Evidence (traces, logs, generated `.cpp` with sha256 prefix) goes under
   `testing/python/intel_npu/device/evidence/` with an `INDEX.md` row per device session.
-* **Read the per-SHAVE status words before blaming the device** (2026-11-08, question 8). `npu_rt_device.hpp`'s
+- **Read the per-SHAVE status words before blaming the device** (2026-11-08, question 8). `npu_rt_device.hpp`'s
   `finish()` writes 16 words per SHAVE and `npu_run`'s watchdog dumps them even on a timeout:
   `{code, detail, cmx_free_at_entry, cmx_used, dpu_waited, dpu_idu_ticks, dpu_odu_ticks, dpu_started, t_entry,
   t_finish, ring[0..5]}`. So a `DEVICE_LOST` dump already says whether the kernel ran: `word0 == kStatusOk (1)`
   means the body returned and wrote its record, `word7 == word4` means no DPU workload was orphaned, and
-  `(word9 - word8) / 19.2e6` is the kernel's own duration in seconds. A watchdog whose words read `1 0 ... ` with
+  `(word9 - word8) / 19.2e6` is the kernel's own duration in seconds. A watchdog whose words read `1 0 ...` with
   a normal duration is **not** a device hang: the kernel finished and the host never saw the completion event, so
   the fault is in what the launch left behind, not in the kernel body. Question 8 chased the wrong half of the
   system for several rounds before these words were decoded.
-* **Hardware facts are looked up before they are measured and before they are asked** (`<user>`, 2026-11-07):
+- **Hardware facts are looked up before they are measured and before they are asked** (`<user>`, 2026-11-07):
   the VPUX knowledge base (`knowledges/hw/npu5/*.md`, `knowledges/compiler/platform-resources.md`; the
   `intel-npu-hardware` skill) is the first stop; a measurement confirms a sourced fact or exposes a
   difference; the hardware owner is asked what neither gives. Every constant the backend depends on is a
@@ -402,38 +489,38 @@ One defect -- a 512 B buffer the compiler sank into a loop -- took a day, **eigh
 five wrong conclusions published along the way**. The wrong turns cost more than the fix, so they are the
 part worth keeping.
 
-* **A device claim needs independent trials. One run inside a tolerance is not evidence.** The GDN prefill
+- **A device claim needs independent trials. One run inside a tolerance is not evidence.** The GDN prefill
   scan was committed as "device PASS rel 5e-4" and was in fact wrong about two runs in three at 3 x 2: a
   single launch passes most of the time, which is exactly how a flaky kernel reports as working.
   `run_gdn_scan_prefill_device.py` and `run_moe_prefill_device.py` take `--trials` and print `n/N`; P2a and
   P2b were re-earned under it, and P1 was re-earned by five consecutive runs agreeing to three digits. **The
   other device runners still report one run and their PASSes are worth what P3's was.** A tolerance cannot
   tell a kernel that is right from one that is right four times in five.
-* **Build what you measure.** Two rounds of observations -- "1 x 2 fails 6/8", "the state is correct and only
+- **Build what you measure.** Two rounds of observations -- "1 x 2 fails 6/8", "the state is correct and only
   the output is sparse-wrong" -- were artifacts of `runner.write_kernel` plus a hand-built `DeviceBuild`,
   which runs whatever ELF is already registered under that name, not the source just written. Both were
   published before the instrument was checked. Use `runner.build`.
-* **Read the first-party consumer before explaining a number.** Two mechanisms were invented and written down
+- **Read the first-party consumer before explaining a number.** Two mechanisms were invented and written down
   without opening the code they rested on: "the `inout` state drifts across repeats" (`npu_run.cpp` restores
   every input before each launch, so repeating only re-rolls the dice) and "cmx_used says the peak is 5.5%"
   (the word is sampled in `finish()`, after the scopes are released, so it is what is still held; the peak is
   priced at compile time by `CheckIntelNpuBudgets`).
-* **Say what an A/B actually varies.** Running the same kernel on npu_dsl's `fused_rt` and getting the same
+- **Say what an A/B actually varies.** Running the same kernel on npu_dsl's `fused_rt` and getting the same
   failure rate was read as "the mechanism is below both runtimes, so it is the hardware". Both arms shared
   this backend's lowering -- the same CMX scoping, the same call sequence -- so the experiment could only ever
   exclude the runtime. `<user>` rejected the conclusion and it was withdrawn.
-* **A partial version of a hypothesis failing does not falsify the hypothesis.** Hoisting three of the
+- **A partial version of a hypothesis failing does not falsify the hypothesis.** Hoisting three of the
   kernel's buffers out of the loops did not help, so CMX scoping was struck off the list -- while the one
   buffer that mattered sat two loop levels deeper. It cost five more hypotheses to come back to it.
-* **A hardware constant constrains nothing until a probe has tried to break it.** Separately the same day, a
+- **A hardware constant constrains nothing until a probe has tried to break it.** Separately the same day, a
   "max 8192 output points" reading of `hw/npu5/dpu.md` had been written into `hw_facts.py` and into a compiler
   check that refused `M*N > 8192`; a working npu_dsl kernel issues 128x128, and `device/run_dpu_points_probe.py`
   then reached 128x512. The check became per-dimension and prefill attention got 8.9% faster for it.
-* **An assertion that cannot fail is worse than none.** `assert src.count("ctx.alloc<half>(64)") == 1` was
+- **An assertion that cannot fail is worse than none.** `assert src.count("ctx.alloc<half>(64)") == 1` was
   written to check an allocation had been hoisted; a sunk allocation is also emitted once textually. Every new
   gate here is now run against the broken state first -- both scoped-CMX tests were seen to FAIL with the fix
   disabled.
-* **Our own setup error is not someone else's defect.** The first npu_dsl baseline run produced token 9 at
+- **Our own setup error is not someone else's defect.** The first npu_dsl baseline run produced token 9 at
   every step. That was the wrong exported weights directory; with the right one it is 32/32 and deterministic
   over 8 runs. It was one command away from being filed as an npu_dsl bug.
 
@@ -443,7 +530,7 @@ Getting prefill and decode onto one weight layout and through 40 layers end to e
 hardware constraint and a run of self-inflicted wounds. The constraint is in `hw_facts` territory; the
 wounds are all the same shape -- **a measurement trusted without checking the thing that produced it**.
 
-* **A DMA whose buffer STRADDLES a 4 GiB boundary faults the device** (`ZE_RESULT_ERROR_DEVICE_LOST`); a
+- **A DMA whose buffer STRADDLES a 4 GiB boundary faults the device** (`ZE_RESULT_ERROR_DEVICE_LOST`); a
   buffer wholly above one is fine. Found by padding: 9 layers at a 0.2 GiB pad (top 4.12 GB) returns, the
   same 9 at 0.4 GiB (top 4.32 GB) faults, and 10 layers -- which had never once returned -- returns as soon
   as a 4.5 GiB pad puts every weight above the line with nothing across it. The MoE expert tensors (269 MB)
@@ -452,12 +539,12 @@ wounds are all the same shape -- **a measurement trusted without checking the th
   address afterwards** -- the prediction is a guess about an allocator we do not own, the assert is the
   check. L=9/10/11/12 then return in 322/357/398/424 ms and L=40 in 1424.5 ms. **Why decode never hit this
   is still unexplained**, and that is a loose end, not a result.
-* **A timeout is a property of the instrument, not of the kernel.** The watchdog was a hardcoded 20 s. A
+- **A timeout is a property of the instrument, not of the kernel.** The watchdog was a hardcoded 20 s. A
   40-layer prefill launch is 1.4 s of kernel on top of build and upload, so "hangs" and "is merely slow"
   reported identically, and two bisects went down the wrong path before the constant was noticed. It is
   `TL_NPU_WATCHDOG_S` now. The same lesson as §5.1's "build what you measure", one layer further out: a
   constant inside the harness is as much a part of the experiment as the code under test.
-* **A device runner passing is not evidence the packed layout is right, because the runner does not use the
+- **A device runner passing is not evidence the packed layout is right, because the runner does not use the
   checkpoint.** Prefill's GDN half returned all-NaN from layer 2 on (43008 = 21 x 2048 NaNs) while
   `run_prefill_model_device.py` passed 12/12. The runner's synthetic `layer_weights` builds the gate
   projections b | a **into** `win_int`; the real `pack_gdn_layer` keeps them in a separate fp16 `Wba`, so the
@@ -465,35 +552,35 @@ wounds are all the same shape -- **a measurement trusted without checking the th
   the first was read from the wrong column. The fix is `prefill_ba_block` plus `NIN = CONV + VC`; the lesson
   is that an oracle built from the same wrong assumption as the kernel agrees with it perfectly. **Where a
   runner's inputs are synthesised rather than packed, say so in its docstring.**
-* **The same class of bug twice in one file: a view whose pitch is not the packer's.** `WoutS` / `WoS` are
+- **The same class of bug twice in one file: a view whose pitch is not the packer's.** `WoutS` / `WoS` are
   padded by the packer to the DECODE kernel's `BN2 * tiles` -- 2112 columns at H=2048 -- and prefill viewed
   them as 2048 wide. Silent, and NaN again. `make_prefill_model` now takes the packed row count (`HW`), and
   `decode.py` **asserts** the packed in-proj / qkv-proj row counts against the ones prefill derives, so the
   third one is loud. A shared tensor has exactly one pitch, and it belongs to whoever wrote the bytes.
-* **Verify the device is healthy before believing the next measurement.** Three separate conclusions this
+- **Verify the device is healthy before believing the next measurement.** Three separate conclusions this
   session were drawn from a device left in a bad state by an earlier `DEVICE_LOST`. A one-trial
   `run_moe_device.py --trials 1 --no-build` between measurements costs seconds and would have caught all
   three. "The device is in the same state it was in for the baseline" is an assumption, and it is the one
   most often false.
-* **Check the instrument you are bisecting with.** `decode.py --layers N` / `--layer-ids` with N < 40 hangs
+- **Check the instrument you are bisecting with.** `decode.py --layers N` / `--layer-ids` with N < 40 hangs
   on a device that is demonstrably healthy -- an open defect, independent of prefill. It was used as the
   bisect tool twice before that was noticed, which is §5.1's "build what you measure" restated: a tool that
   has not been exercised on a known-good input is not a tool yet.
-* **Report what ran, not what was asked for.** An E2E decode run was reported as E2E prefill. The numbers
+- **Report what ran, not what was asked for.** An E2E decode run was reported as E2E prefill. The numbers
   were real and the kernel was real; it was the wrong kernel. Name the kernel (and its sha256) in the claim,
   which is what the `INDEX.md` row already forces and what prose skipped.
-* **A gate that cannot fire is not a gate.** `pack.cached_paths` read `m.get("geom", {})`, so a manifest with
+- **A gate that cannot fire is not a gate.** `pack.cached_paths` read `m.get("geom", {})`, so a manifest with
   no geometry passed the staleness check silently -- the check could only ever fire on a manifest that
   already carried the field. It now refuses a geometry-less manifest outright, and
   `test_intel_npu_e2e_pack_geometry.py` runs all three arms (matching geometry served, differing geometry
   raises, geometry-less raises). Same file, the related rule: `PAD_KEYS` is held to the packed bytes by
   comparing **sets**, not counts, because one key wrongly added and one wrongly dropped cancel in a count.
-* **One barrier in the wrong loop costs a ring.** MoE decode regressed to 0.639 ms on the new layout because
+- **One barrier in the wrong loop costs a ring.** MoE decode regressed to 0.639 ms on the new layout because
   each item fetched its own experts' scales, and the per-item barrier drained the weight ring. Fetching all
   `IPT` experts' scales once before the item loop (`wsg_all` / `wsd_all`, read in place via `scales_at`)
   gives 0.543 ms, under the 0.551 ms baseline. The cost of a barrier is not the barrier; it is the prefetch
   that was in flight.
-* **One cheap experiment beats a plausible story.** "The head is slow because its scale fetch should be a
+- **One cheap experiment beats a plausible story.** "The head is slow because its scale fetch should be a
   ring" survived being written down and did not survive being run. `<user>` asked for the experiment before
   the work; it was falsified in one build. The head is still ~10% off its 8.78 ms baseline and the reason is
   still open -- which is the honest state, and better than a fix built on the wrong cause.
@@ -715,7 +802,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
 
 ## 8. Log
 
-* 2026-11-09: **Prefill and decode run end to end on ONE weight layout, and the gate projection prefill never
+- 2026-11-09: **Prefill and decode run end to end on ONE weight layout, and the gate projection prefill never
   had.** Decode moved onto the general pack (plain int4/int8 values plus a separate group-major scale tensor),
   which is what prefill already read, so the 17.91 GB cache serves both; `gemm_i4` / `gemm_i8` gained
   `scales_at=(row, col)` so one DMA serves many chunks, which is what keeps the MoE and the lm_head fast now
@@ -734,7 +821,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   that was itself broken, three conclusions drawn from a device left unhealthy by an earlier `DEVICE_LOST`,
   a decode run reported as a prefill run, and a cache-staleness gate incapable of firing.
 
-* 2026-11-09: **Prefill's attention half catches up with its GDN half: the whole layer, then the whole layer with
+- 2026-11-09: **Prefill's attention half catches up with its GDN half: the whole layer, then the whole layer with
   MoE, each in ONE launch.** P1 and P1b were two phases with nothing joining them; `make_attn_layer_prefill` is
   norm -> qkv projection -> P1b (per-head norms, RoPE, the cache append) -> P1's flash attention -> o_proj ->
   residual, and `make_attn_moe_layer_prefill` adds the post norm, P2a's routing, P2b's grouped expert FFN and the
@@ -763,7 +850,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   not decode's chunk blocks), and the driver (`chunked prompt, pos0 / Nt, the cos/sin table, scratch sizing, state
   carry, TTFT`). Commits `c7bb03f0`, `9f6b5955`.
 
-* 2026-11-08: **The DPU's "8192 output points" was a misreading, it cost real time, and a device probe killed it.**
+- 2026-11-08: **The DPU's "8192 output points" was a misreading, it cost real time, and a device probe killed it.**
   `dpu.md` §13 says "max output points per operation 8192 on VPU5"; this plan and `hw_facts.py` recorded that as the
   output tile's **M x N product**, and `LowerIntelNpuTileOp` refused any gemm above it. P3 exposed the contradiction:
   npu_dsl's device-verified prefill GDN layer issues `ctx.matmul(dS, kdT, vnT, 128, 128, 64)` as ONE workload, 16384
@@ -782,7 +869,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   **Open for the hardware owner:** what does §13's "output points per operation" count, if not M x N? Candidates are
   spatial output points with channels excluded, or an operation class other than the fp16 matmul. The per-dimension
   bound is what is enforced until that is answered.
-* 2026-11-08: **Prefill P2 is on the device, and a routing golden must rank the device's OWN logits.** The MoE
+- 2026-11-08: **Prefill P2 is on the device, and a routing golden must rank the device's OWN logits.** The MoE
   routing (P2a, `tl_moe_route_prefill_n64_h2048_e256` `7d5b65ee0104`, **0.331 ms**) and the grouped expert FFN
   (P2b, `tl_moe_expert_prefill_n64_h2048_i512_e256_mb16` `d430e5021d85`, **53.8 ms** rel 5.49e-4) both pass at
   Qwen3.8's shape for 64 prompt tokens (`device/run_moe_prefill_device.py --n 64 --phase both --negative`).
@@ -798,7 +885,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   of 257 experts, so the kernel reads 349 MB of int4 once against the 906 MB a per-token walk would read. The ratio
   is `N*(TOPK+1) / experts_visited`; it is near 1 for small N and saturates once N exceeds the expert count. A
   prefill chunk size chosen for MoE should be read off that curve, not assumed.
-* 2026-11-08: **The KV cache is sized by attention layers, not by layer slots: 126 MB -> 32 MB.** The entry below
+- 2026-11-08: **The KV cache is sized by attention layers, not by layer slots: 126 MB -> 32 MB.** The entry below
   left `KcAll` / `VtAll` indexed by the layer slot `li`, so a 40-layer launch reserved 40 caches for its 10
   full-attention layers. `make_decode_model` now takes `KVL` (the launch's attention-layer count) as their leading
   extent and indexes with the KV slot the host writes into the previously unused `Kind[li, 1]` column;
@@ -828,7 +915,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   host allocator, and **validate on `--layer-ids 3,7` before 40 layers** -- question 8's mechanism is still unknown,
   so a two-layer launch is the cheap canary.
 
-* 2026-11-08: **M6: the whole decode step in ONE launch. The KV cache became a kernel parameter, which unblocked
+- 2026-11-08: **M6: the whole decode step in ONE launch. The KV cache became a kernel parameter, which unblocked
   question 8.** The device loss that forced `--chunked` since M5 step 3 is gone, and the per-token cost went from 20
   launches to 1.
   **The fix.** `make_decode_model` reached each attention layer's cache through `T.ddr_view(Table[li, col["S0"/"S1"]])`,
@@ -872,9 +959,9 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   VB positions is one contiguous DMA) -- `npu_dsl/lib/kv_cache.py`. The new layout here is one pool plus a runtime
   index, which is the shape a paged cache needs, so paging does not require another relayout.
 
-* 2026-11-08: **Same-checkpoint Qwen3.8 A/B, short-context KV fix, and launch-overhead attribution.** Exported `D:\models\qwen38-w4a16` into npu_dsl's ABI separately and ran both projects on the same PTL/TURBO system. npu_dsl (`9ebbd7e7`, `qwen36_run --single`) measured 31 decode steps in 1176.88 ms, median 37.8 ms = 26.45 tok/s; TileLang `--chunked` measured 32 outputs in 1.95 s = 16.5 tok/s (49.4 ms device / 61 ms median step wall, 20 launches/step). Counts differ by one output: npu_dsl's first token comes from prefill; TileLang times the final prompt-token forward. Both step-wall values include submit/wait and are not device-only A/Bs. An 8-token instrumentation run measured 20 launch calls per step at 56.3 ms summed host time versus 50.0 ms summed NCE_TIME kernels: launch submit/wait contributes **6.3 ms/step (~0.31 ms/launch)**, about one quarter of the 23-25 ms host-wall gap; another ~6.7 ms is upload/Python overhead. Thus launch count is material but not the majority; kernel execution is also substantially slower in aggregate (TileLang device stamps 50 ms versus npu_dsl's 37.8 ms host step, a conservative comparison). Golden remains 16/16, layer-39 residual rel 7.59e-4. **Flash finding:** the original position bound still issued K/V ring fills on tiles with no valid keys because all tiles shared a minimum two-SHAVE extent. `attn_block` now uses a tile-dependent local-ring `kv_extent`; pos 22 attention improved 0.523 -> 0.514 ms and pos 1000 0.558 -> 0.546 ms (UNPROFILED TURBO, warmup 10/repeat 10), but full-model throughput only moved 16.1 -> 16.5 tok/s. The profile traces in `testing/python/intel_npu/device/evidence/` are for attribution only; `trace_model_l1_head` includes the head and must not be directly compared with npu_dsl's attention+MoE total. Next optimization priority: reduce per-layer device work (especially GDN/MoE paths) and safely collapse GDN-only chunks where the measured launch-cost savings justify it; merging attention with another layer remains blocked by the known device-lost trigger.
+- 2026-11-08: **Same-checkpoint Qwen3.8 A/B, short-context KV fix, and launch-overhead attribution.** Exported `D:\models\qwen38-w4a16` into npu_dsl's ABI separately and ran both projects on the same PTL/TURBO system. npu_dsl (`9ebbd7e7`, `qwen36_run --single`) measured 31 decode steps in 1176.88 ms, median 37.8 ms = 26.45 tok/s; TileLang `--chunked` measured 32 outputs in 1.95 s = 16.5 tok/s (49.4 ms device / 61 ms median step wall, 20 launches/step). Counts differ by one output: npu_dsl's first token comes from prefill; TileLang times the final prompt-token forward. Both step-wall values include submit/wait and are not device-only A/Bs. An 8-token instrumentation run measured 20 launch calls per step at 56.3 ms summed host time versus 50.0 ms summed NCE_TIME kernels: launch submit/wait contributes **6.3 ms/step (~0.31 ms/launch)**, about one quarter of the 23-25 ms host-wall gap; another ~6.7 ms is upload/Python overhead. Thus launch count is material but not the majority; kernel execution is also substantially slower in aggregate (TileLang device stamps 50 ms versus npu_dsl's 37.8 ms host step, a conservative comparison). Golden remains 16/16, layer-39 residual rel 7.59e-4. **Flash finding:** the original position bound still issued K/V ring fills on tiles with no valid keys because all tiles shared a minimum two-SHAVE extent. `attn_block` now uses a tile-dependent local-ring `kv_extent`; pos 22 attention improved 0.523 -> 0.514 ms and pos 1000 0.558 -> 0.546 ms (UNPROFILED TURBO, warmup 10/repeat 10), but full-model throughput only moved 16.1 -> 16.5 tok/s. The profile traces in `testing/python/intel_npu/device/evidence/` are for attribution only; `trace_model_l1_head` includes the head and must not be directly compared with npu_dsl's attention+MoE total. Next optimization priority: reduce per-layer device work (especially GDN/MoE paths) and safely collapse GDN-only chunks where the measured launch-cost savings justify it; merging attention with another layer remains blocked by the known device-lost trigger.
 
-* 2026-11-08: **M5 step 5: GDN delta rule at npu_dsl's code quality; the runner's 50 ms poll; 52 ms of device time per
+- 2026-11-08: **M5 step 5: GDN delta rule at npu_dsl's code quality; the runner's 50 ms poll; 52 ms of device time per
   token.** (1) `gdn_head` rewritten on npu_dsl's `gdn_scan` algebra (`kernels_poc/common/fused_ops.hpp:350`, named per the
   section 0 amendment): one read of S accumulates both S^T k and S^T q into four register accumulators with **scalar
   k_d / q_d splats** (`CMU.CP.512.32.R` is one instruction; the earlier note that a splat costs ~16 lane copies was wrong,
@@ -901,7 +988,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   last 76 us per layer (S state double-buffered, the per-head scalar tail), and the single launch (11 ms of host round
   trips plus npu_dsl's measured 14 ms of fusion gain) behind the device loss below. Commits `81d5ce51`, `133a44a3`,
   `9ac24960`; INDEX row.
-* 2026-11-08: **M5 step 4: same-day A/B per section against npu_dsl's layer kernels (`run_npudsl_layer_device.py
+- 2026-11-08: **M5 step 4: same-day A/B per section against npu_dsl's layer kernels (`run_npudsl_layer_device.py
   --profile`, traces segmented at DPU idle gaps, cluster 0, pos 0, us).** GDN layer: in_proj stream 248 (ours standalone)
   vs 332; conv + delta rule (SHAVE only, DPU and DMA idle) **461 vs 247**; out_proj 92 vs 91; MoE **560 vs ~390**; layer
   tail ~70 vs ~30; whole layer + MoE 1.77 (per-layer kernel) vs **1.144**. Attention layer: qkv 220 vs 213; norm + RoPE +
@@ -911,7 +998,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   token while its fused single launch is 40: fusion is worth 14 ms there (cross-layer prefetch, no per-launch ramp).
   Tools: `D:\tmp\trace_segments.py` (segments one cluster's DPU track at idle gaps and sums the SHAVE waits inside each),
   `trace_window.py`; INDEX row with the table.
-* 2026-11-08: **M5 step 3: the decode step as ONE kernel, and a device loss that stops it at two layers.** (1) Compiler:
+- 2026-11-08: **M5 step 3: the decode step as ONE kernel, and a device loss that stops it at two layers.** (1) Compiler:
   `T.ddr_view(Table[li, col], shape, dtype)` binds a typed DDR view to an address read from a device-side int64 table
   (builtin, codegen, test); `make_decode_model` is the whole step: a device-side `for li` over the layers with
   `Kind[li]` selecting the GDN or the attention block and `Table[li, :]` (`TABLE_COLS`) giving every layer's weights and
@@ -936,7 +1023,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   golden 16/16 at 80 ms per token (then; see step 5). Four commits `a6530956`, `3dca43e5`, `eb4cfc74`, `9f5cccc5`.
   Finding re-hit: a function-local `static constexpr` array reads as zeros under this SHAVE build (the Phase 3b Step 0
   note); fused_rt's `mm_tune_on` table is such an array, so its M >= 16 stencil path is suspect in our build.
-* 2026-11-08: **M5 step 2: scoped CMX, and one launch per decoder layer: 5.4 -> 13.7 tok/s by `<user>`'s measure.** (1)
+- 2026-11-08: **M5 step 2: scoped CMX, and one launch per decoder layer: 5.4 -> 13.7 tok/s by `<user>`'s measure.** (1)
   **Scoped CMX** (the PlanCmx item, as scopes rather than live-range packing): `PlanAndUpdateBufferAllocationLocation`
   sinks allocations into the loops that use them, `ScopeIntelNpuCmx` gives the phases between grid barriers their own
   `lexical_alloc_scope` block and hoists any allocation out of a SHAVE-dependent branch (every SHAVE must run one
@@ -951,14 +1038,14 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   (`test_intel_npu_m5_layer.py`). **Device, whole model: golden 16/16, worst h rel 2.06e-3; host wall 73 ms per token =
   13.7 tok/s** (device launches 55.5 ms: layers 49.2 + head 6.4); the 41 launches still cost ~0.43 ms each of submit +
   protocol, which the device-side layer loop (one launch per token) removes next. 89 passed.
-* 2026-11-08: **M5 step 1: same-day per-layer A/B against npu_dsl's decoder-layer kernels** (`device/run_npudsl_layer_device.py`,
+- 2026-11-08: **M5 step 1: same-day per-layer A/B against npu_dsl's decoder-layer kernels** (`device/run_npudsl_layer_device.py`,
   real Qwen3.8 weights, the golden's first token): npu_dsl's GDN layer + MoE **1.165 ms** vs this backend's 0.811 + 0.560 =
   1.37; its attention layer + MoE **1.058 ms** vs 0.563 + 0.560 = 1.12; head 9.44 vs 8.78. So the kernels are within
   ~15% (GDN the one behind), and the whole gap between `<user>`'s measure (generate time / tokens: npu_dsl ~25 tok/s in its
   `--single` mode = one launch per step; this backend 5.4 tok/s = 185 ms wall of which 57 ms device) is the 81 launches per
   token and the host round trips. **Next: the single-launch decode kernel** (norms + fp32 residual in-kernel, layer table,
   device-side layer loop, head), then the GDN gap.
-* 2026-11-08: **First end-to-end decode of Qwen3.8-35B-A3B-Distill on the device, golden 16/16** (`testing/python/intel_npu/e2e/`:
+- 2026-11-08: **First end-to-end decode of Qwen3.8-35B-A3B-Distill on the device, golden 16/16** (`testing/python/intel_npu/e2e/`:
   `checkpoint.py` reads the compressed-tensors checkpoint, `pack.py` packs every layer into the kernels' arrays (cached as
   .npy under a pack dir; 8 s per layer the first time), `reference_golden.py` saves the fp32 reference's answer (npu_dsl's
   `qwen36_e2e.reference`, model-side code from `NPU_DSL_ROOT`, run on its own), `decode.py` drives the device). Runtime: `npu_run
@@ -975,7 +1062,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   of pinned weights swaps a 32 GB box (its expert cache and dense fp32 layer caches reach ~17 GB), so the golden is a saved
   file. **Open for M5/M6:** norms and the residual into the kernels, the layer loop in one launch, the head's DMA pattern,
   prefill kernels (TTFT), the same-day A/B against npu_dsl's Qwen3.6 decode step.
-* 2026-11-08: **Decode head closed, and the same-day A/B against npu_dsl's head** (`kernels.make_head`, `device/run_head_device.py`,
+- 2026-11-08: **Decode head closed, and the same-day A/B against npu_dsl's head** (`kernels.make_head`, `device/run_head_device.py`,
   `test_intel_npu_m5_head.py`; `device/run_npudsl_head_device.py`). Qwen3.6's shape: the zero-centred final norm (SHAVE 0 of
   every tile) -> lm_head int8 g128 GEMV over 248320 rows (padded to 248832 = a multiple of BN x tiles x SHAVEs; int8 chunk
   blocks of 128 rows + 2 group-major scale rows, `pack_chunk_blocks_i8`, a local ring of 2 slots per SHAVE, two merged-FC
@@ -993,7 +1080,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   function; ours stamps NCE_TIME around it and writes this runner's status record), imports nothing, and takes the checkout
   from `NPU_DSL_ROOT`. **The decode path now has every block; next is the host session (one process, weights resident,
   per-token launch sequence over the layer kernels) and the real checkpoint.**
-* 2026-11-08: **Attention decode layer closed** (`kernels.make_attn_decode`, `device/run_attn_device.py`,
+- 2026-11-08: **Attention decode layer closed** (`kernels.make_attn_decode`, `device/run_attn_device.py`,
   `test_intel_npu_m1_attn_decode.py`): Qwen3.6's shape (16 q-heads over 2 kv-heads of 256, RoPE 64, output gate,
   zero-centred norms, int4 g128 qkv [9216, 2048] / o_proj [2048, 4096], a 1536-position cache). qkv GEMV -> the 18
   head items dealt over the workers (norm, RoPE from host cos/sin, K row and V^T column appended at pos) -> flash-
@@ -1007,7 +1094,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   pos (today every chunk of the window streams and the mask does the rest: the long-context lever for M5), decode
   attention cost split. **With this the decode path has every block but the head**: embedding row, final norm,
   lm_head int8 GEMV + argmax, and then the layer loop (M5).
-* 2026-11-08: **M4 decode closed: the Gated DeltaNet mixer layer in one launch** (`kernels.make_gdn_decode`,
+- 2026-11-08: **M4 decode closed: the Gated DeltaNet mixer layer in one launch** (`kernels.make_gdn_decode`,
   `device/run_gdn_device.py`, `test_intel_npu_m4_gdn.py`). Qwen3.6's shape (H 2048, 16 k-heads / 32 v-heads of 128,
   conv k 4, int4 g128 in_proj [12352, 2048] and out_proj [2048, 4096]): in_proj GEMV (rows padded to the tile
   multiple, chunk blocks, local ring) -> `T.sync_grid()` -> causal conv + SiLU per channel block with the conv state
@@ -1032,7 +1119,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   DDR read past a scratch buffer (the last worker's whole-block row loads; scratch now padded, `gdn_sizes`) hangs the
   device, and the CMX budget must include the merged-FC scratch. Prefill GDN (chunked scan on the DPU, npu_dsl's
   `gated_delta_net_prefill` is the precedent) is open. 79 passed.
-* 2026-11-08: **M3 closed: the MoE decode layer in one launch** (`kernels.make_moe_decode`, `device/run_moe_device.py`,
+- 2026-11-08: **M3 closed: the MoE decode layer in one launch** (`kernels.make_moe_decode`, `device/run_moe_device.py`,
   `test_intel_npu_m3_moe.py`). Qwen3.6's shape (H 2048, 256 experts of inter 512, top-8 softmax renormalised + a
   shared expert gated by sigmoid(router row E), int4 g128): router fp16 GEMM (x padded to 16 rows, 288 padded router
   rows split over the tiles) -> `T.sync_grid()` -> top-k on SHAVE 0 of every tile (redundant, so no second grid
@@ -1064,10 +1151,10 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   asynchronous `dpu_run` with double-buffered merged-FC scratch (M5); (c) the maintainability rules: cost model as the
   acceptance gate (>25% deviation = runtime/model defect), automatic predicted-vs-measured phase split in the runner,
   one-command re-measure of every pinned kernel after a runtime change.
-* 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
+- 2026-11-06: plan written; branch `feat/intel-npu-backend` created from `main` (`da53da96`);
   the untracked 2026-10-29 `tilelang/ptl` PoC and its adapter edits removed; working tree is `main`
   plus this file.
-* 2026-11-07: **M2 closed: int8 g128 GEMV (`T.gemm_i8`, the lm_head's format), and the GEMV's variance explained.**
+- 2026-11-07: **M2 closed: int8 g128 GEMV (`T.gemm_i8`, the lm_head's format), and the GEMV's variance explained.**
   `dpu_matmul_qg(bits)` shares the merged-FC body: int8 rows K bytes apart, PPE 1/256. Device int8 N 6144 K 2048:
   PASS, **0.308 ms = 41 GB/s** of weights. The 0.22-0.32 ms spread of the int4 GEMV was a **launch-set step**: the
   per-run kernel-only list (now printed by the runner) reads 0.333 x4 then 0.213 x6 -- a clock or power state that
@@ -1077,7 +1164,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   concurrent issuers; the lever is a tile-shared chunk filled by one issuer and consumed by both SHAVEs (a ring
   variant), left for the model's profile to justify. M2 coverage: prefill W4A16 both roles, decode int4 and int8;
   74 passed.
-* 2026-11-07: **M2 step 2: the decode GEMV through the DPU's int4-weight mode.** New dialect op `T.gemm_i4(a, wq, s,
+- 2026-11-07: **M2 step 2: the decode GEMV through the DPU's int4-weight mode.** New dialect op `T.gemm_i4(a, wq, s,
   out, group, row0, rows)` -> runtime `dpu_matmul_i4g`: one mixed-mode DPU workload (fp16 activations x packed int4
   weights read in place, `wmode = I4`) over the M x ng pseudo-rows against N x ng channels whose weight-table
   offsets point at (row, group), PPE multiplier 1/16, then the SHAVE keeps the diagonal blocks and sums them with the
@@ -1093,7 +1180,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   Tests: `test_intel_npu_m2_w4a16.py` (GEMV lowering, host-sim golden), 73 passed. The negative controls of the W4A16
   runner now perturb a whole group of a row: one nibble met a 0.02 activation and stayed under the bar (a gate seen
   to pass is not evidence; this one was caught by the rule).
-* 2026-11-07: **M2 step 1: W4A16 projections on the device, both role assignments.** Source
+- 2026-11-07: **M2 step 1: W4A16 projections on the device, both role assignments.** Source
   `kernels.make_w4a16_flow` (int4 g128, two per byte low nibble first, fp16 scale per group: npu_dsl's
   DEQUANT_I4 / W4A16 format, `pack_int4` the reference packer). Three generic capabilities landed for it:
   (1) **slots the SHAVE reads** -- a streamed buffer no gemm reads gets `ring_slot_acquire` (wait READY, consume)
@@ -1115,7 +1202,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   kernels and every device build compiled the glob (~50 s); sweeps now remove their arms (`runner.remove_kernels`),
   builds are ~21 s. Next for M2: the GEMV (decode, M = 1) on the SHAVE; the dequant row op's inner schedule
   (0.26 -> 0.13) is a known, bounded item.
-* 2026-11-07: **M1 step 3c (end): ring hoisting; the split is now SHAVE math 57%, per-Q-block overhead 26%,
+- 2026-11-07: **M1 step 3c (end): ring hoisting; the split is now SHAVE math 57%, per-Q-block overhead 26%,
   ring protocol 17%.** `LowerIntelNpuPipelined` hoists a `T.Pipelined` loop out of an enclosing serial loop
   when no stream's fill reads the outer variable and the inner chunk count is a multiple of the SHAVEs: one
   ring over outer x inner chunks, the use loop in the inner loop's place with global use `outer * per + u`, the
@@ -1128,7 +1215,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   flight is the lever), per-Q-block ~30 us (Q fill with two tile syncs, merge on one SHAVE, output store),
   protocol ~0.18 ms. Stopping the single-kernel work here (`<user>`: model first); the levers are recorded, the
   counters stay in the status record for every later kernel.
-* 2026-11-07: **M1 step 3c (continued): where the flash phase's time goes, and four generic fixes.** Instrument
+- 2026-11-07: **M1 step 3c (continued): where the flash phase's time goes, and four generic fixes.** Instrument
   first: the ring path now accumulates six per-SHAVE phase counters (live-wait, order-wait, submit, dpu-wait,
   free-wait, fill-issue; NCE_TIME ticks) into the status record's extra words, and `run_flash_device.py --floor`
   runs the phase with no SHAVE math (output wrong by design) to expose the protocol floor. Findings on
@@ -1148,7 +1235,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   hoist a ring whose fills do not reference the enclosing serial loop's variable out of that loop (one
   begin/end per kernel instead of per Q block), then submit QK^T(u+1) before softmax(u) (multi-gemm
   submit-ahead). Hardware question 7 asks for the DPU gate/complete latencies this protocol pays per workload.
-* 2026-11-07: **Turbo, and hardware facts with provenance.** (1) `<user>` pointed at the VPUX knowledge base
+- 2026-11-07: **Turbo, and hardware facts with provenance.** (1) `<user>` pointed at the VPUX knowledge base
   (`applications.ai.vpu-accelerators.vpux-plugin/knowledges`): it already held what this plan had been
   measuring and asking for: the NPU5010 CMX workspace of 1439 KiB (`compiler/platform-resources.md#3`; equals the
   1,473,536 B `Ctx` sees), FP16 at 8 C steps per clock = 2048 MAC/clk per DPU (`hw/npu5/dpu.md#3.4`), the
@@ -1168,7 +1255,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   (64x192 / 32x192 at K=1600 and 32x256 at K=2048 do not: status 2 CMX_EXHAUSTED); why the 2026-11-06 run of
   the same script reported a 32x192 row is not established (the script, shapes and `Ctx` allocations are
   unchanged in git; `Ctx` reads 1,473,536 B free today), so that row is not quoted again.
-* 2026-11-07: **M1 step 3b: same-shape A/B against npu_dsl's flash attention.** `make_flash_attention_phase`
+- 2026-11-07: **M1 step 3b: same-shape A/B against npu_dsl's flash attention.** `make_flash_attention_phase`
   takes any `numQ` that is a multiple of `BQ x tiles`: Q blocks are dealt round-robin over the tiles in a serial
   loop around the phase (the resident Q fill becomes "SEGMENTED resident in a loop, tile sync before and after";
   the two rings are re-begun per block on the same ids). **Sq 960 x Skv 1024 x d 64, vectorised, 3 x 2: 3.588 ms
@@ -1182,7 +1269,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   the source. Caveat for the comparison: npu_dsl's figures are its October record on a box whose DPU is now ~2.1x
   slower (section 7 question 5); the DPU is ~1% of either kernel, so the SHAVE-bound comparison stands, but a
   same-day re-run of its harness would make it exact.
-* 2026-11-07: **M1 step 3a: SHAVE vector codegen; the flash phase's softmax is 9.4x faster from `T.vectorized`
+- 2026-11-07: **M1 step 3a: SHAVE vector codegen; the flash phase's softmax is 9.4x faster from `T.vectorized`
   alone.** Generic path, no per-kernel code: `VectorizeLoop` joins the pipeline after `ConfigIndexBitwidth`;
   `CodeGenTileLangIntelNpu` prints moviCompile's ext_vector types (`half8/16/32`, `float4/8/16`, `int4/8/16`,
   ...), splats a `Broadcast` as `((halfN)(x))`, lowers a vector `Cast` to `__builtin_convertvector` (a C cast
@@ -1199,7 +1286,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   bound (next: register-resident accumulators, fewer scalar lane reductions, and the kernel-only A/B against
   npu_dsl's flash at the same shape). Host sim of the vectorised serial phase passes at the same tolerance
   (`test_intel_npu_m1_flash.py`, 61 passed).
-* 2026-11-07: **M1 step 2a: barrier id reuse across phases, device-verified.** `AssignIntelNpuBarriers`
+- 2026-11-07: **M1 step 2a: barrier id reuse across phases, device-verified.** `AssignIntelNpuBarriers`
   colours rings by live range (`ring_begin`..`ring_end` in program order, first fit): rings one after another
   share one block, rings live at once (the flash phase's two streams) never do; the note says `N rings, P live at
   once, I ids by reuse`; the refusal counts live rings (`test_barrier_pool_exhaustion_is_refused`: three
@@ -1217,7 +1304,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   how (a) became a status instead of a 120 s host timeout. Standing rule from the two: **no toolkit wait without a
   bound on the kernel's control path** -- `mm_->wait()` and `dma_.wait()` remain only in the synchronous
   Phase 1-2 paths (`dpu_matmul`, `dma_load/store`).
-* 2026-11-07: **M1 step 1: the flash-attention phase lowers through the generalised ring and passes its
+- 2026-11-07: **M1 step 1: the flash-attention phase lowers through the generalised ring and passes its
   device golden.** Source `kernels.make_flash_attention_phase` (Q resident, K and Vt streamed in one
   `T.Pipelined` loop, two `T.gemm`, online softmax in fp32 scalar loops between them, merge of the two SHAVEs'
   partials after `T.sync_threads`). Compiler: `LowerIntelNpuPipelined` grew a general body (any number of
@@ -1240,7 +1327,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   (`lastOnPort_`), which costs nothing in this schedule (the previous fill has long landed) and the golden
   passes. Hardware question 6 records it. Tests: `test_intel_npu_m1_flash.py` (two rings over one loop, 2-D
   fill, general body, serial phase host-sim golden with a negative) -- 59 passed.
-* 2026-11-06: **Phase 3b step C closed: the flow is measured kernel-only and checked from its trace.**
+- 2026-11-06: **Phase 3b step C closed: the flow is measured kernel-only and checked from its trace.**
   (1) Kernel-only time: the status record grew to 64 B with NCE_TIME stamps at `Ctx` entry and `finish`;
   `npu_run` reports `median_kernel_ms` = max(finish) - min(entry) over the SHAVEs (19.2 MHz); the host wall
   carries ~0.15-0.2 ms of submit on top. (2) `device/trace_timeline.py` renders one steady-state window per
@@ -1248,42 +1335,42 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   cluster, alternating SHAVE submissions, fills on tile 0's DMA row only, no row at the profiler cap, DPU busy
   >= a bar): exit 0 on the flow trace, 1 on the Phase 1 GEMM trace; a hardware-free test pins both. (3) **Numbers
   (UNPROFILED, kernel-only, 3 tiles x 2 SHAVEs, fp16 x fp16):** reference shape Y[2048, 768] = X[2048, 2048] .
-  W[768, 2048]^T, BM=32, BN=256: **0.799 ms = 8.07 TOPS = 35.5% of 22.73 TOPS** (basis 2048 MAC/cycle/tile at
+W[768, 2048]^T, BM=32, BN=256: **0.799 ms = 8.07 TOPS = 35.5% of 22.73 TOPS** (basis 2048 MAC/cycle/tile at
   1.85 GHz; 32.1% of 25.13 turbo), DPU IDU busy 87%, so the flow is DPU-bound and the DPU's own rate (10.9 us
-  per 32x256x2048 workload = 1540 MAC/ns) is the gap. Same ops at BM=64, BN=128 (N=384): 0.401 ms = 8.04 TOPS,
+per 32x256x2048 workload = 1540 MAC/ns) is the gap. Same ops at BM=64, BN=128 (N=384): 0.401 ms = 8.04 TOPS,
   DPU 70% busy, DMA-bound; roles swapped (`make_ring_flow_swapped`): 1.090 ms = 5.91 TOPS. The compiled flow
-  equals the hand kernel (0.799 vs 0.799). (4) **DMA ceiling, measured** (`device/run_dma_rate_probe.py`,
+equals the hand kernel (0.799 vs 0.799). (4) **DMA ceiling, measured** (`device/run_dma_rate_probe.py`,
   128 KiB DDR->CMX, NCE_TIME): one issuer one port 17.5 GB/s, one issuer two ports **21.7 GB/s**, multicast to 3
-  tiles costs nothing (17.6 / 21.7), and more issuers do NOT add bandwidth (3 issuers x 2 ports 14.7, 6 x 2 8.7
+tiles costs nothing (17.6 / 21.7), and more issuers do NOT add bandwidth (3 issuers x 2 ports 14.7, 6 x 2 8.7
   GB/s). So the box's DMA DDR->CMX ceiling is ~22 GB/s and the fill-vs-compute balance is a shape property:
-  bytes per MAC = 2 / (3 BN) for the streamed operand, 14.8 GB/s needed at BN=256 (fits), 29.7 at BN=128 (does
+bytes per MAC = 2 / (3 BN) for the streamed operand, 14.8 GB/s needed at BN=256 (fits), 29.7 at BN=128 (does
   not), matching the two measurements. The prior art's 62 GB/s "golden" was a vpuem simulator trace, not
-  hardware. TileGemm has its two constants: VPUNN DPU cycles x ~1.6 and 22 GB/s. (5) Lessons: the host-sim
+hardware. TileGemm has its two constants: VPUNN DPU cycles x ~1.6 and 22 GB/s. (5) Lessons: the host-sim
   library cache now keys on the runtime headers too (a stale 32-byte-status library passed as "unwritten
-  status"); `--no-build` reuses stale device ELFs after a runtime header change, so rebuild after one.
+status"); `--no-build` reuses stale device ELFs after a runtime header change, so rebuild after one.
 
   > Amendment 2026-11-06, same day: the "~22 GB/s ceiling" in (4) is a 128 KiB-job artifact. The job-size
-  > sweep (section 7 question 4) shows ~4.5 us fixed per job plus ~67 GB/s streaming on two ports (~34 per
+    > sweep (section 7 question 4) shows ~4.5 us fixed per job plus ~67 GB/s streaming on two ports (~34 per
   > port), reproducing the npu_dsl record's 51.6 GB/s at 512 KiB. TileGemm's constant is
-  > `4.5 us + bytes / 67 GB/s`, and the lever is larger fills, not more ports.
-* 2026-11-06: **Phase 3b step B: the compiler emits the flow from the author's loops.** Three Python
-  passes after `LowerIntelNpuTileOp` (section 3 items 7, 9, 9b): `PlanIntelNpuDistribution`,
+    > `4.5 us + bytes / 67 GB/s`, and the lever is larger fills, not more ports.
+- 2026-11-06: **Phase 3b step B: the compiler emits the flow from the author's loops.** Three Python
+passes after `LowerIntelNpuTileOp` (section 3 items 7, 9, 9b): `PlanIntelNpuDistribution`,
   `LowerIntelNpuPipelined`, `AssignIntelNpuBarriers`; `PlanIntelNpuWorkloads` now also plans
-  `ring_dpu_submit`. The source (`kernels.make_ring_flow`) is the README's: `alloc_shared` for the
+`ring_dpu_submit`. The source (`kernels.make_ring_flow`) is the README's: `alloc_shared` for the
   resident and streamed operands (the dialect's `alloc_shared` is scope `shared`, not the GPU
-  `shared.dyn`, which the late kernel-launch pass takes for dynamic shared memory), one
+`shared.dyn`, which the late kernel-launch pass takes for dynamic shared memory), one
   `T.Pipelined(num_stages=2)` loop with fill, gemm, store. Codegen prints `alloc_shared`, the ring
-  builtins and `npu::Ctx::Ring` for the `Bind`; `CheckBudgets` counts shared buffers once. Every
+builtins and `npu::Ctx::Ring` for the `Bind`; `CheckBudgets` counts shared buffers once. Every
   derivation is written into the generated source as `// intel_npu:` notes. **Device: the compiled
-  flow PASSes** (rel 2.86e-4; 0.970 ms host wall incl. submit vs the hand kernel's 0.944; 6 SHAVEs OK;
-  perturbed W FAILs), and the **generality clause holds**: `make_ring_flow_swapped` (roles swapped,
-  streamed operand second, other names and loops) lowers and PASSes with zero compiler edits
-  (rel 2.78e-4). Negatives, each seen to fire: depth != SHAVEs, tile-dependent streamed fill,
-  one-tile launch, 3 rings on 2 tiles (short by 3 ids). Suite 55 passed (50 + 5 skips without VPUNN).
-  Two rules relaxed on evidence: a tile-invariant copy into a local buffer is legal and noted, not
+flow PASSes** (rel 2.86e-4; 0.970 ms host wall incl. submit vs the hand kernel's 0.944; 6 SHAVEs OK;
+perturbed W FAILs), and the **generality clause holds**: `make_ring_flow_swapped` (roles swapped,
+streamed operand second, other names and loops) lowers and PASSes with zero compiler edits
+(rel 2.78e-4). Negatives, each seen to fire: depth != SHAVEs, tile-dependent streamed fill,
+one-tile launch, 3 rings on 2 tiles (short by 3 ids). Suite 55 passed (50 + 5 skips without VPUNN).
+Two rules relaxed on evidence: a tile-invariant copy into a local buffer is legal and noted, not
   refused (fixtures and probes do it legitimately); the ring borrows the compiler's shared slot
   buffer so `CheckBudgets` sees the slots.
-* 2026-11-06: **Phase 3b step A: the ping-pong ring runs on the device from the runtime.** `npu::Ctx`
+- 2026-11-06: **Phase 3b step A: the ping-pong ring runs on the device from the runtime.** `npu::Ctx`
   gained `alloc_shared` (one tile-shared allocation, same offset on every tile), `dpu_prepare` /
   async DPU with barrier setters, and `Ring`: `ring_begin` (slots = SHAVEs, order words, first-use
   configs on tile 0, one grid rendezvous), `ring_fill` (issuer = tile 0's SHAVE s for slot s: wait
@@ -1305,7 +1392,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   696 us per tile. Submit-ahead alone was worth 5%. Choosing K per chunk so that D >= chain is
   TileGemm's job (section 3.2), with VPUNN's DPU and DMA costs. Timing caveat: host wall includes
   ~0.2 ms of submit; a kernel-only stamp is step C's work before any TOPS claim.
-* 2026-11-06: **`PlanIntelNpuWorkloads` landed (section 3 item 6b), the first cost-driven pass.** A Python
+- 2026-11-06: **`PlanIntelNpuWorkloads` landed (section 3 item 6b), the first cost-driven pass.** A Python
   `prim_func_pass` after the sync passes: for every `intel_npu_dpu_matmul` call still at the runtime
   defaults it ranks (cuboid, spatial x | M, x <= 64) with `vpunn.GemmCost.best_stencil` and writes the
   cheapest pair into the call; explicit kernel-wide knobs are kept. Modes `tl.intel_npu.plan_workloads`
@@ -1317,7 +1404,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   is planned with zero edits. Device: Phase 1 GEMM golden PASS (rel 3.24e-4, kernel `0039c507d6e3`,
   `64x64x512 -> CUBOID_8x16 x=16`), two-phase PASS (rel 5.67e-4). Suite: 49 passed with VPUNN;
   44 passed, 5 skipped by name without it.
-* 2026-11-06: **Phase 3b Step 0 done: VPUNN wired and calibrated on the device.** (1) VPUNN v1.10.2
+- 2026-11-06: **Phase 3b Step 0 done: VPUNN wired and calibrated on the device.** (1) VPUNN v1.10.2
   built as a pybind module from a standalone clone (section 0); `tilelang/intel_npu/vpunn.py` costs a
   GEMM tile as VPUX does (1x1 CONVOLUTION, ZXY, `W x H = M`, `N` output channels), plus a 1-D DMA cost.
   (2) The DPU builtin gained the two workload-shape knobs VPUX chooses per workload, `spatial_x` and
@@ -1335,7 +1422,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   this box (npu_dsl SS690.2), so they are reported in microseconds; and a function-local `static constexpr`
   array in SHAVE runtime code reads back wrong under moviCompile (it produced a full sweep of golden FAILs
   before being replaced by ternaries), so the runtime holds no static tables.
-* 2026-11-06: **Pre-3b research filed (section 3.2).** `<user>` asked how VPUX tiles a GEMM and whether its
+- 2026-11-06: **Pre-3b research filed (section 3.2).** `<user>` asked how VPUX tiles a GEMM and whether its
   tiling / multi-cluster / scheduling code can be used. Findings: MatMul is a grouped 1x1 convolution;
   tile count, SOH/SOK/Clustering and the DPU stencil per workload are all chosen by the VPUNN cost
   model under a CMX-fit constraint; VPUNN itself (`thirdparty/vpucostmodel`) is MLIR-free, has an
@@ -1343,7 +1430,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   not. Section 3 item 7 amended from rule-based to cost-based; Phase 3b gains a Step 0 (cost model +
   calibration). Two decisions taken by `<user>` the same day: VPUNN via its Python binding; cost
   passes in Python.
-* 2026-11-06: **Phase 3a closed: `sync_grid` on hardware barriers.** `<user>` ruled: HAS is right, use
+- 2026-11-06: **Phase 3a closed: `sync_grid` on hardware barriers.** `<user>` ruled: HAS is right, use
   hardware barriers as far as possible; which low ids are already taken is uncertain, so it is
   measured. (1) `device/probe_barriers.py` + `probes/barrier_probe.cpp` sweep every id of a job in its
   own process: 3-tile job ids 0-47: **0-3, 5, 6 never go live; 4 and 7-47 OK** (7 is the toolkit mutex,
@@ -1364,7 +1451,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   wall-clock timeout catches it. Finding, recorded in `kernels.py`: SHAVE scalar DDR stores go through
   a write-back DL1 with 16-byte lines, so two SHAVEs writing scalars into one line clobber each other;
   per-SHAVE scalars need their own 16-byte slot.
-* 2026-11-06: **Phase 2b closed.** `DeriveIntelNpuGlobalSync` (C++, after tile-op lowering) inserts
+- 2026-11-06: **Phase 2b closed.** `DeriveIntelNpuGlobalSync` (C++, after tile-op lowering) inserts
   `sync_grid` between top-level phases with a DDR RAW/WAR/WAW hazard at buffer granularity; an author's
   barrier is kept and not duplicated; kill switch `tl.intel_npu.derive_global_sync=False` (used only by
   the negative controls). Acceptance met: the two-phase kernel without a hand-written barrier lowers to
@@ -1374,7 +1461,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   sequence is analysed, a serial loop over phases (Phase 5) is the author's or a later refinement.
   `.text` is now measured from the SHAVE `.elf` by the runner and refused above `text_limit_bytes`:
   GEMM 17920 B, two-phase 20096 B (7.7% of 262272; mostly the kernel wrapper and runtime).
-* 2026-11-06: **Phase 2 closed (2a).** `T.sync_grid()` -> `ctx.sync_grid()` (npu::Sync::waitGlobal),
+- 2026-11-06: **Phase 2 closed (2a).** `T.sync_grid()` -> `ctx.sync_grid()` (npu::Sync::waitGlobal),
   `T.sync_threads()` -> `ctx.sync_tile()` (waitLocal); `CheckIntelNpuBudgets` refuses a kernel whose
   CMX allocations x shaves_per_tile + runtime reserve exceed the target's `cmx_bytes`, naming the
   buffers (negative: the Phase 1 over-sized kernel; the verdict follows the target attribute). Two-phase
@@ -1387,7 +1474,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   before every barrier; 180 launches since, 0 lost. Details and the trace row in
   `device/evidence/INDEX.md`. **Open for 2b:** `DeriveGlobalSync` (automatic `sync_grid` from
   global-buffer dataflow) is not started; `.text` is still unmeasured (the runner can read the .elf).
-* 2026-11-06: **Phase 1 closed.** `LowerIntelNpuTileOp` (C++, before `FlattenBuffer`) lowers `copy`
+- 2026-11-06: **Phase 1 closed.** `LowerIntelNpuTileOp` (C++, before `FlattenBuffer`) lowers `copy`
   (DDR<->CMX, 1-D/2-D, byte widths and row strides from the 2-D buffers) to `intel_npu_dma_copy` and
   `gemm` (fp16, `transpose_B`, `clear_accum=True`) to `intel_npu_dpu_matmul`; every other tile op is
   refused by name. Codegen prints them as calls on a per-SHAVE `npu::Ctx`; DDR tensors are
@@ -1409,7 +1496,7 @@ re-measured on the same day as ours, since the box's DPU rate has changed since 
   and `local` are both SHAVE-private until Phase 3 places tile-shared buffers. One unexplained
   one-off (first launch after the first build reported one SHAVE's status unwritten) was recorded in
   `device/evidence/INDEX.md`; it recurred and was root-caused and fixed in Phase 2 (missing DL1 fence).
-* 2026-11-06: **Phase 0 closed.** `tilelang/intel_npu/` (target, manifest, pipeline, dialect with a
+- 2026-11-06: **Phase 0 closed.** `tilelang/intel_npu/` (target, manifest, pipeline, dialect with a
   1-D `T.Kernel`, source-only codegen, `source_only` execution spec), `src/intel_npu/` (target kind
   with PTL defaults, `LowerIntelNpuKernelLaunch`, `CodeGenTileLangIntelNpu` + `kernel_entry`
   emission, `target.build.tilelang_intel_npu_without_compile`), `src/tl_templates/intel_npu/npu_rt.hpp`

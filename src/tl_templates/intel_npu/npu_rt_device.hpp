@@ -9,18 +9,21 @@
 //    window of the tile's CMX (DmaDrv40xx::init: cmx.METADATA + 0x129C0);
 //  * DpuMatMul::init(M, N, K) builds a weight table of 16 bytes per (padded) N
 //    row at the address given to its constructor;
-//  * a SHAVE's direct DDR store (DdrAccessor) sits in its data L1 until flushed:
+//  * a SHAVE's direct DDR store (DdrAccessor) sits in its data L1 until
+//  flushed:
 //    without npu::sync::memoryFence() the store can be lost when the SHAVE
 //    halts (seen as an unwritten status record in ~1 of 25 launches);
-//  * the toolkit kicks the DMA and the DPU with volatile register stores and flushes
-//    CMX with an `asm volatile` that has NO "memory" clobber, so neither orders the
-//    kernel's ordinary stores (a buffer just written, a descriptor just configured)
-//    before the kick, nor its loads after a watermark wait. In a large kernel at -O3
-//    the VLIW scheduler does move them (M5: a whole-model kernel finished on every SHAVE
-//    and the device was then lost -- a DPU/DMA started on a half-written descriptor;
-//    the same kernel with the runtime compiled unoptimised ran). Every method here that
-//    touches hardware is therefore a real call (TL_NPU_HW_CALL) with compiler barriers
-//    around its kick and its wait.
+//  * the toolkit kicks the DMA and the DPU with volatile register stores and
+//  flushes
+//    CMX with an `asm volatile` that has NO "memory" clobber, so neither orders
+//    the kernel's ordinary stores (a buffer just written, a descriptor just
+//    configured) before the kick, nor its loads after a watermark wait. In a
+//    large kernel at -O3 the VLIW scheduler does move them (M5: a whole-model
+//    kernel finished on every SHAVE and the device was then lost -- a DPU/DMA
+//    started on a half-written descriptor; the same kernel with the runtime
+//    compiled unoptimised ran). Every method here that touches hardware is
+//    therefore a real call (TL_NPU_HW_CALL) with compiler barriers around its
+//    kick and its wait.
 #ifndef TL_TEMPLATES_INTEL_NPU_NPU_RT_DEVICE_HPP_
 #define TL_TEMPLATES_INTEL_NPU_NPU_RT_DEVICE_HPP_
 
@@ -37,20 +40,28 @@
 #include <shave/sync/include/memory_fence.hpp>
 
 #include <cstdint>
-#include <new>
 #include <math.h>
+#include <new>
 
-// fp16 math behind the intel_npu intrinsic rules (intrin_rule_intel_npu.cc). The SAU has a
-// scalar fp16 exp; the rest go through float.
-static inline half tl_npu_hexp(half x) { return __builtin_shave_sau_exp_f16_r(x); }
+// fp16 math behind the intel_npu intrinsic rules (intrin_rule_intel_npu.cc).
+// The SAU has a scalar fp16 exp; the rest go through float.
+static inline half tl_npu_hexp(half x) {
+  return __builtin_shave_sau_exp_f16_r(x);
+}
 static inline half tl_npu_hexp2(half x) { return (half)exp2f((float)x); }
 static inline half tl_npu_hlog(half x) { return (half)logf((float)x); }
 static inline half tl_npu_hlog2(half x) { return (half)log2f((float)x); }
 static inline half tl_npu_hsqrt(half x) { return (half)sqrtf((float)x); }
-static inline half tl_npu_hrsqrt(half x) { return (half)(1.0f / sqrtf((float)x)); }
+static inline half tl_npu_hrsqrt(half x) {
+  return (half)(1.0f / sqrtf((float)x));
+}
 static inline half tl_npu_htanh(half x) { return (half)tanhf((float)x); }
-static inline half tl_npu_hsigmoid(half x) { return (half)(1.0f / (1.0f + expf(-(float)x))); }
-static inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }   // the scalar fp32 tirx.sigmoid (not in libm)
+static inline half tl_npu_hsigmoid(half x) {
+  return (half)(1.0f / (1.0f + expf(-(float)x)));
+}
+static inline float sigmoidf(float x) {
+  return 1.0f / (1.0f + expf(-x));
+} // the scalar fp32 tirx.sigmoid (not in libm)
 static inline half tl_npu_hfabs(half x) { return (half)fabsf((float)x); }
 static inline half tl_npu_hfloor(half x) { return (half)floorf((float)x); }
 static inline half tl_npu_hceil(half x) { return (half)ceilf((float)x); }
@@ -59,19 +70,23 @@ static inline half tl_npu_hround(half x) { return (half)roundf((float)x); }
 template <class T> static inline T max(T a, T b) { return a > b ? a : b; }
 template <class T> static inline T min(T a, T b) { return a < b ? a : b; }
 
-// Vector fp16 transcendentals: the VAU has EXP/LOG/TANH on half32 only (the v8f16
-// forms are not on this SHAVE variant); half16/half8 widen to one half32 op.
+// Vector fp16 transcendentals: the VAU has EXP/LOG/TANH on half32 only (the
+// v8f16 forms are not on this SHAVE variant); half16/half8 widen to one half32
+// op.
 #define TL_NPU_VAU_F16(NAME, BUILTIN)                                          \
   static inline half32 tl_npu_h##NAME(half32 x) { return BUILTIN(x); }         \
   static inline half16 tl_npu_h##NAME(half16 x) {                              \
-    const half32 w = __builtin_shufflevector(x, x, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, \
-                                             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); \
+    const half32 w = __builtin_shufflevector(                                  \
+        x, x, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2,   \
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);                          \
     const half32 e = BUILTIN(w);                                               \
-    return __builtin_shufflevector(e, e, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); \
+    return __builtin_shufflevector(e, e, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, \
+                                   12, 13, 14, 15);                            \
   }                                                                            \
   static inline half8 tl_npu_h##NAME(half8 x) {                                \
-    const half32 w = __builtin_shufflevector(x, x, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, \
-                                             0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7); \
+    const half32 w = __builtin_shufflevector(                                  \
+        x, x, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4,   \
+        5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7);                                      \
     const half32 e = BUILTIN(w);                                               \
     return __builtin_shufflevector(e, e, 0, 1, 2, 3, 4, 5, 6, 7);              \
   }
@@ -86,22 +101,32 @@ TL_NPU_VAU_F16(sigmoid, __builtin_shave_vau_sigm_r_half32)
 #define TL_NPU_VEC_HAS_VAU_SIGMOID 1
 #include "npu_rt_vecmath.hpp"
 
-// Whole-vector reductions (the DSL's T.call_extern("tl_npu_vmax" / "tl_npu_vsum", buf[0:N])):
-// log2(N) rotate-and-combine steps on the CMU/VAU instead of N lane extracts
-// (moviCompile lowers a half-vector extract to one CMU.CP.16 per lane).
+// Whole-vector reductions (the DSL's T.call_extern("tl_npu_vmax" /
+// "tl_npu_vsum", buf[0:N])): log2(N) rotate-and-combine steps on the CMU/VAU
+// instead of N lane extracts (moviCompile lowers a half-vector extract to one
+// CMU.CP.16 per lane).
 static inline half tl_npu_vmax(half32 v) {
-  v = __builtin_shave_cmu_max_f16_rr_half32(v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 32));
-  v = __builtin_shave_cmu_max_f16_rr_half32(v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 16));
-  v = __builtin_shave_cmu_max_f16_rr_half32(v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 8));
-  v = __builtin_shave_cmu_max_f16_rr_half32(v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 4));
-  v = __builtin_shave_cmu_max_f16_rr_half32(v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 2));
+  v = __builtin_shave_cmu_max_f16_rr_half32(
+      v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 32));
+  v = __builtin_shave_cmu_max_f16_rr_half32(
+      v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 16));
+  v = __builtin_shave_cmu_max_f16_rr_half32(
+      v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 8));
+  v = __builtin_shave_cmu_max_f16_rr_half32(
+      v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 4));
+  v = __builtin_shave_cmu_max_f16_rr_half32(
+      v, __builtin_shave_cmu_alignvec_rri_half32(v, v, 2));
   return v[0];
 }
 static inline float tl_npu_vmax(float16 v) {
-  v = __builtin_shave_cmu_max_f32_rr_float16(v, __builtin_shave_cmu_alignvec_rri_float16(v, v, 32));
-  v = __builtin_shave_cmu_max_f32_rr_float16(v, __builtin_shave_cmu_alignvec_rri_float16(v, v, 16));
-  v = __builtin_shave_cmu_max_f32_rr_float16(v, __builtin_shave_cmu_alignvec_rri_float16(v, v, 8));
-  v = __builtin_shave_cmu_max_f32_rr_float16(v, __builtin_shave_cmu_alignvec_rri_float16(v, v, 4));
+  v = __builtin_shave_cmu_max_f32_rr_float16(
+      v, __builtin_shave_cmu_alignvec_rri_float16(v, v, 32));
+  v = __builtin_shave_cmu_max_f32_rr_float16(
+      v, __builtin_shave_cmu_alignvec_rri_float16(v, v, 16));
+  v = __builtin_shave_cmu_max_f32_rr_float16(
+      v, __builtin_shave_cmu_alignvec_rri_float16(v, v, 8));
+  v = __builtin_shave_cmu_max_f32_rr_float16(
+      v, __builtin_shave_cmu_alignvec_rri_float16(v, v, 4));
   return v[0];
 }
 static inline float tl_npu_vsum(float16 v) {
@@ -120,36 +145,40 @@ static inline half tl_npu_vsum(half32 v) {
   return v[0];
 }
 
-// Per-task profiling records (`Ctx::task_add`). OFF by default and opt-in per build, because it is NOT free:
-// measured +5.2% on the median and a 13x wider spread (2-layer prefill, n=192, UNPROFILED TURBO, 2026-11-09:
-// 93.939 ms off vs 98.858 ms on, 111911 records = ~268 ns each). That is the cost VPUX's guide warns about --
-// "profiling data must be transferred into the profiling output buffer ... may be inserted on the critical
-// path" -- so VPUX gates it on PERF_COUNT and npu_dsl on -DFRT_PROFILE, and so does this.
-// Every latency claim comes from a build with this OFF.
+// Per-task profiling records (`Ctx::task_add`). OFF by default and opt-in per
+// build, because it is NOT free: measured +5.2% on the median and a 13x wider
+// spread (2-layer prefill, n=192, UNPROFILED TURBO, 2026-11-09: 93.939 ms off
+// vs 98.858 ms on, 111911 records = ~268 ns each). That is the cost VPUX's
+// guide warns about -- "profiling data must be transferred into the profiling
+// output buffer ... may be inserted on the critical path" -- so VPUX gates it
+// on PERF_COUNT and npu_dsl on -DFRT_PROFILE, and so does this. Every latency
+// claim comes from a build with this OFF.
 #ifndef TL_NPU_PHASE_PROF
 #define TL_NPU_PHASE_PROF 0
 #endif
 #if TL_NPU_PHASE_PROF
 #define TL_NPU_PROF_T0() const std::uint32_t tl_prof_t0 = perf_ticks()
-#define TL_NPU_PROF_BAR()                                                                                      \
-  do {                                                                                                         \
-    const std::uint32_t tl_prof_t1 = perf_ticks();                                                             \
-    barTicks_ += tl_prof_t1 - tl_prof_t0;                                                                      \
-    ++barCalls_;                                                                                               \
-    task_add(kTaskBarrier, tl_prof_t0, tl_prof_t1);                                                            \
+#define TL_NPU_PROF_BAR()                                                      \
+  do {                                                                         \
+    const std::uint32_t tl_prof_t1 = perf_ticks();                             \
+    barTicks_ += tl_prof_t1 - tl_prof_t0;                                      \
+    ++barCalls_;                                                               \
+    task_add(kTaskBarrier, tl_prof_t0, tl_prof_t1);                            \
   } while (0)
 #else
 #define TL_NPU_PROF_T0() ((void)0)
 #define TL_NPU_PROF_BAR() ((void)0)
 #endif
 
-// Named SHAVE compute regions are `Ctx::task_begin` / `task_end` now: they become per-task records with their
-// own name, which the toolkit's VEC_COMPUTE spans could not do beyond its 1984-event budget.
+// Named SHAVE compute regions are `Ctx::task_begin` / `task_end` now: they
+// become per-task records with their own name, which the toolkit's VEC_COMPUTE
+// spans could not do beyond its 1984-event budget.
 
-// Packed signed int4 (two per byte, LOW nibble first, symmetric: value = (n ^ 8) - 8) to fp16:
-// the LSU converts in the load (`LSU.LD512.i4.i8`: 32 bytes -> 64 int8), lo = values 0..31,
-// hi = 32..63. The DSL writes `w[r, k:k+32] = tl_npu_i4x64_lo(&q[r, k/2]) * scale` (T.call_extern);
-// the fp16 product of |q| <= 8 by an fp16 scale is exact. Same format as npu_dsl's DEQUANT_I4.
+// Packed signed int4 (two per byte, LOW nibble first, symmetric: value = (n ^
+// 8) - 8) to fp16: the LSU converts in the load (`LSU.LD512.i4.i8`: 32 bytes ->
+// 64 int8), lo = values 0..31, hi = 32..63. The DSL writes `w[r, k:k+32] =
+// tl_npu_i4x64_lo(&q[r, k/2]) * scale` (T.call_extern); the fp16 product of |q|
+// <= 8 by an fp16 scale is exact. Same format as npu_dsl's DEQUANT_I4.
 static inline half32 tl_npu_i4x64_lo(const void *p) {
   const schar64 v = __builtin_shave_lsu_ld512_i4_i8_r((const char64 *)p);
   return __builtin_convertvector(v.lo, half32);
@@ -158,22 +187,32 @@ static inline half32 tl_npu_i4x64_hi(const void *p) {
   const schar64 v = __builtin_shave_lsu_ld512_i4_i8_r((const char64 *)p);
   return __builtin_convertvector(v.hi, half32);
 }
-// The 64 int8 lanes themselves (`q[0:64] = tl_npu_ld_i4x64(p)` then `T.cast(q[0:32], float16x32)`).
-static inline schar64 tl_npu_ld_i4x64(const void *p) { return __builtin_shave_lsu_ld512_i4_i8_r((const char64 *)p); }
+// The 64 int8 lanes themselves (`q[0:64] = tl_npu_ld_i4x64(p)` then
+// `T.cast(q[0:32], float16x32)`).
+static inline schar64 tl_npu_ld_i4x64(const void *p) {
+  return __builtin_shave_lsu_ld512_i4_i8_r((const char64 *)p);
+}
 
-// One row of int4 g`group` weights -> fp16 (`T.call_extern("handle", "tl_npu_dequant_i4_row", dst, src, scales,
-// width, group)`). Blocks of 512 values: the 8 convert-loads and the scale splats are issued before the
-// block's 16 stores, so the LSU latency is hidden (the schedule of npu_dsl's DEQUANT_I4 fast path, `E7-63`;
-// the generic DSL statement form loaded twice and stored the loads back to CMX: 0.7 cycles per value).
-// Requires width % 512 == 0 and group % 64 == 0; the fp16 product of |q| <= 8 by an fp16 scale is exact.
-static inline void tl_npu_dequant_i4_row(half *__restrict dst, const unsigned char *__restrict src,
-                                         const half *__restrict scales, std::uint32_t width, std::uint32_t group) {
+// One row of int4 g`group` weights -> fp16 (`T.call_extern("handle",
+// "tl_npu_dequant_i4_row", dst, src, scales, width, group)`). Blocks of 512
+// values: the 8 convert-loads and the scale splats are issued before the
+// block's 16 stores, so the LSU latency is hidden (the schedule of npu_dsl's
+// DEQUANT_I4 fast path, `E7-63`; the generic DSL statement form loaded twice
+// and stored the loads back to CMX: 0.7 cycles per value). Requires width % 512
+// == 0 and group % 64 == 0; the fp16 product of |q| <= 8 by an fp16 scale is
+// exact.
+static inline void tl_npu_dequant_i4_row(half *__restrict dst,
+                                         const unsigned char *__restrict src,
+                                         const half *__restrict scales,
+                                         std::uint32_t width,
+                                         std::uint32_t group) {
   for (std::uint32_t b = 0; b < width / 512; ++b) {
     schar64 s[8];
     half32 sc[8];
 #pragma unroll
     for (std::uint32_t i = 0; i < 8; ++i) {
-      s[i] = __builtin_shave_lsu_ld512_i4_i8_r((const char64 *)(src + b * 256 + i * 32));
+      s[i] = __builtin_shave_lsu_ld512_i4_i8_r(
+          (const char64 *)(src + b * 256 + i * 32));
       sc[i] = (half32)(scales[(b * 512 + i * 64) / group]);
     }
     half32 *d = reinterpret_cast<half32 *>(dst + b * 512);
@@ -185,84 +224,121 @@ static inline void tl_npu_dequant_i4_row(half *__restrict dst, const unsigned ch
   }
 }
 
-// VPUX's hand-scheduled int4 -> fp16 loop (asm/dequant_dynamic_i4_v0.asm, assembled into every kernel ELF by
-// device/CMakeLists.txt): 0.043 static cycles per element against tl_npu_dequant_i4_row's 0.091. `n` is the
-// number of CONTIGUOUS 128-element groups and `scl` carries one fp16 per group in the same order -- the case the
-// production kernel dispatches here (vpux-plugin sw_runtime_kernels/kernels/src/dynamic_dequantize.cpp:493).
-extern "C" void asm_dequant_dynamic_i4_f16_v0(const void *inp, const half *scl, half *out, int n);
+// VPUX's hand-scheduled int4 -> fp16 loop (asm/dequant_dynamic_i4_v0.asm,
+// assembled into every kernel ELF by device/CMakeLists.txt): 0.043 static
+// cycles per element against tl_npu_dequant_i4_row's 0.091. `n` is the number
+// of CONTIGUOUS 128-element groups and `scl` carries one fp16 per group in the
+// same order -- the case the production kernel dispatches here (vpux-plugin
+// sw_runtime_kernels/kernels/src/dynamic_dequantize.cpp:493).
+extern "C" void asm_dequant_dynamic_i4_f16_v0(const void *inp, const half *scl,
+                                              half *out, int n);
 
-// A whole [rows, width] block of int4 g`group` weights -> fp16 (`T.call_extern("handle", "tl_npu_dequant_i4_block",
-// dst, src, scales, rows, width, group)`). Row-major values and row-major scales make the block one flat run of
-// width / group groups per row, so it is ONE asm call, not one per row -- which is also what keeps the scale
-// pointer aligned when a row carries an odd number of groups.
+// A whole [rows, width] block of int4 g`group` weights -> fp16
+// (`T.call_extern("handle", "tl_npu_dequant_i4_block", dst, src, scales, rows,
+// width, group)`). Row-major values and row-major scales make the block one
+// flat run of width / group groups per row, so it is ONE asm call, not one per
+// row -- which is also what keeps the scale pointer aligned when a row carries
+// an odd number of groups.
 //
-// The asm prefetches one unroll ahead, so it reads up to 128 bytes past `src` and 4 past `scales`; both are CMX
-// buffers here and the reads are discarded, which is the same bargain the production kernel takes.
-static inline void tl_npu_dequant_i4_block(half *__restrict dst, const unsigned char *__restrict src,
-                                           const half *__restrict scales, std::uint32_t rows, std::uint32_t width,
+// The asm prefetches one unroll ahead, so it reads up to 128 bytes past `src`
+// and 4 past `scales`; both are CMX buffers here and the reads are discarded,
+// which is the same bargain the production kernel takes.
+static inline void tl_npu_dequant_i4_block(half *__restrict dst,
+                                           const unsigned char *__restrict src,
+                                           const half *__restrict scales,
+                                           std::uint32_t rows,
+                                           std::uint32_t width,
                                            std::uint32_t group) {
   const std::uint32_t n = rows * (width / group);
   if (group == 128 && width % 128 == 0 && n >= 2) {
-    asm_dequant_dynamic_i4_f16_v0(src, scales, dst, (int)n); // n = 1 corrupts elements 64..127 (VPUX)
+    asm_dequant_dynamic_i4_f16_v0(
+        src, scales, dst, (int)n); // n = 1 corrupts elements 64..127 (VPUX)
     return;
   }
   for (std::uint32_t r = 0; r < rows; ++r)
-    tl_npu_dequant_i4_row(dst + r * width, src + r * (width / 2), scales + r * (width / group), width, group);
+    tl_npu_dequant_i4_row(dst + r * width, src + r * (width / 2),
+                          scales + r * (width / group), width, group);
 }
 
-// The same block with GROUP-MAJOR scales: `out[r, k] = q[r, k] * s[(k / group) * sStride + r]`, which is the
-// layout the DPU's int4 path reads in place (`dpu_matmul_i4`'s sStride > 0), so one scale tensor serves both the
-// DPU GEMV and this SHAVE dequantisation and a model that runs both paths uploads its weights once.
+// The same block with GROUP-MAJOR scales: `out[r, k] = q[r, k] * s[(k / group)
+// * sStride + r]`, which is the layout the DPU's int4 path reads in place
+// (`dpu_matmul_i4`'s sStride > 0), so one scale tensor serves both the DPU GEMV
+// and this SHAVE dequantisation and a model that runs both paths uploads its
+// weights once.
 //
-// `sStride` is the scale table's row pitch and defaults to `rows`, which is the compact case -- a chunk DMA'd
-// into its own CMX buffer. Passing a larger pitch reads a chunk out of a WIDER hoisted table in place, which is
-// what the MoE expert's down projection does: it fetches one expert's scales in a single DMA and then hands each
-// row chunk a pointer into it, so the layout costs no extra copy.
+// `sStride` is the scale table's row pitch and defaults to `rows`, which is the
+// compact case -- a chunk DMA'd into its own CMX buffer. Passing a larger pitch
+// reads a chunk out of a WIDER hoisted table in place, which is what the MoE
+// expert's down projection does: it fetches one expert's scales in a single DMA
+// and then hands each row chunk a pointer into it, so the layout costs no extra
+// copy.
 //
-// Ported from npu_dsl's `dequant_i4_gm` (kernels_poc/common/fused_ops.hpp; plan section 0's amendment: its
-// hardware-verified SHAVE algorithms may be ported with the origin named), with the stride generalised. The
-// point of the port is that the VPUX assembly is KEPT: a chunk of rows has its scales transposed into a
-// 512-entry stack buffer first -- four groups x eight rows per step, four half8 loads and eight half4 stores --
-// so the per-element rate stays the asm's 0.043 cycles and only the scales (1/`group` of the values) pay for the
+// Ported from npu_dsl's `dequant_i4_gm` (kernels_poc/common/fused_ops.hpp; plan
+// section 0's amendment: its hardware-verified SHAVE algorithms may be ported
+// with the origin named), with the stride generalised. The point of the port is
+// that the VPUX assembly is KEPT: a chunk of rows has its scales transposed
+// into a 512-entry stack buffer first -- four groups x eight rows per step,
+// four half8 loads and eight half4 stores -- so the per-element rate stays the
+// asm's 0.043 cycles and only the scales (1/`group` of the values) pay for the
 // layout.
-static inline void tl_npu_dequant_i4_gm(half *__restrict dst, const unsigned char *__restrict src,
-                                        const half *__restrict s, std::uint32_t rows, std::uint32_t width,
-                                        std::uint32_t group, std::uint32_t sStride = 0) {
-  if (sStride == 0) sStride = rows;
+static inline void tl_npu_dequant_i4_gm(half *__restrict dst,
+                                        const unsigned char *__restrict src,
+                                        const half *__restrict s,
+                                        std::uint32_t rows, std::uint32_t width,
+                                        std::uint32_t group,
+                                        std::uint32_t sStride = 0) {
+  if (sStride == 0)
+    sStride = rows;
   if (group == 128 && width % 128 == 0 && width >= 256 && width / 128 <= 512) {
     const std::uint32_t ng = width / 128, per = 512 / ng;
     half st[512];
     for (std::uint32_t r0 = 0; r0 < rows; r0 += per) {
       const std::uint32_t rc = rows - r0 < per ? rows - r0 : per;
-      // every half8 load below is `s + g * sStride + r0 + r`, so the pitch, the chunk base and the chunk length
-      // all have to be 8 halves (16 bytes) wide for the vector transpose to be legal
+      // every half8 load below is `s + g * sStride + r0 + r`, so the pitch, the
+      // chunk base and the chunk length all have to be 8 halves (16 bytes) wide
+      // for the vector transpose to be legal
       if (ng % 4 == 0 && rc % 8 == 0 && r0 % 8 == 0 && sStride % 8 == 0 &&
           (reinterpret_cast<std::uintptr_t>(s) & 15) == 0) {
         for (std::uint32_t g = 0; g < ng; g += 4)
           for (std::uint32_t r = 0; r < rc; r += 8) {
             const half *p = s + g * sStride + r0 + r;
-            const half8 a = *reinterpret_cast<const half8 *>(p), b = *reinterpret_cast<const half8 *>(p + sStride);
-            const half8 c = *reinterpret_cast<const half8 *>(p + 2 * sStride), d = *reinterpret_cast<const half8 *>(p + 3 * sStride);
-            const half8 ab0 = __builtin_shufflevector(a, b, 0, 8, 1, 9, 2, 10, 3, 11);
-            const half8 ab1 = __builtin_shufflevector(a, b, 4, 12, 5, 13, 6, 14, 7, 15);
-            const half8 cd0 = __builtin_shufflevector(c, d, 0, 8, 1, 9, 2, 10, 3, 11);
-            const half8 cd1 = __builtin_shufflevector(c, d, 4, 12, 5, 13, 6, 14, 7, 15);
+            const half8 a = *reinterpret_cast<const half8 *>(p),
+                        b = *reinterpret_cast<const half8 *>(p + sStride);
+            const half8 c = *reinterpret_cast<const half8 *>(p + 2 * sStride),
+                        d = *reinterpret_cast<const half8 *>(p + 3 * sStride);
+            const half8 ab0 =
+                __builtin_shufflevector(a, b, 0, 8, 1, 9, 2, 10, 3, 11);
+            const half8 ab1 =
+                __builtin_shufflevector(a, b, 4, 12, 5, 13, 6, 14, 7, 15);
+            const half8 cd0 =
+                __builtin_shufflevector(c, d, 0, 8, 1, 9, 2, 10, 3, 11);
+            const half8 cd1 =
+                __builtin_shufflevector(c, d, 4, 12, 5, 13, 6, 14, 7, 15);
             half *o = st + r * ng + g;
-            *reinterpret_cast<half4 *>(o + 0 * ng) = __builtin_shufflevector(ab0, cd0, 0, 1, 8, 9);
-            *reinterpret_cast<half4 *>(o + 1 * ng) = __builtin_shufflevector(ab0, cd0, 2, 3, 10, 11);
-            *reinterpret_cast<half4 *>(o + 2 * ng) = __builtin_shufflevector(ab0, cd0, 4, 5, 12, 13);
-            *reinterpret_cast<half4 *>(o + 3 * ng) = __builtin_shufflevector(ab0, cd0, 6, 7, 14, 15);
-            *reinterpret_cast<half4 *>(o + 4 * ng) = __builtin_shufflevector(ab1, cd1, 0, 1, 8, 9);
-            *reinterpret_cast<half4 *>(o + 5 * ng) = __builtin_shufflevector(ab1, cd1, 2, 3, 10, 11);
-            *reinterpret_cast<half4 *>(o + 6 * ng) = __builtin_shufflevector(ab1, cd1, 4, 5, 12, 13);
-            *reinterpret_cast<half4 *>(o + 7 * ng) = __builtin_shufflevector(ab1, cd1, 6, 7, 14, 15);
+            *reinterpret_cast<half4 *>(o + 0 * ng) =
+                __builtin_shufflevector(ab0, cd0, 0, 1, 8, 9);
+            *reinterpret_cast<half4 *>(o + 1 * ng) =
+                __builtin_shufflevector(ab0, cd0, 2, 3, 10, 11);
+            *reinterpret_cast<half4 *>(o + 2 * ng) =
+                __builtin_shufflevector(ab0, cd0, 4, 5, 12, 13);
+            *reinterpret_cast<half4 *>(o + 3 * ng) =
+                __builtin_shufflevector(ab0, cd0, 6, 7, 14, 15);
+            *reinterpret_cast<half4 *>(o + 4 * ng) =
+                __builtin_shufflevector(ab1, cd1, 0, 1, 8, 9);
+            *reinterpret_cast<half4 *>(o + 5 * ng) =
+                __builtin_shufflevector(ab1, cd1, 2, 3, 10, 11);
+            *reinterpret_cast<half4 *>(o + 6 * ng) =
+                __builtin_shufflevector(ab1, cd1, 4, 5, 12, 13);
+            *reinterpret_cast<half4 *>(o + 7 * ng) =
+                __builtin_shufflevector(ab1, cd1, 6, 7, 14, 15);
           }
       } else {
         for (std::uint32_t r = 0; r < rc; ++r)
           for (std::uint32_t g = 0; g < ng; ++g)
             st[r * ng + g] = s[g * sStride + r0 + r];
       }
-      asm_dequant_dynamic_i4_f16_v0(src + r0 * width / 2, st, dst + r0 * width, (int)(rc * ng));
+      asm_dequant_dynamic_i4_f16_v0(src + r0 * width / 2, st, dst + r0 * width,
+                                    (int)(rc * ng));
     }
     return;
   }
@@ -270,12 +346,14 @@ static inline void tl_npu_dequant_i4_gm(half *__restrict dst, const unsigned cha
     for (std::uint32_t r = 0; r < rows; ++r)
       for (std::uint32_t b = 0; b < width / 512; ++b) {
         const unsigned char *__restrict q = src + (r * width + b * 512) / 2;
-        half32 *__restrict d = reinterpret_cast<half32 *>(dst + r * width + b * 512);
+        half32 *__restrict d =
+            reinterpret_cast<half32 *>(dst + r * width + b * 512);
         schar64 v[8];
         half32 sc[8];
 #pragma unroll
         for (std::uint32_t i = 0; i < 8; ++i) {
-          v[i] = __builtin_shave_lsu_ld512_i4_i8_r((const char64 *)(q + i * 32));
+          v[i] =
+              __builtin_shave_lsu_ld512_i4_i8_r((const char64 *)(q + i * 32));
           sc[i] = (half32)(s[((b * 512 + i * 64) / group) * sStride + r]);
         }
 #pragma unroll
@@ -289,8 +367,11 @@ static inline void tl_npu_dequant_i4_gm(half *__restrict dst, const unsigned cha
   for (std::uint32_t r = 0; r < rows; ++r)
     for (std::uint32_t k = 0; k < width; ++k) {
       const std::uint32_t i = r * width + k;
-      const std::int32_t nib = (i % 2 == 0) ? (src[i / 2] & 0xF) : (src[i / 2] >> 4);
-      dst[i] = static_cast<half>(static_cast<float>((nib ^ 8) - 8) * static_cast<float>(s[(k / group) * sStride + r]));
+      const std::int32_t nib =
+          (i % 2 == 0) ? (src[i / 2] & 0xF) : (src[i / 2] >> 4);
+      dst[i] =
+          static_cast<half>(static_cast<float>((nib ^ 8) - 8) *
+                            static_cast<float>(s[(k / group) * sStride + r]));
     }
 }
 
@@ -303,11 +384,14 @@ enum : std::uint32_t {
   kStatusBadParams = 3,
   kStatusUnsupported = 4,
   kStatusBarrierNotLive = 5, // detail: barrier id whose config never went live
-  kStatusBarrierTimeout = 6, // detail: barrier id whose count never reached zero
-  kStatusRingRefused = 7,    // detail: reason code (ring_* below)
-  kStatusOrderTimeout = 8,   // detail: the DPU submission-order word waited for
-  kStatusDpuTimeout = 9,     // detail: the ring use whose DPU workload never completed
-  kStatusDmaTimeout = 10,    // detail: which ring fill descriptor never set its watermark (see dma_wait)
+  kStatusBarrierTimeout =
+      6,                   // detail: barrier id whose count never reached zero
+  kStatusRingRefused = 7,  // detail: reason code (ring_* below)
+  kStatusOrderTimeout = 8, // detail: the DPU submission-order word waited for
+  kStatusDpuTimeout =
+      9, // detail: the ring use whose DPU workload never completed
+  kStatusDmaTimeout = 10, // detail: which ring fill descriptor never set its
+                          // watermark (see dma_wait)
 };
 
 template <class T> struct Ddr;
@@ -334,12 +418,14 @@ template <class T> struct Ddr {
   }
 };
 
-#ifndef TL_NPU_RUNTIME_FRT   // the fused_rt shim (npu_rt_device_frt.hpp) provides its own npu::Ctx over this surface
+#ifndef TL_NPU_RUNTIME_FRT // the fused_rt shim (npu_rt_device_frt.hpp) provides
+                           // its own npu::Ctx over this surface
 class Ctx {
 public:
   static constexpr std::uint32_t kAlign = 64;
   static constexpr std::uint32_t kMaxDpuN = 1024;
-  // sync_grid uses this many rotating hardware barrier ids starting at syncBarrierBase.
+  // sync_grid uses this many rotating hardware barrier ids starting at
+  // syncBarrierBase.
   static constexpr std::uint32_t kSyncBarriers = 3;
   static constexpr std::uint32_t kNoHwSync = 0xFFFFFFFFu;
 
@@ -359,14 +445,16 @@ public:
       return;
     }
     cmxFree0_ = cmx_.getAvailableSize();
-    desc_ = alloc_hw<DmaDescriptor>(4);   // 0 sync load, 1 sync store, 2/3 dual-port async load
+    desc_ = alloc_hw<DmaDescriptor>(
+        4); // 0 sync load, 1 sync store, 2/3 dual-port async load
     ringOrder_ = alloc_shared<std::uint32_t>(16 * kRingPool);
     ringFill_ = alloc_hw<DmaDescriptor>(2 * kRingMaxDepth * kRingPool);
     for (std::uint32_t i = 0; i < kDpuSets; ++i) {
       dpu_[i].desc = alloc_hw<DpuMatMul::DescriptorsBuffer>(1);
       dpu_[i].wt = alloc<std::uint32_t>(4 * kMaxDpuN);
       if (ok_)
-        dpu_[i].mm = new (dpu_[i].store) DpuMatMul(env_.getDpuDrv(), dpu_[i].desc, dpu_[i].wt);
+        dpu_[i].mm = new (dpu_[i].store)
+            DpuMatMul(env_.getDpuDrv(), dpu_[i].desc, dpu_[i].wt);
     }
     if (ok_) {
       mm_ = dpu_[0].mm;
@@ -380,19 +468,21 @@ public:
   std::int32_t num_tiles() const { return tiles_; }
   std::int32_t shaves_per_tile() const { return spt_; }
 
-  // Worker-private CMX: one allocation of spt_ slots, this SHAVE takes slot shave_.
+  // Worker-private CMX: one allocation of spt_ slots, this SHAVE takes slot
+  // shave_.
   template <class T> TL_NPU_HW_CALL T *alloc(std::uint32_t count) {
     const std::uint32_t bytes = alignUp(count * sizeof(T), kAlign);
-    auto *base = reinterpret_cast<std::uint8_t *>(cmx_.alloc<kAlign>(bytes * spt_));
+    auto *base =
+        reinterpret_cast<std::uint8_t *>(cmx_.alloc<kAlign>(bytes * spt_));
     if (base == nullptr) {
       fail(kStatusCmxExhausted, bytes * spt_);
       return nullptr;
     }
     return reinterpret_cast<T *>(base + bytes * shave_);
   }
-  // Tile-shared CMX: one allocation, the same address on every SHAVE of the tile
-  // (identical allocation sequences) and the same offset on every tile, which is
-  // what a multicast fill needs.
+  // Tile-shared CMX: one allocation, the same address on every SHAVE of the
+  // tile (identical allocation sequences) and the same offset on every tile,
+  // which is what a multicast fill needs.
   template <class T> TL_NPU_HW_CALL T *alloc_shared(std::uint32_t count) {
     const std::uint32_t bytes = alignUp(count * sizeof(T), kAlign);
     auto *base = cmx_.alloc<kAlign>(bytes);
@@ -402,16 +492,19 @@ public:
     }
     return reinterpret_cast<T *>(base);
   }
-  // Codegen brackets every C++ scope that allocates with a CmxScope: the toolkit's LinearAllocator is a
-  // (base, size) value, so a scope saves it and puts it back at its end, releasing the scope's allocations.
-  // Every SHAVE runs the same sequence (allocations never sit under a SHAVE-dependent branch: the compiler
-  // hoists them), so shared buffers keep one address per tile and one offset across tiles.
+  // Codegen brackets every C++ scope that allocates with a CmxScope: the
+  // toolkit's LinearAllocator is a (base, size) value, so a scope saves it and
+  // puts it back at its end, releasing the scope's allocations. Every SHAVE
+  // runs the same sequence (allocations never sit under a SHAVE-dependent
+  // branch: the compiler hoists them), so shared buffers keep one address per
+  // tile and one offset across tiles.
   using CmxMark = LinearAllocator;
-  // Real calls, not inlined: with the mark / restore / alloc sequence inlined into a large kernel at -O3,
-  // moviCompile 22.1.1 produced a kernel whose SHAVEs all finished and whose device was then lost (M5: the
-  // single-launch model with an attention layer inside the layer loop; the same kernel with cmx_restore
-  // out of line ran). The allocator's state is the one thing every buffer address derives from, so it is
-  // kept behind call boundaries.
+  // Real calls, not inlined: with the mark / restore / alloc sequence inlined
+  // into a large kernel at -O3, moviCompile 22.1.1 produced a kernel whose
+  // SHAVEs all finished and whose device was then lost (M5: the single-launch
+  // model with an attention layer inside the layer loop; the same kernel with
+  // cmx_restore out of line ran). The allocator's state is the one thing every
+  // buffer address derives from, so it is kept behind call boundaries.
   TL_NPU_HW_CALL CmxMark cmx_mark() const { return cmx_; }
   TL_NPU_HW_CALL void cmx_restore(const CmxMark &m) { cmx_ = m; }
   class CmxScope {
@@ -426,39 +519,59 @@ public:
     CmxMark m_;
   };
 
-  void dma_load(void *dst, Ddr<void> src, std::uint32_t width, std::uint32_t rows,
-                std::uint32_t dstStride, std::uint32_t srcStride) {
+  void dma_load(void *dst, Ddr<void> src, std::uint32_t width,
+                std::uint32_t rows, std::uint32_t dstStride,
+                std::uint32_t srcStride) {
     dma_load(dst, src.addr, width, rows, dstStride, srcStride);
   }
   template <class T>
   void dma_load(T *dst, Ddr<T> src, std::uint32_t width, std::uint32_t rows,
                 std::uint32_t dstStride, std::uint32_t srcStride) {
-    dma_load(static_cast<void *>(dst), src.addr, width, rows, dstStride, srcStride);
+    dma_load(static_cast<void *>(dst), src.addr, width, rows, dstStride,
+             srcStride);
   }
-  void dma_load_async(void *dst, Ddr<void> src, std::uint32_t width, std::uint32_t rows,
-                      std::uint32_t dstStride, std::uint32_t srcStride) {
+  void dma_load_async(void *dst, Ddr<void> src, std::uint32_t width,
+                      std::uint32_t rows, std::uint32_t dstStride,
+                      std::uint32_t srcStride) {
     dma_load_async_impl(dst, src.addr, width, rows, dstStride, srcStride);
   }
   template <class T>
-  void dma_load_async(T *dst, Ddr<T> src, std::uint32_t width, std::uint32_t rows,
-                      std::uint32_t dstStride, std::uint32_t srcStride) {
-    dma_load_async_impl(static_cast<void *>(dst), src.addr, width, rows, dstStride, srcStride);
+  void dma_load_async(T *dst, Ddr<T> src, std::uint32_t width,
+                      std::uint32_t rows, std::uint32_t dstStride,
+                      std::uint32_t srcStride) {
+    dma_load_async_impl(static_cast<void *>(dst), src.addr, width, rows,
+                        dstStride, srcStride);
   }
   void dma_load_wait() { dma_load_wait_impl(); }
   template <class T>
-  void dma_store(Ddr<T> dst, const T *src, std::uint32_t width, std::uint32_t rows,
-                 std::uint32_t dstStride, std::uint32_t srcStride) {
-    dma_store(dst.addr, static_cast<const void *>(src), width, rows, dstStride, srcStride);
+  void dma_load_multicast(T *dst, Ddr<T> src, std::uint32_t width,
+                          std::uint32_t rows, std::uint32_t dstStride,
+                          std::uint32_t srcStride) {
+    if (tile_ == 0) {
+      const std::uint32_t mask = (1u << tiles_) - 1;
+      dma_load(reinterpret_cast<void *>(convertToCmxMulticastAddr(dst, mask)),
+               src.addr, width, rows, dstStride, srcStride);
+    }
+  }
+  template <class T>
+  void dma_store(Ddr<T> dst, const T *src, std::uint32_t width,
+                 std::uint32_t rows, std::uint32_t dstStride,
+                 std::uint32_t srcStride) {
+    dma_store(dst.addr, static_cast<const void *>(src), width, rows, dstStride,
+              srcStride);
   }
 
   // out[M,N] = a[M,K] . bt[N,K]^T, fp16, one DPU workload. Overwrites out.
   // spatialX 0 keeps DpuMatMul::init's M split; mpe -1 keeps its stencil, else
   // 0/1/2 = CUBOID_4x16/8x16/16x16 as (nthw_ntk, odu_nthw) pairs. The ODU nthw
-  // must change with nthw_ntk or output rows come back permuted (npu_dsl Round 705).
-  TL_NPU_HW_CALL void dpu_matmul(half *out, const half *a, const half *bt, std::uint32_t M,
-                  std::uint32_t N, std::uint32_t K, std::uint32_t spatialX = 0,
-                  std::int32_t mpe = -1) {
-    dpu_matmul_wait();   // the pending workload owns the descriptor set dpu_prepare would re-prepare
+  // must change with nthw_ntk or output rows come back permuted (npu_dsl Round
+  // 705).
+  TL_NPU_HW_CALL void dpu_matmul(half *out, const half *a, const half *bt,
+                                 std::uint32_t M, std::uint32_t N,
+                                 std::uint32_t K, std::uint32_t spatialX = 0,
+                                 std::int32_t mpe = -1) {
+    dpu_matmul_wait(); // the pending workload owns the descriptor set
+                       // dpu_prepare would re-prepare
     if (!dpu_prepare(M, N, K, spatialX, mpe))
       return;
     // No barriers on a synchronous workload (a ring use may have set them).
@@ -470,12 +583,15 @@ public:
     dpu_account();
   }
 
-  // The same workload split in two, so the SHAVE can work while the DPU runs (npu_dsl's expert FFN
-  // dequantises the next weight tile during the current tile's matmul; with the synchronous form the DPU sat
-  // at 4% busy through the MoE phase). ONE workload in flight: a second start waits for the first, because
-  // the descriptor set it would re-prepare is the one still in use.
-  TL_NPU_HW_CALL void dpu_matmul_start(half *out, const half *a, const half *bt, std::uint32_t M,
-                                       std::uint32_t N, std::uint32_t K, std::uint32_t spatialX = 0,
+  // The same workload split in two, so the SHAVE can work while the DPU runs
+  // (npu_dsl's expert FFN dequantises the next weight tile during the current
+  // tile's matmul; with the synchronous form the DPU sat at 4% busy through the
+  // MoE phase). ONE workload in flight: a second start waits for the first,
+  // because the descriptor set it would re-prepare is the one still in use.
+  TL_NPU_HW_CALL void dpu_matmul_start(half *out, const half *a, const half *bt,
+                                       std::uint32_t M, std::uint32_t N,
+                                       std::uint32_t K,
+                                       std::uint32_t spatialX = 0,
                                        std::int32_t mpe = -1) {
     dpu_matmul_wait();
     if (!dpu_prepare(M, N, K, spatialX, mpe))
@@ -493,66 +609,91 @@ public:
       return;
     const std::uint32_t t0 = perf_ticks();
     dpuPend_->wait();
-    TL_NPU_COMPILER_BARRIER();   // the output's loads stay after the wait
+    TL_NPU_COMPILER_BARRIER(); // the output's loads stay after the wait
     dpuPend_ = nullptr;
     ringTicks_[kTickDpuWait] += perf_ticks() - t0;
     dpu_account();
   }
 
-  // out[M, N] = a[M, K] . (q * s)^T for packed int4 q [N, K] (two per byte, low nibble first) and fp16
-  // group scales s [N, K/G]: ONE mixed-mode DPU workload (fp16 activations x int4 weights read in place,
-  // no dequantisation) over the M x ng pseudo-rows a[m, g-th group] against C = N x ng output channels
-  // (channel g * N + n = row n's group g, through the weight table's per-channel offsets), then the SHAVE
-  // keeps the diagonal blocks and sums them with the scales (q_reduce). The DPU computes ng times the
-  // needed products, which at decode's M = 1 is free: the workload is bound by reading the weights.
-  // VPUX's merged FC; ported from npu_dsl's fused_rt.hpp matmul_qg / q_reduce (plan section 0 amendment).
-  // Scratch (part [M x ng, C] fp16, sT [ng, N] fp16) is allocated on first use at that call's size.
-  // `sStride` 0: s is row-major [N, ng] and the SHAVE transposes it while the DPU runs; > 0: s is group-major
-  // [ng, sStride] (the packer's layout) and is read in place -- the transpose cost ~70 ns per row when ng % 8
+  // out[M, N] = a[M, K] . (q * s)^T for packed int4 q [N, K] (two per byte, low
+  // nibble first) and fp16 group scales s [N, K/G]: ONE mixed-mode DPU workload
+  // (fp16 activations x int4 weights read in place, no dequantisation) over the
+  // M x ng pseudo-rows a[m, g-th group] against C = N x ng output channels
+  // (channel g * N + n = row n's group g, through the weight table's
+  // per-channel offsets), then the SHAVE keeps the diagonal blocks and sums
+  // them with the scales (q_reduce). The DPU computes ng times the needed
+  // products, which at decode's M = 1 is free: the workload is bound by reading
+  // the weights. VPUX's merged FC; ported from npu_dsl's fused_rt.hpp matmul_qg
+  // / q_reduce (plan section 0 amendment). Scratch (part [M x ng, C] fp16, sT
+  // [ng, N] fp16) is allocated on first use at that call's size. `sStride` 0: s
+  // is row-major [N, ng] and the SHAVE transposes it while the DPU runs; > 0: s
+  // is group-major [ng, sStride] (the packer's layout) and is read in place --
+  // the transpose cost ~70 ns per row when ng % 8
   // != 0 (scalar path), 210 us per SHAVE in the MoE's down GEMVs (M3).
-  void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride = 0, bool defer = false) {
+  void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q,
+                      const half *s, std::uint32_t M, std::uint32_t N,
+                      std::uint32_t K, std::uint32_t G,
+                      std::uint32_t sStride = 0, bool defer = false) {
     dpu_matmul_qg(out, a, q, s, M, N, K, G, 4, sStride, defer);
   }
-  // int8 weights (one signed byte per value, rows K bytes apart), the DPU's native mixed mode; PPE 1/256.
-  void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q, const half *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride = 0, bool defer = false) {
-    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), s, M, N, K, G, 8, sStride, defer);
+  // int8 weights (one signed byte per value, rows K bytes apart), the DPU's
+  // native mixed mode; PPE 1/256.
+  void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q,
+                      const half *s, std::uint32_t M, std::uint32_t N,
+                      std::uint32_t K, std::uint32_t G,
+                      std::uint32_t sStride = 0, bool defer = false) {
+    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), s, M, N, K,
+                  G, 8, sStride, defer);
   }
-  // The scales packed after the weight rows of the chunk (gemm_i4's scales_row): addressed as bytes.
-  void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const std::uint8_t *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride, bool defer = false) {
-    dpu_matmul_qg(out, a, q, reinterpret_cast<const half *>(s), M, N, K, G, 4, sStride, defer);
-  }
-  void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q, const std::int8_t *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride, bool defer = false) {
-    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), reinterpret_cast<const half *>(s), M, N, K, G, 8,
+  // The scales packed after the weight rows of the chunk (gemm_i4's
+  // scales_row): addressed as bytes.
+  void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q,
+                      const std::uint8_t *s, std::uint32_t M, std::uint32_t N,
+                      std::uint32_t K, std::uint32_t G, std::uint32_t sStride,
+                      bool defer = false) {
+    dpu_matmul_qg(out, a, q, reinterpret_cast<const half *>(s), M, N, K, G, 4,
                   sStride, defer);
   }
-  // `defer` (npu_dsl fused_rt's matmul_qg defer): the SHAVE reduction of this workload is left pending and run by the
-  // NEXT dpu_matmul_qg after it has kicked its own DPU workload, so the reduce overlaps that workload's DPU time. The
-  // scratch `part` is double-buffered for it; `qg_flush()` runs a pending reduction (before any read of `out`: the
-  // codegen emits it where the author's statements read the output, and the sync / finish paths call it).
+  void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q,
+                      const std::int8_t *s, std::uint32_t M, std::uint32_t N,
+                      std::uint32_t K, std::uint32_t G, std::uint32_t sStride,
+                      bool defer = false) {
+    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q),
+                  reinterpret_cast<const half *>(s), M, N, K, G, 8, sStride,
+                  defer);
+  }
+  // `defer` (npu_dsl fused_rt's matmul_qg defer): the SHAVE reduction of this
+  // workload is left pending and run by the NEXT dpu_matmul_qg after it has
+  // kicked its own DPU workload, so the reduce overlaps that workload's DPU
+  // time. The scratch `part` is double-buffered for it; `qg_flush()` runs a
+  // pending reduction (before any read of `out`: the codegen emits it where the
+  // author's statements read the output, and the sync / finish paths call it).
   TL_NPU_HW_CALL void qg_flush() {
-    dma_load_wait_impl(); // an asynchronous load is pending here for the same reason
-    dpu_matmul_wait();   // an asynchronous fp16 workload is pending here for the same reason
+    dma_load_wait_impl(); // an asynchronous load is pending here for the same
+                          // reason
+    dpu_matmul_wait(); // an asynchronous fp16 workload is pending here for the
+                       // same reason
     if (i4Pend_.out != nullptr) {
-      q_reduce(i4Pend_.out, i4Pend_.part, i4Pend_.sT, i4Pend_.sRow, i4Pend_.M, i4Pend_.N, i4Pend_.ng, i4Pend_.inv);
+      q_reduce(i4Pend_.out, i4Pend_.part, i4Pend_.sT, i4Pend_.sRow, i4Pend_.M,
+               i4Pend_.N, i4Pend_.ng, i4Pend_.inv);
       i4Pend_.out = nullptr;
     }
   }
-  // The merged-FC scratch (part [M x ng, C] fp16 -- two of them for the largest DEFERRED shape, whose pending
-  // reduction reads one while the DPU writes the other -- sT [ng, N] fp16, one descriptor set and
-  // weight table) for the
-  // largest quantised GEMV shape of the kernel: codegen emits the call from the kernel's gemm_i4/i8 ops, so the
-  // CMX budget is exact and the first workload pays no allocation; a larger later shape re-sizes (the old buffers
-  // are left behind, which is the case the up-front reservation avoids).
-  TL_NPU_HW_CALL void reserve_qg(std::uint32_t partElems, std::uint32_t stElems, std::uint32_t deferElems = 0) {
+  // The merged-FC scratch (part [M x ng, C] fp16 -- two of them for the largest
+  // DEFERRED shape, whose pending reduction reads one while the DPU writes the
+  // other -- sT [ng, N] fp16, one descriptor set and weight table) for the
+  // largest quantised GEMV shape of the kernel: codegen emits the call from the
+  // kernel's gemm_i4/i8 ops, so the CMX budget is exact and the first workload
+  // pays no allocation; a larger later shape re-sizes (the old buffers are left
+  // behind, which is the case the up-front reservation avoids).
+  TL_NPU_HW_CALL void reserve_qg(std::uint32_t partElems, std::uint32_t stElems,
+                                 std::uint32_t deferElems = 0) {
     if (!ok_)
       return;
     if (deferElems > i4DeferElems_)
       i4DeferElems_ = deferElems;
-    const std::uint32_t need = partElems > 2 * i4DeferElems_ ? partElems : 2 * i4DeferElems_;
+    const std::uint32_t need =
+        partElems > 2 * i4DeferElems_ ? partElems : 2 * i4DeferElems_;
     if (need > i4PartElems_) {
       i4PartElems_ = need;
       i4Part_ = alloc<half>(i4PartElems_);
@@ -569,9 +710,12 @@ public:
       i4Mm_ = new (i4Store_) DpuMatMul(env_.getDpuDrv(), i4Desc_, i4Wt_);
     }
   }
-  TL_NPU_HW_CALL void dpu_matmul_qg(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
-                     std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t bits, std::uint32_t sStride,
-                     bool defer = false) {
+  TL_NPU_HW_CALL void dpu_matmul_qg(half *out, const half *a,
+                                    const std::uint8_t *q, const half *s,
+                                    std::uint32_t M, std::uint32_t N,
+                                    std::uint32_t K, std::uint32_t G,
+                                    std::uint32_t bits, std::uint32_t sStride,
+                                    bool defer = false) {
     if (!ok_)
       return;
     const std::uint32_t ng = K / G, C = N * ng;
@@ -580,16 +724,23 @@ public:
       return;
     }
     const std::uint32_t partElems = M * ng * C;
-    if (i4Part_ == nullptr || partElems > i4PartElems_ || ng * N > i4STElems_ || (defer && partElems > i4DeferElems_))
+    if (i4Part_ == nullptr || partElems > i4PartElems_ || ng * N > i4STElems_ ||
+        (defer && partElems > i4DeferElems_))
       reserve_qg(partElems, ng * N, defer ? partElems : 0);
     if (!ok_)
       return;
     const float partScale = bits == 8 ? kI8PartScale : kI4PartScale;
-    const std::uint64_t key = (static_cast<std::uint64_t>(M) << 40) | (static_cast<std::uint64_t>(N) << 20) |
-                              (static_cast<std::uint64_t>(K) << 8) | ((G >> 4) << 1) | (bits == 8);
+    const std::uint64_t key = (static_cast<std::uint64_t>(M) << 40) |
+                              (static_cast<std::uint64_t>(N) << 20) |
+                              (static_cast<std::uint64_t>(K) << 8) |
+                              ((G >> 4) << 1) | (bits == 8);
     if (key != i4Key_) {
-      // weight table rows {byte offset of (row n, group g) in q, 0, PPE multiplier, 0}, channel g * N + n
-      union { float f; std::uint32_t u; } sc;
+      // weight table rows {byte offset of (row n, group g) in q, 0, PPE
+      // multiplier, 0}, channel g * N + n
+      union {
+        float f;
+        std::uint32_t u;
+      } sc;
       sc.f = partScale;
       const std::uint32_t rowB = K * bits / 8, grpB = G * bits / 8;
       for (std::uint32_t g = 0; g < ng; ++g)
@@ -600,7 +751,7 @@ public:
           w[2] = sc.u;
           w[3] = 0;
         }
-      i4Mm_->initMixedDescOnly(M * ng, C, G);   // sets the int8 weight mode
+      i4Mm_->initMixedDescOnly(M * ng, C, G); // sets the int8 weight mode
       if (bits == 4)
         i4Desc_->invariant.tensor_mode.tensor_mode_bf.wmode =
             static_cast<std::uint32_t>(npu40xx::VpuInputTensorDType::I4);
@@ -612,18 +763,24 @@ public:
     ++dpuStarts_;
     half *part = i4Part_;
     if (partElems <= i4DeferElems_) {
-      part += i4PartHalf_ ? i4DeferElems_ : 0;   // the half the pending reduction is not reading
+      part += i4PartHalf_ ? i4DeferElems_
+                          : 0; // the half the pending reduction is not reading
       i4PartHalf_ ^= 1u;
     } else {
-      qg_flush();   // a shape beyond the ping-pong halves takes the whole scratch
+      qg_flush(); // a shape beyond the ping-pong halves takes the whole scratch
     }
-    i4Mm_->startMixed(part, const_cast<half *>(a), reinterpret_cast<std::int8_t *>(const_cast<std::uint8_t *>(q)));
+    i4Mm_->startMixed(
+        part, const_cast<half *>(a),
+        reinterpret_cast<std::int8_t *>(const_cast<std::uint8_t *>(q)));
     TL_NPU_COMPILER_BARRIER();
-    qg_flush();   // the previous workload's deferred reduction, overlapping this one's DPU time
-    // s [N, ng] -> sT [ng, N] while the DPU runs: 8x8 vector transposes (npu_dsl's transpose_h) when the
-    // shape allows, a scalar loop otherwise (1024 strided scalar copies cost ~9 us at N=64, ng=16).
-    // Group-major s (sStride > 0) needs none of it. (Under defer, sT must stay valid until the next call: the
-    // packed group-major scales of a ring slot do, the transposed copy in i4ST_ would not, so defer needs sStride > 0.)
+    qg_flush(); // the previous workload's deferred reduction, overlapping this
+                // one's DPU time
+    // s [N, ng] -> sT [ng, N] while the DPU runs: 8x8 vector transposes
+    // (npu_dsl's transpose_h) when the shape allows, a scalar loop otherwise
+    // (1024 strided scalar copies cost ~9 us at N=64, ng=16). Group-major s
+    // (sStride > 0) needs none of it. (Under defer, sT must stay valid until
+    // the next call: the packed group-major scales of a ring slot do, the
+    // transposed copy in i4ST_ would not, so defer needs sStride > 0.)
     const half *sT = s;
     std::uint32_t sRow = sStride;
     if (sStride == 0) {
@@ -642,33 +799,64 @@ public:
     TL_NPU_COMPILER_BARRIER();
     const std::uint32_t t2 = perf_ticks();
     dpuCount_ += 1;
-    dpuIduTicks_ += static_cast<volatile const DpuMatMul::DescriptorsBuffer *>(i4Desc_)->hwpStats.idu_workload_duration;
-    dpuOduTicks_ += static_cast<volatile const DpuMatMul::DescriptorsBuffer *>(i4Desc_)->hwpStats.odu_workload_duration;
+    dpuIduTicks_ +=
+        static_cast<volatile const DpuMatMul::DescriptorsBuffer *>(i4Desc_)
+            ->hwpStats.idu_workload_duration;
+    dpuOduTicks_ +=
+        static_cast<volatile const DpuMatMul::DescriptorsBuffer *>(i4Desc_)
+            ->hwpStats.odu_workload_duration;
     if (defer)
       i4Pend_ = {out, part, sT, sRow, M, N, ng, 1.0f / partScale};
     else
       q_reduce(out, part, sT, sRow, M, N, ng, 1.0f / partScale);
     const std::uint32_t t3 = perf_ticks();
-    ringTicks_[kTickSubmit] += (t1 - t0) + (t3 - t2);   // SHAVE side: start + transpose, reduce
-    ringTicks_[kTickDpuWait] += t2 - t1;                // DPU time not hidden behind the transpose
+    ringTicks_[kTickSubmit] +=
+        (t1 - t0) + (t3 - t2); // SHAVE side: start + transpose, reduce
+    ringTicks_[kTickDpuWait] +=
+        t2 - t1; // DPU time not hidden behind the transpose
   }
 
-  // dst[cols, rows] = src[rows, cols]^T in 8x8 blocks of half8 shuffles (npu_dsl's fused_rt.hpp transpose_h);
-  // rows % 8 == 0 and cols % 8 == 0.
-  static void transpose_h(half *__restrict dst, const half *__restrict src, std::uint32_t rows, std::uint32_t cols) {
+  // dst[cols, rows] = src[rows, cols]^T in 8x8 blocks of half8 shuffles
+  // (npu_dsl's fused_rt.hpp transpose_h); rows % 8 == 0 and cols % 8 == 0.
+  static void transpose_h(half *__restrict dst, const half *__restrict src,
+                          std::uint32_t rows, std::uint32_t cols) {
     for (std::uint32_t r0 = 0; r0 < rows; r0 += 8)
       for (std::uint32_t c0 = 0; c0 < cols; c0 += 8) {
         half8 r[8];
         for (int i = 0; i < 8; ++i)
           r[i] = *reinterpret_cast<const half8 *>(src + (r0 + i) * cols + c0);
-        const half8 t0 = __builtin_shufflevector(r[0], r[1], 0, 8, 1, 9, 2, 10, 3, 11), t1 = __builtin_shufflevector(r[0], r[1], 4, 12, 5, 13, 6, 14, 7, 15);
-        const half8 t2 = __builtin_shufflevector(r[2], r[3], 0, 8, 1, 9, 2, 10, 3, 11), t3 = __builtin_shufflevector(r[2], r[3], 4, 12, 5, 13, 6, 14, 7, 15);
-        const half8 t4 = __builtin_shufflevector(r[4], r[5], 0, 8, 1, 9, 2, 10, 3, 11), t5 = __builtin_shufflevector(r[4], r[5], 4, 12, 5, 13, 6, 14, 7, 15);
-        const half8 t6 = __builtin_shufflevector(r[6], r[7], 0, 8, 1, 9, 2, 10, 3, 11), t7 = __builtin_shufflevector(r[6], r[7], 4, 12, 5, 13, 6, 14, 7, 15);
-        const half8 u0 = __builtin_shufflevector(t0, t2, 0, 1, 8, 9, 2, 3, 10, 11), u1 = __builtin_shufflevector(t0, t2, 4, 5, 12, 13, 6, 7, 14, 15);
-        const half8 u2 = __builtin_shufflevector(t1, t3, 0, 1, 8, 9, 2, 3, 10, 11), u3 = __builtin_shufflevector(t1, t3, 4, 5, 12, 13, 6, 7, 14, 15);
-        const half8 u4 = __builtin_shufflevector(t4, t6, 0, 1, 8, 9, 2, 3, 10, 11), u5 = __builtin_shufflevector(t4, t6, 4, 5, 12, 13, 6, 7, 14, 15);
-        const half8 u6 = __builtin_shufflevector(t5, t7, 0, 1, 8, 9, 2, 3, 10, 11), u7 = __builtin_shufflevector(t5, t7, 4, 5, 12, 13, 6, 7, 14, 15);
+        const half8 t0 = __builtin_shufflevector(r[0], r[1], 0, 8, 1, 9, 2, 10,
+                                                 3, 11),
+                    t1 = __builtin_shufflevector(r[0], r[1], 4, 12, 5, 13, 6,
+                                                 14, 7, 15);
+        const half8 t2 = __builtin_shufflevector(r[2], r[3], 0, 8, 1, 9, 2, 10,
+                                                 3, 11),
+                    t3 = __builtin_shufflevector(r[2], r[3], 4, 12, 5, 13, 6,
+                                                 14, 7, 15);
+        const half8 t4 = __builtin_shufflevector(r[4], r[5], 0, 8, 1, 9, 2, 10,
+                                                 3, 11),
+                    t5 = __builtin_shufflevector(r[4], r[5], 4, 12, 5, 13, 6,
+                                                 14, 7, 15);
+        const half8 t6 = __builtin_shufflevector(r[6], r[7], 0, 8, 1, 9, 2, 10,
+                                                 3, 11),
+                    t7 = __builtin_shufflevector(r[6], r[7], 4, 12, 5, 13, 6,
+                                                 14, 7, 15);
+        const half8 u0 = __builtin_shufflevector(t0, t2, 0, 1, 8, 9, 2, 3, 10,
+                                                 11),
+                    u1 = __builtin_shufflevector(t0, t2, 4, 5, 12, 13, 6, 7, 14,
+                                                 15);
+        const half8 u2 = __builtin_shufflevector(t1, t3, 0, 1, 8, 9, 2, 3, 10,
+                                                 11),
+                    u3 = __builtin_shufflevector(t1, t3, 4, 5, 12, 13, 6, 7, 14,
+                                                 15);
+        const half8 u4 = __builtin_shufflevector(t4, t6, 0, 1, 8, 9, 2, 3, 10,
+                                                 11),
+                    u5 = __builtin_shufflevector(t4, t6, 4, 5, 12, 13, 6, 7, 14,
+                                                 15);
+        const half8 u6 = __builtin_shufflevector(t5, t7, 0, 1, 8, 9, 2, 3, 10,
+                                                 11),
+                    u7 = __builtin_shufflevector(t5, t7, 4, 5, 12, 13, 6, 7, 14,
+                                                 15);
         half8 *d = reinterpret_cast<half8 *>(dst + c0 * rows + r0);
         const std::uint32_t st = rows / 8;
         d[0 * st] = __builtin_shufflevector(u0, u4, 0, 1, 2, 3, 8, 9, 10, 11);
@@ -682,11 +870,13 @@ public:
       }
   }
 
-  // out[m, n] = inv x sum_g sT[g, n] x part[(m, g), g * N + n] (sT rows `sRow` apart): four 16-column blocks
-  // at a time (independent accumulators; the sum order per output is fixed, so the result is deterministic).
-  // N % 16 == 0.
-  static void q_reduce(half *__restrict out, const half *__restrict part, const half *__restrict sT, std::uint32_t sRow,
-                       std::uint32_t M, std::uint32_t N, std::uint32_t ng, float inv) {
+  // out[m, n] = inv x sum_g sT[g, n] x part[(m, g), g * N + n] (sT rows `sRow`
+  // apart): four 16-column blocks at a time (independent accumulators; the sum
+  // order per output is fixed, so the result is deterministic). N % 16 == 0.
+  static void q_reduce(half *__restrict out, const half *__restrict part,
+                       const half *__restrict sT, std::uint32_t sRow,
+                       std::uint32_t M, std::uint32_t N, std::uint32_t ng,
+                       float inv) {
     const std::uint32_t C = N * ng;
     for (std::uint32_t m = 0; m < M; ++m) {
       std::uint32_t n0 = 0;
@@ -695,27 +885,45 @@ public:
         for (std::uint32_t g = 0; g < ng; ++g) {
           const half *p = part + (m * ng + g) * C + g * N + n0;
           const half *w = sT + g * sRow + n0;
-          a0 += __builtin_convertvector(*reinterpret_cast<const half16 *>(p), float16) *
-                __builtin_convertvector(*reinterpret_cast<const half16 *>(w), float16);
-          a1 += __builtin_convertvector(*reinterpret_cast<const half16 *>(p + 16), float16) *
-                __builtin_convertvector(*reinterpret_cast<const half16 *>(w + 16), float16);
-          a2 += __builtin_convertvector(*reinterpret_cast<const half16 *>(p + 32), float16) *
-                __builtin_convertvector(*reinterpret_cast<const half16 *>(w + 32), float16);
-          a3 += __builtin_convertvector(*reinterpret_cast<const half16 *>(p + 48), float16) *
-                __builtin_convertvector(*reinterpret_cast<const half16 *>(w + 48), float16);
+          a0 += __builtin_convertvector(*reinterpret_cast<const half16 *>(p),
+                                        float16) *
+                __builtin_convertvector(*reinterpret_cast<const half16 *>(w),
+                                        float16);
+          a1 += __builtin_convertvector(
+                    *reinterpret_cast<const half16 *>(p + 16), float16) *
+                __builtin_convertvector(
+                    *reinterpret_cast<const half16 *>(w + 16), float16);
+          a2 += __builtin_convertvector(
+                    *reinterpret_cast<const half16 *>(p + 32), float16) *
+                __builtin_convertvector(
+                    *reinterpret_cast<const half16 *>(w + 32), float16);
+          a3 += __builtin_convertvector(
+                    *reinterpret_cast<const half16 *>(p + 48), float16) *
+                __builtin_convertvector(
+                    *reinterpret_cast<const half16 *>(w + 48), float16);
         }
         half *o = out + m * N + n0;
-        *reinterpret_cast<half16 *>(o) = __builtin_convertvector(a0 * inv, half16);
-        *reinterpret_cast<half16 *>(o + 16) = __builtin_convertvector(a1 * inv, half16);
-        *reinterpret_cast<half16 *>(o + 32) = __builtin_convertvector(a2 * inv, half16);
-        *reinterpret_cast<half16 *>(o + 48) = __builtin_convertvector(a3 * inv, half16);
+        *reinterpret_cast<half16 *>(o) =
+            __builtin_convertvector(a0 * inv, half16);
+        *reinterpret_cast<half16 *>(o + 16) =
+            __builtin_convertvector(a1 * inv, half16);
+        *reinterpret_cast<half16 *>(o + 32) =
+            __builtin_convertvector(a2 * inv, half16);
+        *reinterpret_cast<half16 *>(o + 48) =
+            __builtin_convertvector(a3 * inv, half16);
       }
       for (; n0 < N; n0 += 16) {
         float16 acc = 0.f;
         for (std::uint32_t g = 0; g < ng; ++g)
-          acc += __builtin_convertvector(*reinterpret_cast<const half16 *>(part + (m * ng + g) * C + g * N + n0), float16) *
-                 __builtin_convertvector(*reinterpret_cast<const half16 *>(sT + g * sRow + n0), float16);
-        *reinterpret_cast<half16 *>(out + m * N + n0) = __builtin_convertvector(acc * inv, half16);
+          acc +=
+              __builtin_convertvector(*reinterpret_cast<const half16 *>(
+                                          part + (m * ng + g) * C + g * N + n0),
+                                      float16) *
+              __builtin_convertvector(
+                  *reinterpret_cast<const half16 *>(sT + g * sRow + n0),
+                  float16);
+        *reinterpret_cast<half16 *>(out + m * N + n0) =
+            __builtin_convertvector(acc * inv, half16);
       }
     }
   }
@@ -725,39 +933,48 @@ public:
   //
   // One operand streams through `slots` CMX slots shared by the tile's SHAVEs
   // (slots = depth x spt): chunk c is the work of SHAVE c % spt, whose use u of
-  // the ring lives in slot (c % spt) + spt * (u % depth). Tile 0's SHAVE s fills
-  // its slots for every tile with ONE multicast DMA each, split in two halves on
-  // ports 0 and 1. Per (slot, parity of u / depth) two hardware barriers: READY
-  // (the two halves produce, every tile's DPU workload consumes) and FREE (every
-  // tile's DPU workload produces, the issuer consumes before it refills). A fill
-  // is issued `depth` uses ahead and gated on the slot's previous occupant's FREE,
-  // so with depth > 1 the fill's fixed latency overlaps the DPU and SHAVE work of
-  // the uses in between (the flash phase: 0.2 us workloads behind 2.5 us fills).
-  // Barrier ids alternate by parity so a config is never more than one deep in
-  // the barrier FIFO and "consumer count != 0" means "this use's config is live";
-  // the ids of use u are re-armed by the fill of use u (after it consumed the
-  // FREE of use u - depth, the last consumer of those ids). The tile's SHAVEs
-  // submit to the one DPU FIFO in chunk order through CMX order words.
+  // the ring lives in slot (c % spt) + spt * (u % depth). Tile 0's SHAVE s
+  // fills its slots for every tile with ONE multicast DMA each, split in two
+  // halves on ports 0 and 1. Per (slot, parity of u / depth) two hardware
+  // barriers: READY (the two halves produce, every tile's DPU workload
+  // consumes) and FREE (every tile's DPU workload produces, the issuer consumes
+  // before it refills). A fill is issued `depth` uses ahead and gated on the
+  // slot's previous occupant's FREE, so with depth > 1 the fill's fixed latency
+  // overlaps the DPU and SHAVE work of the uses in between (the flash phase:
+  // 0.2 us workloads behind 2.5 us fills). Barrier ids alternate by parity so a
+  // config is never more than one deep in the barrier FIFO and "consumer count
+  // != 0" means "this use's config is live"; the ids of use u are re-armed by
+  // the fill of use u (after it consumed the FREE of use u - depth, the last
+  // consumer of those ids). The tile's SHAVEs submit to the one DPU FIFO in
+  // chunk order through CMX order words.
   struct Ring {
-    std::uint8_t *slotBase;   // shared: slots x slotBytes, same offset on every tile
+    std::uint8_t
+        *slotBase; // shared: slots x slotBytes, same offset on every tile
     std::uint32_t slotBytes;
     std::uint32_t slots;
-    std::uint32_t depth;      // slots / spt: this SHAVE's slots, fills in flight ahead
-    std::int32_t port;        // -1: each fill in two halves on ports 0 and 1; 0/1: whole fill on that port;
-                              // 2/3: whole fill on port (use & 1) / (use + 1) & 1, so a ring of depth 2 has one
-                              // fill in flight per port (the toolkit's chain takes one job per port per SHAVE: a
-                              // second start on a port waits for the first; M3's num_stages=4 arm spent 280 us there)
-    bool multicast;           // true: tile 0 fills every tile's slot; false: each tile fills its own (split stream)
-    bool local;               // split stream read by the SHAVE that fills it: no barriers (the fill's DMA
-                              // watermark is READY; program order is FREE), no cross-tile coupling
-    std::uint32_t total;      // chunks streamed in this ring
-    std::uint32_t myUses;     // chunks of this SHAVE
-    std::uint32_t readyBase;  // READY id = readyBase + slot * 2 + parity
-    std::uint32_t freeBase;   // FREE id  = freeBase  + slot * 2 + parity
+    std::uint32_t
+        depth; // slots / spt: this SHAVE's slots, fills in flight ahead
+    std::int32_t
+        port; // -1: each fill in two halves on ports 0 and 1; 0/1: whole fill
+              // on that port; 2/3: whole fill on port (use & 1) / (use + 1) &
+              // 1, so a ring of depth 2 has one fill in flight per port (the
+              // toolkit's chain takes one job per port per SHAVE: a second
+              // start on a port waits for the first; M3's num_stages=4 arm
+              // spent 280 us there)
+    bool multicast; // true: tile 0 fills every tile's slot; false: each tile
+                    // fills its own (split stream)
+    bool local;     // split stream read by the SHAVE that fills it: no barriers
+                // (the fill's DMA watermark is READY; program order is FREE),
+                // no cross-tile coupling
+    std::uint32_t total;           // chunks streamed in this ring
+    std::uint32_t myUses;          // chunks of this SHAVE
+    std::uint32_t readyBase;       // READY id = readyBase + slot * 2 + parity
+    std::uint32_t freeBase;        // FREE id  = freeBase  + slot * 2 + parity
     volatile std::uint32_t *order; // shared: one word per SHAVE, uses submitted
-    DmaDescriptor *fill;      // issuer's two half descriptors per owned slot
-    std::uint32_t armedUpTo;  // issuer: ids of uses < armedUpTo are configured
-    DpuMatMul::DescriptorsBuffer *desc[2]; // descriptor set of use u at u & 1 (submit-ahead is one use deep)
+    DmaDescriptor *fill;     // issuer's two half descriptors per owned slot
+    std::uint32_t armedUpTo; // issuer: ids of uses < armedUpTo are configured
+    DpuMatMul::DescriptorsBuffer *desc[2]; // descriptor set of use u at u & 1
+                                           // (submit-ahead is one use deep)
     bool armed;
   };
   enum : std::uint32_t {
@@ -769,7 +986,9 @@ public:
   std::uint32_t ring_slot_index(const Ring &r, std::uint32_t use) const {
     return shave_ + spt_ * (use % r.depth);
   }
-  std::uint32_t ring_parity(const Ring &r, std::uint32_t use) const { return (use / r.depth) & 1u; }
+  std::uint32_t ring_parity(const Ring &r, std::uint32_t use) const {
+    return (use / r.depth) & 1u;
+  }
   std::uint32_t ring_ready(const Ring &r, std::uint32_t use) const {
     return r.readyBase + ring_slot_index(r, use) * 2 + ring_parity(r, use);
   }
@@ -782,22 +1001,29 @@ public:
   template <class T> T *ring_slot(const Ring &r, std::uint32_t use) const {
     return reinterpret_cast<T *>(ring_slot(r, use));
   }
-  DmaDescriptor *ring_fill_desc(const Ring &r, std::uint32_t use) const { return r.fill + 2 * (use % r.depth); }
+  DmaDescriptor *ring_fill_desc(const Ring &r, std::uint32_t use) const {
+    return r.fill + 2 * (use % r.depth);
+  }
   std::uint32_t ring_fill_port(const Ring &r, std::uint32_t use) const {
-    return r.port >= 2 ? ((use + static_cast<std::uint32_t>(r.port)) & 1u) : static_cast<std::uint32_t>(r.port);
+    return r.port >= 2 ? ((use + static_cast<std::uint32_t>(r.port)) & 1u)
+                       : static_cast<std::uint32_t>(r.port);
   }
   std::uint32_t ring_uses(const Ring &r) const { return r.myUses; }
-  std::uint32_t ring_chunk(std::uint32_t use) const { return use * spt_ + shave_; }
+  std::uint32_t ring_chunk(std::uint32_t use) const {
+    return use * spt_ + shave_;
+  }
 
-  // `slotBase` is the compiler's shared buffer of slots x slotBytes (same address
-  // on every SHAVE of the tile, same offset on every tile). Allocates the order
-  // words (shared) and the issuer's fill descriptors; arms the ids of the first
-  // 2 x depth uses on tile 0 (every (slot, parity) once); one grid rendezvous so
-  // every config is live before any gate. `readyBase`/`freeBase` come from the
-  // compiler's barrier assignment (2 x slots ids each).
-  TL_NPU_HW_CALL Ring ring_begin(void *slotBase, std::uint32_t slotBytes, std::uint32_t slots, std::uint32_t total,
-                  std::uint32_t readyBase, std::uint32_t freeBase, std::int32_t port = -1, bool multicast = true,
-                  bool local = false) {
+  // `slotBase` is the compiler's shared buffer of slots x slotBytes (same
+  // address on every SHAVE of the tile, same offset on every tile). Allocates
+  // the order words (shared) and the issuer's fill descriptors; arms the ids of
+  // the first 2 x depth uses on tile 0 (every (slot, parity) once); one grid
+  // rendezvous so every config is live before any gate. `readyBase`/`freeBase`
+  // come from the compiler's barrier assignment (2 x slots ids each).
+  TL_NPU_HW_CALL Ring ring_begin(void *slotBase, std::uint32_t slotBytes,
+                                 std::uint32_t slots, std::uint32_t total,
+                                 std::uint32_t readyBase,
+                                 std::uint32_t freeBase, std::int32_t port = -1,
+                                 bool multicast = true, bool local = false) {
     Ring r{};
     r.slotBase = static_cast<std::uint8_t *>(slotBase);
     r.slotBytes = slotBytes;
@@ -823,8 +1049,9 @@ public:
       fail(kStatusRingRefused, kRingSlotsNeShaves);
       return r;
     }
-    // Control memory from the root pool (npu_dsl's static form): a scope-allocated descriptor is released
-    // and overwritten by the next phase's buffers while the link agent may still reference it.
+    // Control memory from the root pool (npu_dsl's static form): a
+    // scope-allocated descriptor is released and overwritten by the next
+    // phase's buffers while the link agent may still reference it.
     const std::uint32_t slot = ringSeq_++ % kRingPool;
     r.order = ringOrder_ + 16 * slot;
     r.fill = ringFill_ + 2 * kRingMaxDepth * slot;
@@ -839,7 +1066,7 @@ public:
       flushCmxWrites();
     }
     if (local) {
-      r.armed = ok_;   // no ids to configure, no rendezvous
+      r.armed = ok_; // no ids to configure, no rendezvous
       return r;
     }
     if (tile_ == 0) {
@@ -847,7 +1074,8 @@ public:
         ring_config(r, u);
       r.armedUpTo = 2 * r.depth < r.myUses ? 2 * r.depth : r.myUses;
       for (std::uint32_t u = 0; u < r.armedUpTo; ++u)
-        if (!barrier_check_live(ring_ready(r, u), 0, ring_consumers(r)) || !barrier_check_live(ring_free(r, u), 0, ring_free_consumers(r)))
+        if (!barrier_check_live(ring_ready(r, u), 0, ring_consumers(r)) ||
+            !barrier_check_live(ring_free(r, u), 0, ring_free_consumers(r)))
           return r;
     }
     sync_grid();
@@ -855,34 +1083,47 @@ public:
     return r;
   }
 
-  // Barrier counts. Multicast: one issuer's fill (1 or 2 halves) produces READY, every tile's
-  // reader consumes; every tile's reader produces FREE, the issuer consumes. Split stream: the
-  // ids are still shared by the tiles, so every tile's fill produces READY and every tile's
-  // issuer consumes FREE (the counts scale by the tile count; a tile waits for its peers' fills).
+  // Barrier counts. Multicast: one issuer's fill (1 or 2 halves) produces
+  // READY, every tile's reader consumes; every tile's reader produces FREE, the
+  // issuer consumes. Split stream: the ids are still shared by the tiles, so
+  // every tile's fill produces READY and every tile's issuer consumes FREE (the
+  // counts scale by the tile count; a tile waits for its peers' fills).
   std::uint8_t ring_ready_producers(const Ring &r) const {
-    return static_cast<std::uint8_t>((r.port < 0 ? 2 : 1) * (r.multicast ? 1 : tiles_));
+    return static_cast<std::uint8_t>((r.port < 0 ? 2 : 1) *
+                                     (r.multicast ? 1 : tiles_));
   }
-  std::uint8_t ring_consumers(const Ring &) const { return static_cast<std::uint8_t>(tiles_); }
-  std::uint8_t ring_free_consumers(const Ring &r) const { return static_cast<std::uint8_t>(r.multicast ? 1 : tiles_); }
+  std::uint8_t ring_consumers(const Ring &) const {
+    return static_cast<std::uint8_t>(tiles_);
+  }
+  std::uint8_t ring_free_consumers(const Ring &r) const {
+    return static_cast<std::uint8_t>(r.multicast ? 1 : tiles_);
+  }
   void ring_config(const Ring &r, std::uint32_t use) {
-    // Barrier safety is the runtime's job (hw_barriers.md: the hardware does not check that an id's previous
-    // config has retired before a new one is pushed). A push behind a live config queues in the id's FIFO and
-    // a produce / consume in that window hits the OLD config; so the push waits until the id reads (0, 0):
-    // nothing live, nothing queued (a queued config goes live the moment the previous one retires).
-    // Reached across tiles: a split ring's FREE(use - 2 depth) is consumed by EVERY tile's fill(use - depth),
-    // and tile 0 (the armer) cannot know its peers got there; a ring re-begun on ids a previous ring used
-    // (a layer loop) likewise.
-    if (!barrier_wait_retired(ring_ready(r, use)) || !barrier_wait_retired(ring_free(r, use)))
+    // Barrier safety is the runtime's job (hw_barriers.md: the hardware does
+    // not check that an id's previous config has retired before a new one is
+    // pushed). A push behind a live config queues in the id's FIFO and a
+    // produce / consume in that window hits the OLD config; so the push waits
+    // until the id reads (0, 0): nothing live, nothing queued (a queued config
+    // goes live the moment the previous one retires). Reached across tiles: a
+    // split ring's FREE(use - 2 depth) is consumed by EVERY tile's fill(use -
+    // depth), and tile 0 (the armer) cannot know its peers got there; a ring
+    // re-begun on ids a previous ring used (a layer loop) likewise.
+    if (!barrier_wait_retired(ring_ready(r, use)) ||
+        !barrier_wait_retired(ring_free(r, use)))
       return;
-    barrier_config(ring_ready(r, use), ring_ready_producers(r), ring_consumers(r), false);
-    barrier_config(ring_free(r, use), ring_consumers(r), ring_free_consumers(r), false);
+    barrier_config(ring_ready(r, use), ring_ready_producers(r),
+                   ring_consumers(r), false);
+    barrier_config(ring_free(r, use), ring_consumers(r), ring_free_consumers(r),
+                   false);
   }
-  bool ring_issuer(const Ring &r) const { return r.multicast ? tile_ == 0 : true; }
+  bool ring_issuer(const Ring &r) const {
+    return r.multicast ? tile_ == 0 : true;
+  }
 
-  // Issuer: configure the ids of `use` once, at whichever of its fill or its submit
-  // comes first. Valid because ids(use) == ids(use - 2 depth), whose READY every DPU
-  // consumed and whose FREE the fill of use - depth consumed, and that fill precedes
-  // both callers in every lowered program.
+  // Issuer: configure the ids of `use` once, at whichever of its fill or its
+  // submit comes first. Valid because ids(use) == ids(use - 2 depth), whose
+  // READY every DPU consumed and whose FREE the fill of use - depth consumed,
+  // and that fill precedes both callers in every lowered program.
   void ring_arm(Ring &r, std::uint32_t use) {
     if (tile_ != 0 || use < r.armedUpTo || use >= r.myUses)
       return;
@@ -891,16 +1132,18 @@ public:
     r.armedUpTo = use + 1;
   }
 
-  // Issuer (tile 0, SHAVE s): fill the slot of my `use` with chunk `use * spt + s`
-  // from `src` (`rows` rows of `width` bytes, `srcStride` bytes apart in DDR;
-  // contiguous in the slot), two halves on ports 0 and 1, both producing
-  // READY[use]. The halves split the rows (the bytes when there is one row). For
-  // use >= depth it first waits until every tile's DPU has produced FREE[use - depth]
-  // (the slot's previous occupant), then re-arms this use's ids when they were used
-  // before (use >= 2 x depth).
-  TL_NPU_HW_CALL void ring_fill(Ring &r, std::uint32_t use, std::uint64_t src, std::uint32_t width,
-                 std::uint32_t rows, std::uint32_t srcStride) {
-    qg_flush();   // the fill may overwrite the slot whose scales a deferred reduction reads
+  // Issuer (tile 0, SHAVE s): fill the slot of my `use` with chunk `use * spt +
+  // s` from `src` (`rows` rows of `width` bytes, `srcStride` bytes apart in
+  // DDR; contiguous in the slot), two halves on ports 0 and 1, both producing
+  // READY[use]. The halves split the rows (the bytes when there is one row).
+  // For use >= depth it first waits until every tile's DPU has produced
+  // FREE[use - depth] (the slot's previous occupant), then re-arms this use's
+  // ids when they were used before (use >= 2 x depth).
+  TL_NPU_HW_CALL void ring_fill(Ring &r, std::uint32_t use, std::uint64_t src,
+                                std::uint32_t width, std::uint32_t rows,
+                                std::uint32_t srcStride) {
+    qg_flush(); // the fill may overwrite the slot whose scales a deferred
+                // reduction reads
     if (!ok_ || !ring_issuer(r) || use >= r.myUses)
       return;
     DmaDescriptor *d = ring_fill_desc(r, use);
@@ -912,7 +1155,8 @@ public:
           return;
         barrier_consume(freeId);
       }
-      // The previous halves have completed (READY lifted); the chains still need the wait.
+      // The previous halves have completed (READY lifted); the chains still
+      // need the wait.
       if (!dma_wait(d, 1) || (r.port < 0 && !dma_wait(d + 1, 2)))
         return;
     }
@@ -921,14 +1165,16 @@ public:
     task_add(kTaskRingWait, t0, t1);
     if (!r.local) {
       ring_arm(r, use);
-      // A split stream's issuer on another tile produces on ids tile 0 arms: wait for the config.
+      // A split stream's issuer on another tile produces on ids tile 0 arms:
+      // wait for the config.
       if (!r.multicast && tile_ != 0 && !barrier_wait_live(ring_ready(r, use)))
         return;
     }
-    // One descriptor of this SHAVE in flight per port: a second start while another
-    // ring's fill is still running on the port left one half unproduced (flash phase,
-    // two rings; READY stuck at p=1). Before initDesc below: it clears the watermark
-    // this wait reads when the previous descriptor is this ring's own.
+    // One descriptor of this SHAVE in flight per port: a second start while
+    // another ring's fill is still running on the port left one half unproduced
+    // (flash phase, two rings; READY stuck at p=1). Before initDesc below: it
+    // clears the watermark this wait reads when the previous descriptor is this
+    // ring's own.
     if (r.port < 0) {
       port_retire(0);
       port_retire(1);
@@ -939,14 +1185,17 @@ public:
       return;
     const std::uint32_t mask = (1u << tiles_) - 1u;
     std::uint8_t *dst0 = ring_slot(r, use);
-    // multicast: the CMX address that writes every tile's copy; split: this tile's own slot
+    // multicast: the CMX address that writes every tile's copy; split: this
+    // tile's own slot
     auto cmx = [&](std::uint8_t *p) {
-      return reinterpret_cast<std::uint32_t>(r.multicast ? convertToCmxMulticastAddr(p, mask) : p);
+      return reinterpret_cast<std::uint32_t>(
+          r.multicast ? convertToCmxMulticastAddr(p, mask) : p);
     };
     const std::uint32_t ready = r.local ? 0 : ring_ready(r, use);
     DmaDrv::initDesc(d);
     if (r.port >= 0) {
-      // whole fill, one descriptor on this ring's port (several streams share the two ports)
+      // whole fill, one descriptor on this ring's port (several streams share
+      // the two ports)
       const std::uint32_t port = ring_fill_port(r, use);
       config_copy(d, cmx(dst0), src, width, rows, width, srcStride);
       if (!r.local)
@@ -959,7 +1208,9 @@ public:
       lastOnPort_[port] = d;
       const std::uint32_t t3 = perf_ticks();
       if (r.local)
-        ringTicks_[kTickOrder] += t3 - t2;   // local rings have no order wait: the counter holds the toolkit start (chain spin + kick)
+        ringTicks_[kTickOrder] +=
+            t3 - t2; // local rings have no order wait: the counter holds the
+                     // toolkit start (chain spin + kick)
       ringTicks_[kTickFillIssue] += t3 - t1;
       task_add(kTaskRing, t1, t3);
       return;
@@ -972,7 +1223,8 @@ public:
     } else {
       const std::uint32_t rows0 = rows / 2;
       config_copy(d, cmx(dst0), src, width, rows0, width, srcStride);
-      config_copy(d + 1, cmx(dst0 + rows0 * width), src + static_cast<std::uint64_t>(rows0) * srcStride, width,
+      config_copy(d + 1, cmx(dst0 + rows0 * width),
+                  src + static_cast<std::uint64_t>(rows0) * srcStride, width,
                   rows - rows0, width, srcStride);
     }
     if (!r.local) {
@@ -994,22 +1246,25 @@ public:
     }
   }
   template <class T>
-  void ring_fill(Ring &r, std::uint32_t use, Ddr<T> src, std::uint32_t width, std::uint32_t rows,
-                 std::uint32_t srcStride) {
+  void ring_fill(Ring &r, std::uint32_t use, Ddr<T> src, std::uint32_t width,
+                 std::uint32_t rows, std::uint32_t srcStride) {
     ring_fill(r, use, src.addr, width, rows, srcStride);
   }
 
   // Every SHAVE: submit the DPU workload of my `use`, gated on READY[use] (in
   // hardware, so it may be queued before the chunk has landed) and producing
-  // FREE[use], in chunk order after the other SHAVE's previous chunk. The caller
-  // may submit use u+1 right after use u completes (submit-ahead, README 6c fact
-  // 3), before its FREE wait, fill kick and store, so the DPU FIFO never drains
-  // while a SHAVE does its own work; that needs the output buffer double-buffered
-  // by use parity. The ids of a use are armed by ring_arm at its fill or its
-  // submit, whichever the program reaches first.
-  TL_NPU_HW_CALL void ring_dpu_submit(Ring &r, std::uint32_t use, half *out, const half *a, const half *bt,
-                       std::uint32_t M, std::uint32_t N, std::uint32_t K,
-                       std::uint32_t spatialX = 0, std::int32_t mpe = -1) {
+  // FREE[use], in chunk order after the other SHAVE's previous chunk. The
+  // caller may submit use u+1 right after use u completes (submit-ahead, README
+  // 6c fact 3), before its FREE wait, fill kick and store, so the DPU FIFO
+  // never drains while a SHAVE does its own work; that needs the output buffer
+  // double-buffered by use parity. The ids of a use are armed by ring_arm at
+  // its fill or its submit, whichever the program reaches first.
+  TL_NPU_HW_CALL void ring_dpu_submit(Ring &r, std::uint32_t use, half *out,
+                                      const half *a, const half *bt,
+                                      std::uint32_t M, std::uint32_t N,
+                                      std::uint32_t K,
+                                      std::uint32_t spatialX = 0,
+                                      std::int32_t mpe = -1) {
     if (!ok_ || !r.armed || use >= r.myUses)
       return;
     ring_arm(r, use);
@@ -1020,8 +1275,8 @@ public:
     std::uint32_t t1 = perf_ticks();
     ringTicks_[kTickLive] += t1 - t0;
     task_add(kTaskRingWait, t0, t1);
-    // Submission order P0(u), P1(u), P0(u+1), ...: SHAVE 0 needs SHAVE 1 at `use`
-    // submissions, SHAVE 1 needs SHAVE 0 at `use + 1`.
+    // Submission order P0(u), P1(u), P0(u+1), ...: SHAVE 0 needs SHAVE 1 at
+    // `use` submissions, SHAVE 1 needs SHAVE 0 at `use + 1`.
     const std::uint32_t prev = (shave_ + spt_ - 1) % spt_;
     if (!order_wait(r.order + prev, shave_ == 0 ? use : use + 1))
       return;
@@ -1039,8 +1294,9 @@ public:
     flushCmxWrites();
     ringTicks_[kTickSubmit] += perf_ticks() - t0;
   }
-  // A slot read by the SHAVE instead of the DPU (a dequant, a norm): the SHAVE is the
-  // READY consumer and the FREE producer, one per tile per slot, so the same counts hold.
+  // A slot read by the SHAVE instead of the DPU (a dequant, a norm): the SHAVE
+  // is the READY consumer and the FREE producer, one per tile per slot, so the
+  // same counts hold.
   TL_NPU_HW_CALL void ring_slot_acquire(Ring &r, std::uint32_t use) {
     if (!ok_ || !r.armed || use >= r.myUses)
       return;
@@ -1057,9 +1313,10 @@ public:
         return;
       barrier_consume(ready);
     }
-    TL_NPU_COMPILER_BARRIER();   // the slot's loads stay after the wait
-    // the acquire wait (the fill landing) is counted with the submit path's barrier-live wait (counter 0), apart
-    // from the DPU wait (counter 3), so a SHAVE-read ring's DMA and DPU waits are told apart in the status words
+    TL_NPU_COMPILER_BARRIER(); // the slot's loads stay after the wait
+    // the acquire wait (the fill landing) is counted with the submit path's
+    // barrier-live wait (counter 0), apart from the DPU wait (counter 3), so a
+    // SHAVE-read ring's DMA and DPU waits are told apart in the status words
     {
       const std::uint32_t tt = perf_ticks();
       ringTicks_[kTickLive] += tt - t0;
@@ -1067,25 +1324,27 @@ public:
     }
   }
   TL_NPU_HW_CALL void ring_slot_release(Ring &r, std::uint32_t use) {
-    qg_flush();   // a deferred reduction may read the slot's scales
+    qg_flush(); // a deferred reduction may read the slot's scales
     if (!ok_ || !r.armed || use >= r.myUses || r.local)
       return;
-    TL_NPU_COMPILER_BARRIER();   // the slot's last reads stay before the release
+    TL_NPU_COMPILER_BARRIER(); // the slot's last reads stay before the release
     barrier_produce(ring_free(r, use));
   }
 
   TL_NPU_HW_CALL void ring_dpu_wait(Ring &r, std::uint32_t use) {
     if (!ok_ || !r.armed || use >= r.myUses)
       return;
-    // The driver's wait spins forever on a workload whose READY gate never opens; the
-    // same watermark (DpuDrvBase::wait) with a bound, so a stuck gate is a report.
+    // The driver's wait spins forever on a workload whose READY gate never
+    // opens; the same watermark (DpuDrvBase::wait) with a bound, so a stuck
+    // gate is a report.
     DpuMatMul::DescriptorsBuffer *desc = r.desc[use & 1u];
     volatile const std::uint16_t *watermark = &desc->hwpStats.odu_workload_id;
-    const std::uint16_t expected = desc->variant.hwp_wload_id.hwp_wload_id_bf.wload_id;
+    const std::uint16_t expected =
+        desc->variant.hwp_wload_id.hwp_wload_id_bf.wload_id;
     const std::uint32_t t0 = perf_ticks();
     for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
       if (*watermark == expected) {
-        TL_NPU_COMPILER_BARRIER();   // the output's loads stay after the wait
+        TL_NPU_COMPILER_BARRIER(); // the output's loads stay after the wait
         ringTicks_[kTickDpuWait] += perf_ticks() - t0;
         dpu_account(desc);
         return;
@@ -1096,14 +1355,17 @@ public:
     std::uint8_t rp = 0, rc = 0, fp = 0, fc = 0;
     hw::nce::barriers::hgl::getCounters(ring_ready(r, use), &rp, &rc);
     hw::nce::barriers::hgl::getCounters(ring_free(r, use), &fp, &fc);
-    detail_ = (ring_ready(r, use) << 24) | (static_cast<std::uint32_t>(use & 0xff) << 16) |
-              (static_cast<std::uint32_t>(rp & 0xf) << 12) | (static_cast<std::uint32_t>(rc & 0xf) << 8) |
-              (static_cast<std::uint32_t>(fp & 0xf) << 4) | static_cast<std::uint32_t>(fc & 0xf);
+    detail_ = (ring_ready(r, use) << 24) |
+              (static_cast<std::uint32_t>(use & 0xff) << 16) |
+              (static_cast<std::uint32_t>(rp & 0xf) << 12) |
+              (static_cast<std::uint32_t>(rc & 0xf) << 8) |
+              (static_cast<std::uint32_t>(fp & 0xf) << 4) |
+              static_cast<std::uint32_t>(fc & 0xf);
   }
 
-  // Issuer: the last fills must be retired on their chains before the kernel ends,
-  // and the last FREE of every owned slot consumed so every id is quiescent (a
-  // later ring may reuse the ids).
+  // Issuer: the last fills must be retired on their chains before the kernel
+  // ends, and the last FREE of every owned slot consumed so every id is
+  // quiescent (a later ring may reuse the ids).
   TL_NPU_HW_CALL void ring_end(Ring &r) {
     if (!ok_ || !ring_issuer(r) || r.myUses == 0)
       return;
@@ -1153,28 +1415,30 @@ public:
     TL_NPU_PROF_BAR();
   }
 
-  // Hardware barrier primitives (NCE barrier registers; ids from the job's pool).
-  // Every wait is bounded: a barrier that never goes live or never drains
-  // reports kStatusBarrierNotLive / kStatusBarrierTimeout with the id and the
-  // kernel returns, instead of hanging the launch. The bound is far above any
-  // legitimate wait (a grid barrier completes in a few microseconds).
+  // Hardware barrier primitives (NCE barrier registers; ids from the job's
+  // pool). Every wait is bounded: a barrier that never goes live or never
+  // drains reports kStatusBarrierNotLive / kStatusBarrierTimeout with the id
+  // and the kernel returns, instead of hanging the launch. The bound is far
+  // above any legitimate wait (a grid barrier completes in a few microseconds).
   static constexpr std::uint32_t kBarrierSpinLimit = 50u * 1000u * 1000u;
-  // A pushed config goes live within microseconds; this bound is a few hundred ms.
+  // A pushed config goes live within microseconds; this bound is a few hundred
+  // ms.
   static constexpr std::uint32_t kConfigSpinLimit = 2u * 1000u * 1000u;
 
-  bool barrier_config(std::uint32_t id, std::uint8_t producers, std::uint8_t consumers,
-                      bool waitLive) {
+  bool barrier_config(std::uint32_t id, std::uint8_t producers,
+                      std::uint8_t consumers, bool waitLive) {
     hw::nce::barriers::hgl::pushCounters(id, producers, consumers);
     if (!waitLive)
       return true;
     return barrier_check_live(id, producers, consumers);
   }
-  // True once the barrier's config is live. Only the consumer side is checked: a
-  // dead barrier reads (0, 0), while a fast peer may already have PRODUCED on a
-  // live one before a slow peer looks (seen under profiling skew: an exact
+  // True once the barrier's config is live. Only the consumer side is checked:
+  // a dead barrier reads (0, 0), while a fast peer may already have PRODUCED on
+  // a live one before a slow peer looks (seen under profiling skew: an exact
   // (p, c) check spun out and reported NOT_LIVE on a healthy barrier). Nobody
   // consumes before every producer has arrived, so c stays at its armed value.
-  bool barrier_check_live(std::uint32_t id, std::uint8_t /*producers*/, std::uint8_t consumers) {
+  bool barrier_check_live(std::uint32_t id, std::uint8_t /*producers*/,
+                          std::uint8_t consumers) {
     std::uint8_t p = 0, c = 0;
     for (std::uint32_t spins = 0; spins < kConfigSpinLimit; ++spins) {
       hw::nce::barriers::hgl::getCounters(id, &p, &c);
@@ -1184,10 +1448,15 @@ public:
     fail(kStatusBarrierNotLive, id);
     return false;
   }
-  static void barrier_produce(std::uint32_t id) { hw::nce::barriers::hgl::produceBarrier(id); }
-  static void barrier_consume(std::uint32_t id) { hw::nce::barriers::hgl::consumeBarrier(id); }
-  // Wait until every producer has arrived (producer count reaches zero). A barrier
-  // whose config is not live reads (0, 0) and would pass: callers arm with waitLive.
+  static void barrier_produce(std::uint32_t id) {
+    hw::nce::barriers::hgl::produceBarrier(id);
+  }
+  static void barrier_consume(std::uint32_t id) {
+    hw::nce::barriers::hgl::consumeBarrier(id);
+  }
+  // Wait until every producer has arrived (producer count reaches zero). A
+  // barrier whose config is not live reads (0, 0) and would pass: callers arm
+  // with waitLive.
   bool barrier_wait_produced(std::uint32_t id) {
     std::uint8_t p = 1, c = 0;
     for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
@@ -1208,7 +1477,8 @@ public:
     fail(kStatusBarrierTimeout, id);
     return false;
   }
-  // Both counts zero: the previous config retired and nothing is queued (see ring_config).
+  // Both counts zero: the previous config retired and nothing is queued (see
+  // ring_config).
   bool barrier_wait_retired(std::uint32_t id) {
     std::uint8_t p = 1, c = 1;
     for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
@@ -1220,8 +1490,8 @@ public:
     return false;
   }
   // A config is live once its consumer count is non-zero (a dead barrier reads
-  // (0, 0)); the exact counts are not checked because producers may already have
-  // arrived.
+  // (0, 0)); the exact counts are not checked because producers may already
+  // have arrived.
   bool barrier_wait_live(std::uint32_t id) {
     std::uint8_t p = 0, c = 0;
     for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
@@ -1233,19 +1503,23 @@ public:
     return false;
   }
 
-  // Writes the per-SHAVE status record (64 B): {code, detail, cmx_free_at_entry, cmx_used,
-  // dpu_workloads, dpu_idu_ticks, dpu_odu_ticks, 0, t_entry, t_finish, extra[0..5]}. The stamps
-  // are the NCE_TIME free-running counter (19.2 MHz perf clock on this box): the host takes
-  // max(t_finish) - min(t_entry) over the SHAVEs as the kernel-only time. `extra` is a probe's.
+  // Writes the per-SHAVE status record (64 B): {code, detail,
+  // cmx_free_at_entry, cmx_used, dpu_workloads, dpu_idu_ticks, dpu_odu_ticks,
+  // 0, t_entry, t_finish, extra[0..5]}. The stamps are the NCE_TIME
+  // free-running counter (19.2 MHz perf clock on this box): the host takes
+  // max(t_finish) - min(t_entry) over the SHAVEs as the kernel-only time.
+  // `extra` is a probe's.
   static constexpr std::uint32_t kStatusBytes = 64;
-  TL_NPU_HW_CALL void finish(const std::uint32_t *extra = nullptr, std::uint32_t nExtra = 0) {
+  TL_NPU_HW_CALL void finish(const std::uint32_t *extra = nullptr,
+                             std::uint32_t nExtra = 0) {
     qg_flush();
     task_flush();
     if (statusAddr_ == 0)
       return;
-    const std::uint64_t a = statusAddr_ + static_cast<std::uint64_t>(kStatusBytes) * worker();
-    DdrAccessor<std::uint32_t> s0(a), s1(a + 4), s2(a + 8), s3(a + 12), s4(a + 16), s5(a + 20),
-        s6(a + 24), s7(a + 28), s8(a + 32), s9(a + 36);
+    const std::uint64_t a =
+        statusAddr_ + static_cast<std::uint64_t>(kStatusBytes) * worker();
+    DdrAccessor<std::uint32_t> s0(a), s1(a + 4), s2(a + 8), s3(a + 12),
+        s4(a + 16), s5(a + 20), s6(a + 24), s7(a + 28), s8(a + 32), s9(a + 36);
     s0 = ok_ ? kStatusOk : code_;
     s1 = detail_;
     s2 = cmxFree0_;
@@ -1253,11 +1527,13 @@ public:
     s4 = dpuCount_;
     s5 = dpuIduTicks_;
     s6 = dpuOduTicks_;
-    s7 = dpuStarts_;   // DPU workloads started; s4 counts the ones waited for (equal unless one was orphaned)
+    s7 = dpuStarts_; // DPU workloads started; s4 counts the ones waited for
+                     // (equal unless one was orphaned)
     s8 = tStart_;
     s9 = perf_ticks();
     if (extra == nullptr) {
-      extra = ringTicks_;   // ring phase counters: live-wait, order-wait, submit, dpu-wait, free-wait, fill-issue
+      extra = ringTicks_; // ring phase counters: live-wait, order-wait, submit,
+                          // dpu-wait, free-wait, fill-issue
       nExtra = 6;
     }
     for (std::uint32_t i = 0; i < nExtra && i < 6; ++i) {
@@ -1267,38 +1543,60 @@ public:
     sync::memoryFence();
   }
 
-  // Hardware descriptors for a hand-written probe (the ring and the DMA/DPU paths use their own).
-  template <class T> T *alloc_descriptors(std::uint32_t count) { return alloc_hw<T>(count); }
+  // Hardware descriptors for a hand-written probe (the ring and the DMA/DPU
+  // paths use their own).
+  template <class T> T *alloc_descriptors(std::uint32_t count) {
+    return alloc_hw<T>(count);
+  }
 
-  // --- per-task records (VPUX's arrangement: guides/how_to_use_profiling.md) ---------------------------
-  // One 16-byte record per TASK -- every DMA, DPU workload, barrier and phase -- written straight to a DDR
-  // area and decoded offline into Trace Event Format. Per-task is what gives DMA, DPU and SHAVE their own
-  // REAL tracks with real start and end, which a per-phase sum cannot: VPUX instruments dma / dpu / sw as
-  // three independent paths for exactly this reason.
+  // --- per-task records (VPUX's arrangement: guides/how_to_use_profiling.md)
+  // --------------------------- One 16-byte record per TASK -- every DMA, DPU
+  // workload, barrier and phase -- written straight to a DDR area and decoded
+  // offline into Trace Event Format. Per-task is what gives DMA, DPU and SHAVE
+  // their own REAL tracks with real start and end, which a per-phase sum
+  // cannot: VPUX instruments dma / dpu / sw as three independent paths for
+  // exactly this reason.
   //
-  // On NPU50xx every timestamp comes from one fixed-frequency counter, so unlike NPU37xx/40xx no cross-engine
-  // clock calibration is needed (the guide's "Timestamp collection and synchronization").
+  // On NPU50xx every timestamp comes from one fixed-frequency counter, so
+  // unlike NPU37xx/40xx no cross-engine clock calibration is needed (the
+  // guide's "Timestamp collection and synchronization").
   //
-  // Record: {t0, t1, kind, phase}. `dropped` is counted and reported -- a truncated capture must be loud, which
-  // is the one thing the toolkit's 1984-entry profiler gets wrong (it drops with a bare return).
-  // Area: statusAddr + kStatusReserve + worker * kTaskBytes; header word 0 = records written, 1 = dropped.
-  enum : std::uint32_t { kTaskDmaLoad = 0, kTaskDmaStore = 1, kTaskRing = 2, kTaskDpu = 3, kTaskBarrier = 4,
-                         kTaskPhase = 5, kTaskRingWait = 6, kTaskShave = 7 };
+  // Record: {t0, t1, kind, phase}. `dropped` is counted and reported -- a
+  // truncated capture must be loud, which is the one thing the toolkit's
+  // 1984-entry profiler gets wrong (it drops with a bare return). Area:
+  // statusAddr + kStatusReserve + worker * kTaskBytes; header word 0 = records
+  // written, 1 = dropped.
+  enum : std::uint32_t {
+    kTaskDmaLoad = 0,
+    kTaskDmaStore = 1,
+    kTaskRing = 2,
+    kTaskDpu = 3,
+    kTaskBarrier = 4,
+    kTaskPhase = 5,
+    kTaskRingWait = 6,
+    kTaskShave = 7
+  };
   static constexpr std::uint32_t kTaskWords = 4;
-  static constexpr std::uint32_t kTaskMax = 128u * 1024u;     // 2 MiB a worker
-  static constexpr std::uint32_t kTaskBytes = 4 * kTaskWords * (kTaskMax + 4);   // + a 4-word header
-  static constexpr std::uint32_t kStatusReserve = 4096;       // npu_run.cpp's kStatusReserve
+  static constexpr std::uint32_t kTaskMax = 128u * 1024u; // 2 MiB a worker
+  static constexpr std::uint32_t kTaskBytes =
+      4 * kTaskWords * (kTaskMax + 4); // + a 4-word header
+  static constexpr std::uint32_t kStatusReserve =
+      4096; // npu_run.cpp's kStatusReserve
 
-  TL_NPU_HW_CALL void task_add(std::uint32_t kind, std::uint32_t t0, std::uint32_t t1) {
+  TL_NPU_HW_CALL void task_add(std::uint32_t kind, std::uint32_t t0,
+                               std::uint32_t t1) {
 #if TL_NPU_PHASE_PROF
     if (statusAddr_ == 0)
       return;
-    const std::uint64_t base = statusAddr_ + kStatusReserve + static_cast<std::uint64_t>(kTaskBytes) * worker();
+    const std::uint64_t base =
+        statusAddr_ + kStatusReserve +
+        static_cast<std::uint64_t>(kTaskBytes) * worker();
     if (taskN_ >= kTaskMax) {
       ++taskDrop_;
       return;
     }
-    const std::uint64_t a = base + 16 + static_cast<std::uint64_t>(4 * kTaskWords) * taskN_;
+    const std::uint64_t a =
+        base + 16 + static_cast<std::uint64_t>(4 * kTaskWords) * taskN_;
     DdrAccessor<std::uint32_t> s0(a), s1(a + 4), s2(a + 8), s3(a + 12);
     s0 = t0;
     s1 = t1;
@@ -1320,7 +1618,9 @@ public:
     (void)name;
 #endif
   }
-  TL_NPU_HW_CALL void phase_begin(const char *name) { phase_begin(npu::packName4(name)); }
+  TL_NPU_HW_CALL void phase_begin(const char *name) {
+    phase_begin(npu::packName4(name));
+  }
 
   TL_NPU_HW_CALL void phase_end() {
 #if TL_NPU_PHASE_PROF
@@ -1328,8 +1628,9 @@ public:
 #endif
   }
 
-  // A named SHAVE region inside a phase (a dequant, a gemm, a gather) -- VPUX's per-task "site", recorded under
-  // its own name so it gets a real track. One level: these sites are siblings, never nested.
+  // A named SHAVE region inside a phase (a dequant, a gemm, a gather) -- VPUX's
+  // per-task "site", recorded under its own name so it gets a real track. One
+  // level: these sites are siblings, never nested.
   TL_NPU_HW_CALL void task_begin(std::uint32_t name) {
 #if TL_NPU_PHASE_PROF
     sName_ = name;
@@ -1338,28 +1639,34 @@ public:
     (void)name;
 #endif
   }
-  TL_NPU_HW_CALL void task_begin(const char *name) { task_begin(npu::packName4(name)); }
+  TL_NPU_HW_CALL void task_begin(const char *name) {
+    task_begin(npu::packName4(name));
+  }
 
   TL_NPU_HW_CALL void task_end() {
 #if TL_NPU_PHASE_PROF
     const std::uint32_t t1 = perf_ticks();
     const std::uint32_t keep = phName_;
-    phName_ = sName_;            // the record is named by the site, not the phase it sits in
+    phName_ =
+        sName_; // the record is named by the site, not the phase it sits in
     task_add(kTaskShave, sT0_, t1);
     phName_ = keep;
 #endif
   }
 
-  // Written once per worker at `finish`: the record count and what had to be dropped.
+  // Written once per worker at `finish`: the record count and what had to be
+  // dropped.
   TL_NPU_HW_CALL void task_flush() {
 #if TL_NPU_PHASE_PROF
     if (statusAddr_ == 0)
       return;
-    const std::uint64_t base = statusAddr_ + kStatusReserve + static_cast<std::uint64_t>(kTaskBytes) * worker();
+    const std::uint64_t base =
+        statusAddr_ + kStatusReserve +
+        static_cast<std::uint64_t>(kTaskBytes) * worker();
     DdrAccessor<std::uint32_t> h0(base), h1(base + 4), h2(base + 8);
     h0 = taskN_;
     h1 = taskDrop_;
-    h2 = 0x4B534154u;   // "TASK"
+    h2 = 0x4B534154u; // "TASK"
 #endif
   }
 
@@ -1372,7 +1679,8 @@ private:
 
   std::uint32_t worker() const { return tile_ * spt_ + shave_; }
 
-  // NCE_TIME free-running counter (kernel_profiler.hpp NCE_TIME_FREE_RUNNING_ADR).
+  // NCE_TIME free-running counter (kernel_profiler.hpp
+  // NCE_TIME_FREE_RUNNING_ADR).
   static std::uint32_t perf_ticks() { return getRegWordVal(0x2f020000U); }
 
   // Grid rendezvous on hardware barriers syncBase_ + (k mod 3): every SHAVE
@@ -1383,7 +1691,8 @@ private:
   // behind one software rendezvous.
   void hw_sync_grid() {
     if (!ok_)
-      return; // a failed SHAVE stops at its status; the others time out and report too
+      return; // a failed SHAVE stops at its status; the others time out and
+              // report too
     const std::uint8_t n = static_cast<std::uint8_t>(tiles_ * spt_);
     if (!syncArmed_) {
       if (worker() == 0)
@@ -1391,8 +1700,8 @@ private:
           barrier_config(syncBase_ + i, n, n, false);
       sync_.waitGlobal();
       syncArmed_ = true;
-      // Every SHAVE checks liveness itself: a dead barrier reads (0, 0), which a
-      // producer wait would take for "all arrived".
+      // Every SHAVE checks liveness itself: a dead barrier reads (0, 0), which
+      // a producer wait would take for "all arrived".
       for (std::uint32_t i = 0; i < kSyncBarriers; ++i)
         if (!barrier_check_live(syncBase_ + i, n, n))
           return;
@@ -1426,13 +1735,15 @@ private:
     TL_NPU_COMPILER_BARRIER();
   }
 
-  // The driver's wait (DmaDrvBase::wait) spins on the tail descriptor's watermark without a
-  // bound; the same test with one, so a fill that never completes is a report. `where`:
-  // 1/2 ring_fill previous halves, 3/4 ring_end, 5/6 port_retire.
+  // The driver's wait (DmaDrvBase::wait) spins on the tail descriptor's
+  // watermark without a bound; the same test with one, so a fill that never
+  // completes is a report. `where`: 1/2 ring_fill previous halves, 3/4
+  // ring_end, 5/6 port_retire.
   bool dma_wait(volatile DmaDescriptor *tail, std::uint32_t where) {
     for (std::uint32_t spins = 0; spins < kBarrierSpinLimit; ++spins) {
       if (tail->watermark != 0) {
-        TL_NPU_COMPILER_BARRIER();   // the landed slot's loads stay after the wait
+        TL_NPU_COMPILER_BARRIER(); // the landed slot's loads stay after the
+                                   // wait
         return true;
       }
     }
@@ -1450,11 +1761,11 @@ private:
   }
 
   // Selects the DPU descriptor set for this workload shape, programming it on a
-  // miss (kDpuSets sets, least recently used replaced). One set re-initialised on
-  // every submit cost 1.2 us per workload when two shapes alternated (the flash
-  // phase's QK^T and PV; M1 step 3c counters).
-  bool dpu_prepare(std::uint32_t M, std::uint32_t N, std::uint32_t K, std::uint32_t spatialX,
-                   std::int32_t mpe) {
+  // miss (kDpuSets sets, least recently used replaced). One set re-initialised
+  // on every submit cost 1.2 us per workload when two shapes alternated (the
+  // flash phase's QK^T and PV; M1 step 3c counters).
+  bool dpu_prepare(std::uint32_t M, std::uint32_t N, std::uint32_t K,
+                   std::uint32_t spatialX, std::int32_t mpe) {
     if (!ok_)
       return false;
     if (N > kMaxDpuN) {
@@ -1471,7 +1782,8 @@ private:
     }
     const std::uint64_t key = (static_cast<std::uint64_t>(M) << 40) |
                               (static_cast<std::uint64_t>(N) << 20) | K;
-    const std::uint32_t shapeKey = (spatialX << 8) | static_cast<std::uint32_t>(mpe + 1);
+    const std::uint32_t shapeKey =
+        (spatialX << 8) | static_cast<std::uint32_t>(mpe + 1);
     ++dpuStamp_;
     std::uint32_t pick = 0;
     for (std::uint32_t i = 0; i < kDpuSets; ++i) {
@@ -1512,8 +1824,9 @@ private:
     dpuIduTicks_ += d->hwpStats.idu_workload_duration;
     dpuOduTicks_ += d->hwpStats.odu_workload_duration;
 #if TL_NPU_PHASE_PROF
-    // the HWP gives a DURATION, so the workload's extent is derived back from the observation point; on
-    // NPU50xx both are the one fixed-frequency counter, so no calibration is owed (VPUX profiling guide)
+    // the HWP gives a DURATION, so the workload's extent is derived back from
+    // the observation point; on NPU50xx both are the one fixed-frequency
+    // counter, so no calibration is owed (VPUX profiling guide)
     const std::uint32_t t1 = perf_ticks();
     task_add(kTaskDpu, t1 - d->hwpStats.idu_workload_duration, t1);
 #endif
@@ -1527,7 +1840,8 @@ private:
       T *p = alloc<T>(count);
       if (p == nullptr)
         return nullptr;
-      const std::uint32_t base = reinterpret_cast<std::uint32_t>(p) - bytes * shave_;
+      const std::uint32_t base =
+          reinterpret_cast<std::uint32_t>(p) - bytes * shave_;
       const std::uint32_t end = base + bytes * spt_;
       const std::uint32_t lo = ((base >> 21) << 21) + kTrapLo;
       const std::uint32_t hi = ((base >> 21) << 21) + kTrapHi;
@@ -1538,20 +1852,24 @@ private:
     return nullptr;
   }
 
-  TL_NPU_HW_CALL void dma_load(void *dst, std::uint64_t src, std::uint32_t width, std::uint32_t rows,
-                std::uint32_t dstStride, std::uint32_t srcStride) {
+  TL_NPU_HW_CALL void dma_load(void *dst, std::uint64_t src,
+                               std::uint32_t width, std::uint32_t rows,
+                               std::uint32_t dstStride,
+                               std::uint32_t srcStride) {
     if (!ok_ || width == 0 || rows == 0)
       return;
     dma_load_wait_impl();
-    // The toolkit's start re-kicks a port's chain as soon as its fences ran, before the
-    // previous job completed: a ring fill in flight on the port lost its READY (hoisted
-    // ring, Q fill after the first K fill). One job per port per SHAVE, here too.
+    // The toolkit's start re-kicks a port's chain as soon as its fences ran,
+    // before the previous job completed: a ring fill in flight on the port lost
+    // its READY (hoisted ring, Q fill after the first K fill). One job per port
+    // per SHAVE, here too.
     port_retire(0);
     port_retire(1);
     if (!ok_)
       return;
     DmaDrv::initDesc(desc_);
-    config_copy(desc_, reinterpret_cast<std::uint32_t>(dst), src, width, rows, dstStride, srcStride);
+    config_copy(desc_, reinterpret_cast<std::uint32_t>(dst), src, width, rows,
+                dstStride, srcStride);
     TL_NPU_COMPILER_BARRIER();
 #if TL_NPU_PHASE_PROF
     const std::uint32_t t0 = perf_ticks();
@@ -1566,11 +1884,16 @@ private:
     TL_NPU_COMPILER_BARRIER();
   }
 
-  // `dma_load` ISSUED and left in flight, so the statements after it run while it streams; `dma_load_wait` joins
-  // it. One in flight at a time (the descriptor is reused), and it is registered on the port like a ring fill, so
-  // any later synchronous DMA's port_retire joins it too: a missing wait costs time, never correctness.
-  TL_NPU_HW_CALL void dma_load_async_impl(void *dst, std::uint64_t src, std::uint32_t width, std::uint32_t rows,
-                                          std::uint32_t dstStride, std::uint32_t srcStride) {
+  // `dma_load` ISSUED and left in flight, so the statements after it run while
+  // it streams; `dma_load_wait` joins it. One in flight at a time (the
+  // descriptor is reused), and it is registered on the port like a ring fill,
+  // so any later synchronous DMA's port_retire joins it too: a missing wait
+  // costs time, never correctness.
+  TL_NPU_HW_CALL void dma_load_async_impl(void *dst, std::uint64_t src,
+                                          std::uint32_t width,
+                                          std::uint32_t rows,
+                                          std::uint32_t dstStride,
+                                          std::uint32_t srcStride) {
     if (!ok_ || width == 0 || rows == 0)
       return;
     dma_load_wait_impl();
@@ -1584,8 +1907,9 @@ private:
     if (rows > 1) {
       const std::uint32_t rows0 = rows / 2;
       config_copy(desc_ + 2, dst0, src, width, rows0, dstStride, srcStride);
-      config_copy(desc_ + 3, dst0 + rows0 * dstStride, src + static_cast<std::uint64_t>(rows0) * srcStride,
-                  width, rows - rows0, dstStride, srcStride);
+      config_copy(desc_ + 3, dst0 + rows0 * dstStride,
+                  src + static_cast<std::uint64_t>(rows0) * srcStride, width,
+                  rows - rows0, dstStride, srcStride);
     } else {
       const std::uint32_t width0 = width / 2;
       if (width0 == 0) {
@@ -1600,8 +1924,8 @@ private:
         return;
       }
       config_copy(desc_ + 2, dst0, src, width0, 1, width0, width0);
-      config_copy(desc_ + 3, dst0 + width0, src + width0, width - width0, 1, width - width0,
-                  width - width0);
+      config_copy(desc_ + 3, dst0 + width0, src + width0, width - width0, 1,
+                  width - width0, width - width0);
     }
     DmaDrv::setConsumerBarriers(desc_ + 2, 0, 0);
     DmaDrv::setConsumerBarriers(desc_ + 3, 0, 0);
@@ -1625,14 +1949,18 @@ private:
     const std::uint32_t t1 = perf_ticks();
     dmaTicks_ += t1 - asyncT0_;
     ++dmaCalls_;
-    task_add(kTaskDmaLoad, asyncT0_, t1);   // the whole span; the overlap shows as the gap it leaves elsewhere
+    task_add(
+        kTaskDmaLoad, asyncT0_,
+        t1); // the whole span; the overlap shows as the gap it leaves elsewhere
 #endif
     TL_NPU_COMPILER_BARRIER();
   }
 
-  TL_NPU_HW_CALL void dma_store(std::uint64_t dst, const void *src, std::uint32_t width, std::uint32_t rows,
-                 std::uint32_t dstStride, std::uint32_t srcStride) {
-    qg_flush();   // the store may read a deferred reduction's output
+  TL_NPU_HW_CALL void dma_store(std::uint64_t dst, const void *src,
+                                std::uint32_t width, std::uint32_t rows,
+                                std::uint32_t dstStride,
+                                std::uint32_t srcStride) {
+    qg_flush(); // the store may read a deferred reduction's output
     if (!ok_ || width == 0 || rows == 0)
       return;
     port_retire(0);
@@ -1642,7 +1970,8 @@ private:
     TL_NPU_COMPILER_BARRIER();
     flushCmxWrites();
     DmaDrv::initDesc(desc_ + 1);
-    config_copy(desc_ + 1, dst, reinterpret_cast<std::uint32_t>(src), width, rows, dstStride, srcStride);
+    config_copy(desc_ + 1, dst, reinterpret_cast<std::uint32_t>(src), width,
+                rows, dstStride, srcStride);
     TL_NPU_COMPILER_BARRIER();
 #if TL_NPU_PHASE_PROF
     const std::uint32_t t0 = perf_ticks();
@@ -1657,11 +1986,14 @@ private:
     TL_NPU_COMPILER_BARRIER();
   }
 
-  // The fewest dimensions that describe the copy: rows that are contiguous on both sides are ONE 1-D
-  // transfer (a 2-D descriptor of 512 rows x 256 B ran at a third of the rate of 1024-B rows: the
-  // engine's per-row cost; M3), one strided side keeps the other side as a single run.
-  static void config_copy(DmaDescriptor *d, std::uint64_t dst, std::uint64_t src, std::uint32_t width,
-                          std::uint32_t rows, std::uint32_t dstStride, std::uint32_t srcStride) {
+  // The fewest dimensions that describe the copy: rows that are contiguous on
+  // both sides are ONE 1-D transfer (a 2-D descriptor of 512 rows x 256 B ran
+  // at a third of the rate of 1024-B rows: the engine's per-row cost; M3), one
+  // strided side keeps the other side as a single run.
+  static void config_copy(DmaDescriptor *d, std::uint64_t dst,
+                          std::uint64_t src, std::uint32_t width,
+                          std::uint32_t rows, std::uint32_t dstStride,
+                          std::uint32_t srcStride) {
     if (rows == 1 || (dstStride == width && srcStride == width))
       configDmaCopy(d, dst, src, width * rows);
     else if (dstStride == width)
@@ -1690,13 +2022,15 @@ private:
   DmaDescriptor *lastOnPort_[2]{nullptr, nullptr};
   bool asyncPending_{false};
   std::uint32_t asyncT0_{0};
-  // Ring control pool: kRingPool rings' order words (shared) and fill descriptors (per SHAVE), cycled.
+  // Ring control pool: kRingPool rings' order words (shared) and fill
+  // descriptors (per SHAVE), cycled.
   static constexpr std::uint32_t kRingPool = 8, kRingMaxDepth = 2;
   std::uint32_t *ringOrder_ = nullptr;
   DmaDescriptor *ringFill_ = nullptr;
   std::uint32_t ringSeq_ = 0;
-  // DPU descriptor sets, one per recently used workload shape (CheckIntelNpuBudgets
-  // reserves their CMX: kDpuSets x (descriptors + 16 KiB weight table) per SHAVE).
+  // DPU descriptor sets, one per recently used workload shape
+  // (CheckIntelNpuBudgets reserves their CMX: kDpuSets x (descriptors + 16 KiB
+  // weight table) per SHAVE).
   static constexpr std::uint32_t kDpuSets = 2;
   struct DpuSet {
     DpuMatMul::DescriptorsBuffer *desc{nullptr};
@@ -1710,11 +2044,13 @@ private:
   DpuSet dpu_[kDpuSets];
   std::uint32_t dpuStamp_{0};
   std::uint32_t dpuStarts_{0};
-  DpuMatMul *mm_{nullptr};                           // the set of the last prepared shape
-  DpuMatMul *dpuPend_{nullptr};                      // a workload started and not yet waited for
+  DpuMatMul *mm_{nullptr};      // the set of the last prepared shape
+  DpuMatMul *dpuPend_{nullptr}; // a workload started and not yet waited for
   DpuMatMul::DescriptorsBuffer *dpuDesc_{nullptr};
-  // Mixed-mode (fp16 x int4 weights) set for dpu_matmul_i4g, allocated on first use.
-  static constexpr float kI4PartScale = 1.0f / 16.0f;  // PPE multiplier keeping the group partials in fp16 range
+  // Mixed-mode (fp16 x int4 weights) set for dpu_matmul_i4g, allocated on first
+  // use.
+  static constexpr float kI4PartScale =
+      1.0f / 16.0f; // PPE multiplier keeping the group partials in fp16 range
   static constexpr float kI8PartScale = 1.0f / 256.0f; // |q| <= 128
   alignas(DpuMatMul) unsigned char i4Store_[sizeof(DpuMatMul)];
   DpuMatMul *i4Mm_{nullptr};
@@ -1722,7 +2058,8 @@ private:
   std::uint32_t *i4Wt_{nullptr};
   half *i4Part_{nullptr}, *i4ST_{nullptr};
   std::uint32_t i4PartHalf_ = 0;
-  std::uint32_t i4DeferElems_ = 0;   // part elems of the largest deferred shape: the scratch holds two of them
+  std::uint32_t i4DeferElems_ = 0; // part elems of the largest deferred shape:
+                                   // the scratch holds two of them
   struct QgPending {
     half *out = nullptr, *part = nullptr;
     const half *sT = nullptr;
@@ -1732,16 +2069,25 @@ private:
   std::uint32_t i4PartElems_{0}, i4STElems_{0};
   std::uint64_t i4Key_{~0ull};
   std::uint32_t dpuCount_{0}, dpuIduTicks_{0}, dpuOduTicks_{0};
-  // Ring path phase counters (19.2 MHz ticks), the status record's extra words when a
-  // probe gives none: where a SHAVE's time in the ring protocol goes.
-  enum { kTickLive = 0, kTickOrder = 1, kTickSubmit = 2, kTickDpuWait = 3, kTickFreeWait = 4, kTickFillIssue = 5 };
+  // Ring path phase counters (19.2 MHz ticks), the status record's extra words
+  // when a probe gives none: where a SHAVE's time in the ring protocol goes.
+  enum {
+    kTickLive = 0,
+    kTickOrder = 1,
+    kTickSubmit = 2,
+    kTickDpuWait = 3,
+    kTickFreeWait = 4,
+    kTickFillIssue = 5
+  };
   std::uint32_t ringTicks_[6]{0, 0, 0, 0, 0, 0};
-  // Whole-kernel accumulators, snapshotted and differenced by the per-phase record (`phase_begin` / `phase_end`).
-  // An accumulator costs O(kinds), not O(events), which is why this survives 40 layers where the toolkit's
-  // 1984-entry event buffer cannot -- npu_dsl's FRT_PROFILE arrangement, in the place this runtime already
-  // accumulated `ringTicks_` and `dpuIduTicks_`.
+  // Whole-kernel accumulators, snapshotted and differenced by the per-phase
+  // record (`phase_begin` / `phase_end`). An accumulator costs O(kinds), not
+  // O(events), which is why this survives 40 layers where the toolkit's
+  // 1984-entry event buffer cannot -- npu_dsl's FRT_PROFILE arrangement, in the
+  // place this runtime already accumulated `ringTicks_` and `dpuIduTicks_`.
   std::uint32_t dmaTicks_{0}, dmaCalls_{0}, barTicks_{0}, barCalls_{0};
-  std::uint32_t phT0_{0}, phName_{0}, taskN_{0}, taskDrop_{0}, sT0_{0}, sName_{0};
+  std::uint32_t phT0_{0}, phName_{0}, taskN_{0}, taskDrop_{0}, sT0_{0},
+      sName_{0};
 };
 #endif // TL_NPU_RUNTIME_FRT
 

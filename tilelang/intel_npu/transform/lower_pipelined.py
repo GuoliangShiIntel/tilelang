@@ -1,10 +1,13 @@
-﻿"""PlanIntelNpuDistribution and LowerIntelNpuPipelined: the multi-tile flow from the author's loops.
+"""PlanIntelNpuDistribution and LowerIntelNpuPipelined: the multi-tile flow from the author's loops.
 
 docs/examples/pingpong_multitile/README.md sections 1-3, as the plan's section 3.2 orders it.
 Both passes run after LowerIntelNpuTileOp (copies are `intel_npu_dma_copy`, gemms are
 `intel_npu_dpu_matmul`) and before LowerOpaqueBlock (allocations are still SBlock buffers).
 
 PlanIntelNpuDistribution derives, for every DDR -> CMX copy, how it is distributed:
+    * with tl.intel_npu.multicast enabled (default false), a local DPU operand loaded from a
+        parameter DDR buffer at a tile-invariant address in uniform serial control flow is
+        broadcast by tile 0's matching SHAVE, between grid rendezvous; ownership is unchanged;
   * destination scope local  -> per-SHAVE copy, left alone (the source names the worker);
   * destination scope shared, outside a pipelined loop -> SEGMENTED resident operand: the rows
     are split over the tile's SHAVEs (both DMA ports) and a tile sync follows;
@@ -168,6 +171,7 @@ def _with_notes(func: tirx.PrimFunc, text: str) -> tirx.PrimFunc:
 # PlanIntelNpuDistribution
 # ---------------------------------------------------------------------------------------------
 
+
 def PlanIntelNpuDistribution():
     @prim_func_pass(opt_level=0, name="tl.PlanIntelNpuDistribution")
     def _pass(func: tirx.PrimFunc, mod, ctx):
@@ -175,7 +179,145 @@ def PlanIntelNpuDistribution():
         notes = []
         pipelined_depth = [0]
         loop_depth = [0]
-        shave_branch = []   # one flag per enclosing SHAVE-dependent branch: did it fill a shared buffer?
+        shave_branch = []  # one flag per enclosing SHAVE-dependent branch: did it fill a shared buffer?
+        multicast = bool(ctx.config.get("tl.intel_npu.multicast", False)) and launch.tiles > 1
+        uniform = [list(func.params)]
+        dpu_inputs = []
+
+        def find_input(node):
+            if isinstance(node, tirx.Call) and getattr(node.op, "name", "") == DPU_MATMUL:
+                dpu_inputs.extend(_load_of(arg).buffer.data for arg in node.args[1:3])
+
+        post_order_visit(func.body, find_input)
+
+        def is_uniform(expr):
+            safe = [True]
+
+            def visit(node):
+                if (
+                    isinstance(node, (tirx.BufferLoad, tirx.Call))
+                    or isinstance(node, tirx.Var)
+                    and not any(node.same_as(var) for var in uniform[-1])
+                ):
+                    safe[0] = False
+
+            post_order_visit(expr, visit)
+            return safe[0]
+
+        overlap_buffers = []
+
+        def plan_overlap(loop):
+            if not bool(ctx.config.get("tl.intel_npu.multicast_overlap", False)) or launch.tiles < 2:
+                return None
+            if not uniform[-1] or not is_uniform(loop.min) or not is_uniform(loop.extent):
+                return None
+            if loop.kind != tirx.ForKind.SERIAL or _const_or(loop.min, -1) != 0:
+                return None
+            trips = _const_or(loop.extent, 0)
+            if trips < 2 or int(loop.annotations.get("num_stages", 0)) > 0:
+                return None
+            items = list(loop.body.seq) if isinstance(loop.body, tirx.SeqStmt) else [loop.body]
+            if len(items) != 3 or not all(_is_call(item, name) for item, name in zip(items, [DMA_COPY, DPU_MATMUL, DMA_COPY])):
+                return None
+            fill, gemm, store = (item.value for item in items)
+            if len(fill.args) != 7 or _const_or(fill.args[6], 0) != 1 or _const_or(store.args[6], 1) != 0:
+                return None
+            activation, source = _load_of(fill.args[0]), _load_of(fill.args[1])
+            output, weights = _load_of(gemm.args[0]), _load_of(gemm.args[2])
+            destination = _load_of(store.args[0])
+            if activation.buffer.scope() != "local" or output.buffer.scope() != "local":
+                return None
+            if weights.buffer.scope() not in ("shared", "shared.dyn"):
+                return None
+            if not _load_of(gemm.args[1]).buffer.same_as(activation.buffer):
+                return None
+            if not _load_of(store.args[1]).buffer.same_as(output.buffer):
+                return None
+            if source.buffer.data.same_as(destination.buffer.data):
+                return None
+            if any(_uses(weights, var) for var in (loop.loop_var, launch.shave_var)):
+                return None
+            if not any(source.buffer.data.same_as(buf.data) for buf in func.buffer_map.values()):
+                return None
+            if any(_uses(index, launch.tile_var) for index in source.indices):
+                return None
+            allowed = uniform[-1] + [loop.loop_var, launch.shave_var]
+            safe_address = [True]
+
+            def check_address(node):
+                if (
+                    isinstance(node, (tirx.BufferLoad, tirx.Call))
+                    or isinstance(node, tirx.Var)
+                    and not any(node.same_as(var) for var in allowed)
+                ):
+                    safe_address[0] = False
+
+            for index in source.indices:
+                post_order_visit(index, check_address)
+            if not safe_address[0]:
+                return None
+            from .prefetch import _full_buffer_load, _refs
+
+            if not _full_buffer_load(fill, activation.buffer):
+                return None
+            if not all(_const_or(index, -1) == 0 for index in output.indices):
+                return None
+            for buffer in (activation.buffer, output.buffer):
+                if _refs(func.body, buffer.data) != _refs(loop.body, buffer.data):
+                    return None
+            chunk = tirx.Var(loop.loop_var.name + "_chunk", loop.loop_var.dtype)
+            sub = {loop.loop_var: tirx.floordiv(chunk, launch.shaves), launch.shave_var: tirx.floormod(chunk, launch.shaves)}
+            body = substitute(loop.body, sub)
+            new_items = list(body.seq)
+            new_source = _load_of(new_items[0].value.args[1])
+            new_destination = _load_of(new_items[2].value.args[0])
+            rows = _const_or(gemm.args[3], 0)
+            analyzer = tvm.arith.Analyzer()
+            for address in (new_source, new_destination):
+                if len(address.indices) != 2 or _uses(address.indices[1], chunk):
+                    return None
+                row = address.indices[0]
+                if not analyzer.can_prove_equal(substitute(row, {chunk: chunk + 1}) - row, rows):
+                    return None
+            shared = tirx.decl_buffer(list(activation.buffer.shape), activation.buffer.dtype, activation.buffer.name, scope="shared")
+            overlap_buffers.append((activation.buffer, shared))
+            annotations = dict(loop.annotations)
+            annotations["num_stages"] = launch.shaves
+            annotations["intel_npu.no_hoist"] = 1
+            notes.append(
+                f"{activation.buffer.name}: ownership-preserving automatic multicast ring; "
+                f"{trips} uses per SHAVE, shared resident operand, no hoist across weight preparation"
+            )
+            return tirx.For(chunk, loop.min, _i32(trips * launch.shaves), loop.kind, body, loop.thread_binding, annotations)
+
+        def multicast_fill(stmt):
+            args = stmt.value.args
+            dst, src = _load_of(args[0]), _load_of(args[1])
+            if not multicast or len(args) != 7 or not uniform[-1]:
+                return None
+            if dst.buffer.scope() != "local" or not any(dst.buffer.data.same_as(var) for var in dpu_inputs):
+                return None
+            if not any(src.buffer.data.same_as(buf.data) for buf in func.buffer_map.values()):
+                return None
+            allowed = uniform[-1] + [launch.shave_var]
+            for expr in list(dst.indices) + list(src.indices) + list(args[2:6]):
+                bad = [False]
+
+                def visit(node):
+                    if (
+                        isinstance(node, (tirx.BufferLoad, tirx.Call))
+                        or isinstance(node, tirx.Var)
+                        and not any(node.same_as(var) for var in allowed)
+                    ):
+                        bad[0] = True
+
+                post_order_visit(expr, visit)
+                if bad[0]:
+                    return None
+            fill = tirx.Evaluate(tirx.Call(stmt.value.dtype, stmt.value.op, list(args) + [_i32(0), _i32(1)]))
+            sync = tirx.Evaluate(tirx.Call("int32", _op("tl.sync_grid"), []))
+            notes.append(f"{dst.buffer.name}: MULTICAST (serial, worker ownership unchanged)")
+            return tirx.SeqStmt([sync, fill, sync])
 
         def deal_fill_loop(stmt):
             """A loop whose whole body is ONE unsplittable DDR -> shared fill writing a different row each
@@ -198,47 +340,60 @@ def PlanIntelNpuDistribution():
                 return None
             args = body.value.args
             if _const_or(args[6], 0) != 1:
-                return None                              # a store
+                return None  # a store
             dst = _load_of(args[0])
             if dst.buffer.scope() == "local":
-                return None                              # SHAVE-private: nothing to share
+                return None  # SHAVE-private: nothing to share
             if _const_or(args[3], 0) % launch.shaves == 0:
-                return None                              # the row split already uses both SHAVEs
+                return None  # the row split already uses both SHAVEs
             if not any(_uses(i, stmt.loop_var) for i in dst.indices):
-                return None                              # every iteration writes the same rows: a real serial chain
+                return None  # every iteration writes the same rows: a real serial chain
             if _uses(body.value, launch.shave_var):
-                return None                              # the author already chose which SHAVE fills
-            notes.append(f"{dst.buffer.name}: unsplittable fill, the loop's {int(stmt.extent)} iterations dealt "
-                         f"over the tile's SHAVEs, tile sync before and after the loop")
-            guarded = tirx.IfThenElse(tirx.floormod(stmt.loop_var, _i32(launch.shaves)) == launch.shave_var,
-                                      body, None)
-            loop = tirx.For(stmt.loop_var, stmt.min, stmt.extent, stmt.kind, guarded, stmt.thread_binding,
-                            stmt.annotations)
+                return None  # the author already chose which SHAVE fills
+            notes.append(
+                f"{dst.buffer.name}: unsplittable fill, the loop's {int(stmt.extent)} iterations dealt "
+                f"over the tile's SHAVEs, tile sync before and after the loop"
+            )
+            guarded = tirx.IfThenElse(tirx.floormod(stmt.loop_var, _i32(launch.shaves)) == launch.shave_var, body, None)
+            loop = tirx.For(stmt.loop_var, stmt.min, stmt.extent, stmt.kind, guarded, stmt.thread_binding, stmt.annotations)
             return tirx.SeqStmt([_storage_sync_shared(), loop, _storage_sync_shared()])
 
         def pre(stmt):
             if isinstance(stmt, tirx.For):
+                planned = plan_overlap(stmt)
+                if planned is not None:
+                    return planned
                 dealt = deal_fill_loop(stmt)
                 if dealt is not None:
                     return dealt
+                uniform.append(uniform[-1] + [stmt.loop_var] if uniform[-1] and is_uniform(stmt.min) and is_uniform(stmt.extent) else [])
                 loop_depth[0] += 1
                 if int(stmt.annotations.get("num_stages", 0)) > 0:
                     pipelined_depth[0] += 1
-            elif isinstance(stmt, tirx.IfThenElse) and _uses(stmt.condition, launch.shave_var):
-                shave_branch.append(False)
+            elif isinstance(stmt, tirx.IfThenElse):
+                uniform.append(uniform[-1] if uniform[-1] and is_uniform(stmt.condition) else [])
+                if _uses(stmt.condition, launch.shave_var):
+                    shave_branch.append(False)
+            elif isinstance(stmt, tirx.While):
+                uniform.append([])
             return None
 
         def post(stmt):
             if isinstance(stmt, tirx.For):
+                uniform.pop()
                 loop_depth[0] -= 1
                 if int(stmt.annotations.get("num_stages", 0)) > 0:
                     pipelined_depth[0] -= 1
                 return None
             if isinstance(stmt, tirx.IfThenElse):
+                uniform.pop()
                 if _uses(stmt.condition, launch.shave_var) and shave_branch.pop():
                     # the fill ran on one SHAVE; the tile still has to meet, and the meeting point is HERE,
                     # after the branch, where every SHAVE arrives
                     return tirx.SeqStmt([stmt, _storage_sync_shared()])
+                return None
+            if isinstance(stmt, tirx.While):
+                uniform.pop()
                 return None
             if not _is_call(stmt, DMA_COPY):
                 return None
@@ -252,13 +407,19 @@ def PlanIntelNpuDistribution():
             src_tile = any(_uses(i, launch.tile_var) for i in src_expr)
             src_shave = any(_uses(i, launch.shave_var) for i in src_expr)
             if dst_scope == "local":
+                if pipelined_depth[0] == 0:
+                    fill = multicast_fill(stmt)
+                    if fill is not None:
+                        return fill
                 if not src_tile and not src_shave and pipelined_depth[0] == 0:
                     # The same DDR bytes read once per worker (a bias, a probe's operand): legal, and
                     # said in the source so a large one is noticed; the flow's operands are shared.
                     loop_vars = [v for i in src_expr for v in _vars_of(i)]
                     if not loop_vars:
-                        notes.append(f"{dst.buffer.name}: tile-invariant source copied into a SHAVE-private "
-                                     f"buffer on every worker (make it shared to read it once per tile)")
+                        notes.append(
+                            f"{dst.buffer.name}: tile-invariant source copied into a SHAVE-private "
+                            f"buffer on every worker (make it shared to read it once per tile)"
+                        )
                 return None
             if pipelined_depth[0] > 0:
                 if src_tile:
@@ -279,7 +440,7 @@ def PlanIntelNpuDistribution():
             rows = _const(args[3])
             spt = launch.shaves
             tx = launch.shave_var
-            kind = 'SEGMENTED' if src_tile else 'tile-invariant'
+            kind = "SEGMENTED" if src_tile else "tile-invariant"
             if rows % spt != 0:
                 # Too few rows to share (a decode activation row): SHAVE 0 does the whole fill, the tile meets.
                 fill = tirx.IfThenElse(tx == 0, stmt, None)
@@ -291,19 +452,47 @@ def PlanIntelNpuDistribution():
             # the rows of a 2-D region are its second-to-last index (a [g, row, col] cache source, not only [row, col])
             dst_idx[-2 if len(dst_idx) >= 2 else -1] = dst_idx[-2 if len(dst_idx) >= 2 else -1] + tx * per
             src_idx[-2 if len(src_idx) >= 2 else -1] = src_idx[-2 if len(src_idx) >= 2 else -1] + tx * per
-            new_args = [_address_of(dst.buffer, dst_idx), _address_of(src.buffer, src_idx), args[2], _i32(per),
-                        args[4], args[5], args[6]]
+            new_args = [_address_of(dst.buffer, dst_idx), _address_of(src.buffer, src_idx), args[2], _i32(per), args[4], args[5], args[6]]
             fill = tirx.Evaluate(tirx.Call(stmt.value.dtype, stmt.value.op, new_args))
             if loop_depth[0] > 0:
                 # Refilled in a loop: the other SHAVE may still read the previous contents (WAR).
-                notes.append(f"{dst.buffer.name}: {'SEGMENTED' if src_tile else 'tile-invariant'} resident in a loop, "
-                             f"{rows} rows split {per} per SHAVE, tile sync before and after")
+                notes.append(
+                    f"{dst.buffer.name}: {'SEGMENTED' if src_tile else 'tile-invariant'} resident in a loop, "
+                    f"{rows} rows split {per} per SHAVE, tile sync before and after"
+                )
                 return tirx.SeqStmt([_storage_sync_shared(), fill, _storage_sync_shared()])
-            notes.append(f"{dst.buffer.name}: {'SEGMENTED' if src_tile else 'tile-invariant'} resident, "
-                         f"{rows} rows split {per} per SHAVE, tile sync after")
+            notes.append(
+                f"{dst.buffer.name}: {'SEGMENTED' if src_tile else 'tile-invariant'} resident, "
+                f"{rows} rows split {per} per SHAVE, tile sync after"
+            )
             return tirx.SeqStmt([fill, _storage_sync_shared()])
 
-        body = ir_transform(func.body, pre, post, ["tirx.For", "tirx.IfThenElse", "tirx.Evaluate"])
+        body = ir_transform(func.body, pre, post, ["tirx.For", "tirx.IfThenElse", "tirx.While", "tirx.Evaluate"])
+        if overlap_buffers:
+
+            def mapped(buffer):
+                return next((new for old, new in overlap_buffers if old.same_as(buffer)), buffer)
+
+            def rebuffer(node):
+                if isinstance(node, tirx.BufferLoad):
+                    buffer = mapped(node.buffer)
+                    if not buffer.same_as(node.buffer):
+                        return tirx.BufferLoad(buffer, node.indices)
+                elif isinstance(node, tirx.SBlock):
+                    return tirx.SBlock(
+                        node.iter_vars,
+                        node.reads,
+                        node.writes,
+                        node.name_hint,
+                        node.body,
+                        node.init,
+                        [mapped(buffer) for buffer in node.alloc_buffers],
+                        node.match_buffers,
+                        node.annotations,
+                    )
+                return None
+
+            body = ir_transform(body, None, rebuffer, ["tirx.BufferLoad", "tirx.SBlock"])
         func = func.with_body(body)
         if notes:
             func = _with_notes(func, "distribution: " + "; ".join(notes))
@@ -316,7 +505,7 @@ def PlanIntelNpuDistribution():
 # LowerIntelNpuPipelined
 # ---------------------------------------------------------------------------------------------
 
-_WIDENED: dict = {}   # hash(data var) -> the widened Buffer; one object per CMX buffer however many rings use it
+_WIDENED: dict = {}  # hash(data var) -> the widened Buffer; one object per CMX buffer however many rings use it
 
 
 def _widen(buf, factor: int):
@@ -326,8 +515,10 @@ def _widen(buf, factor: int):
     hit = _WIDENED.get(key)
     if hit is not None:
         if int(hit.shape[0]) != int(buf.shape[0]) * factor:
-            raise ValueError(f"intel_npu: {buf.name} is widened x{factor} by one ring and x{int(hit.shape[0]) // int(buf.shape[0])} "
-                             "by another; give each pipelined loop its own buffer")
+            raise ValueError(
+                f"intel_npu: {buf.name} is widened x{factor} by one ring and x{int(hit.shape[0]) // int(buf.shape[0])} "
+                "by another; give each pipelined loop its own buffer"
+            )
         return hit
     new = tirx.decl_buffer([buf.shape[0] * factor] + list(buf.shape[1:]), buf.dtype, buf.name, data=buf.data, scope=buf.scope())
     _WIDENED[key] = new
@@ -346,13 +537,14 @@ class _Stream:
         if _const(fa[2]) != _const(fa[4]):
             raise ValueError(
                 f"intel_npu: the streamed fill into {self.slot_buf.name} is not contiguous in the slot (width {fa[2]}, "
-                f"slot row stride {fa[4]}); allocate the slot buffer at the chunk's shape")
+                f"slot row stride {fa[4]}); allocate the slot buffer at the chunk's shape"
+            )
         self.src = fa[1]
         self.width, self.rows, self.src_stride = _const(fa[2]), _const(fa[3]), _const(fa[5])
         self.slot_bytes = self.width * self.rows
         self.slots = _widen(self.slot_buf, stages)
         self.ring = tirx.Var("ring", "handle")
-        self.gemm = None        # the one gemm that reads the slot (its last reader produces FREE)
+        self.gemm = None  # the one gemm that reads the slot (its last reader produces FREE)
         self.stream_is_a = None
 
     def bind_gemm(self, gemm: tirx.Evaluate):
@@ -362,8 +554,10 @@ class _Stream:
         if not (is_a or is_bt):
             return False
         if self.gemm is not None:
-            raise ValueError(f"intel_npu: the streamed buffer {self.slot_buf.name} is read by two gemms in one "
-                             f"pipelined loop; the slot has one DPU reader (its FREE producer)")
+            raise ValueError(
+                f"intel_npu: the streamed buffer {self.slot_buf.name} is read by two gemms in one "
+                f"pipelined loop; the slot has one DPU reader (its FREE producer)"
+            )
         if is_a and is_bt:
             raise ValueError(f"intel_npu: a gemm reads {self.slot_buf.name} as both operands")
         self.gemm, self.stream_is_a = gemm, is_a
@@ -375,7 +569,7 @@ class _Pipeline:
 
     def __init__(self, loop: tirx.For, launch: _Launch, outer: tirx.For | None = None):
         self.loop = loop
-        self.outer = outer   # the enclosing serial loop the ring is hoisted over, if any
+        self.outer = outer  # the enclosing serial loop the ring is hoisted over, if any
         self.c = loop.loop_var
         # The chunk count may be a runtime value (a decode step streams the cache up to its position, not
         # SMAX): it must be the same on every SHAVE of every tile (the barrier counts are shared), which a
@@ -395,12 +589,14 @@ class _Pipeline:
             raise ValueError(
                 f"intel_npu: T.Pipelined(num_stages={self.stages}) on a tile with {launch.shaves} SHAVEs: the "
                 f"ring depth must be a multiple of the SHAVEs per tile (SHAVE s owns slots s, s + {launch.shaves}, "
-                f"...; README section 3)")
-        self.depth = self.stages // launch.shaves   # slots per SHAVE: fills issued this many uses ahead
+                f"...; README section 3)"
+            )
+        self.depth = self.stages // launch.shaves  # slots per SHAVE: fills issued this many uses ahead
         if launch.tiles < 2:
             raise ValueError(
                 "intel_npu: the hardware ring needs at least 2 tiles (one tile has no multicast and a barrier "
-                "pool of 8 ids, 3 of them sync_grid's); launch more tiles or write a serial loop")
+                "pool of 8 ids, 3 of them sync_grid's); launch more tiles or write a serial loop"
+            )
         body = loop.body
         self.stmts = list(body.seq) if isinstance(body, tirx.SeqStmt) else [body]
         fills = [s for s in self.stmts if _is_call(s, DMA_COPY) and _const(s.value.args[6]) == 1]
@@ -419,18 +615,19 @@ class _Pipeline:
                 continue
             # No gemm reads the slot: its readers are SHAVE statements (a dequant, a norm). The SHAVE acquires
             # the slot (waits READY) before the first and releases it (produces FREE) after the last.
-            readers = [i for i, s in enumerate(self.stmts)
-                       if not (_is_call(s, DMA_COPY) and _const(s.value.args[6]) == 1) and _reads_buffer(s, st.slot_buf)]
+            readers = [
+                i
+                for i, s in enumerate(self.stmts)
+                if not (_is_call(s, DMA_COPY) and _const(s.value.args[6]) == 1) and _reads_buffer(s, st.slot_buf)
+            ]
             if not readers:
-                raise ValueError(f"intel_npu: the streamed buffer {st.slot_buf.name} is filled but nothing in the loop "
-                                 f"reads it")
+                raise ValueError(f"intel_npu: the streamed buffer {st.slot_buf.name} is filled but nothing in the loop reads it")
             st.first_reader, st.last_reader = readers[0], readers[-1]
         self.shave_streams = [st for st in self.streams if st.gemm is None]
         self.stores = [s for s in self.stmts if _is_call(s, DMA_COPY) and _const(s.value.args[6]) == 0]
         others = [s for s in self.stmts if not (_is_call(s, DMA_COPY) or _is_call(s, DPU_MATMUL))]
         # The simple body (one stream, its gemm, stores) gets the submit-ahead program.
-        self.simple = (len(self.streams) == 1 and len(self.gemms) == 1 and bool(self.stores) and not others
-                       and not self.shave_streams)
+        self.simple = len(self.streams) == 1 and len(self.gemms) == 1 and bool(self.stores) and not others and not self.shave_streams
         for st in self.stores:
             if _load_of(st.value.args[1]).buffer.scope() != "local":
                 raise ValueError("intel_npu: a store in a pipelined loop must read a SHAVE-local buffer")
@@ -462,8 +659,9 @@ def LowerIntelNpuPipelined():
             if st.pipe.outer is not None:
                 sub[st.pipe.outer.loop_var] = tirx.floordiv(chunk(use), st.pipe.total)
             src = substitute(st.src, sub)
-            return tirx.Evaluate(tirx.Call("handle", _op(RING_FILL),
-                                           [st.ring, use, src, _i32(st.width), _i32(st.rows), _i32(st.src_stride)]))
+            return tirx.Evaluate(
+                tirx.Call("handle", _op(RING_FILL), [st.ring, use, src, _i32(st.width), _i32(st.rows), _i32(st.src_stride)])
+            )
 
         def submit(st, use, out_addr):
             da = list(st.gemm.value.args)
@@ -493,10 +691,24 @@ def LowerIntelNpuPipelined():
             multicast = 0 if _uses(st.src, launch.tile_var) else 1
             local = 1 if (multicast == 0 and st.gemm is None) else 0
             st.local = local
-            return tirx.Bind(st.ring, tirx.Call("handle", _op(RING_BEGIN),
-                                                [_address_of(st.slots, [_i32(0)] * len(st.slots.shape)),
-                                                 _i32(st.slot_bytes), _i32(p.stages), p.total_chunks, _i32(-1),
-                                                 _i32(-1), _i32(st.port), _i32(multicast), _i32(local)]))
+            return tirx.Bind(
+                st.ring,
+                tirx.Call(
+                    "handle",
+                    _op(RING_BEGIN),
+                    [
+                        _address_of(st.slots, [_i32(0)] * len(st.slots.shape)),
+                        _i32(st.slot_bytes),
+                        _i32(p.stages),
+                        p.total_chunks,
+                        _i32(-1),
+                        _i32(-1),
+                        _i32(st.port),
+                        _i32(multicast),
+                        _i32(local),
+                    ],
+                ),
+            )
 
         def assign_ports(pipes):
             """DMA ports for the streams of the rings live together. The runtime takes one job in flight per port
@@ -515,7 +727,7 @@ def LowerIntelNpuPipelined():
             if len(shallow) == 1 and not deep:
                 shallow[0].port = -1
                 return
-            fixed_bytes = 175 * 1024   # 2.5 us at 70 GB/s
+            fixed_bytes = 175 * 1024  # 2.5 us at 70 GB/s
             load = [0, 0]
             for st in deep:
                 for port in (0, 1):
@@ -533,7 +745,7 @@ def LowerIntelNpuPipelined():
             if p.outer is None:
                 uses = tirx.floordiv(p.total - tx + _i32(spt - 1), _i32(spt))
                 return tirx.For(u, _i32(0), uses, tirx.ForKind.SERIAL, body(u))
-            per = tirx.truncdiv(p.total, _i32(spt))   # hoisted only when the extent is a multiple of spt
+            per = tirx.truncdiv(p.total, _i32(spt))  # hoisted only when the extent is a multiple of spt
             return tirx.For(u, _i32(0), per, tirx.ForKind.SERIAL, body(p.outer.loop_var * per + u))
 
         def lower_simple(p: _Pipeline):
@@ -560,12 +772,16 @@ def LowerIntelNpuPipelined():
                 return substitute(tirx.Evaluate(tirx.Call(s.value.dtype, s.value.op, sa)), {p.c: inner_chunk(p, use)})
 
             def loop_body(g):
-                return tirx.SeqStmt([wait(st, g), submit(st, g + 1, out_addr(tirx.floormod(g + 1, 2))), fill(st, g + p.depth)]
-                                    + [store(s, g, tirx.floormod(g, 2)) for s in p.stores])
+                return tirx.SeqStmt(
+                    [wait(st, g), submit(st, g + 1, out_addr(tirx.floormod(g + 1, 2))), fill(st, g + p.depth)]
+                    + [store(s, g, tirx.floormod(g, 2)) for s in p.stores]
+                )
 
-            notes.append(f"ring over {p.c.name} ({p.total_text} chunks of {st.slot_bytes} B into {st.slot_buf.name}"
-                         f"[{p.stages} slots], SHAVE s owns {p.depth} slot(s), fills {p.depth} use(s) ahead, output "
-                         f"{out_buf.name} x2 by use parity, submit-ahead; issuer tile 0, two halves on ports 0/1)")
+            notes.append(
+                f"ring over {p.c.name} ({p.total_text} chunks of {st.slot_bytes} B into {st.slot_buf.name}"
+                f"[{p.stages} slots], SHAVE s owns {p.depth} slot(s), fills {p.depth} use(s) ahead, output "
+                f"{out_buf.name} x2 by use parity, submit-ahead; issuer tile 0, two halves on ports 0/1)"
+            )
             prologue = [begin(st, p)] + [fill(st, _i32(k)) for k in range(p.depth)] + [submit(st, _i32(0), out_addr(_i32(0)))]
             return prologue, use_loop(p, u, loop_body), [end(st)]
 
@@ -601,11 +817,13 @@ def LowerIntelNpuPipelined():
                 return tirx.SeqStmt(seq)
 
             prologue = [begin(st, p) for st in p.streams] + [fill(st, _i32(k)) for k in range(p.depth) for st in p.streams]
-            kinds = (f"{len(p.gemms)} gemm(s)" + (f", {len(p.shave_streams)} slot(s) read by the SHAVE" if p.shave_streams else ""))
-            notes.append(f"ring over {p.c.name} ({p.total_text} chunks; streams " +
-                         ", ".join(f"{st.slot_buf.name}[{p.stages} slots, {st.slot_bytes} B]" for st in p.streams) +
-                         f"; SHAVE s owns {p.depth} slot(s), fills {p.depth} use(s) ahead; {kinds} with SHAVE "
-                         f"statements between, no submit-ahead)")
+            kinds = f"{len(p.gemms)} gemm(s)" + (f", {len(p.shave_streams)} slot(s) read by the SHAVE" if p.shave_streams else "")
+            notes.append(
+                f"ring over {p.c.name} ({p.total_text} chunks; streams "
+                + ", ".join(f"{st.slot_buf.name}[{p.stages} slots, {st.slot_bytes} B]" for st in p.streams)
+                + f"; SHAVE s owns {p.depth} slot(s), fills {p.depth} use(s) ahead; {kinds} with SHAVE "
+                f"statements between, no submit-ahead)"
+            )
             return prologue, use_loop(p, u, loop_body), [end(st) for st in p.streams]
 
         def is_pipelined(s):
@@ -670,23 +888,32 @@ def LowerIntelNpuPipelined():
             if not isinstance(outer, tirx.For) or outer.kind != tirx.ForKind.SERIAL or is_pipelined(outer):
                 return []
             if not isinstance(outer.extent, tirx.IntImm):
-                return []   # a runtime trip count (an expert's token chunks): one ring per iteration
+                return []  # a runtime trip count (an expert's token chunks): one ring per iteration
             stmts = list(outer.body.seq) if isinstance(outer.body, tirx.SeqStmt) else [outer.body]
             written = _written_in(outer.body)
             bound = _let_bound_in(outer.body)
             hoisted = []
             for inner in (s for s in stmts if is_pipelined(s)):
-                fills = [s for s in (list(inner.body.seq) if isinstance(inner.body, tirx.SeqStmt) else [inner.body])
-                         if _is_call(s, DMA_COPY) and _const(s.value.args[6]) == 1]
+                if int(inner.annotations.get("intel_npu.no_hoist", 0)):
+                    continue
+                fills = [
+                    s
+                    for s in (list(inner.body.seq) if isinstance(inner.body, tirx.SeqStmt) else [inner.body])
+                    if _is_call(s, DMA_COPY) and _const(s.value.args[6]) == 1
+                ]
                 if not fills or not _divisible(inner.extent, spt):
                     continue  # uses would straddle outer iterations unevenly; one ring per iteration instead
                 if any(any(w.same_as(b) for w in written) for f in fills for b in _index_reads(f.value.args[1])):
-                    notes.append(f"ring over {inner.loop_var.name} not hoisted over {outer.loop_var.name}: a fill's "
-                                 f"source index reads a buffer the iteration writes")
+                    notes.append(
+                        f"ring over {inner.loop_var.name} not hoisted over {outer.loop_var.name}: a fill's "
+                        f"source index reads a buffer the iteration writes"
+                    )
                     continue
                 if any(any(v.same_as(_load_of(f.value.args[1]).buffer.data) for v in bound) for f in fills):
-                    notes.append(f"ring over {inner.loop_var.name} not hoisted over {outer.loop_var.name}: a fill's "
-                                 f"source is a DDR view bound inside the iteration")
+                    notes.append(
+                        f"ring over {inner.loop_var.name} not hoisted over {outer.loop_var.name}: a fill's "
+                        f"source is a DDR view bound inside the iteration"
+                    )
                     continue
                 hoisted.append(inner)
             return hoisted
@@ -707,14 +934,14 @@ def LowerIntelNpuPipelined():
                 ends += end
                 loops[inner] = loop
                 reads_outer = any(_uses(st.src, stmt.loop_var) for st in p.streams)
-                notes.append(f"ring over {inner.loop_var.name} hoisted over {stmt.loop_var.name} "
-                             f"({_const(stmt.extent)} iterations: one begin/end"
-                             + (", fills read the iteration" if reads_outer else "") + ")")
+                notes.append(
+                    f"ring over {inner.loop_var.name} hoisted over {stmt.loop_var.name} "
+                    f"({_const(stmt.extent)} iterations: one begin/end" + (", fills read the iteration" if reads_outer else "") + ")"
+                )
             stmts = list(stmt.body.seq) if isinstance(stmt.body, tirx.SeqStmt) else [stmt.body]
             replaced = [next((l for k, l in loops.items() if s.same_as(k)), s) for s in stmts]
             new_body = replaced[0] if len(replaced) == 1 else tirx.SeqStmt(replaced)
-            outer = tirx.For(stmt.loop_var, stmt.min, stmt.extent, stmt.kind, new_body, stmt.thread_binding,
-                             stmt.annotations)
+            outer = tirx.For(stmt.loop_var, stmt.min, stmt.extent, stmt.kind, new_body, stmt.thread_binding, stmt.annotations)
             return tirx.SeqStmt(prologue + [outer] + ends)
 
         def lower(stmt):
@@ -743,8 +970,17 @@ def LowerIntelNpuPipelined():
             if isinstance(node, tirx.SBlock):
                 allocs = [mapped(b) for b in node.alloc_buffers]
                 if any(not a.same_as(b) for a, b in zip(allocs, node.alloc_buffers)):
-                    return tirx.SBlock(node.iter_vars, node.reads, node.writes, node.name_hint, node.body, node.init,
-                                       allocs, node.match_buffers, node.annotations)
+                    return tirx.SBlock(
+                        node.iter_vars,
+                        node.reads,
+                        node.writes,
+                        node.name_hint,
+                        node.body,
+                        node.init,
+                        allocs,
+                        node.match_buffers,
+                        node.annotations,
+                    )
             return None
 
         body = ir_transform(body, None, rebuf, ["tirx.BufferLoad", "tirx.SBlock"])

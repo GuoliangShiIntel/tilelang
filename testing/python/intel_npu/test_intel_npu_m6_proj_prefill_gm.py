@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 import tilelang  # noqa: F401
+import tvm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_sim  # noqa: E402
@@ -55,8 +56,7 @@ def _problem(seed=0):
 
 
 def _sim(scales_gm, x, wq, s):
-    low = lowering.lower(make_proj_prefill(NP=NP, M=M, K=K, BN=BN, MB=MB, G=G, tiles=TILES, shaves=SHAVES,
-                                           scales_gm=scales_gm))
+    low = lowering.lower(make_proj_prefill(NP=NP, M=M, K=K, BN=BN, MB=MB, G=G, tiles=TILES, shaves=SHAVES, scales_gm=scales_gm))
     lib = host_sim.build(low.source, f"proj_prefill_{'gm' if scales_gm else 'rm'}_{NP}_{M}_{K}")
     out = np.zeros((NP, M), np.float16)
     arrays = {"X": x, "Wq": wq, "S": s, "Yout": out}
@@ -67,7 +67,7 @@ def _sim(scales_gm, x, wq, s):
 @needs_cxx
 def test_matches_the_reference():
     x, w_int, wq, s_row = _problem()
-    got = _sim(True, x, wq, np.ascontiguousarray(s_row.T))      # [KG, M]
+    got = _sim(True, x, wq, np.ascontiguousarray(s_row.T))  # [KG, M]
     ref = proj_prefill_reference(x, w_int, s_row, G)
     d = np.abs(got.astype(np.float32) - ref).max() / (np.abs(ref).max() + 1e-9)
     assert d < REL, f"rel {d}"
@@ -81,6 +81,47 @@ def test_is_bit_identical_to_the_row_major_kernel():
     rm = _sim(False, x, wq, s_row)
     gm = _sim(True, x, wq, np.ascontiguousarray(s_row.T))
     assert np.array_equal(rm, gm)
+
+
+@needs_cxx
+@pytest.mark.parametrize("scales_gm", [False, True])
+@pytest.mark.parametrize("weight_rows", [32, 64])
+def test_tile_shared_weights_match_private_weights(scales_gm, weight_rows):
+    x, _, wq, s_row = _problem(seed=4)
+    scales = np.ascontiguousarray(s_row.T) if scales_gm else s_row
+    expected = _sim(scales_gm, x, wq, scales)
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.multicast": True}):
+        low = lowering.lower(
+            make_proj_prefill(
+                NP=NP, M=M, K=K, BN=weight_rows, MB=16, G=G, tiles=TILES, shaves=SHAVES, scales_gm=scales_gm, shared_weights=True
+            )
+        )
+    assert "ctx.dma_load_multicast(" in low.source
+    assert f"ctx.alloc_shared<half>({weight_rows * K})" in low.source
+    lib = host_sim.build(low.source, "shared_proj_prefill")
+    output = np.zeros_like(expected)
+    arrays = lowering.order_arrays(low, {"X": x, "Wq": wq, "S": scales, "Yout": output})
+    host_sim.check_status(host_sim.run(lib, arrays, tiles=TILES, shaves=SHAVES))
+    np.testing.assert_array_equal(output, expected)
+
+
+def test_shared_weights_fit_the_reference_projection_geometry():
+    kwargs = dict(NP=192, M=12288, K=2048, BN=128, MB=48, G=128, tiles=3, shaves=2, scales_gm=True)
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.multicast": True}):
+        low = lowering.lower(make_proj_prefill(**kwargs, shared_weights=True))
+        assert "ctx.alloc_shared<half>(262144)" in low.source
+        assert "ctx.dma_load_multicast(" in low.source
+        with pytest.raises(Exception, match="CMX budget exceeded"):
+            lowering.lower(make_proj_prefill(**kwargs))
+
+
+def test_shared_weight_overlap_stays_after_weight_preparation():
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.multicast_overlap": True}):
+        low = lowering.lower(make_proj_prefill(NP=192, M=12288, K=2048, BN=128, MB=48, scales_gm=True, shared_weights=True))
+    assert "ctx.ring_begin(" in low.source
+    assert low.source.index("tl_npu_dequant_i4_gm(") < low.source.index("ctx.ring_begin(")
+    assert "ownership-preserving" in low.source
+    assert "hoisted over it" not in low.source
 
 
 @needs_cxx

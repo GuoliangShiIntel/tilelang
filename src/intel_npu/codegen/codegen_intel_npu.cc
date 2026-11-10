@@ -40,9 +40,11 @@ void CodeGenTileLangIntelNpu::PrintType(DataType t, std::ostream &os) {
       os << "bfloat16";
       return;
     }
-  } else if (t.lanes() >= 2 && (t.lanes() <= 32 || (t.lanes() == 64 && t.bits() == 8)) && (t.lanes() & (t.lanes() - 1)) == 0) {
-    // moviCompile's ext_vector typedefs: half8/16/32, float4/8/16, int4/8/16, ...
-    // (VectorizeLoop decides the lanes; the SHAVE VRF is 512 bits).
+  } else if (t.lanes() >= 2 &&
+             (t.lanes() <= 32 || (t.lanes() == 64 && t.bits() == 8)) &&
+             (t.lanes() & (t.lanes() - 1)) == 0) {
+    // moviCompile's ext_vector typedefs: half8/16/32, float4/8/16, int4/8/16,
+    // ... (VectorizeLoop decides the lanes; the SHAVE VRF is 512 bits).
     if (t.is_float16()) {
       os << "half" << t.lanes();
       return;
@@ -80,7 +82,8 @@ void CodeGenTileLangIntelNpu::PrintType(DataType t, std::ostream &os) {
 }
 
 void CodeGenTileLangIntelNpu::VisitStmt_(const ForNode *op) {
-  // T.unroll: moviCompile is clang; the pragma is how the author asks for straight-line code.
+  // T.unroll: moviCompile is clang; the pragma is how the author asks for
+  // straight-line code.
   if (op->kind == tirx::ForKind::kUnrolled) {
     PrintIndent();
     stream << "#pragma unroll\n";
@@ -88,13 +91,16 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const ForNode *op) {
   CodeGenC::VisitStmt_(op);
 }
 
-void CodeGenTileLangIntelNpu::VisitExpr_(const BroadcastNode *op, std::ostream &os) {
-  // A scalar cast to an ext_vector type splats. A lane of a register buffer is splatted by a shuffle instead:
-  // moviCompile's backend cannot select v16f32 LANESPLAT of an extracted lane (M1 decode's norm factor), a
-  // shuffle of the register with a constant index list it can.
+void CodeGenTileLangIntelNpu::VisitExpr_(const BroadcastNode *op,
+                                         std::ostream &os) {
+  // A scalar cast to an ext_vector type splats. A lane of a register buffer is
+  // splatted by a shuffle instead: moviCompile's backend cannot select v16f32
+  // LANESPLAT of an extracted lane (M1 decode's norm factor), a shuffle of the
+  // register with a constant index list it can.
   if (const auto *load = op->value.as<BufferLoadNode>()) {
     const auto *imm = load->indices[0].as<IntImmNode>();
-    if (IsRegisterBuffer(load->buffer->data.get()) && load->dtype.lanes() == 1 && imm != nullptr &&
+    if (IsRegisterBuffer(load->buffer->data.get()) &&
+        load->dtype.lanes() == 1 && imm != nullptr &&
         op->dtype.element_of() == load->buffer->dtype) {
       const std::string vid = GetVarID(load->buffer->data.get());
       os << "__builtin_shufflevector(" << vid << ", " << vid;
@@ -114,7 +120,8 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CastNode *op, std::ostream &os) {
     CodeGenC::VisitExpr_(op, os);
     return;
   }
-  // A C cast between same-size vectors is a bitcast; lane-wise conversion is this builtin.
+  // A C cast between same-size vectors is a bitcast; lane-wise conversion is
+  // this builtin.
   os << "__builtin_convertvector(" << PrintExpr(op->value) << ", ";
   PrintType(op->dtype, os);
   os << ")";
@@ -166,7 +173,8 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const AttrStmtNode *op) {
     return;
   }
   if (op->attr_key == tl::attr::kLexicalAllocScope) {
-    // A phase's allocations live in this block (ScopeIntelNpuCmx): the CmxScope inside releases them.
+    // A phase's allocations live in this block (ScopeIntelNpuCmx): the CmxScope
+    // inside releases them.
     PrintIndent();
     stream << "{\n";
     int scope = BeginScope();
@@ -201,10 +209,11 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const AllocBufferNode *op) {
   // SHAVE (and the same offset on every tile, which a multicast fill needs).
   const bool shared = scope != "local";
   const DataType dt = op->buffer->dtype;
-  const bool one_vector = !shared && dt.lanes() == 1 && dt.is_float() &&
-                          needs_memory_.count(op->buffer->data.get()) == 0 &&
-                          ((dt.bits() == 16 && (count == 8 || count == 16 || count == 32)) ||
-                           (dt.bits() == 32 && (count == 4 || count == 8 || count == 16)));
+  const bool one_vector =
+      !shared && dt.lanes() == 1 && dt.is_float() &&
+      needs_memory_.count(op->buffer->data.get()) == 0 &&
+      ((dt.bits() == 16 && (count == 8 || count == 16 || count == 32)) ||
+       (dt.bits() == 32 && (count == 4 || count == 8 || count == 16)));
   if (one_vector) {
     // a vector register, not CMX (see register_lanes_)
     register_lanes_[op->buffer->data.get()] = static_cast<int>(count);
@@ -215,20 +224,23 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const AllocBufferNode *op) {
     return;
   }
   PrintIndent();
-  // The scope object releases this block's allocations at its end (phases and loop bodies share CMX).
+  // The scope object releases this block's allocations at its end (phases and
+  // loop bodies share CMX).
   stream << "npu::Ctx::CmxScope cmx_scope_" << cmx_scope_count_++ << "(ctx);\n";
   PrintIndent();
   PrintType(op->buffer->dtype, stream);
-  // Distinct allocations never alias; without __restrict moviCompile keeps every
-  // vector accumulator in CMX and re-issues each load after the previous store
-  // (NOP 8 per load in the flash softmax row loop, M1 step 3c).
-  stream << "* __restrict " << vid << " = ctx." << (shared ? "alloc_shared<" : "alloc<");
+  // Distinct allocations never alias; without __restrict moviCompile keeps
+  // every vector accumulator in CMX and re-issues each load after the previous
+  // store (NOP 8 per load in the flash softmax row loop, M1 step 3c).
+  stream << "* __restrict " << vid << " = ctx."
+         << (shared ? "alloc_shared<" : "alloc<");
   PrintType(op->buffer->dtype, stream);
   stream << ">(" << count << ");  // " << scope << "\n";
   RegisterHandleType(op->buffer->data.get(), op->buffer->dtype);
 }
 
-void CodeGenTileLangIntelNpu::VisitExpr_(const BufferLoadNode *op, std::ostream &os) {
+void CodeGenTileLangIntelNpu::VisitExpr_(const BufferLoadNode *op,
+                                         std::ostream &os) {
   const VarNode *v = op->buffer->data.get();
   if (!IsRegisterBuffer(v)) {
     CodeGenC::VisitExpr_(op, os);
@@ -242,13 +254,15 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const BufferLoadNode *op, std::ostream 
     return;
   }
   arith::PVar<PrimExpr> base;
-  if (op->dtype.lanes() == lanes && arith::ramp(base, 1, lanes).Match(index) && is_zero(base.Eval())) {
+  if (op->dtype.lanes() == lanes && arith::ramp(base, 1, lanes).Match(index) &&
+      is_zero(base.Eval())) {
     os << GetVarID(v);
     return;
   }
-  TVM_FFI_THROW(ValueError) << "intel_npu: the one-vector buffer " << op->buffer->name
-                            << " is read as a partial or shifted vector (" << index
-                            << "); read the whole vector or single lanes";
+  TVM_FFI_THROW(ValueError)
+      << "intel_npu: the one-vector buffer " << op->buffer->name
+      << " is read as a partial or shifted vector (" << index
+      << "); read the whole vector or single lanes";
 }
 
 void CodeGenTileLangIntelNpu::VisitStmt_(const BufferStoreNode *op) {
@@ -263,49 +277,55 @@ void CodeGenTileLangIntelNpu::VisitStmt_(const BufferStoreNode *op) {
   const std::string value = PrintExpr(op->value);
   PrintIndent();
   if (op->value.dtype().lanes() == 1) {
-    stream << GetVarID(v) << "[" << PrintExpr(index) << "] = " << value << ";\n";
+    stream << GetVarID(v) << "[" << PrintExpr(index) << "] = " << value
+           << ";\n";
     return;
   }
   arith::PVar<PrimExpr> base;
-  if (op->value.dtype().lanes() == lanes && arith::ramp(base, 1, lanes).Match(index) && is_zero(base.Eval())) {
+  if (op->value.dtype().lanes() == lanes &&
+      arith::ramp(base, 1, lanes).Match(index) && is_zero(base.Eval())) {
     stream << GetVarID(v) << " = " << value << ";\n";
     return;
   }
-  TVM_FFI_THROW(ValueError) << "intel_npu: the one-vector buffer " << op->buffer->name
-                            << " is written as a partial or shifted vector (" << index
-                            << "); write the whole vector or single lanes";
+  TVM_FFI_THROW(ValueError)
+      << "intel_npu: the one-vector buffer " << op->buffer->name
+      << " is written as a partial or shifted vector (" << index
+      << "); write the whole vector or single lanes";
 }
 
 void CodeGenTileLangIntelNpu::VisitStmt_(const BindNode *op) {
   if (const auto *call = op->value.as<CallNode>()) {
     if (call->op.same_as(tl::intel_npu_ring_begin())) {
       PrintIndent();
-      stream << "npu::Ctx::Ring " << AllocVarID(op->var.get()) << " = " << PrintExpr(op->value)
-             << ";\n";
+      stream << "npu::Ctx::Ring " << AllocVarID(op->var.get()) << " = "
+             << PrintExpr(op->value) << ";\n";
       return;
     }
     if (call->op.same_as(tl::intel_npu_ddr_ptr())) {
-      // a DDR tensor at a run-time address (a layer table entry): typed by the second argument
+      // a DDR tensor at a run-time address (a layer table entry): typed by the
+      // second argument
       const DataType dt = call->args[1].dtype();
       RegisterHandleType(op->var.get(), dt);
       PrintIndent();
       stream << "const npu::Ddr<";
       PrintType(dt, stream);
-      stream << "> " << AllocVarID(op->var.get()) << "((uint64_t)" << PrintExpr(call->args[0]) << ");\n";
+      stream << "> " << AllocVarID(op->var.get()) << "((uint64_t)"
+             << PrintExpr(call->args[0]) << ");\n";
       return;
     }
   }
   CodeGenC::VisitStmt_(op);
 }
 
-void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
-                                         std::ostream &os) {
+void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op, std::ostream &os) {
   if (op->op.same_as(builtin::address_of())) {
     if (const auto *load = op->args[0].as<BufferLoadNode>()) {
       if (IsRegisterBuffer(load->buffer->data.get())) {
-        TVM_FFI_THROW(ValueError) << "intel_npu: the one-vector buffer " << load->buffer->name
-                                  << " is a register; it has no address (a DMA or extern call cannot use it): "
-                                     "give it more than one vector's worth of elements";
+        TVM_FFI_THROW(ValueError)
+            << "intel_npu: the one-vector buffer " << load->buffer->name
+            << " is a register; it has no address (a DMA or extern call cannot "
+               "use it): "
+               "give it more than one vector's worth of elements";
       }
     }
   }
@@ -322,10 +342,19 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
     // (dst, src, width_bytes, rows, dst_stride, src_stride, to_cmx[, async])
     const auto *to_cmx = op->args[6].as<IntImmNode>();
     ICHECK(to_cmx != nullptr);
-    const auto *async = op->args.size() > 7 ? op->args[7].as<IntImmNode>() : nullptr;
+    const auto *async =
+        op->args.size() > 7 ? op->args[7].as<IntImmNode>() : nullptr;
     const bool is_async = async != nullptr && async->value != 0;
-    ICHECK(!is_async || to_cmx->value) << "intel_npu: only a LOAD can be left in flight";
-    os << (to_cmx->value ? (is_async ? "ctx.dma_load_async(" : "ctx.dma_load(") : "ctx.dma_store(")
+    const auto *multicast =
+        op->args.size() > 8 ? op->args[8].as<IntImmNode>() : nullptr;
+    const bool is_multicast = multicast != nullptr && multicast->value != 0;
+    ICHECK(!is_async || to_cmx->value)
+        << "intel_npu: only a LOAD can be left in flight";
+    ICHECK(!is_multicast || (to_cmx->value && !is_async));
+    os << (to_cmx->value ? (is_multicast ? "ctx.dma_load_multicast("
+                            : is_async   ? "ctx.dma_load_async("
+                                         : "ctx.dma_load(")
+                         : "ctx.dma_store(")
        << args(0, 6) << ")";
     return;
   }
@@ -404,9 +433,10 @@ void CodeGenTileLangIntelNpu::PrintStorageSync(const CallNode *op) {
     stream << "ctx.sync_grid();\n";
     return;
   }
-  TVM_FFI_THROW(ValueError) << "intel_npu: storage sync scope '" << s
-                            << "' has no meaning on this target (shared = the tile's SHAVEs, "
-                               "global / T.sync_grid() = every SHAVE)";
+  TVM_FFI_THROW(ValueError)
+      << "intel_npu: storage sync scope '" << s
+      << "' has no meaning on this target (shared = the tile's SHAVEs, "
+         "global / T.sync_grid() = every SHAVE)";
 }
 
 void CodeGenTileLangIntelNpu::AddFunction(const PrimFunc &f) {
@@ -429,20 +459,25 @@ void CodeGenTileLangIntelNpu::AddFunction(const PrimFunc &f) {
       static_cast<std::string>(global_symbol.value());
   bool no_alias = f->HasNonzeroAttr(tirx::attr::kNoAlias);
 
-  // sync_grid on hardware barriers: the top kSyncBarriers ids of the JOB's pool,
-  // [barrier_pool_first, barriers_per_tile x launch tiles). An id beyond the
-  // job's allocation is a context violation that hangs the run, so the pool
+  // sync_grid on hardware barriers: the top kSyncBarriers ids of the JOB's
+  // pool, [barrier_pool_first, barriers_per_tile x launch tiles). An id beyond
+  // the job's allocation is a context violation that hangs the run, so the pool
   // follows the kernel's own tile count, not the platform's.
   sync_barrier_base_ = -1;
-  const bool hw_sync = tvm::transform::PassContext::Current()
-                           ->GetConfig<Bool>(tl::kIntelNpuHwSyncGrid, Bool(true))
-                           .value();
+  const bool hw_sync =
+      tvm::transform::PassContext::Current()
+          ->GetConfig<Bool>(tl::kIntelNpuHwSyncGrid, Bool(true))
+          .value();
   if (hw_sync) {
     if (auto target = f->GetAttr<Target>(tvm::attr::kTarget)) {
-      const int64_t first =
-          target.value()->GetAttr<Integer>("barrier_pool_first").value_or(Integer(-1)).IntValue();
-      const int64_t per_tile =
-          target.value()->GetAttr<Integer>("barriers_per_tile").value_or(Integer(0)).IntValue();
+      const int64_t first = target.value()
+                                ->GetAttr<Integer>("barrier_pool_first")
+                                .value_or(Integer(-1))
+                                .IntValue();
+      const int64_t per_tile = target.value()
+                                   ->GetAttr<Integer>("barriers_per_tile")
+                                   .value_or(Integer(0))
+                                   .IntValue();
       int64_t launch_tiles = 0;
       tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &n) {
         if (const auto *attr = n.as<AttrStmtNode>()) {
@@ -461,8 +496,8 @@ void CodeGenTileLangIntelNpu::AddFunction(const PrimFunc &f) {
         sync_barrier_base_ = pool_end - 3;
       } else {
         TVM_FFI_THROW(ValueError)
-            << "intel_npu: the hardware-barrier pool [" << first << ", " << pool_end
-            << ") of a " << launch_tiles
+            << "intel_npu: the hardware-barrier pool [" << first << ", "
+            << pool_end << ") of a " << launch_tiles
             << "-tile launch has no room for the 3 sync_grid barriers; set "
                "tl.intel_npu.hw_sync_grid=False or launch more tiles";
       }
@@ -474,13 +509,18 @@ void CodeGenTileLangIntelNpu::AddFunction(const PrimFunc &f) {
       alloc_storage_scope_[param.get()] = GetPtrStorageScope(param);
     }
   }
-  // The merged-FC scratch (npu_rt_device.hpp dpu_matmul_qg): part [M x ng, N x ng] and sT [ng, N] halves of the
-  // largest quantised GEMV, reserved up front in kernel_entry so a kernel with two GEMV shapes pays no re-size.
+  // The merged-FC scratch (npu_rt_device.hpp dpu_matmul_qg): part [M x ng, N x
+  // ng] and sT [ng, N] halves of the largest quantised GEMV, reserved up front
+  // in kernel_entry so a kernel with two GEMV shapes pays no re-size.
   qg_part_elems_ = qg_st_elems_ = qg_defer_elems_ = 0;
-  // A buffer stays in CMX rather than becoming a vector register when either disqualifies it:
-  //   * it is accessed at a variable lane (indexed by a loop variable) -- a splat of a variable-lane extract is
-  //     unselectable on the SHAVE (the flash-decoding o_acc update by corr[i], M1 decode);
-  //   * its address is taken -- a register has none, and a DMA or an extern call needs one.
+  // A buffer stays in CMX rather than becoming a vector register when either
+  // disqualifies it:
+  //   * it is accessed at a variable lane (indexed by a loop variable) -- a
+  //   splat of a variable-lane extract is
+  //     unselectable on the SHAVE (the flash-decoding o_acc update by corr[i],
+  //     M1 decode);
+  //   * its address is taken -- a register has none, and a DMA or an extern
+  //   call needs one.
   needs_memory_.clear();
   register_lanes_.clear();
   tirx::PostOrderVisit(f->body, [&](const ffi::ObjectRef &n) {
@@ -519,7 +559,8 @@ void CodeGenTileLangIntelNpu::AddFunction(const PrimFunc &f) {
       const int64_t part = M->value * ng * N->value * ng;
       qg_part_elems_ = std::max(qg_part_elems_, part);
       qg_st_elems_ = std::max(qg_st_elems_, ng * N->value);
-      const auto *defer = call->args.size() > 9 ? call->args[9].as<IntImmNode>() : nullptr;
+      const auto *defer =
+          call->args.size() > 9 ? call->args[9].as<IntImmNode>() : nullptr;
       if (defer != nullptr && defer->value != 0)
         qg_defer_elems_ = std::max(qg_defer_elems_, part);
     }
@@ -551,7 +592,8 @@ void CodeGenTileLangIntelNpu::AddFunction(const PrimFunc &f) {
       } else {
         elem << "void";
       }
-      // DDR addresses are 64-bit on a 32-bit SHAVE: a typed address, not a pointer.
+      // DDR addresses are 64-bit on a 32-bit SHAVE: a typed address, not a
+      // pointer.
       if (is_ddr) {
         ctype << "npu::Ddr<" << elem.str() << ">";
       } else {
@@ -587,9 +629,10 @@ void CodeGenTileLangIntelNpu::EmitKernelEntry(
   stream << "void kernel_entry(int numParams, uint64_t* params, const "
             "npu::Environment& env) {\n";
   if (sync_barrier_base_ >= 0) {
-    // Named here so a launch that never returns can be matched to the ids it touches.
-    stream << "  // hardware barrier ids used by this kernel: sync_grid " << sync_barrier_base_ << ".."
-           << sync_barrier_base_ + 2 << "\n";
+    // Named here so a launch that never returns can be matched to the ids it
+    // touches.
+    stream << "  // hardware barrier ids used by this kernel: sync_grid "
+           << sync_barrier_base_ << ".." << sync_barrier_base_ + 2 << "\n";
   }
   stream << "  npu::Ctx ctx(env, numParams, params, " << params.size();
   if (sync_barrier_base_ >= 0) {
@@ -598,8 +641,10 @@ void CodeGenTileLangIntelNpu::EmitKernelEntry(
   stream << ");\n";
   stream << "  if (!ctx.ok()) { ctx.finish(); return; }\n";
   if (qg_part_elems_ > 0) {
-    stream << "  ctx.reserve_qg(" << qg_part_elems_ << ", " << qg_st_elems_ << ", " << qg_defer_elems_
-           << ");  // merged-FC scratch of the largest gemm_i4/i8 shape (and 2 x the largest deferred one)\n";
+    stream << "  ctx.reserve_qg(" << qg_part_elems_ << ", " << qg_st_elems_
+           << ", " << qg_defer_elems_
+           << ");  // merged-FC scratch of the largest gemm_i4/i8 shape (and 2 "
+              "x the largest deferred one)\n";
     stream << "  if (!ctx.ok()) { ctx.finish(); return; }\n";
   }
   stream << "  " << kernel_name << "(ctx";

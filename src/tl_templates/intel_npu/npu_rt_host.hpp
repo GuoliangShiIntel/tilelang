@@ -22,15 +22,20 @@
 typedef _Float16 half;
 
 #include <cmath>
-// fp16 math behind the intel_npu intrinsic rules (intrin_rule_intel_npu.cc), float math on the host.
+// fp16 math behind the intel_npu intrinsic rules (intrin_rule_intel_npu.cc),
+// float math on the host.
 static inline half tl_npu_hexp(half x) { return (half)expf((float)x); }
 static inline half tl_npu_hexp2(half x) { return (half)exp2f((float)x); }
 static inline half tl_npu_hlog(half x) { return (half)logf((float)x); }
 static inline half tl_npu_hlog2(half x) { return (half)log2f((float)x); }
 static inline half tl_npu_hsqrt(half x) { return (half)sqrtf((float)x); }
-static inline half tl_npu_hrsqrt(half x) { return (half)(1.0f / sqrtf((float)x)); }
+static inline half tl_npu_hrsqrt(half x) {
+  return (half)(1.0f / sqrtf((float)x));
+}
 static inline half tl_npu_htanh(half x) { return (half)tanhf((float)x); }
-static inline half tl_npu_hsigmoid(half x) { return (half)(1.0f / (1.0f + expf(-(float)x))); }
+static inline half tl_npu_hsigmoid(half x) {
+  return (half)(1.0f / (1.0f + expf(-(float)x)));
+}
 static inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
 static inline half tl_npu_hfabs(half x) { return (half)fabsf((float)x); }
 static inline half tl_npu_hfloor(half x) { return (half)floorf((float)x); }
@@ -40,7 +45,8 @@ static inline half tl_npu_hround(half x) { return (half)roundf((float)x); }
 template <class T> static inline T max(T a, T b) { return a > b ? a : b; }
 template <class T> static inline T min(T a, T b) { return a < b ? a : b; }
 
-// The SHAVE compiler's ext_vector typedefs (the codegen prints half16, float8, ...).
+// The SHAVE compiler's ext_vector typedefs (the codegen prints half16, float8,
+// ...).
 typedef half half4 __attribute__((ext_vector_type(4)));
 typedef half half8 __attribute__((ext_vector_type(8)));
 typedef half half16 __attribute__((ext_vector_type(16)));
@@ -54,19 +60,20 @@ typedef int int8 __attribute__((ext_vector_type(8)));
 typedef int int16 __attribute__((ext_vector_type(16)));
 #include "npu_rt_vecmath.hpp"
 
-// Whole-vector reductions behind T.call_extern("tl_npu_vmax" / "tl_npu_vsum", buf[0:N]).
-#define TL_NPU_HOST_REDUCE(V, S, N)                                             \
-  static inline S tl_npu_vmax(V v) {                                            \
-    S r = v[0];                                                                 \
-    for (int i = 1; i < N; ++i)                                                 \
-      r = v[i] > r ? (S)v[i] : r;                                               \
-    return r;                                                                   \
-  }                                                                             \
-  static inline S tl_npu_vsum(V v) {                                            \
-    S r = v[0];                                                                 \
-    for (int i = 1; i < N; ++i)                                                 \
-      r = r + (S)v[i];                                                          \
-    return r;                                                                   \
+// Whole-vector reductions behind T.call_extern("tl_npu_vmax" / "tl_npu_vsum",
+// buf[0:N]).
+#define TL_NPU_HOST_REDUCE(V, S, N)                                            \
+  static inline S tl_npu_vmax(V v) {                                           \
+    S r = v[0];                                                                \
+    for (int i = 1; i < N; ++i)                                                \
+      r = v[i] > r ? (S)v[i] : r;                                              \
+    return r;                                                                  \
+  }                                                                            \
+  static inline S tl_npu_vsum(V v) {                                           \
+    S r = v[0];                                                                \
+    for (int i = 1; i < N; ++i)                                                \
+      r = r + (S)v[i];                                                         \
+    return r;                                                                  \
   }
 TL_NPU_HOST_REDUCE(half32, half, 32)
 TL_NPU_HOST_REDUCE(half16, half, 16)
@@ -76,9 +83,10 @@ TL_NPU_HOST_REDUCE(float8, float, 8)
 TL_NPU_HOST_REDUCE(float4, float, 4)
 #undef TL_NPU_HOST_REDUCE
 
-// Perf regions are `Ctx::task_begin` / `task_end`; no-ops in the host simulation.
-// Packed signed int4 (two per byte, low nibble first, value = (n ^ 8) - 8) to fp16, 64 values
-// from 32 bytes as two half32 halves (the device's LSU convert-load).
+// Perf regions are `Ctx::task_begin` / `task_end`; no-ops in the host
+// simulation. Packed signed int4 (two per byte, low nibble first, value = (n ^
+// 8) - 8) to fp16, 64 values from 32 bytes as two half32 halves (the device's
+// LSU convert-load).
 static inline half32 tl_npu_i4x64_part(const void *p, int first) {
   const unsigned char *b = (const unsigned char *)p;
   half32 r;
@@ -89,8 +97,12 @@ static inline half32 tl_npu_i4x64_part(const void *p, int first) {
   }
   return r;
 }
-static inline half32 tl_npu_i4x64_lo(const void *p) { return tl_npu_i4x64_part(p, 0); }
-static inline half32 tl_npu_i4x64_hi(const void *p) { return tl_npu_i4x64_part(p, 32); }
+static inline half32 tl_npu_i4x64_lo(const void *p) {
+  return tl_npu_i4x64_part(p, 0);
+}
+static inline half32 tl_npu_i4x64_hi(const void *p) {
+  return tl_npu_i4x64_part(p, 32);
+}
 typedef signed char schar64 __attribute__((ext_vector_type(64)));
 typedef signed char schar32 __attribute__((ext_vector_type(32)));
 static inline schar64 tl_npu_ld_i4x64(const void *p) {
@@ -102,28 +114,36 @@ static inline schar64 tl_npu_ld_i4x64(const void *p) {
   }
   return r;
 }
-static inline void tl_npu_dequant_i4_row(half *dst, const unsigned char *src, const half *scales, unsigned width,
+static inline void tl_npu_dequant_i4_row(half *dst, const unsigned char *src,
+                                         const half *scales, unsigned width,
                                          unsigned group) {
   for (unsigned k = 0; k < width; ++k) {
     const int n = (k & 1) ? (src[k >> 1] >> 4) : (src[k >> 1] & 0xF);
     dst[k] = (half)((float)((n ^ 8) - 8) * (float)scales[k / group]);
   }
 }
-static inline void tl_npu_dequant_i4_block(half *dst, const unsigned char *src, const half *scales, unsigned rows,
+static inline void tl_npu_dequant_i4_block(half *dst, const unsigned char *src,
+                                           const half *scales, unsigned rows,
                                            unsigned width, unsigned group) {
   for (unsigned r = 0; r < rows; ++r)
-    tl_npu_dequant_i4_row(dst + r * width, src + r * (width / 2), scales + r * (width / group), width, group);
+    tl_npu_dequant_i4_row(dst + r * width, src + r * (width / 2),
+                          scales + r * (width / group), width, group);
 }
-// Group-major scales, the device runtime's `tl_npu_dequant_i4_gm`: s[(k / group) * sStride + r], where sStride
-// defaults to `rows` (a chunk in its own buffer) and is larger when the chunk sits inside a wider scale table.
-static inline void tl_npu_dequant_i4_gm(half *dst, const unsigned char *src, const half *s, unsigned rows,
-                                        unsigned width, unsigned group, unsigned sStride = 0) {
-  if (sStride == 0) sStride = rows;
+// Group-major scales, the device runtime's `tl_npu_dequant_i4_gm`: s[(k /
+// group) * sStride + r], where sStride defaults to `rows` (a chunk in its own
+// buffer) and is larger when the chunk sits inside a wider scale table.
+static inline void tl_npu_dequant_i4_gm(half *dst, const unsigned char *src,
+                                        const half *s, unsigned rows,
+                                        unsigned width, unsigned group,
+                                        unsigned sStride = 0) {
+  if (sStride == 0)
+    sStride = rows;
   for (unsigned r = 0; r < rows; ++r)
     for (unsigned k = 0; k < width; ++k) {
       const unsigned i = r * width + k;
       const int n = (i & 1) ? (src[i >> 1] >> 4) : (src[i >> 1] & 0xF);
-      dst[i] = (half)((float)((n ^ 8) - 8) * (float)s[(k / group) * sStride + r]);
+      dst[i] =
+          (half)((float)((n ^ 8) - 8) * (float)s[(k / group) * sStride + r]);
     }
 }
 
@@ -142,33 +162,43 @@ void kernel_entry(int numParams, uint64_t *params, const npu::Environment &env);
 namespace npu {
 
 // Reusable rendezvous for a fixed party count (C++17; std::barrier is C++20).
-// A stuck barrier REPORTS rather than hanging, as the device runtime's waits do: the per-worker arrival
-// counts say which worker never got there and how many barriers it had passed, which is what turns a
-// 10-minute "the sim is slow" into a line number. TL_NPU_HOST_BARRIER_TIMEOUT_S overrides the 120 s bound.
+// A stuck barrier REPORTS rather than hanging, as the device runtime's waits
+// do: the per-worker arrival counts say which worker never got there and how
+// many barriers it had passed, which is what turns a 10-minute "the sim is
+// slow" into a line number. TL_NPU_HOST_BARRIER_TIMEOUT_S overrides the 120 s
+// bound.
 class Barrier {
 public:
-  explicit Barrier(unsigned parties) : parties_(parties), arrived_(parties, 0) {}
+  explicit Barrier(unsigned parties)
+      : parties_(parties), arrived_(parties, 0) {}
   void wait(unsigned who = 0u, const char *what = "barrier") {
     std::unique_lock<std::mutex> lk(m_);
     const unsigned gen = gen_;
     if (who < arrived_.size())
       ++arrived_[who];
     if (trace())
-      std::fprintf(stderr, "w%u %s #%u\n", who, what, who < arrived_.size() ? arrived_[who] : 0u);
+      std::fprintf(stderr, "w%u %s #%u\n", who, what,
+                   who < arrived_.size() ? arrived_[who] : 0u);
     if (++count_ == parties_) {
       count_ = 0;
       ++gen_;
       cv_.notify_all();
       return;
     }
-    if (!cv_.wait_for(lk, std::chrono::seconds(timeout_s()), [&] { return gen != gen_; })) {
-      std::fprintf(stderr, "npu host sim: %s STUCK at generation %u -- %u of %u arrived\n", what, gen, count_,
-                   parties_);
+    if (!cv_.wait_for(lk, std::chrono::seconds(timeout_s()),
+                      [&] { return gen != gen_; })) {
+      std::fprintf(
+          stderr,
+          "npu host sim: %s STUCK at generation %u -- %u of %u arrived\n", what,
+          gen, count_, parties_);
       std::fprintf(stderr, "  barriers passed per party:");
       for (std::size_t i = 0; i < arrived_.size(); ++i)
         std::fprintf(stderr, " [%zu]=%u", i, arrived_[i]);
-      std::fprintf(stderr, "\n  the party with the LOWEST count is the one still running; its count is the"
-                           " index of the %s it never reached\n", what);
+      std::fprintf(stderr,
+                   "\n  the party with the LOWEST count is the one still "
+                   "running; its count is the"
+                   " index of the %s it never reached\n",
+                   what);
       std::fflush(stderr);
       std::abort();
     }
@@ -201,7 +231,9 @@ template <class T> struct Ddr;
 template <class T> struct DdrRef {
   std::uint64_t addr;
   Ddr<T> operator&() const { return Ddr<T>{addr}; }
-  operator T() const { return *reinterpret_cast<const T *>(static_cast<std::uintptr_t>(addr)); }
+  operator T() const {
+    return *reinterpret_cast<const T *>(static_cast<std::uintptr_t>(addr));
+  }
   DdrRef &operator=(const T &v) {
     *reinterpret_cast<T *>(static_cast<std::uintptr_t>(addr)) = v;
     return *this;
@@ -218,10 +250,11 @@ template <class T> struct Ddr {
 
 struct Environment {
   std::uint32_t tile, shave, tiles, spt;
-  std::uint8_t *cmx;       // this tile's arena
+  std::uint8_t *cmx; // this tile's arena
   std::uint32_t cmxBytes;
-  Barrier *grid;           // all SHAVEs of all tiles
-  Barrier *tileBarrier;    // the SHAVEs of this tile
+  Barrier *grid;        // all SHAVEs of all tiles
+  Barrier *tileBarrier; // the SHAVEs of this tile
+  std::vector<std::vector<std::uint8_t>> *arenas;
 };
 
 class Ctx {
@@ -231,8 +264,8 @@ public:
 
   static constexpr std::uint32_t kNoHwSync = 0xFFFFFFFFu;
 
-  Ctx(const Environment &env, int numParams, std::uint64_t *params, int numTensorParams,
-      std::uint32_t /*syncBarrierBase*/ = kNoHwSync)
+  Ctx(const Environment &env, int numParams, std::uint64_t *params,
+      int numTensorParams, std::uint32_t /*syncBarrierBase*/ = kNoHwSync)
       : env_(env) {
     statusAddr_ = numParams > numTensorParams ? params[numTensorParams] : 0;
     if (numParams < numTensorParams) {
@@ -257,7 +290,8 @@ public:
     offset_ += need;
     return reinterpret_cast<T *>(base + bytes * env_.shave);
   }
-  // Tile-shared: both SHAVEs of a tile run the same allocation sequence on the same arena.
+  // Tile-shared: both SHAVEs of a tile run the same allocation sequence on the
+  // same arena.
   template <class T> T *alloc_shared(std::uint32_t count) {
     const std::uint32_t bytes = alignUp(count * sizeof(T), kAlign);
     if (offset_ + bytes > env_.cmxBytes) {
@@ -268,12 +302,14 @@ public:
     offset_ += bytes;
     return reinterpret_cast<T *>(base);
   }
-  // Codegen brackets every C++ scope that allocates with a CmxScope: the allocations of a phase or a
-  // loop body are released at its end, so sequential phases share CMX (the device runtime does the same).
+  // Codegen brackets every C++ scope that allocates with a CmxScope: the
+  // allocations of a phase or a loop body are released at its end, so
+  // sequential phases share CMX (the device runtime does the same).
   using CmxMark = std::uint32_t;
   CmxMark cmx_mark() const { return offset_; }
   void cmx_restore(CmxMark m) { offset_ = m; }
-  void phase_begin(const char *) {}     // the per-task records are device-only; the simulation has no clock
+  void phase_begin(const char *) {
+  } // the per-task records are device-only; the simulation has no clock
   void phase_end() {}
   void task_begin(const char *) {}
   void task_end() {}
@@ -292,23 +328,40 @@ public:
   template <class T>
   void dma_load(T *dst, Ddr<T> src, std::uint32_t width, std::uint32_t rows,
                 std::uint32_t dstStride, std::uint32_t srcStride) {
-    copy2d(reinterpret_cast<std::uint8_t *>(dst), ptr(src.addr), width, rows, dstStride, srcStride);
+    copy2d(reinterpret_cast<std::uint8_t *>(dst), ptr(src.addr), width, rows,
+           dstStride, srcStride);
   }
-  // the simulation has no engine to overlap with, so the prefetched load simply happens here
+  // the simulation has no engine to overlap with, so the prefetched load simply
+  // happens here
   template <class T>
-  void dma_load_async(T *dst, Ddr<T> src, std::uint32_t width, std::uint32_t rows,
-                      std::uint32_t dstStride, std::uint32_t srcStride) {
+  void dma_load_async(T *dst, Ddr<T> src, std::uint32_t width,
+                      std::uint32_t rows, std::uint32_t dstStride,
+                      std::uint32_t srcStride) {
     dma_load(dst, src, width, rows, dstStride, srcStride);
   }
   void dma_load_wait() {}
   template <class T>
-  void dma_store(Ddr<T> dst, const T *src, std::uint32_t width, std::uint32_t rows,
-                 std::uint32_t dstStride, std::uint32_t srcStride) {
-    copy2d(ptr(dst.addr), reinterpret_cast<const std::uint8_t *>(src), width, rows, dstStride, srcStride);
+  void dma_load_multicast(T *dst, Ddr<T> src, std::uint32_t width,
+                          std::uint32_t rows, std::uint32_t dstStride,
+                          std::uint32_t srcStride) {
+    if (env_.tile != 0)
+      return;
+    const auto offset = reinterpret_cast<std::uint8_t *>(dst) - env_.cmx;
+    for (auto &arena : *env_.arenas)
+      copy2d(arena.data() + offset, ptr(src.addr), width, rows, dstStride,
+             srcStride);
+  }
+  template <class T>
+  void dma_store(Ddr<T> dst, const T *src, std::uint32_t width,
+                 std::uint32_t rows, std::uint32_t dstStride,
+                 std::uint32_t srcStride) {
+    copy2d(ptr(dst.addr), reinterpret_cast<const std::uint8_t *>(src), width,
+           rows, dstStride, srcStride);
   }
 
-  void dpu_matmul(half *out, const half *a, const half *bt, std::uint32_t M, std::uint32_t N,
-                  std::uint32_t K, std::uint32_t spatialX = 0, std::int32_t mpe = -1) {
+  void dpu_matmul(half *out, const half *a, const half *bt, std::uint32_t M,
+                  std::uint32_t N, std::uint32_t K, std::uint32_t spatialX = 0,
+                  std::int32_t mpe = -1) {
     if (!ok_)
       return;
     if (N > kMaxDpuN) {
@@ -332,31 +385,46 @@ public:
     }
   }
 
-  // The device's merged-FC quantised GEMV, with its rounding points: each (row, group) partial product is
-  // scaled by 1/16 and rounded to fp16 by the DPU's ODU, the SHAVE sums partial x scale in fp32, x16, fp16.
-  // `defer` is a device scheduling hint (the reduction runs later); the host sim reduces at once.
-  void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride = 0, bool = false) {
+  // The device's merged-FC quantised GEMV, with its rounding points: each (row,
+  // group) partial product is scaled by 1/16 and rounded to fp16 by the DPU's
+  // ODU, the SHAVE sums partial x scale in fp32, x16, fp16. `defer` is a device
+  // scheduling hint (the reduction runs later); the host sim reduces at once.
+  void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q,
+                      const half *s, std::uint32_t M, std::uint32_t N,
+                      std::uint32_t K, std::uint32_t G,
+                      std::uint32_t sStride = 0, bool = false) {
     dpu_matmul_qg(out, a, q, s, M, N, K, G, 4, sStride);
   }
-  void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q, const half *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride = 0, bool = false) {
-    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), s, M, N, K, G, 8, sStride);
+  void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q,
+                      const half *s, std::uint32_t M, std::uint32_t N,
+                      std::uint32_t K, std::uint32_t G,
+                      std::uint32_t sStride = 0, bool = false) {
+    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), s, M, N, K,
+                  G, 8, sStride);
   }
-  void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q, const std::uint8_t *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride, bool = false) {
-    dpu_matmul_qg(out, a, q, reinterpret_cast<const half *>(s), M, N, K, G, 4, sStride);
-  }
-  void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q, const std::int8_t *s, std::uint32_t M,
-                      std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t sStride, bool = false) {
-    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q), reinterpret_cast<const half *>(s), M, N, K, G, 8,
+  void dpu_matmul_i4g(half *out, const half *a, const std::uint8_t *q,
+                      const std::uint8_t *s, std::uint32_t M, std::uint32_t N,
+                      std::uint32_t K, std::uint32_t G, std::uint32_t sStride,
+                      bool = false) {
+    dpu_matmul_qg(out, a, q, reinterpret_cast<const half *>(s), M, N, K, G, 4,
                   sStride);
   }
+  void dpu_matmul_i8g(half *out, const half *a, const std::int8_t *q,
+                      const std::int8_t *s, std::uint32_t M, std::uint32_t N,
+                      std::uint32_t K, std::uint32_t G, std::uint32_t sStride,
+                      bool = false) {
+    dpu_matmul_qg(out, a, reinterpret_cast<const std::uint8_t *>(q),
+                  reinterpret_cast<const half *>(s), M, N, K, G, 8, sStride);
+  }
   void qg_flush() {}
-  // sStride 0: s row-major [N, K/G]; > 0: s group-major [K/G, sStride] (the device reads it in place).
-  void reserve_qg(std::uint32_t, std::uint32_t, std::uint32_t = 0) {}   // the device's merged-FC scratch; nothing to reserve here
-  void dpu_matmul_qg(half *out, const half *a, const std::uint8_t *q, const half *s, std::uint32_t M,
-                     std::uint32_t N, std::uint32_t K, std::uint32_t G, std::uint32_t bits, std::uint32_t sStride) {
+  // sStride 0: s row-major [N, K/G]; > 0: s group-major [K/G, sStride] (the
+  // device reads it in place).
+  void reserve_qg(std::uint32_t, std::uint32_t, std::uint32_t = 0) {
+  } // the device's merged-FC scratch; nothing to reserve here
+  void dpu_matmul_qg(half *out, const half *a, const std::uint8_t *q,
+                     const half *s, std::uint32_t M, std::uint32_t N,
+                     std::uint32_t K, std::uint32_t G, std::uint32_t bits,
+                     std::uint32_t sStride) {
     if (!ok_)
       return;
     const std::uint32_t ng = K / G;
@@ -373,29 +441,37 @@ public:
           for (std::uint32_t k = g * G; k < (g + 1) * G; ++k) {
             int w;
             if (bits == 8) {
-              w = static_cast<signed char>(q[static_cast<std::size_t>(n) * K + k]);
+              w = static_cast<signed char>(
+                  q[static_cast<std::size_t>(n) * K + k]);
             } else {
-              const unsigned byte = q[static_cast<std::size_t>(n) * (K / 2) + k / 2];
+              const unsigned byte =
+                  q[static_cast<std::size_t>(n) * (K / 2) + k / 2];
               const int nib = (k & 1) ? (byte >> 4) : (byte & 0xF);
               w = (nib ^ 8) - 8;
             }
-            part += static_cast<float>(a[static_cast<std::size_t>(m) * K + k]) * static_cast<float>(w);
+            part += static_cast<float>(a[static_cast<std::size_t>(m) * K + k]) *
+                    static_cast<float>(w);
           }
           const half p16 = static_cast<half>(part * partScale);
-          const half sc = sStride ? s[static_cast<std::size_t>(g) * sStride + n] : s[static_cast<std::size_t>(n) * ng + g];
+          const half sc = sStride ? s[static_cast<std::size_t>(g) * sStride + n]
+                                  : s[static_cast<std::size_t>(n) * ng + g];
           acc += static_cast<float>(p16) * static_cast<float>(sc);
         }
-        out[static_cast<std::size_t>(m) * N + n] = static_cast<half>(acc / partScale);
+        out[static_cast<std::size_t>(m) * N + n] =
+            static_cast<half>(acc / partScale);
       }
   }
 
-  void sync_grid() { env_.grid->wait(env_.tile * env_.spt + env_.shave, "grid barrier"); }
+  void sync_grid() {
+    env_.grid->wait(env_.tile * env_.spt + env_.shave, "grid barrier");
+  }
   void sync_tile() { env_.tileBarrier->wait(env_.shave, "tile barrier"); }
 
   void finish() {
     if (statusAddr_ == 0)
       return;
-    auto *s = reinterpret_cast<std::uint32_t *>(ptr(statusAddr_ + 64ull * worker()));
+    auto *s =
+        reinterpret_cast<std::uint32_t *>(ptr(statusAddr_ + 64ull * worker()));
     s[0] = ok_ ? kStatusOk : code_;
     s[1] = detail_;
     s[2] = env_.cmxBytes;
@@ -417,8 +493,9 @@ private:
       detail_ = detail;
     }
   }
-  void copy2d(std::uint8_t *dst, const std::uint8_t *src, std::uint32_t width, std::uint32_t rows,
-              std::uint32_t dstStride, std::uint32_t srcStride) {
+  void copy2d(std::uint8_t *dst, const std::uint8_t *src, std::uint32_t width,
+              std::uint32_t rows, std::uint32_t dstStride,
+              std::uint32_t srcStride) {
     if (!ok_)
       return;
     for (std::uint32_t r = 0; r < rows; ++r)
@@ -438,9 +515,10 @@ private:
 // Runs kernel_entry on tiles x spt host threads with a cmxBytes arena per tile.
 // `params` is the kernel's parameter block; the status area (if any) is
 // params[numTensorParams] and must hold 32 bytes per SHAVE. Returns 0.
-NPU_SIM_EXPORT int npu_sim_run(int numParams, uint64_t *params, uint32_t tiles, uint32_t spt,
-                               uint32_t cmxBytes) {
-  std::vector<std::vector<std::uint8_t>> arenas(tiles, std::vector<std::uint8_t>(cmxBytes));
+NPU_SIM_EXPORT int npu_sim_run(int numParams, uint64_t *params, uint32_t tiles,
+                               uint32_t spt, uint32_t cmxBytes) {
+  std::vector<std::vector<std::uint8_t>> arenas(
+      tiles, std::vector<std::uint8_t>(cmxBytes));
   npu::Barrier grid(tiles * spt);
   std::deque<npu::Barrier> tileBarriers;
   for (uint32_t t = 0; t < tiles; ++t)
@@ -448,7 +526,9 @@ NPU_SIM_EXPORT int npu_sim_run(int numParams, uint64_t *params, uint32_t tiles, 
   std::vector<npu::Environment> envs;
   for (uint32_t t = 0; t < tiles; ++t)
     for (uint32_t s = 0; s < spt; ++s)
-      envs.push_back(npu::Environment{t, s, tiles, spt, arenas[t].data(), cmxBytes, &grid, &tileBarriers[t]});
+      envs.push_back(npu::Environment{t, s, tiles, spt, arenas[t].data(),
+                                      cmxBytes, &grid, &tileBarriers[t],
+                                      &arenas});
   std::vector<std::thread> threads;
   for (auto &env : envs)
     threads.emplace_back([&] { kernel_entry(numParams, params, env); });

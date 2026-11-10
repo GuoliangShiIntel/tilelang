@@ -22,15 +22,18 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuPlanWorkloads, ffi::String);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuBarrierReuse, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuScopedCmx, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuPrefetch, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuMulticast, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuMulticastOverlap, Bool);
 
 TIR_DEFINE_TL_BUILTIN(intel_npu_dma_copy)
-    .set_num_inputs(-1)   // 7, or 8 with the async flag PlanIntelNpuPrefetch adds
+    .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_BUILTIN(intel_npu_dma_wait)
     .set_num_inputs(0)
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_BUILTIN(intel_npu_dpu_matmul)
     .set_num_inputs(8)
@@ -39,41 +42,53 @@ TIR_DEFINE_TL_BUILTIN(intel_npu_dpu_matmul)
 
 TIR_DEFINE_TL_BUILTIN(intel_npu_ddr_ptr)
     .set_num_inputs(2)
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure));
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure));
 
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_begin)
     .set_num_inputs(9)
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_uses)
     .set_num_inputs(1)
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure));
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure));
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_slot)
     .set_num_inputs(2)
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure));
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure));
 TIR_DEFINE_TL_BUILTIN(intel_npu_dpu_matmul_i4g)
     .set_num_inputs(10)
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(intel_npu_dpu_matmul_i8g)
     .set_num_inputs(10)
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_slot_acquire)
     .set_num_inputs(2)
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_slot_release)
     .set_num_inputs(2)
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_fill)
     .set_num_inputs(6)
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_dpu_submit)
     .set_num_inputs(10)
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_dpu_wait)
     .set_num_inputs(2)
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(intel_npu_ring_end)
     .set_num_inputs(1)
-    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 
 } // namespace tl
 } // namespace tvm
