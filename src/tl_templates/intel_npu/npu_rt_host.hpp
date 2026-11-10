@@ -294,6 +294,13 @@ public:
                 std::uint32_t dstStride, std::uint32_t srcStride) {
     copy2d(reinterpret_cast<std::uint8_t *>(dst), ptr(src.addr), width, rows, dstStride, srcStride);
   }
+  // the simulation has no engine to overlap with, so the prefetched load simply happens here
+  template <class T>
+  void dma_load_async(T *dst, Ddr<T> src, std::uint32_t width, std::uint32_t rows,
+                      std::uint32_t dstStride, std::uint32_t srcStride) {
+    dma_load(dst, src, width, rows, dstStride, srcStride);
+  }
+  void dma_load_wait() {}
   template <class T>
   void dma_store(Ddr<T> dst, const T *src, std::uint32_t width, std::uint32_t rows,
                  std::uint32_t dstStride, std::uint32_t srcStride) {

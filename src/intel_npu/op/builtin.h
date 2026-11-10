@@ -30,6 +30,8 @@ static constexpr const char *kIntelNpuBarrierReuse = "tl.intel_npu.barrier_reuse
 // Pass config: scoped CMX (allocations sink to the block that uses them and are released at its end; default
 // true); false keeps every allocation for the whole kernel (the A/B of the scoping).
 static constexpr const char *kIntelNpuScopedCmx = "tl.intel_npu.scoped_cmx";
+// Pass config: compiler-derived one-iteration DMA prefetch (default true); false is the paired A/B control.
+static constexpr const char *kIntelNpuPrefetch = "tl.intel_npu.prefetch";
 // AttrStmt key: free-text notes a pass leaves for the reader of the generated source
 // (what was planned, or what was skipped and why); a StringImm value, printed as a comment.
 // An AttrStmt rather than a PrimFunc attribute because SplitHostDevice keeps only a fixed
@@ -40,12 +42,19 @@ static constexpr const char *kIntelNpuNotesAttr = "intel_npu.notes";
  * \brief 2-D DMA between DDR and CMX.
  *
  *   intel_npu_dma_copy(dst_ptr, src_ptr, width_bytes, rows,
- *                      dst_stride_bytes, src_stride_bytes, to_cmx)
+ *                      dst_stride_bytes, src_stride_bytes, to_cmx[, async])
  *
  * Pointers are `address_of(BufferLoad)`; `to_cmx` is 1 for DDR->CMX, 0 for
- * CMX->DDR. Synchronous in Phase 1 (the runtime waits before returning).
+ * CMX->DDR. Synchronous unless `async` is 1, which only PlanIntelNpuPrefetch
+ * sets: the load is left in flight and `intel_npu_dma_wait` joins it.
  */
 TVM_DLL const Op &intel_npu_dma_copy();
+
+/*!
+ * \brief Join the load `intel_npu_dma_copy(..., async=1)` left in flight. The runtime also joins at every
+ * synchronous DMA and at `qg_flush`, so a missing wait costs time rather than correctness.
+ */
+TVM_DLL const Op &intel_npu_dma_wait();
 
 /*!
  * \brief One DPU fp16 matmul workload: out[M,N] = a[M,K] . bt[N,K]^T, every

@@ -359,7 +359,7 @@ public:
       return;
     }
     cmxFree0_ = cmx_.getAvailableSize();
-    desc_ = alloc_hw<DmaDescriptor>(2);
+    desc_ = alloc_hw<DmaDescriptor>(4);   // 0 sync load, 1 sync store, 2/3 dual-port async load
     ringOrder_ = alloc_shared<std::uint32_t>(16 * kRingPool);
     ringFill_ = alloc_hw<DmaDescriptor>(2 * kRingMaxDepth * kRingPool);
     for (std::uint32_t i = 0; i < kDpuSets; ++i) {
@@ -435,6 +435,16 @@ public:
                 std::uint32_t dstStride, std::uint32_t srcStride) {
     dma_load(static_cast<void *>(dst), src.addr, width, rows, dstStride, srcStride);
   }
+  void dma_load_async(void *dst, Ddr<void> src, std::uint32_t width, std::uint32_t rows,
+                      std::uint32_t dstStride, std::uint32_t srcStride) {
+    dma_load_async_impl(dst, src.addr, width, rows, dstStride, srcStride);
+  }
+  template <class T>
+  void dma_load_async(T *dst, Ddr<T> src, std::uint32_t width, std::uint32_t rows,
+                      std::uint32_t dstStride, std::uint32_t srcStride) {
+    dma_load_async_impl(static_cast<void *>(dst), src.addr, width, rows, dstStride, srcStride);
+  }
+  void dma_load_wait() { dma_load_wait_impl(); }
   template <class T>
   void dma_store(Ddr<T> dst, const T *src, std::uint32_t width, std::uint32_t rows,
                  std::uint32_t dstStride, std::uint32_t srcStride) {
@@ -524,6 +534,7 @@ public:
   // scratch `part` is double-buffered for it; `qg_flush()` runs a pending reduction (before any read of `out`: the
   // codegen emits it where the author's statements read the output, and the sync / finish paths call it).
   TL_NPU_HW_CALL void qg_flush() {
+    dma_load_wait_impl(); // an asynchronous load is pending here for the same reason
     dpu_matmul_wait();   // an asynchronous fp16 workload is pending here for the same reason
     if (i4Pend_.out != nullptr) {
       q_reduce(i4Pend_.out, i4Pend_.part, i4Pend_.sT, i4Pend_.sRow, i4Pend_.M, i4Pend_.N, i4Pend_.ng, i4Pend_.inv);
@@ -1531,6 +1542,7 @@ private:
                 std::uint32_t dstStride, std::uint32_t srcStride) {
     if (!ok_ || width == 0 || rows == 0)
       return;
+    dma_load_wait_impl();
     // The toolkit's start re-kicks a port's chain as soon as its fences ran, before the
     // previous job completed: a ring fill in flight on the port lost its READY (hoisted
     // ring, Q fill after the first K fill). One job per port per SHAVE, here too.
@@ -1550,6 +1562,70 @@ private:
     task_add(kTaskDmaLoad, t0, t1);
 #else
     dma_.run(desc_);
+#endif
+    TL_NPU_COMPILER_BARRIER();
+  }
+
+  // `dma_load` ISSUED and left in flight, so the statements after it run while it streams; `dma_load_wait` joins
+  // it. One in flight at a time (the descriptor is reused), and it is registered on the port like a ring fill, so
+  // any later synchronous DMA's port_retire joins it too: a missing wait costs time, never correctness.
+  TL_NPU_HW_CALL void dma_load_async_impl(void *dst, std::uint64_t src, std::uint32_t width, std::uint32_t rows,
+                                          std::uint32_t dstStride, std::uint32_t srcStride) {
+    if (!ok_ || width == 0 || rows == 0)
+      return;
+    dma_load_wait_impl();
+    port_retire(0);
+    port_retire(1);
+    if (!ok_)
+      return;
+    DmaDrv::initDesc(desc_ + 2);
+    DmaDrv::initDesc(desc_ + 3);
+    const std::uint32_t dst0 = reinterpret_cast<std::uint32_t>(dst);
+    if (rows > 1) {
+      const std::uint32_t rows0 = rows / 2;
+      config_copy(desc_ + 2, dst0, src, width, rows0, dstStride, srcStride);
+      config_copy(desc_ + 3, dst0 + rows0 * dstStride, src + static_cast<std::uint64_t>(rows0) * srcStride,
+                  width, rows - rows0, dstStride, srcStride);
+    } else {
+      const std::uint32_t width0 = width / 2;
+      if (width0 == 0) {
+        config_copy(desc_ + 2, dst0, src, width, rows, dstStride, srcStride);
+        DmaDrv::setConsumerBarriers(desc_ + 2, 0, 0);
+        TL_NPU_COMPILER_BARRIER();
+        asyncT0_ = perf_ticks();
+        dma_.start(desc_ + 2, 0);
+        TL_NPU_COMPILER_BARRIER();
+        lastOnPort_[0] = desc_ + 2;
+        asyncPending_ = true;
+        return;
+      }
+      config_copy(desc_ + 2, dst0, src, width0, 1, width0, width0);
+      config_copy(desc_ + 3, dst0 + width0, src + width0, width - width0, 1, width - width0,
+                  width - width0);
+    }
+    DmaDrv::setConsumerBarriers(desc_ + 2, 0, 0);
+    DmaDrv::setConsumerBarriers(desc_ + 3, 0, 0);
+    TL_NPU_COMPILER_BARRIER();
+    asyncT0_ = perf_ticks();
+    dma_.start(desc_ + 2, 0);
+    dma_.start(desc_ + 3, 1);
+    TL_NPU_COMPILER_BARRIER();
+    lastOnPort_[0] = desc_ + 2;
+    lastOnPort_[1] = desc_ + 3;
+    asyncPending_ = true;
+  }
+
+  TL_NPU_HW_CALL void dma_load_wait_impl() {
+    if (!asyncPending_)
+      return;
+    asyncPending_ = false;
+    port_retire(0);
+    port_retire(1);
+#if TL_NPU_PHASE_PROF
+    const std::uint32_t t1 = perf_ticks();
+    dmaTicks_ += t1 - asyncT0_;
+    ++dmaCalls_;
+    task_add(kTaskDmaLoad, asyncT0_, t1);   // the whole span; the overlap shows as the gap it leaves elsewhere
 #endif
     TL_NPU_COMPILER_BARRIER();
   }
@@ -1612,6 +1688,8 @@ private:
 
   DmaDescriptor *desc_{nullptr};
   DmaDescriptor *lastOnPort_[2]{nullptr, nullptr};
+  bool asyncPending_{false};
+  std::uint32_t asyncT0_{0};
   // Ring control pool: kRingPool rings' order words (shared) and fill descriptors (per SHAVE), cycled.
   static constexpr std::uint32_t kRingPool = 8, kRingMaxDepth = 2;
   std::uint32_t *ringOrder_ = nullptr;

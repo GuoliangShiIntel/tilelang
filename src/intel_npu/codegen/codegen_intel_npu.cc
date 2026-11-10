@@ -319,11 +319,18 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op,
     return s;
   };
   if (op->op.same_as(tl::intel_npu_dma_copy())) {
-    // (dst, src, width_bytes, rows, dst_stride, src_stride, to_cmx)
+    // (dst, src, width_bytes, rows, dst_stride, src_stride, to_cmx[, async])
     const auto *to_cmx = op->args[6].as<IntImmNode>();
     ICHECK(to_cmx != nullptr);
-    os << (to_cmx->value ? "ctx.dma_load(" : "ctx.dma_store(") << args(0, 6)
-       << ")";
+    const auto *async = op->args.size() > 7 ? op->args[7].as<IntImmNode>() : nullptr;
+    const bool is_async = async != nullptr && async->value != 0;
+    ICHECK(!is_async || to_cmx->value) << "intel_npu: only a LOAD can be left in flight";
+    os << (to_cmx->value ? (is_async ? "ctx.dma_load_async(" : "ctx.dma_load(") : "ctx.dma_store(")
+       << args(0, 6) << ")";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_dma_wait())) {
+    os << "ctx.dma_load_wait()";
     return;
   }
   if (op->op.same_as(tl::intel_npu_dpu_matmul())) {

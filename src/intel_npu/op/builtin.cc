@@ -21,11 +21,16 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuDpuMpe, Integer);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuPlanWorkloads, ffi::String);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuBarrierReuse, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuScopedCmx, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kIntelNpuPrefetch, Bool);
 
 TIR_DEFINE_TL_BUILTIN(intel_npu_dma_copy)
-    .set_num_inputs(7)
+    .set_num_inputs(-1)   // 7, or 8 with the async flag PlanIntelNpuPrefetch adds
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(intel_npu_dma_wait)
+    .set_num_inputs(0)
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_BUILTIN(intel_npu_dpu_matmul)
     .set_num_inputs(8)

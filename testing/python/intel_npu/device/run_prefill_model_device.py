@@ -143,7 +143,8 @@ def main(argv):
     NQKV_pad = -(-NQKV // BN1) * BN1
     YW, OW = max(NIN_pad, NQKV_pad), max(VC, KO)
 
-    cfg = {"tl.intel_npu.scoped_cmx": "--no-scoped-cmx" not in argv}
+    cfg = {"tl.intel_npu.scoped_cmx": "--no-scoped-cmx" not in argv,
+           "tl.intel_npu.prefetch": "--no-prefetch" not in argv}
     t_low = time.time()
     with tvm.transform.PassContext(config=cfg):
         low = lowering.lower(make_prefill_model(L=L, N=NP, H=H, KH=KH, VH=VH, DK=DK, DV=DV, NH=NH, NKV=NKV, D=D,
@@ -157,6 +158,7 @@ def main(argv):
     name = (f"tl_prefill_model_l{L}_n{NP}_h{H}_s{SMAX}_bn{BN1}"
             + (f"_mbe{MBe}" if MBe != 16 else "")
             + (f"_mb{MB}" if MB != 16 else "")
+            + ("_noprefetch" if "--no-prefetch" in argv else "")
             + (f"_db{DB}" if DB != 4 else "")
             + (f"_t{TILES}" if TILES != 3 else "")
             + ("_sm" if "--shave-major" in argv else "")

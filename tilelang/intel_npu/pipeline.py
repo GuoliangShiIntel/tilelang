@@ -17,6 +17,7 @@ from tilelang.backend.pass_pipeline.pipeline_utils import allow_vectorize, shoul
 DEFAULT_SHAVES_PER_TILE = 2
 DERIVE_GLOBAL_SYNC_KEY = "tl.intel_npu.derive_global_sync"
 SCOPED_CMX_KEY = "tl.intel_npu.scoped_cmx"
+PREFETCH_KEY = "tl.intel_npu.prefetch"
 
 
 def _shaves_per_tile(target: Target) -> int:
@@ -32,6 +33,11 @@ def _derive_global_sync_enabled() -> bool:
 def _scoped_cmx_enabled() -> bool:
     pass_ctx = tilelang.transform.get_pass_context()
     return bool(pass_ctx.config.get(SCOPED_CMX_KEY, True)) if pass_ctx else True
+
+
+def _prefetch_enabled() -> bool:
+    pass_ctx = tilelang.transform.get_pass_context()
+    return bool(pass_ctx.config.get(PREFETCH_KEY, True)) if pass_ctx else True
 
 
 def IntelNpuPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
@@ -80,6 +86,10 @@ def IntelNpuPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     if _scoped_cmx_enabled():
         # phases between grid barriers get their own CMX scope; allocations under SHAVE-dependent branches hoisted
         mod = tilelang.intel_npu.transform.ScopeIntelNpuCmx()(mod)
+    # a leading DDR -> CMX load whose address follows the loop variable runs an iteration ahead, into a twin of
+    # its destination; before the budget check, which must price the twin
+    if _prefetch_enabled():
+        mod = tilelang.intel_npu.transform.PlanIntelNpuPrefetch()(mod)
     mod = tilelang.intel_npu.transform.CheckIntelNpuBudgets()(mod)
     mod = tirx.transform.NarrowDataType(32)(mod)
     mod = tilelang.transform.FlattenBuffer()(mod)
