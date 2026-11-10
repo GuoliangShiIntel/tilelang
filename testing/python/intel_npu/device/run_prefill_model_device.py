@@ -156,6 +156,12 @@ def main(argv):
             + ("_skip_" + "_".join(sorted(skip)) if skip else "")
             + ("_noscope" if "--no-scoped-cmx" in argv else ""))
     source = low.source
+    if "--phases" in argv:
+        # instrumentation is opt-in: it costs ~5% (npu_rt_device.hpp's TL_NPU_PHASE_PROF), so the default
+        # build is the one every latency number comes from
+        source = "#define TL_NPU_PHASE_PROF 1\n" + source
+        name += "_prof"
+        low = type(low)(source=source, param_names=low.param_names)
     if "--frt" in argv:
         # the SAME generated kernel on npu_dsl's fused_rt: both arms share this lowering, the generated C++,
         # the toolkit and the hardware, so a difference can only be the runtime
@@ -170,7 +176,8 @@ def main(argv):
 
     exe = HERE / "build" / "Release" / "npu_run.exe"
     s = runner.Session(exe, HERE / "run_prefill_model", TILES, SHAVES)
-    s.kernel("model", name)
+    profiled = "--profile" in argv      # every launch of the alias, so this run is observability, not a timing
+    s.kernel("model", name, profile=profiled)
     print(f"session up, TURBO {s.turbo}")
 
     # ---- weights: one layer at a time, uploaded and then kept only for the oracle -------------------------
@@ -288,13 +295,28 @@ def main(argv):
         good += int(max(v for _, v in named) < REL)
     km = float(np.median(kms))
     verdict = "PASS" if good == trials else "FAIL"
-    print(f"prefill model: {km:.3f} ms [{'TURBO' if s.turbo else 'NO TURBO'}, UNPROFILED] -> {verdict}; "
+    print(f"prefill model: {km:.3f} ms [{'TURBO' if s.turbo else 'NO TURBO'}, "
+          f"{'PROFILED (observability, NOT a timing)' if profiled else 'UNPROFILED'}] -> {verdict}; "
           f"{good}/{trials} trials match the layer oracles chained (stream, KV caches, both GDN states), "
           f"worst rel {worst:.2e}")
     print(f"  {'/'.join(kinds)}: {L} layers, {n} tokens at pos0 {pos0}, H={H}, E={E} top-{TOPK}: "
           f"{1e3 * km / n:.1f} us per token, {1e3 * km / n / L:.1f} us per token per layer")
     print("  kernel-only per run ms: " + " ".join(f"{t:.3f}" for t in kms))
     rc = 0 if verdict == "PASS" else 1
+
+    if profiled:
+        trace = HERE / "evidence" / f"{name}_trace.json"
+        s.profile("model", trace)
+        print(f"  PROFILED trace: {trace}")
+        print(f"  python {Path(__file__).with_name('perf_attr.py')} {trace}")
+
+    if "--phases" in argv:
+        f = s.phases()
+        sys.path.insert(0, str(HERE))
+        import task_report
+        per, dropped = task_report.load(f, TILES * SHAVES)
+        task_report.table(per, dropped)
+        print(task_report.chrome_json(per, dropped, HERE / "evidence" / f"{name}_tasks.json"))
 
     if "--audit" in argv:
         # Which HEADS of the conv phase are wrong? The q half, the k half and the state slice of head hb are

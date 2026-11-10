@@ -120,11 +120,31 @@ static inline half tl_npu_vsum(half32 v) {
   return v[0];
 }
 
-// Named SHAVE compute regions on the profiler's SHAVE track (the DSL's `T.call_extern("tl_npu_perf_begin", "name")` /
-// `tl_npu_perf_end`): a VEC_COMPUTE span with a 4-char label and the instruction counter, so a section's SHAVE time
-// is measured rather than inferred by subtracting waits. Each pair is two profiler events of the 1984 per SHAVE.
-static inline void tl_npu_perf_begin(const char *name) { npu::vecComputeStart(npu::packName4(name)); }
-static inline void tl_npu_perf_end() { npu::vecComputeEnd(); }
+// Per-task profiling records (`Ctx::task_add`). OFF by default and opt-in per build, because it is NOT free:
+// measured +5.2% on the median and a 13x wider spread (2-layer prefill, n=192, UNPROFILED TURBO, 2026-11-09:
+// 93.939 ms off vs 98.858 ms on, 111911 records = ~268 ns each). That is the cost VPUX's guide warns about --
+// "profiling data must be transferred into the profiling output buffer ... may be inserted on the critical
+// path" -- so VPUX gates it on PERF_COUNT and npu_dsl on -DFRT_PROFILE, and so does this.
+// Every latency claim comes from a build with this OFF.
+#ifndef TL_NPU_PHASE_PROF
+#define TL_NPU_PHASE_PROF 0
+#endif
+#if TL_NPU_PHASE_PROF
+#define TL_NPU_PROF_T0() const std::uint32_t tl_prof_t0 = perf_ticks()
+#define TL_NPU_PROF_BAR()                                                                                      \
+  do {                                                                                                         \
+    const std::uint32_t tl_prof_t1 = perf_ticks();                                                             \
+    barTicks_ += tl_prof_t1 - tl_prof_t0;                                                                      \
+    ++barCalls_;                                                                                               \
+    task_add(kTaskBarrier, tl_prof_t0, tl_prof_t1);                                                            \
+  } while (0)
+#else
+#define TL_NPU_PROF_T0() ((void)0)
+#define TL_NPU_PROF_BAR() ((void)0)
+#endif
+
+// Named SHAVE compute regions are `Ctx::task_begin` / `task_end` now: they become per-task records with their
+// own name, which the toolkit's VEC_COMPUTE spans could not do beyond its 1984-event budget.
 
 // Packed signed int4 (two per byte, LOW nibble first, symmetric: value = (n ^ 8) - 8) to fp16:
 // the LSU converts in the load (`LSU.LD512.i4.i8`: 32 bytes -> 64 int8), lo = values 0..31,
@@ -856,6 +876,7 @@ public:
     }
     std::uint32_t t1 = perf_ticks();
     ringTicks_[kTickFreeWait] += t1 - t0;
+    task_add(kTaskRingWait, t0, t1);
     if (!r.local) {
       ring_arm(r, use);
       // A split stream's issuer on another tile produces on ids tile 0 arms: wait for the config.
@@ -898,6 +919,7 @@ public:
       if (r.local)
         ringTicks_[kTickOrder] += t3 - t2;   // local rings have no order wait: the counter holds the toolkit start (chain spin + kick)
       ringTicks_[kTickFillIssue] += t3 - t1;
+      task_add(kTaskRing, t1, t3);
       return;
     }
     DmaDrv::initDesc(d + 1);
@@ -923,7 +945,11 @@ public:
     TL_NPU_COMPILER_BARRIER();
     lastOnPort_[0] = d;
     lastOnPort_[1] = d + 1;
-    ringTicks_[kTickFillIssue] += perf_ticks() - t1;
+    {
+      const std::uint32_t tt = perf_ticks();
+      ringTicks_[kTickFillIssue] += tt - t1;
+      task_add(kTaskRing, t1, tt);
+    }
   }
   template <class T>
   void ring_fill(Ring &r, std::uint32_t use, Ddr<T> src, std::uint32_t width, std::uint32_t rows,
@@ -951,6 +977,7 @@ public:
       return;
     std::uint32_t t1 = perf_ticks();
     ringTicks_[kTickLive] += t1 - t0;
+    task_add(kTaskRingWait, t0, t1);
     // Submission order P0(u), P1(u), P0(u+1), ...: SHAVE 0 needs SHAVE 1 at `use`
     // submissions, SHAVE 1 needs SHAVE 0 at `use + 1`.
     const std::uint32_t prev = (shave_ + spt_ - 1) % spt_;
@@ -991,7 +1018,11 @@ public:
     TL_NPU_COMPILER_BARRIER();   // the slot's loads stay after the wait
     // the acquire wait (the fill landing) is counted with the submit path's barrier-live wait (counter 0), apart
     // from the DPU wait (counter 3), so a SHAVE-read ring's DMA and DPU waits are told apart in the status words
-    ringTicks_[kTickLive] += perf_ticks() - t0;
+    {
+      const std::uint32_t tt = perf_ticks();
+      ringTicks_[kTickLive] += tt - t0;
+      task_add(kTaskRingWait, t0, tt);
+    }
   }
   TL_NPU_HW_CALL void ring_slot_release(Ring &r, std::uint32_t use) {
     qg_flush();   // a deferred reduction may read the slot's scales
@@ -1056,6 +1087,7 @@ public:
   // Barriers. DMA is synchronous in Phase 1-2, so only SHAVE-side writes need
   // publishing: CMX writes to the tile, direct DDR stores out of the data L1.
   TL_NPU_HW_CALL void sync_grid() {
+    TL_NPU_PROF_T0();
     qg_flush();
     TL_NPU_COMPILER_BARRIER();
     flushCmxWrites();
@@ -1066,14 +1098,17 @@ public:
       hw_sync_grid();
     }
     TL_NPU_COMPILER_BARRIER();
+    TL_NPU_PROF_BAR();
   }
   TL_NPU_HW_CALL void sync_tile() {
+    TL_NPU_PROF_T0();
     qg_flush();
     TL_NPU_COMPILER_BARRIER();
     flushCmxWrites();
     sync::memoryFence();
     sync_.waitLocal();
     TL_NPU_COMPILER_BARRIER();
+    TL_NPU_PROF_BAR();
   }
 
   // Hardware barrier primitives (NCE barrier registers; ids from the job's pool).
@@ -1163,6 +1198,7 @@ public:
   static constexpr std::uint32_t kStatusBytes = 64;
   TL_NPU_HW_CALL void finish(const std::uint32_t *extra = nullptr, std::uint32_t nExtra = 0) {
     qg_flush();
+    task_flush();
     if (statusAddr_ == 0)
       return;
     const std::uint64_t a = statusAddr_ + static_cast<std::uint64_t>(kStatusBytes) * worker();
@@ -1191,6 +1227,99 @@ public:
 
   // Hardware descriptors for a hand-written probe (the ring and the DMA/DPU paths use their own).
   template <class T> T *alloc_descriptors(std::uint32_t count) { return alloc_hw<T>(count); }
+
+  // --- per-task records (VPUX's arrangement: guides/how_to_use_profiling.md) ---------------------------
+  // One 16-byte record per TASK -- every DMA, DPU workload, barrier and phase -- written straight to a DDR
+  // area and decoded offline into Trace Event Format. Per-task is what gives DMA, DPU and SHAVE their own
+  // REAL tracks with real start and end, which a per-phase sum cannot: VPUX instruments dma / dpu / sw as
+  // three independent paths for exactly this reason.
+  //
+  // On NPU50xx every timestamp comes from one fixed-frequency counter, so unlike NPU37xx/40xx no cross-engine
+  // clock calibration is needed (the guide's "Timestamp collection and synchronization").
+  //
+  // Record: {t0, t1, kind, phase}. `dropped` is counted and reported -- a truncated capture must be loud, which
+  // is the one thing the toolkit's 1984-entry profiler gets wrong (it drops with a bare return).
+  // Area: statusAddr + kStatusReserve + worker * kTaskBytes; header word 0 = records written, 1 = dropped.
+  enum : std::uint32_t { kTaskDmaLoad = 0, kTaskDmaStore = 1, kTaskRing = 2, kTaskDpu = 3, kTaskBarrier = 4,
+                         kTaskPhase = 5, kTaskRingWait = 6, kTaskShave = 7 };
+  static constexpr std::uint32_t kTaskWords = 4;
+  static constexpr std::uint32_t kTaskMax = 128u * 1024u;     // 2 MiB a worker
+  static constexpr std::uint32_t kTaskBytes = 4 * kTaskWords * (kTaskMax + 4);   // + a 4-word header
+  static constexpr std::uint32_t kStatusReserve = 4096;       // npu_run.cpp's kStatusReserve
+
+  TL_NPU_HW_CALL void task_add(std::uint32_t kind, std::uint32_t t0, std::uint32_t t1) {
+#if TL_NPU_PHASE_PROF
+    if (statusAddr_ == 0)
+      return;
+    const std::uint64_t base = statusAddr_ + kStatusReserve + static_cast<std::uint64_t>(kTaskBytes) * worker();
+    if (taskN_ >= kTaskMax) {
+      ++taskDrop_;
+      return;
+    }
+    const std::uint64_t a = base + 16 + static_cast<std::uint64_t>(4 * kTaskWords) * taskN_;
+    DdrAccessor<std::uint32_t> s0(a), s1(a + 4), s2(a + 8), s3(a + 12);
+    s0 = t0;
+    s1 = t1;
+    s2 = kind;
+    s3 = phName_;
+    ++taskN_;
+#else
+    (void)kind;
+    (void)t0;
+    (void)t1;
+#endif
+  }
+
+  TL_NPU_HW_CALL void phase_begin(std::uint32_t name) {
+#if TL_NPU_PHASE_PROF
+    phName_ = name;
+    phT0_ = perf_ticks();
+#else
+    (void)name;
+#endif
+  }
+  TL_NPU_HW_CALL void phase_begin(const char *name) { phase_begin(npu::packName4(name)); }
+
+  TL_NPU_HW_CALL void phase_end() {
+#if TL_NPU_PHASE_PROF
+    task_add(kTaskPhase, phT0_, perf_ticks());
+#endif
+  }
+
+  // A named SHAVE region inside a phase (a dequant, a gemm, a gather) -- VPUX's per-task "site", recorded under
+  // its own name so it gets a real track. One level: these sites are siblings, never nested.
+  TL_NPU_HW_CALL void task_begin(std::uint32_t name) {
+#if TL_NPU_PHASE_PROF
+    sName_ = name;
+    sT0_ = perf_ticks();
+#else
+    (void)name;
+#endif
+  }
+  TL_NPU_HW_CALL void task_begin(const char *name) { task_begin(npu::packName4(name)); }
+
+  TL_NPU_HW_CALL void task_end() {
+#if TL_NPU_PHASE_PROF
+    const std::uint32_t t1 = perf_ticks();
+    const std::uint32_t keep = phName_;
+    phName_ = sName_;            // the record is named by the site, not the phase it sits in
+    task_add(kTaskShave, sT0_, t1);
+    phName_ = keep;
+#endif
+  }
+
+  // Written once per worker at `finish`: the record count and what had to be dropped.
+  TL_NPU_HW_CALL void task_flush() {
+#if TL_NPU_PHASE_PROF
+    if (statusAddr_ == 0)
+      return;
+    const std::uint64_t base = statusAddr_ + kStatusReserve + static_cast<std::uint64_t>(kTaskBytes) * worker();
+    DdrAccessor<std::uint32_t> h0(base), h1(base + 4), h2(base + 8);
+    h0 = taskN_;
+    h1 = taskDrop_;
+    h2 = 0x4B534154u;   // "TASK"
+#endif
+  }
 
 private:
   static constexpr std::uint32_t alignUp(std::uint32_t v, std::uint32_t a) {
@@ -1340,6 +1469,12 @@ private:
     dpuCount_ += 1;
     dpuIduTicks_ += d->hwpStats.idu_workload_duration;
     dpuOduTicks_ += d->hwpStats.odu_workload_duration;
+#if TL_NPU_PHASE_PROF
+    // the HWP gives a DURATION, so the workload's extent is derived back from the observation point; on
+    // NPU50xx both are the one fixed-frequency counter, so no calibration is owed (VPUX profiling guide)
+    const std::uint32_t t1 = perf_ticks();
+    task_add(kTaskDpu, t1 - d->hwpStats.idu_workload_duration, t1);
+#endif
   }
 
   // Hardware descriptors avoid the trap window; every SHAVE of the tile makes
@@ -1375,7 +1510,16 @@ private:
     DmaDrv::initDesc(desc_);
     config_copy(desc_, reinterpret_cast<std::uint32_t>(dst), src, width, rows, dstStride, srcStride);
     TL_NPU_COMPILER_BARRIER();
+#if TL_NPU_PHASE_PROF
+    const std::uint32_t t0 = perf_ticks();
     dma_.run(desc_);
+    const std::uint32_t t1 = perf_ticks();
+    dmaTicks_ += t1 - t0;
+    ++dmaCalls_;
+    task_add(kTaskDmaLoad, t0, t1);
+#else
+    dma_.run(desc_);
+#endif
     TL_NPU_COMPILER_BARRIER();
   }
 
@@ -1393,7 +1537,16 @@ private:
     DmaDrv::initDesc(desc_ + 1);
     config_copy(desc_ + 1, dst, reinterpret_cast<std::uint32_t>(src), width, rows, dstStride, srcStride);
     TL_NPU_COMPILER_BARRIER();
+#if TL_NPU_PHASE_PROF
+    const std::uint32_t t0 = perf_ticks();
     dma_.run(desc_ + 1);
+    const std::uint32_t t1 = perf_ticks();
+    dmaTicks_ += t1 - t0;
+    ++dmaCalls_;
+    task_add(kTaskDmaStore, t0, t1);
+#else
+    dma_.run(desc_ + 1);
+#endif
     TL_NPU_COMPILER_BARRIER();
   }
 
@@ -1473,6 +1626,12 @@ private:
   // probe gives none: where a SHAVE's time in the ring protocol goes.
   enum { kTickLive = 0, kTickOrder = 1, kTickSubmit = 2, kTickDpuWait = 3, kTickFreeWait = 4, kTickFillIssue = 5 };
   std::uint32_t ringTicks_[6]{0, 0, 0, 0, 0, 0};
+  // Whole-kernel accumulators, snapshotted and differenced by the per-phase record (`phase_begin` / `phase_end`).
+  // An accumulator costs O(kinds), not O(events), which is why this survives 40 layers where the toolkit's
+  // 1984-entry event buffer cannot -- npu_dsl's FRT_PROFILE arrangement, in the place this runtime already
+  // accumulated `ringTicks_` and `dpuIduTicks_`.
+  std::uint32_t dmaTicks_{0}, dmaCalls_{0}, barTicks_{0}, barCalls_{0};
+  std::uint32_t phT0_{0}, phName_{0}, taskN_{0}, taskDrop_{0}, sT0_{0}, sName_{0};
 };
 #endif // TL_NPU_RUNTIME_FRT
 

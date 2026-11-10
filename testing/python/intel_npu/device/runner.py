@@ -13,6 +13,7 @@ run is an observability run and its time is not a latency claim.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -243,11 +244,13 @@ class Session:
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ)
+        env["NPU_PROFILE_FRC_MHZ"] = "19.2"   # the runtime's 38.4 default halves every timestamp on this box
         if turbo_requested():
             env["NPU_TURBO"] = "YES"
         else:
             env.pop("NPU_TURBO", None)
         self.turbo = turbo_requested()
+        self.tiles, self.shaves = int(tiles), int(shaves)
         self.proc = subprocess.Popen([str(exe), "--session", "--dir", str(self.run_dir), "--tiles", str(tiles), "--shaves", str(shaves)],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                      bufsize=1, cwd=str(Path(exe).parent), env=env)
@@ -358,8 +361,34 @@ class Session:
         self.launches.append((alias, host_ms, kernel_ms))
         return host_ms, kernel_ms
 
+    def phases(self) -> Path:
+        """Write the last launch's per-task records and return the path (`task_report.py` decodes them).
+
+        One 16-byte record per DMA / DPU workload / barrier / phase, in DDR -- VPUX's arrangement, which is
+        what gives DMA, DPU and SHAVE real tracks instead of one aggregate."""
+        f = self.run_dir / "phases.bin"
+        self._cmd(f"phases {f.name}")
+        return f
+
     def profile(self, alias: str, path: Path) -> None:
+        """Write the alias's trace, then stamp it with the kernel time of the launches it covers.
+
+        A SHAVE records at most `kMaxProfilingEntries` (1984) events and `Profiler::mark` DROPS the rest with a
+        bare `return` -- no flag, no overflow bit -- so a truncated trace is a well-formed JSON that simply stops
+        early. The only first-party way to notice is to compare its span against the kernel's own NCE_TIME
+        duration, which means that duration has to travel WITH the trace: a reader cannot be expected to
+        remember it. `perf_attr.py` refuses a trace whose span falls short of this."""
         self._cmd(f"profile {alias} {path}")
+        kms = sorted(k for a, _, k in self.launches if a == alias)
+        if not kms:
+            return
+        p = Path(path)
+        d = json.loads(p.read_text(encoding="utf-8"))
+        d["tl"] = {"alias": alias, "kernel_ms": kms[len(kms) // 2], "launches": len(kms),
+                   "tiles": self.tiles, "shaves": self.shaves, "turbo": self.turbo}
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(d), encoding="utf-8")
+        tmp.replace(p)
 
     def close(self) -> None:
         if self.proc.poll() is None:

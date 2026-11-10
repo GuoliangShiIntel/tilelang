@@ -34,6 +34,12 @@ namespace {
 
 constexpr std::uint32_t kStatusBytesPerShave = 64;
 constexpr std::uint32_t kStatusWords = kStatusBytesPerShave / 4;
+// The per-task records follow a FIXED status reserve (npu_rt_device.hpp's kStatusReserve): one 16-byte record
+// per DMA / DPU / barrier / phase per worker, written straight to DDR and decoded offline into Trace Event
+// Format -- VPUX's arrangement (guides/how_to_use_profiling.md), which is what gives DMA, DPU and SHAVE their
+// own real tracks instead of one aggregate.
+constexpr std::uint32_t kStatusReserve = 4096;
+constexpr std::uint32_t kPhaseBytesPerWorker = 16 * (128u * 1024u + 4u);
 // Status words 8 and 9: NCE_TIME free-running counter at kernel entry and at finish (19.2 MHz on this box).
 constexpr std::uint32_t kStampStart = 8, kStampEnd = 9;
 constexpr double kPerfClkMHz = 19.2;
@@ -115,10 +121,17 @@ int run(int argc, char **argv) {
   // Sized for every tile the device has, so a status written under an unexpected tile id is still visible.
   const std::uint32_t statusSlots = (std::uint32_t)device.getTileCount() * (std::uint32_t)shaves;
   const std::uint64_t statusBytes = (std::uint64_t)statusSlots * kStatusBytesPerShave;
-  auto *status = static_cast<std::uint32_t *>(device.mallocShared(statusBytes));
+  const std::uint64_t phaseBytes = (std::uint64_t)workers * kPhaseBytesPerWorker;
+  const std::uint64_t shareBytes = kStatusReserve + phaseBytes;
+  if (statusBytes > kStatusReserve)
+    throw std::runtime_error("status region exceeds kStatusReserve; the phase records would overlap it");
+  auto *status = static_cast<std::uint32_t *>(device.mallocShared(shareBytes));
+  std::memset(status, 0, (std::size_t)shareBytes);
   auto dumpStatus = [&]() {
     std::ofstream(dir + "/status.bin", std::ios::binary)
         .write(reinterpret_cast<const char *>(status), (std::streamsize)statusBytes);
+    std::ofstream(dir + "/phases.bin", std::ios::binary)
+        .write(reinterpret_cast<const char *>(status) + kStatusReserve, (std::streamsize)phaseBytes);
   };
   auto dumpOutputs = [&]() {
     for (auto &p : ps)
@@ -234,7 +247,11 @@ int session(const std::string &dir, int tiles, int shaves) {
   const std::uint32_t workers = (std::uint32_t)(tiles * shaves);
   const std::uint32_t statusSlots = (std::uint32_t)device.getTileCount() * (std::uint32_t)shaves;
   const std::uint64_t statusBytes = (std::uint64_t)statusSlots * kStatusBytesPerShave;
-  auto *status = static_cast<std::uint32_t *>(device.mallocShared(statusBytes));
+  const std::uint64_t phaseBytes = (std::uint64_t)workers * kPhaseBytesPerWorker;
+  if (statusBytes > kStatusReserve)
+    throw std::runtime_error("status region exceeds kStatusReserve; the phase records would overlap it");
+  auto *status = static_cast<std::uint32_t *>(device.mallocShared(kStatusReserve + phaseBytes));
+  std::memset(status, 0, (std::size_t)(kStatusReserve + phaseBytes));
   auto &stream = device.createStream();
   std::cout << "session ready tiles " << tiles << " shaves " << shaves << std::endl;
   std::string line;
@@ -331,6 +348,13 @@ int session(const std::string &dir, int tiles, int shaves) {
         }
         // the kernel sees the device view of the host allocation (what submit() puts in params[]), not the host pointer
         reply("ok " + std::to_string(reinterpret_cast<std::uint64_t>(device.getDeviceView(it->second.dev))));
+      } else if (cmd == "phases") {
+        // the per-phase records of the last launch (npu_rt_device.hpp's phase_end); one file, the host decodes
+        std::string file;
+        ls >> file;
+        std::ofstream(dir + "/" + file, std::ios::binary)
+            .write(reinterpret_cast<const char *>(status) + kStatusReserve, (std::streamsize)phaseBytes);
+        reply("ok " + std::to_string(phaseBytes));
       } else if (cmd == "kernel") {
         std::string alias, elf, opt;
         ls >> alias >> elf >> opt;
@@ -373,6 +397,7 @@ int session(const std::string &dir, int tiles, int shaves) {
           continue;
         params.push_back(status);
         std::memset(status, 0xFF, statusBytes);
+        std::memset(reinterpret_cast<char *>(status) + kStatusReserve, 0, (std::size_t)phaseBytes);
         auto t0 = std::chrono::steady_clock::now();
         it->second->submit(params, stream);
         {

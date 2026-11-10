@@ -12,6 +12,13 @@ bandwidth comes from the kernel's own notes, not from here. The DMA tracks hold 
     python perf_attr.py trace.json [--cluster "Cluster 0"] [--gap 25] [--vs other.json]
 
 A PROFILED span is a split, never a timing claim. Capture with NPU_PROFILE_FRC_MHZ=19.2.
+
+ADMISSIBILITY. A SHAVE records at most 1984 events and `Profiler::mark` drops the rest with a bare `return`:
+no flag, no overflow bit. A truncated trace is therefore well-formed JSON that simply stops early, and its
+attribution table is a table of the kernel's first few milliseconds wearing the whole kernel's name. `Session.
+profile` stamps every trace it writes with the NCE_TIME duration of the launches it covers (`tl.kernel_ms`);
+this tool refuses to print a table when the span falls short of it. `--allow-truncated` prints anyway and
+labels every line, for when the first N ms really is the question.
 """
 
 import argparse
@@ -23,6 +30,7 @@ from pathlib import Path
 def load(path):
     d = json.load(open(path, encoding="utf-8"))
     ev = d["traceEvents"] if isinstance(d, dict) and "traceEvents" in d else d
+    meta = d.get("tl", {}) if isinstance(d, dict) else {}
     names = {}
     for e in ev:
         if e.get("ph") == "M":
@@ -36,7 +44,46 @@ def load(path):
     for es in tracks.values():
         es.sort(key=lambda e: e["ts"])
     t0 = min(e["ts"] for es in tracks.values() for e in es)
-    return tracks, t0
+    return tracks, t0, meta
+
+
+COVERAGE_MIN = 0.90      # below this the table describes a prefix of the kernel, not the kernel
+
+
+def coverage(tracks, t0, meta):
+    """(span_us, kernel_us or None, fraction or None) -- what the trace covers of the kernel it came from."""
+    span = max(e["ts"] + e.get("dur", 0) for es in tracks.values() for e in es) - t0
+    kms = meta.get("kernel_ms")
+    if not kms:
+        return span, None, None
+    kus = float(kms) * 1000.0
+    return span, kus, (span / kus if kus > 0 else None)
+
+
+def check_admissible(path, tracks, t0, meta, allow_truncated=False):
+    """Refuse a trace that covers only a prefix of its kernel. Returns the coverage line to print."""
+    span, kus, frac = coverage(tracks, t0, meta)
+    per = collections.Counter()
+    for (pn, tn), es in tracks.items():
+        per[pn] += len(es)
+    if kus is None:
+        return (f"coverage: span {span:.0f} us; kernel time UNKNOWN -- this trace carries no `tl.kernel_ms`, so "
+                f"whether it covers its kernel CANNOT BE CHECKED. Recapture through Session.profile.")
+    line = (f"coverage: span {span:.0f} us of a {kus:.0f} us kernel = {100 * frac:.1f}% "
+            f"({meta.get('launches', '?')} launches of '{meta.get('alias', '?')}', "
+            f"{sum(per.values())} events)")
+    if frac >= COVERAGE_MIN:
+        return line
+    msg = (f"{line}\n"
+           f"TRUNCATED: a SHAVE records at most 1984 events and silently drops the rest "
+           f"(kernel_wrapper.cpp Profiler::mark), so this trace stops after the kernel's first {span:.0f} us and "
+           f"an attribution table from it would describe {100 * frac:.1f}% of the work while naming all of it.\n"
+           f"For whole-kernel attribution use the per-task records instead (`--phases`, `task_report.py`), "
+           f"which cost O(tasks) in DDR rather than 1984 events in CMX.\n"
+           f"--allow-truncated prints the table anyway, labelled.")
+    if not allow_truncated:
+        raise SystemExit(msg)
+    return msg
 
 
 def segments(tracks, t0, cluster, gap):
@@ -87,8 +134,46 @@ def window_stats(tracks, t0, cluster, a, b):
     return waits, jobs, jdur, regions
 
 
-def table(path, cluster, gap):
-    tracks, t0 = load(path)
+WAIT_NAMES = ("dma_wait", "dpu_wait", "sync_local", "sync_global", "dma", "dpu")
+def phase_rows(tracks, t0):
+    """Per named region: wall time per worker and share of the capture. Used when a trace has no DPU track to
+    segment on."""
+    shaves = [(k, es) for k, es in tracks.items() if k[1].startswith("SHAVE")]
+    span = max(e["ts"] + e.get("dur", 0) for es in tracks.values() for e in es) - t0
+    per = collections.defaultdict(lambda: collections.defaultdict(float))
+    cnt = collections.Counter()
+    for k, es in shaves:
+        for e in es:
+            if e["name"] in WAIT_NAMES:
+                continue
+            per[e["name"]][k] += e.get("dur", 0)
+            cnt[e["name"]] += 1
+    rows = []
+    for name, byw in per.items():
+        vals = [byw.get(k, 0.0) for k, _ in shaves]
+        rows.append(dict(name=name, mean=sum(vals) / len(vals), lo=min(vals), hi=max(vals),
+                         n=cnt[name] // max(1, len(shaves))))
+    rows.sort(key=lambda r: -r["mean"])
+    return rows, span
+
+
+def fmt_phases(rows, span, title, cov):
+    print(f"== {title}")
+    print(cov)
+    print(f"{'phase':>6} {'n':>4} {'mean us':>10} {'share':>7} {'min us':>10} {'max us':>10} {'imbal':>6}")
+    tot = 0.0
+    for r in rows:
+        tot += r["mean"]
+        imb = (r["hi"] / r["lo"]) if r["lo"] > 0 else float("inf")
+        print(f"{r['name']:>6} {r['n']:>4} {r['mean']:>10.0f} {100 * r['mean'] / span:>6.1f}% "
+              f"{r['lo']:>10.0f} {r['hi']:>10.0f} {imb:>6.2f}")
+    print(f"{'sum':>6} {'':>4} {tot:>10.0f} {100 * tot / span:>6.1f}%   of a {span:.0f} us capture; "
+          f"the remainder is grid barriers and unbracketed code")
+
+
+def table(path, cluster, gap, allow_truncated=False):
+    tracks, t0, meta = load(path)
+    cov = check_admissible(path, tracks, t0, meta, allow_truncated)
     segs = segments(tracks, t0, cluster, gap)
     rows = []
     prev_end = None
@@ -99,11 +184,13 @@ def table(path, cluster, gap):
         waits, jobs, jdur, regions = window_stats(tracks, t0, cluster, sg["start"], sg["end"])
         rows.append(dict(kind=f"seg{i}", **sg, waits=waits, jobs=jobs, jdur=jdur, regions=regions))
         prev_end = sg["end"]
-    return rows, t0
+    return rows, t0, cov
 
 
-def fmt(rows, title):
+def fmt(rows, title, cov=None):
     print(f"== {title}")
+    if cov:
+        print(cov)
     print(f"{'section':8} {'start':>7} {'end':>7} {'span':>6} {'dpu':>4} {'busy%':>5} {'dma jobs':>8} {'jobs us':>7}  SHAVE: dma_wait / dpu_wait / sync / compute (us)")
     for r in rows:
         span = r["end"] - r["start"]
@@ -122,12 +209,26 @@ def main():
     ap.add_argument("--vs", default=None, help="a second trace printed after the first (same cluster and gap)")
     ap.add_argument("--cluster", default="Cluster 0")
     ap.add_argument("--gap", type=float, default=25.0, help="DPU start-to-start idle gap (us) that ends a segment")
+    ap.add_argument("--allow-truncated", action="store_true",
+                    help="print the table even when the trace covers only a prefix of its kernel")
+    ap.add_argument("--phases", action="store_true",
+                    help="per-region phase table, for a trace with no DPU track")
     a = ap.parse_args()
-    rows, _ = table(a.trace, a.cluster, a.gap)
-    fmt(rows, f"{Path(a.trace).name} ({a.cluster}, gap {a.gap:g} us)")
+
+    def one(path):
+        tracks, t0, meta = load(path)
+        cov = check_admissible(path, tracks, t0, meta, a.allow_truncated)
+        title = f"{Path(path).name} ({a.cluster}, gap {a.gap:g} us)"
+        if a.phases or (a.cluster, "DPU") not in tracks:
+            rows, span = phase_rows(tracks, t0)
+            fmt_phases(rows, span, f"{Path(path).name} (phases, all workers)", cov)
+        else:
+            rows, _, _ = table(path, a.cluster, a.gap, a.allow_truncated)
+            fmt(rows, title, cov)
+
+    one(a.trace)
     if a.vs:
-        rows2, _ = table(a.vs, a.cluster, a.gap)
-        fmt(rows2, f"{Path(a.vs).name} ({a.cluster}, gap {a.gap:g} us)")
+        one(a.vs)
 
 
 if __name__ == "__main__":

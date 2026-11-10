@@ -13,21 +13,31 @@ import os
 
 import tilelang.intel_npu.language as T
 
-PERF_REGIONS = os.environ.get("TL_NPU_PERF_REGIONS") == "1"   # named SHAVE compute spans in the profiler trace (perf_attr.py)
-
 
 @T.macro
 def perf_begin(name: str):
-    """Opens a named SHAVE region on the profiler track (4-char label; a no-op unless TL_NPU_PERF_REGIONS=1). A macro:
-    a bare extern call inside a plain helper is evaluated and dropped by the eager builder."""
-    if PERF_REGIONS:
-        T.call_extern("handle", "tl_npu_perf_begin", name)
+    """A named SHAVE site inside a phase (a dequant, a gemm, a gather): one per-task record under that name, so
+    it gets its own track. A macro, because a bare extern call in a plain helper is dropped by the builder.
+
+    Recorded only in a build with `TL_NPU_PHASE_PROF=1` (the runners' `--phases`): the records cost ~5%, so
+    they are opt-in, as VPUX gates on PERF_COUNT and npu_dsl on -DFRT_PROFILE."""
+    T.call_extern("handle", "ctx.task_begin", name)
 
 
 @T.macro
 def perf_end():
-    if PERF_REGIONS:
-        T.call_extern("handle", "tl_npu_perf_end")
+    T.call_extern("handle", "ctx.task_end")
+
+
+@T.macro
+def perf_phase_begin(name: str):
+    """A PHASE boundary: the unit between two grid barriers."""
+    T.call_extern("handle", "ctx.phase_begin", name)
+
+
+@T.macro
+def perf_phase_end(name: str):
+    T.call_extern("handle", "ctx.phase_end")
 
 
 def make_gemm(M: int, N: int, K: int, BM: int = 64, BN: int = 64, tiles: int = 2, shaves: int = 2):
@@ -4218,7 +4228,9 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
                 WdQ = T.ddr_view(Table[li, col["WdQ"]], ((E + 1) * H, I // 2), T.uint8)
                 WdS = T.ddr_view(Table[li, col["WdS"]], (KGI, (E + 1) * H), T.float16)
                 if "norm" not in skip:
+                    perf_phase_begin("nrm1")
                     norm_tokens(Hio, InNorm, Xs, nw, hrow, xrow, ls, st, worker)
+                    perf_phase_end("nrm1")
                 T.sync_grid()
                 if Kind[li, 0] == 0:
                     WinQ = T.ddr_view(Table[li, col["W0"]], (NIN_pad, H // 2), T.uint8)
@@ -4233,17 +4245,27 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
                     ConvState = T.ddr_view(Table[li, col["S0"]], (3, CONV), T.float16)
                     Ssm = T.ddr_view(Table[li, col["S1"]], (VH, DK, DV), T.float32)
                     if "gdn" not in skip:
+                        perf_phase_begin("ginp")
                         in_proj(Xs, WinQ, WinS, Ys, tile, shave)
                         ba_phase(Xs, Wba, BAs, tile, shave)
+                        perf_phase_end("ginp")
                         T.sync_grid()
+                        perf_phase_begin("gcnv")
                         conv_phase(Ys, BAs, ConvW, ConvState, ALog, DtBias, Nt, QKs, Vs, Gbs, Zs, ConvState, tile,
                                    shave, cbuf)
+                        perf_phase_end("gcnv")
                         T.sync_grid()
+                        perf_phase_begin("gscn")
                         scan_phase(QKs, Vs, Gbs, Zs, GNorm, Nt, Ssm, Os, tile, shave)
+                        perf_phase_end("gscn")
                         T.sync_grid()
+                        perf_phase_begin("gout")
                         gdn_out_proj(Os, WoutQ, WoutS, Mix, tile, shave)
+                        perf_phase_end("gout")
                         T.sync_grid()
+                        perf_phase_begin("gres")
                         add_mix(Hio, Mix, hrow, mrow, nt, worker)
+                        perf_phase_end("gres")
                 else:
                     WqkvQ = T.ddr_view(Table[li, col["W0"]], (NQKV_pad, H // 2), T.uint8)
                     WqkvS = T.ddr_view(Table[li, col["W1"]], (H // G, NQKV_pad), T.float16)
@@ -4252,27 +4274,44 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
                     WoQ = T.ddr_view(Table[li, col["W4"]], (HW, KO // 2), T.uint8)
                     WoS = T.ddr_view(Table[li, col["W5"]], (KO // G, HW), T.float16)
                     if "attn" not in skip:
+                        perf_phase_begin("aqkv")
                         qkv_proj(Xs, WqkvQ, WqkvS, Ys, tile, shave)
+                        perf_phase_end("aqkv")
                         T.sync_grid()
+                        perf_phase_begin("arop")
                         qkv_phase(Ys, QNormW, KNormW, CosSin, Pos, Nt, Q, Gate, KcAll, VtAll, tile, shave, Kind, li)
+                        perf_phase_end("arop")
                         T.sync_grid()
+                        perf_phase_begin("afls")
                         flash_phase(Q, KcAll, VtAll, Gate, Pos, Os, tile, shave, Kind, li)
+                        perf_phase_end("afls")
                         T.sync_grid()
+                        perf_phase_begin("aout")
                         o_proj(Os, WoQ, WoS, Mix, tile, shave)
+                        perf_phase_end("aout")
                         T.sync_grid()
+                        perf_phase_begin("ares")
                         add_mix(Hio, Mix, hrow, mrow, nt, worker)
+                        perf_phase_end("ares")
                 T.sync_grid()
                 if "norm" not in skip:
+                    perf_phase_begin("nrm2")
                     norm_tokens(Hio, PostNorm, Xs, nw, hrow, xrow, ls, st, worker)
+                    perf_phase_end("nrm2")
                 T.sync_grid()
                 if "moe" not in skip:
+                    perf_phase_begin("mrot")
                     route_phase(Xs, Wr, Logits, Ids, Wts, Cnt, Off, Slot, tile, shave)
+                    perf_phase_end("mrot")
                     # the grouping is worker 0's alone and the expert phase's first act is to read it back;
                     # DeriveIntelNpuGlobalSync only sees the TOP-LEVEL phase sequence, so inside the layer loop
                     # this barrier has to be written (without it the expert loop bounds are a race)
                     T.sync_grid()
+                    perf_phase_begin("mexp")
                     expert_phase(Xs, WguQ, WguS, WdQ, WdS, Wts, Off, Slot, PartE, MoeOut, tile, shave)
+                    perf_phase_end("mexp")
                     T.sync_grid()
+                    perf_phase_begin("madd")
                     for it in T.serial(NP // workers):     # h += the MoE output, live tokens only
                         t = it * workers + worker
                         if t < nt[0, 0]:
@@ -4282,6 +4321,7 @@ def make_prefill_model(L: int, N: int = 192, H: int = 2048, KH: int = 16, VH: in
                                 for v in T.vectorized(FL):
                                     hrow[0, d0 * FL + v] = hrow[0, d0 * FL + v] + erow[0, d0 * FL + v]
                             T.copy(hrow, Hio[t, 0])
+                    perf_phase_end("madd")
                     T.sync_grid()
 
     return prefill_model

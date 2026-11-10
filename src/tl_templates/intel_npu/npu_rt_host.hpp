@@ -76,10 +76,7 @@ TL_NPU_HOST_REDUCE(float8, float, 8)
 TL_NPU_HOST_REDUCE(float4, float, 4)
 #undef TL_NPU_HOST_REDUCE
 
-// Perf regions (device: profiler VEC_COMPUTE spans) are no-ops in the host simulation.
-static inline void tl_npu_perf_begin(const char *) {}
-static inline void tl_npu_perf_end() {}
-
+// Perf regions are `Ctx::task_begin` / `task_end`; no-ops in the host simulation.
 // Packed signed int4 (two per byte, low nibble first, value = (n ^ 8) - 8) to fp16, 64 values
 // from 32 bytes as two half32 halves (the device's LSU convert-load).
 static inline half32 tl_npu_i4x64_part(const void *p, int first) {
@@ -276,6 +273,10 @@ public:
   using CmxMark = std::uint32_t;
   CmxMark cmx_mark() const { return offset_; }
   void cmx_restore(CmxMark m) { offset_ = m; }
+  void phase_begin(const char *) {}     // the per-task records are device-only; the simulation has no clock
+  void phase_end() {}
+  void task_begin(const char *) {}
+  void task_end() {}
   class CmxScope {
   public:
     explicit CmxScope(Ctx &c) : c_(c), m_(c.cmx_mark()) {}
