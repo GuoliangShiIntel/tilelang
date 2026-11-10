@@ -124,7 +124,8 @@ def main(argv):
     TILES = arg(argv, "--tiles", TILES)
     n, pos0 = arg(argv, "--n", 192), arg(argv, "--pos0", 0)
     trials = arg(argv, "--trials", 3)
-    BN1 = BN2 = arg(argv, "--bn", 32)
+    BN1 = arg(argv, "--bn1", arg(argv, "--bn", 32))
+    BN2 = arg(argv, "--bn2", arg(argv, "--bn", 32))
     global MBe, DB, MB
     MBe = arg(argv, "--mbe", MBe)
     DB = arg(argv, "--db", DB)
@@ -144,7 +145,9 @@ def main(argv):
     YW, OW = max(NIN_pad, NQKV_pad), max(VC, KO)
 
     cfg = {"tl.intel_npu.scoped_cmx": "--no-scoped-cmx" not in argv,
-           "tl.intel_npu.prefetch": "--no-prefetch" not in argv}
+            "tl.intel_npu.prefetch": "--no-prefetch" not in argv,
+            "tl.intel_npu.multicast": "--shared-projections" in argv,
+            "tl.intel_npu.multicast_overlap": "--overlap" in argv}
     t_low = time.time()
     with tvm.transform.PassContext(config=cfg):
         low = lowering.lower(make_prefill_model(L=L, N=NP, H=H, KH=KH, VH=VH, DK=DK, DV=DV, NH=NH, NKV=NKV, D=D,
@@ -153,12 +156,16 @@ def main(argv):
                                                 MBe=MBe, BNG=BNG, BND=BND, DB=DB, tiles=TILES, shaves=SHAVES, KVL=KVL,
                                                 skip=skip, unroll_layers="--unroll" in argv,
                                                 conv_blocked="--roundrobin" not in argv,
-                                                conv_item_worker="shave" if "--shave-major" in argv else "tile"))
+                                                conv_item_worker="shave" if "--shave-major" in argv else "tile",
+                                                shared_projections="--shared-projections" in argv))
     print(f"lower {time.time() - t_low:.0f} s")
     name = (f"tl_prefill_model_l{L}_n{NP}_h{H}_s{SMAX}_bn{BN1}"
+            + (f"_bn2{BN2}" if BN2 != BN1 else "")
             + (f"_mbe{MBe}" if MBe != 16 else "")
             + (f"_mb{MB}" if MB != 16 else "")
             + ("_noprefetch" if "--no-prefetch" in argv else "")
+            + ("_sharedproj" if "--shared-projections" in argv else "")
+            + ("_overlap" if "--overlap" in argv else "")
             + (f"_db{DB}" if DB != 4 else "")
             + (f"_t{TILES}" if TILES != 3 else "")
             + ("_sm" if "--shave-major" in argv else "")
@@ -337,8 +344,10 @@ def main(argv):
         good += int(max(v for _, v in named) < REL)
     km = float(np.median(kms))
     verdict = "PASS" if good == trials else "FAIL"
+    condition = ("INSTRUMENTED (observability, NOT a timing)" if "--phases" in argv else
+                 "PROFILED (observability, NOT a timing)" if profiled else "UNPROFILED")
     print(f"prefill model: {km:.3f} ms [{'TURBO' if s.turbo else 'NO TURBO'}, "
-          f"{'PROFILED (observability, NOT a timing)' if profiled else 'UNPROFILED'}] -> {verdict}; "
+            f"{condition}] -> {verdict}; "
           f"{good}/{trials} trials match the layer oracles chained (stream, KV caches, both GDN states), "
           f"worst rel {worst:.2e}")
     print(f"  {'/'.join(kinds)}: {L} layers, {n} tokens at pos0 {pos0}, H={H}, E={E} top-{TOPK}: "

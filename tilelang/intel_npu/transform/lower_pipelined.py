@@ -183,6 +183,18 @@ def PlanIntelNpuDistribution():
         multicast = bool(ctx.config.get("tl.intel_npu.multicast", False)) and launch.tiles > 1
         uniform = [list(func.params)]
         dpu_inputs = []
+        written = []
+
+        def find_writes(node):
+            if isinstance(node, tirx.BufferStore):
+                written.append(node.buffer.data)
+            elif isinstance(node, tirx.Call) and getattr(node.op, "name", "") == DMA_COPY:
+                if _const_or(node.args[6], 1) == 0:
+                    written.append(_load_of(node.args[0]).buffer.data)
+
+        post_order_visit(func.body, find_writes)
+        readonly = [buffer.data for buffer in func.buffer_map.values()
+                    if not any(buffer.data.same_as(data) for data in written)]
 
         def find_input(node):
             if isinstance(node, tirx.Call) and getattr(node.op, "name", "") == DPU_MATMUL:
@@ -194,11 +206,12 @@ def PlanIntelNpuDistribution():
             safe = [True]
 
             def visit(node):
-                if (
-                    isinstance(node, (tirx.BufferLoad, tirx.Call))
-                    or isinstance(node, tirx.Var)
-                    and not any(node.same_as(var) for var in uniform[-1])
-                ):
+                if isinstance(node, tirx.BufferLoad):
+                    if not any(node.buffer.data.same_as(data) for data in readonly):
+                        safe[0] = False
+                elif isinstance(node, tirx.Call):
+                    safe[0] = False
+                elif isinstance(node, tirx.Var) and not any(node.same_as(var) for var in uniform[-1]):
                     safe[0] = False
 
             post_order_visit(expr, visit)

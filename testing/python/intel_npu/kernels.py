@@ -5192,6 +5192,7 @@ def make_prefill_model(
     conv_blocked: bool = True,
     conv_item_worker: str = "tile",
     HW: int | None = None,
+    shared_projections: bool = False,
 ):
     """P5: a whole PREFILL chunk of `N` prompt tokens through `L` layers in ONE launch -- the prefill counterpart
     of `make_decode_model`. A device-side loop over the layers, `Kind[li, 0]` selecting the Gated DeltaNet or the
@@ -5249,9 +5250,11 @@ def make_prefill_model(
     NIN_pad = -(-NIN // BN1) * BN1
     NQKV_pad = -(-qs["NQKV"] // BN1) * BN1
     YW, OW = max(NIN_pad, NQKV_pad), max(VC, KO)
-    in_proj, _ = make_proj_prefill(NP=NP, M=NIN_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True, scales_gm=True)
+    in_proj, _ = make_proj_prefill(NP=NP, M=NIN_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True,
+                                   scales_gm=True, shared_weights=shared_projections)
     gdn_out_proj, _ = make_proj_prefill(NP=NP, M=H, K=VC, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True, scales_gm=True)
-    qkv_proj, _ = make_proj_prefill(NP=NP, M=NQKV_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True, scales_gm=True)
+    qkv_proj, _ = make_proj_prefill(NP=NP, M=NQKV_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True,
+                                    scales_gm=True, shared_weights=shared_projections)
     o_proj, _ = make_proj_prefill(NP=NP, M=H, K=KO, BN=BN2, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True, scales_gm=True)
     route_phase, rs = make_moe_route_prefill(N=NP, H=H, E=E, TOPK=TOPK, BM=BM, BNR=BNR, tiles=tiles, shaves=shaves, as_block=True)
     expert_phase, _ = make_moe_expert_prefill(

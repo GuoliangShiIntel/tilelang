@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 import tilelang  # noqa: F401
+import tvm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import host_sim  # noqa: E402
@@ -58,11 +59,11 @@ def _has_host_cxx() -> bool:
 needs_cxx = pytest.mark.skipif(not _has_host_cxx(), reason="no host clang++ for the simulation")
 
 
-def _kernel():
+def _kernel(shared_projections=False, expert_block=MBe):
     return make_prefill_model(L=L, N=N, H=H, KH=KH, VH=VH, DK=DK, DV=DV, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX,
                               I=I, E=E, TOPK=TOPK, G=G, TB=TB, C=C, TBq=TBq, TBF=TBF, BKV=BKV, BN1=BN1, BN2=BN2,
-                              MB=MB, BM=BM, BNR=BNR, MBe=MBe, BNG=BNG, BND=BND, tiles=TILES, shaves=SHAVES,
-                              KVL=KVL)
+                              MB=MB, BM=BM, BNR=BNR, MBe=expert_block, BNG=BNG, BND=BND, tiles=TILES, shaves=SHAVES,
+                              KVL=KVL, shared_projections=shared_projections)
 
 
 def _layers(seed=0):
@@ -133,8 +134,11 @@ def _host_arrays(layers):
     return rows, keep
 
 
-def _run(layers, h, pos0=0, n=N):
-    low = lowering.lower(_kernel())
+def _run(layers, h, pos0=0, n=N, shared_projections=False, expert_block=MBe):
+    with tvm.transform.PassContext(config={"tl.intel_npu.multicast": shared_projections}):
+        low = lowering.lower(_kernel(shared_projections, expert_block))
+    if shared_projections:
+        assert "ctx.dma_load_multicast(" in low.source
     lib = host_sim.build(low.source, "prefill_model")
     rows, keep = _host_arrays(layers)
     col = {c: i for i, c in enumerate(PREFILL_TABLE_COLS)}
@@ -231,6 +235,29 @@ def test_every_layer_reads_its_own_row_of_the_table():
         swapped[2][k] = layers[0][k]
     b, _, _, _, _ = _run(swapped, h)
     assert np.abs(a - b).max() > 0, "layer 2 did not read its own table row"
+
+
+@needs_cxx
+@pytest.mark.parametrize("expert_block", [16, 32])
+def test_shared_projections_preserve_model_state(expert_block):
+    layers = _layers(seed=5)
+    h = np.random.default_rng(5).normal(size=(N, H)).astype(np.float32)
+    expected = _run(layers, h, n=N - TB)
+    actual = _run(layers, h, n=N - TB, shared_projections=True, expert_block=expert_block)
+    for got, ref in zip(actual[:3], expected[:3]):
+        np.testing.assert_array_equal(got, ref)
+    for li, layer in enumerate(layers):
+        if layer["kind"] == "gdn":
+            for name in ("S0", "S1"):
+                np.testing.assert_array_equal(actual[3][li][name], expected[3][li][name])
+
+
+def test_model_projection_overlap_under_readonly_kind_table():
+    with tvm.transform.PassContext(config={"tl.intel_npu.multicast_overlap": True,
+                                           "tl.intel_npu.plan_workloads": "off"}):
+        low = lowering.lower(_kernel(shared_projections=True))
+    assert low.source.count("ctx.ring_begin(") == 2
+    assert low.source.count("ownership-preserving") >= 2
 
 
 @needs_cxx

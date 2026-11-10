@@ -4,6 +4,79 @@ Status: plan, 2026-11-06. Branch `feat/intel-npu-backend`. Living document: ever
 its outcome in place when it closes (date, commit, evidence path). Decisions that change get a dated
 amendment, not a silent edit.
 
+## 2026-11-10: Real-checkpoint E2E integration
+
+The standalone mechanism baseline is committed at `30d59e3d`. Formatting checks are deferred at the
+user's request. The subsequent integration adds opt-in shared in-proj/qkv to `make_prefill_model` and
+the real-checkpoint driver; output projections remain private because their row tails are not supported
+by the shared schedule yet. Weights and pack-cache bytes are unchanged.
+
+The distribution pass now accepts uniform control-table reads from parameter buffers the kernel does
+not write, so `Kind[li, 0]` can select a layer kind without blocking multicast/ring planning. Weight
+views are still bound inside each layer. The activation is the model's parameter-backed scratch, not
+a dynamic DDR view; arbitrary dynamic activation views are not enabled.
+
+Real-checkpoint correctness: 40/40 layers, the existing 17.91 GB packed Qwen3.8 checkpoint, prefill
+followed by decode. The short-prompt saved `intro.pt` golden passes 2/2 teacher-forced trials at all
+8 checked tokens, worst logits error 0.372. The golden branch now actually calls prefill before decode;
+previously `--golden --prefill` silently replayed the prompt through decode only. PyTorch token/logit
+goldens and the existing NPZ format are both accepted. Host state-equivalence tests cover interleaved
+layers, partial prompts, KV caches, conv/SSM state and MBe 16/32. Final gate: 191 tests passed.
+
+Same-day clean E2E experiments (UNPROFILED TURBO, cold, one timed prefill launch after weight upload,
+no warmup, 8 generated tokens, upload/build excluded from TTFT). These are single-run observations,
+not repeated-run medians; the prompt bytes are identical within each comparison.
+
+| Prompt | Strategy | Prefill kernel | TTFT | Kernel source SHA256 |
+|---|---|---|---|---|
+| 22 tokens; capacity 192 | original BN1=32 / MB=16 / MBe=16 | 1671 ms | 1.76 s | `91a0a748cd78` |
+| same | shared/ring BN1=32 / MB=16 / MBe=16 | 1679 ms | 1.75 s | `6038bf0991d4` |
+| same | shared/ring BN1=128 / MB=16 / MBe=16 | 1472 ms | 1.55 s | `de93a685b50a` |
+| 1024 tokens; capacity 1152 | original BN1=32 / MB=16 / MBe=16 | 9040 ms | 9.15 s | `4449fe8ca838` |
+| same | shared/ring BN1=128 / MB=16 / MBe=16 | 7690 ms | 7.81 s | `e6392ee4da96` |
+| same | shared/ring BN1=128 / MB=16 / MBe=32 | 6535 ms | 6.65 s | `76eea14af93f` |
+
+All arms produce `33119,11106,26012,318,3950,20971,8,513`. The last prompt token uses decode; therefore
+the prefill kernel processes 21 or 1023 live tokens respectively. Decode source stays `2c88462809d8`;
+SDK `daf6c05`. The larger expert token block is an existing kernel parameter, not a new algorithm.
+The 1K TTFT reduction is about 27%; no comparison with npu_dsl's 2.45 s is claimed because its prompt
+and measurement condition have not been reproduced here. Full-model TOPS is not reported.
+
+Complete two-layer observability captures (not latency measurements):
+
+- `tl_prefill_model_l2_n192_h2048_s1536_bn128_bn232_sharedproj_overlap_prof_tasks.json`:
+  176173 records; dropped=0; source `d6a10b6138fb`. Mexp 71.2% of launch attribution.
+- `tl_prefill_model_l2_n1152_h2048_s1536_bn128_bn232_mbe32_sharedproj_overlap_prof_tasks.json`:
+  454055 records; dropped=0; source `11307398f3bf`; 2/2 chained layer-oracle trials PASS, worst rel
+  3.84e-2. Mexp 53.4%, gscn 9.0%, gcnv 7.7%, ginp 3.9%, aqkv 2.7%. Mexp's named sites per worker:
+  accm 35.5 ms, gdeq 21.5 ms, gath 14.1 ms, ddeq 11.9 ms. These are the next performance targets.
+
+Traces live under `testing/python/intel_npu/device/evidence/` and cover the whole two-layer canary,
+not all 40 checkpoint layers. The old toolkit ring trace is still not an admissible DPU timeline.
+
+```powershell
+python testing/python/intel_npu/e2e/decode.py --ckpt D:\models\qwen38-w4a16 --pack-dir D:\models\qwen38_tlpack --prefill 1024 --prefill-overlap --prefill-bn1 128 --prefill-mbe 32 --new 8
+python testing/python/intel_npu/e2e/decode.py --ckpt D:\models\qwen38-w4a16 --pack-dir D:\models\qwen38_tlpack --prefill 192 --prefill-overlap --prefill-bn1 128 --golden D:\models\qwen38_golden\intro.pt --new 8 --trials 2
+python testing/python/intel_npu/device/run_prefill_model_device.py --kinds gdn,attn --n 1024 --trials 2 --bn1 128 --bn2 32 --mbe 32 --shared-projections --overlap --phases
+```
+
+The first command uses the default short prompt. To reproduce the exact 1K comparison, generate the
+same deterministic token list and pass it with `--ids` to both arms:
+
+```python
+from tokenizers import Tokenizer
+
+tokenizer = Tokenizer.from_file(r"D:\models\qwen38-w4a16\tokenizer.json")
+head = tokenizer.encode("<|im_start|>user\n", add_special_tokens=False).ids
+tail = tokenizer.encode("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", add_special_tokens=False).ids
+body = tokenizer.encode(
+    "Explain how large language models learn patterns from text and use attention to generate useful responses. " * 200,
+    add_special_tokens=False,
+).ids
+ids = head + body[:1024 - len(head) - len(tail)] + tail
+print(",".join(map(str, ids)))
+```
+
 ## 2026-11-10: Shared-weight ownership and serial activation multicast
 
 First correctness milestone; not an E2E performance claim. The previous prefetch prototype is committed

@@ -80,7 +80,8 @@ def prefill_sizes(c, n: int, G: dict) -> dict:
 class DeviceModel:
     def __init__(self, ck: Checkpoint, pack_dir: Path, layers: int, smax: int, build: bool, single: bool = True, log=print,
                  layer_ids: list[int] | None = None, chunked: bool = False, prefill: int = 0,
-                 prefill_ls: list[int] | None = None):
+                 prefill_ls: list[int] | None = None, prefill_shared: bool = False, prefill_overlap: bool = False,
+                 prefill_bn1: int | None = None, prefill_mb: int | None = None, prefill_mbe: int | None = None):
         self.ck, self.c, self.log = ck, ck.cfg, log
         c = self.c
         self.layer_ids = list(layer_ids) if layer_ids is not None else list(range(layers))   # checkpoint layers, in run order
@@ -89,6 +90,14 @@ class DeviceModel:
         self.smax = smax
         self.single = single
         self.prefill_n = prefill
+        prefill_shared = prefill_shared or prefill_overlap
+        pgeom = dict(PREFILL_GEOM)
+        if prefill_bn1 is not None:
+            pgeom["BN1"] = prefill_bn1
+        if prefill_mb is not None:
+            pgeom["MB"] = prefill_mb
+        if prefill_mbe is not None:
+            pgeom["MBe"] = prefill_mbe
         # launch units: the whole model, or (chunked) runs of up to 3 GDN layers and single attention layers, the head in the last
         self.chunks = self._chunks() if (single and chunked) else [self.layer_ids]
         G = pack.GEOM
@@ -127,7 +136,7 @@ class DeviceModel:
                 # same weight tensors decode already uploaded -- that is what the shared group-major scale layout
                 # bought -- and writes the same KV cache, conv state and SSM state, so decode continues from it.
                 assert len(self.chunks) == 1, "--prefill needs the whole model in one launch unit (not --chunked)"
-                ps = prefill_sizes(c, self.prefill_n, PREFILL_GEOM)
+                ps = prefill_sizes(c, self.prefill_n, pgeom)
                 self.ps = ps
                 # a sweep builds one kernel per layer count in THIS pass: they then share the build, the 17.91 GB
                 # upload and the session, so a bisect point costs a launch instead of ~100 s of fixed overhead
@@ -149,20 +158,24 @@ class DeviceModel:
                                   BN1=pack.GEOM["gdn_BN1"], BN2=pack.GEOM["gdn_BN2"])
                 asz_p = attn_sizes(c.hidden, c.n_heads, c.n_kv, c.head_dim, tiles=TILES,
                                    BN2=pack.GEOM["attn_BN2"])
-                assert gsz_p["NIN_pad"] == -(-ps["NIN"] // PREFILL_GEOM["BN1"]) * PREFILL_GEOM["BN1"], (
+                assert gsz_p["NIN_pad"] == -(-ps["NIN"] // pgeom["BN1"]) * pgeom["BN1"], (
                     f"in_proj packed to {gsz_p['NIN_pad']} rows; prefill reads "
-                    f"{-(-ps['NIN'] // PREFILL_GEOM['BN1']) * PREFILL_GEOM['BN1']}")
-                assert asz_p["NQKV"] == -(-ps["NQKV"] // PREFILL_GEOM["BN1"]) * PREFILL_GEOM["BN1"], (
+                    f"{-(-ps['NIN'] // pgeom['BN1']) * pgeom['BN1']}")
+                assert asz_p["NQKV"] == -(-ps["NQKV"] // pgeom["BN1"]) * pgeom["BN1"], (
                     f"qkv_proj packed to {asz_p['NQKV']} rows; prefill reads "
-                    f"{-(-ps['NQKV'] // PREFILL_GEOM['BN1']) * PREFILL_GEOM['BN1']}")
+                    f"{-(-ps['NQKV'] // pgeom['BN1']) * pgeom['BN1']}")
                 for pl in self.prefill_ls:
                     kvl = max(1, sum(1 for i in self.layer_ids[:pl] if c.layer_types[i] != "linear_attention"))
                     kernels[f"prefill{pl}"] = make_prefill_model(
                         L=pl, N=ps["NP"], H=c.hidden, KH=c.lin_kh, VH=c.lin_vh, DK=c.lin_dk, DV=c.lin_dv,
                         NH=c.n_heads, NKV=c.n_kv, D=c.head_dim, ROT=c.rot_dim, SMAX=smax, I=c.moe_inter,
                         E=c.n_experts, TOPK=c.top_k, G=ck.group, tiles=TILES, shaves=SHAVES, eps=c.eps,
-                        KVL=kvl, skip=pskip, HW=hw_g, **PREFILL_GEOM)
+                        KVL=kvl, skip=pskip, HW=hw_g, shared_projections=prefill_shared, **pgeom)
                     names[f"prefill{pl}"] = (f"tl_e2e_prefill_l{pl}_n{ps['NP']}_h{c.hidden}_s{smax}"
+                                             + (f"_bn{pgeom['BN1']}_mb{pgeom['MB']}" if prefill_shared or prefill_bn1 is not None or prefill_mb is not None else "")
+                                             + ("_sharedproj" if prefill_shared else "")
+                                             + ("_overlap" if prefill_overlap else "")
+                                             + (f"_mbe{prefill_mbe}" if prefill_mbe is not None else "")
                                              + ("_skip_" + "_".join(sorted(pskip)) if pskip else ""))
         else:
             kernels = {
@@ -182,8 +195,14 @@ class DeviceModel:
                "tl.intel_npu.scoped_cmx": os.environ.get("TL_NPU_SCOPED_CMX", "1") != "0"}
         if os.environ.get("TL_NPU_PLAN_WORKLOADS") == "off":
             cfg["tl.intel_npu.plan_workloads"] = "off"
-        with tvm.transform.PassContext(config=cfg):
-            self.low = {k: lowering.lower(f) for k, f in kernels.items()}
+        self.low = {}
+        for key, func in kernels.items():
+            options = dict(cfg)
+            if key.startswith("prefill"):
+                options["tl.intel_npu.multicast"] = prefill_shared
+                options["tl.intel_npu.multicast_overlap"] = prefill_overlap
+            with tvm.transform.PassContext(config=options):
+                self.low[key] = lowering.lower(func)
         prefix = os.environ.get("TL_NPU_SOURCE_PREFIX")   # diagnostics: C++ lines prepended to every kernel (e.g. a #define)
         if prefix:
             for k in kernels:
@@ -528,6 +547,11 @@ def main(argv):
     ap.add_argument("--prefill-only", action="store_true",
                     help="stop after the prefill launches, before any decode step: the prefill bisect, which must "
                          "not depend on the decode path (a partial --layers / --layer-ids set hangs decode)")
+    ap.add_argument("--prefill-shared", action="store_true")
+    ap.add_argument("--prefill-overlap", action="store_true")
+    ap.add_argument("--prefill-bn1", type=int, default=None)
+    ap.add_argument("--prefill-mb", type=int, default=None)
+    ap.add_argument("--prefill-mbe", type=int, default=None)
     ap.add_argument("--prefill-sweep", default=None, metavar="L1,L2,...",
                     help="layer counts to launch prefill at, ascending, from ONE session: the kernels are built in "
                          "one pass and share the weight upload, so a bisect point costs a launch instead of a "
@@ -537,7 +561,16 @@ def main(argv):
         print("--ckpt and --pack-dir (or TL_NPU_CKPT / TL_NPU_PACK_DIR) are required")
         return 2
     ck = Checkpoint(a.ckpt)
-    gold = np.load(a.golden) if a.golden else None
+    gold = None
+    if a.golden:
+        if Path(a.golden).suffix == ".pt":
+            import torch
+            saved = torch.load(a.golden, map_location="cpu", weights_only=True)
+            gold = {name: value.numpy() if isinstance(value, torch.Tensor) else np.asarray(value)
+                    for name, value in saved.items()}
+            gold.setdefault("layers", np.int64(ck.cfg.layers))
+        else:
+            gold = np.load(a.golden)
     layers = int(gold["layers"]) if gold is not None else (a.layers if a.layers is not None else ck.cfg.layers)
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(str(Path(a.ckpt) / "tokenizer.json"))
@@ -556,7 +589,9 @@ def main(argv):
     m = DeviceModel(ck, Path(a.pack_dir), layers, a.smax, build=not a.no_build, single=not a.per_layer,
                     layer_ids=[int(x) for x in a.layer_ids.split(",")] if a.layer_ids else None, chunked=a.chunked,
                     prefill=a.prefill if not a.per_layer else 0,
-                    prefill_ls=[int(x) for x in a.prefill_sweep.split(",")] if a.prefill_sweep else None)
+                    prefill_ls=[int(x) for x in a.prefill_sweep.split(",")] if a.prefill_sweep else None,
+                    prefill_shared=a.prefill_shared, prefill_overlap=a.prefill_overlap,
+                    prefill_bn1=a.prefill_bn1, prefill_mb=a.prefill_mb, prefill_mbe=a.prefill_mbe)
     if a.chunked:
         print(f"chunks: {len(m.chunks)} launches per token: " + " ".join("/".join(str(i) for i in ch) for ch in m.chunks))
     try:
@@ -573,7 +608,12 @@ def main(argv):
         if gold is not None:
             t0 = time.perf_counter()
             dev_trace = [] if a.per_layer else None
-            dev_tok, ms = m.step(ids[0], trace=dev_trace)
+            if m.prefill_n:
+                if len(ids) > 1:
+                    m.prefill(ids[:-1])
+                dev_tok, ms = m.step(ids[-1])
+            else:
+                dev_tok, ms = m.step(ids[0], trace=dev_trace)
             if dev_trace is not None:
                 print("layer-by-layer, first prompt token: max |h_dev - h_ref| / max |h_ref| after the layer:")
                 worst = 0.0
@@ -583,21 +623,27 @@ def main(argv):
                     worst = max(worst, rel_h)
                     print(f"  layer {i:2d} {ck.cfg.layer_types[i][:6]}: h rel {rel_h:.2e}")
                 print(f"  worst h rel over the layers: {worst:.2e}")
-            else:
+            elif not m.prefill_n and "trace_out" in gold:
                 ref_out = gold["trace_out"][layers - 1]
                 h_dev = m.s.download("Hio", np.float32, (1, ck.cfg.hidden))[0]
                 print(f"first prompt token, residual stream after layer {layers - 1}: max |h_dev - h_ref| / max |h_ref| = "
                       f"{np.abs(h_dev - ref_out).max() / np.abs(ref_out).max():.2e}")
             # the rest of the prompt, then the reference's greedy tokens, teacher-forced
             ref_logits = gold["logits"].astype(np.float32)        # [1 + new, V]
-            out_ids = [int(x) for x in gold["out_ids"]]
+            out_ids = [int(x) for x in gold["out_ids"][:a.new]]
             clean = 0
             for trial in range(a.trials):
                 if trial:
                     m.reset_state()
-                    dev_tok, ms = m.step(ids[0])
-                for t in ids[1:]:
-                    dev_tok, ms = m.step(t)
+                    if m.prefill_n:
+                        if len(ids) > 1:
+                            m.prefill(ids[:-1])
+                        dev_tok, ms = m.step(ids[-1])
+                    else:
+                        dev_tok, ms = m.step(ids[0])
+                if not m.prefill_n:
+                    for t in ids[1:]:
+                        dev_tok, ms = m.step(t)
                 agree, worst = 0, 0.0
                 dev_logits = m.head_logits()
                 for k, r in enumerate(out_ids):
