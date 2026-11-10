@@ -84,7 +84,7 @@ class DeviceModel:
                  prefill_bn1: int | None = None, prefill_mb: int | None = None, prefill_mbe: int | None = None,
                  prefill_moe_slots: bool = False, prefill_shared_expert: bool = False,
                  prefill_dpu_overlap: bool = False, prefill_combine_rows: int = 1,
-                 prefill_batch_dma: bool = False):
+                 prefill_batch_dma: bool = False, prefill_register_conv: bool = False, prefill_conv_fp16: bool = False):
         self.ck, self.c, self.log = ck, ck.cfg, log
         c = self.c
         self.layer_ids = list(layer_ids) if layer_ids is not None else list(range(layers))   # checkpoint layers, in run order
@@ -177,7 +177,8 @@ class DeviceModel:
                         E=c.n_experts, TOPK=c.top_k, G=ck.group, tiles=TILES, shaves=SHAVES, eps=c.eps,
                         KVL=kvl, skip=pskip, HW=hw_g, shared_projections=prefill_shared,
                         moe_slot_output=prefill_moe_slots, separate_shared_expert=prefill_shared_expert,
-                        moe_combine_rows=prefill_combine_rows, **pgeom)
+                        moe_combine_rows=prefill_combine_rows, register_conv=prefill_register_conv,
+                        conv_fp16=prefill_conv_fp16, **pgeom)
                     names[f"prefill{pl}"] = (f"tl_e2e_prefill_l{pl}_n{ps['NP']}_h{c.hidden}_s{smax}"
                                              + (f"_bn{pgeom['BN1']}_mb{pgeom['MB']}" if prefill_shared or prefill_bn1 is not None or prefill_mb is not None else "")
                                              + ("_sharedproj" if prefill_shared else "")
@@ -188,8 +189,10 @@ class DeviceModel:
                                              + ("_dpuov" if prefill_dpu_overlap else "")
                                              + (f"_cb{prefill_combine_rows}" if prefill_combine_rows != 1 else "")
                                              + ("_batch" if prefill_batch_dma else "")
+                                             + ("_rcv" if prefill_register_conv else "")
+                                             + ("_cv16" if prefill_conv_fp16 else "")
                                              + ("_skip_" + "_".join(sorted(pskip)) if pskip else ""))
-                    if prefill_dpu_overlap or prefill_batch_dma or prefill_combine_rows != 1:
+                    if prefill_dpu_overlap or prefill_batch_dma or prefill_combine_rows != 1 or prefill_register_conv or prefill_conv_fp16:
                         names[f"prefill{pl}"] = (names[f"prefill{pl}"].replace("_sharedproj_overlap", "_spov")
                                                 .replace("_moeslots", "_ms").replace("_sharedexpert", "_se"))
         else:
@@ -579,6 +582,8 @@ def main(argv):
     ap.add_argument("--prefill-dpu-overlap", action="store_true")
     ap.add_argument("--prefill-combine-rows", type=int, default=1)
     ap.add_argument("--prefill-batch-dma", action="store_true")
+    ap.add_argument("--prefill-register-conv", action="store_true")
+    ap.add_argument("--prefill-conv-fp16", action="store_true")
     ap.add_argument("--prefill-sweep", default=None, metavar="L1,L2,...",
                     help="layer counts to launch prefill at, ascending, from ONE session: the kernels are built in "
                          "one pass and share the weight upload, so a bisect point costs a launch instead of a "
@@ -621,7 +626,8 @@ def main(argv):
                     prefill_bn1=a.prefill_bn1, prefill_mb=a.prefill_mb, prefill_mbe=a.prefill_mbe,
                     prefill_moe_slots=a.prefill_moe_slots, prefill_shared_expert=a.prefill_shared_expert,
                     prefill_dpu_overlap=a.prefill_dpu_overlap, prefill_combine_rows=a.prefill_combine_rows,
-                    prefill_batch_dma=a.prefill_batch_dma)
+                    prefill_batch_dma=a.prefill_batch_dma, prefill_register_conv=a.prefill_register_conv,
+                    prefill_conv_fp16=a.prefill_conv_fp16)
     if a.chunked:
         print(f"chunks: {len(m.chunks)} launches per token: " + " ".join("/".join(str(i) for i in ch) for ch in m.chunks))
     try:

@@ -55,10 +55,11 @@ def _problem(n, NP, seed=0):
     return y, ba, conv_w, cs, a_log, dt_bias
 
 
-def _sim(n, N, y, ba, conv_w, cs, a_log, dt_bias, tiles=TILES, shaves=SHAVES):
+def _sim(n, N, y, ba, conv_w, cs, a_log, dt_bias, tiles=TILES, shaves=SHAVES, register_conv=False, conv_fp16=False):
     NP = -(-N // TB) * TB
     low = lowering.lower(make_gdn_conv_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, TB=TB,
-                                               tiles=tiles, shaves=shaves))
+                                               tiles=tiles, shaves=shaves,
+                                               register_conv=register_conv, conv_fp16=conv_fp16))
     lib = host_sim.build(low.source, f"gdn_conv_prefill_{NP}_{tiles}x{shaves}")
     out = dict(QKo=np.zeros((KH, NP, 2 * DK), np.float32), Vo=np.zeros((VH, NP, DV), np.float16),
                Gb=np.zeros((VH, NP, 2), np.float32), Zo=np.zeros((VH, NP, DV), np.float16),
@@ -81,10 +82,11 @@ def test_lowers_without_allocating_inside_a_loop():
 
 
 @needs_cxx
-def test_matches_the_reference():
+@pytest.mark.parametrize("register_conv,conv_fp16", [(False, False), (True, False), (True, True)])
+def test_matches_the_reference(register_conv, conv_fp16):
     n = N = 64
     y, ba, cw, cs, al, db = _problem(n, N)
-    got = _sim(n, N, y, ba, cw, cs, al, db)
+    got = _sim(n, N, y, ba, cw, cs, al, db, register_conv=register_conv, conv_fp16=conv_fp16)
     qk, v, gb, z, new_cs = gdn_conv_prefill_reference(y, cw, cs, al, db, n, KH, VH, DK, DV, ba=ba)
     for name, dev, ref in (("qk", got["QKo"].reshape(KH, N, 2, DK), qk), ("v", got["Vo"], v),
                            ("gb", got["Gb"], gb), ("z", got["Zo"], z), ("conv_state", got["CsOut"], new_cs)):
@@ -93,16 +95,17 @@ def test_matches_the_reference():
 
 
 @needs_cxx
-def test_the_conv_is_causal_in_the_tokens():
+@pytest.mark.parametrize("register_conv,conv_fp16", [(False, False), (True, False), (True, True)])
+def test_the_conv_is_causal_in_the_tokens(register_conv, conv_fp16):
     """Perturbing one token may move its own output and the next three, and nothing earlier -- the width of the
     kernel. A conv that read the whole block at once, or lost the window at a block boundary, would not."""
     n = N = 64
     y, ba, cw, cs, al, db = _problem(n, N)
-    base = _sim(n, N, y, ba, cw, cs, al, db)["QKo"]
+    base = _sim(n, N, y, ba, cw, cs, al, db, register_conv=register_conv, conv_fp16=conv_fp16)["QKo"]
     t = 29                                        # straddles the TB = 32 block boundary with its 3-token reach
     y2 = y.copy()
     y2[t] = (y2[t].astype(np.float32) * 1.5).astype(np.float16)
-    moved = _sim(n, N, y2, ba, cw, cs, al, db)["QKo"]
+    moved = _sim(n, N, y2, ba, cw, cs, al, db, register_conv=register_conv, conv_fp16=conv_fp16)["QKo"]
     d = np.abs(moved.astype(np.float32) - base.astype(np.float32)).max(axis=(0, 2))
     assert d[:t].max() == 0, "an earlier token moved"
     assert d[t] > 0 and d[t + 3] > 0, "the token and its three successors must move"
@@ -110,13 +113,14 @@ def test_the_conv_is_causal_in_the_tokens():
 
 
 @needs_cxx
-def test_the_handed_on_state_continues_the_sequence():
+@pytest.mark.parametrize("register_conv,conv_fp16", [(False, False), (True, False), (True, True)])
+def test_the_handed_on_state_continues_the_sequence(register_conv, conv_fp16):
     """Two chunks of 32 tokens, the second started from the first's returned conv state, must equal one chunk of
     64. This is the only property that makes a long prompt possible and a single-chunk test cannot see it."""
     y, ba, cw, cs, al, db = _problem(64, 64)
-    whole = _sim(64, 64, y, ba, cw, cs, al, db)
-    first = _sim(32, 32, y[:32], ba[:32], cw, cs, al, db)
-    second = _sim(32, 32, y[32:64], ba[32:64], cw, first["CsOut"], al, db)
+    whole = _sim(64, 64, y, ba, cw, cs, al, db, register_conv=register_conv, conv_fp16=conv_fp16)
+    first = _sim(32, 32, y[:32], ba[:32], cw, cs, al, db, register_conv=register_conv, conv_fp16=conv_fp16)
+    second = _sim(32, 32, y[32:64], ba[32:64], cw, first["CsOut"], al, db, register_conv=register_conv, conv_fp16=conv_fp16)
     for name, key in (("qk", "QKo"), ("v", "Vo")):
         a = whole[key].astype(np.float32)
         joined = np.concatenate([first[key].astype(np.float32), second[key].astype(np.float32)], axis=1)
@@ -125,10 +129,11 @@ def test_the_handed_on_state_continues_the_sequence():
 
 
 @needs_cxx
-def test_rows_past_the_live_count_are_zero():
+@pytest.mark.parametrize("register_conv,conv_fp16", [(False, False), (True, False), (True, True)])
+def test_rows_past_the_live_count_are_zero(register_conv, conv_fp16):
     n, N = 50, 64
     y, ba, cw, cs, al, db = _problem(n, N)
-    got = _sim(n, N, y, ba, cw, cs, al, db)
+    got = _sim(n, N, y, ba, cw, cs, al, db, register_conv=register_conv, conv_fp16=conv_fp16)
     assert np.abs(got["QKo"][:, n:]).max() == 0 and np.abs(got["Vo"][:, n:]).max() == 0
     assert np.abs(got["Gb"][:, n:]).max() == 0 and np.abs(got["Zo"][:, n:]).max() == 0
     assert np.abs(got["QKo"][:, :n]).max() > 0, "the live rows are not all zero either"

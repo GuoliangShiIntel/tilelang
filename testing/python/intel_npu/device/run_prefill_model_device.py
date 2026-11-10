@@ -162,7 +162,9 @@ def main(argv):
                                                 shared_projections="--shared-projections" in argv,
                                                 moe_slot_output="--moe-slots" in argv,
                                                 separate_shared_expert="--shared-expert" in argv,
-                                                moe_combine_rows=arg(argv, "--combine-rows", 1)))
+                                                moe_combine_rows=arg(argv, "--combine-rows", 1),
+                                                register_conv="--register-conv" in argv,
+                                                conv_fp16="--conv-fp16" in argv))
     print(f"lower {time.time() - t_low:.0f} s")
     name = (f"tl_prefill_model_l{L}_n{NP}_h{H}_s{SMAX}_bn{BN1}"
             + (f"_bn2{BN2}" if BN2 != BN1 else "")
@@ -183,9 +185,15 @@ def main(argv):
             + ("_skip_" + "_".join(sorted(skip)) if skip else "")
             + ("_noscope" if "--no-scoped-cmx" in argv else ""))
     source = low.source
+    if "--register-conv" in argv:
+        name = name.replace("_sharedproj_overlap_moeslots_sharedexpert", "_spov_ms_se") + "_rcv"
+    if "--conv-fp16" in argv:
+        name = name.replace("_sharedproj_overlap_moeslots_sharedexpert", "_spov_ms_se") + "_cv16"
     if "--combine-rows" in argv or "--batch-dma" in argv:
         name = f"tl_pf_l{L}_n{NP}_bn{BN1}_{BN2}_mb{MB}_me{MBe}_cb{arg(argv, '--combine-rows', 1)}"
         name += "_batch" if "--batch-dma" in argv else "_sync"
+        name += "_rcv" if "--register-conv" in argv else ""
+        name += "_cv16" if "--conv-fp16" in argv else ""
         assert "--shared-projections" in argv and "--overlap" in argv and "--moe-slots" in argv and "--shared-expert" in argv
     if "--dpu-overlap" in argv:
         name = name.replace("_sharedproj_overlap_moeslots_sharedexpert", "_spov_ms_se")

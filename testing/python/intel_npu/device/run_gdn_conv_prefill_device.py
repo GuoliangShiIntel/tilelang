@@ -59,8 +59,13 @@ def main(argv):
     NP = -(-n // TB) * TB
 
     low = lowering.lower(make_gdn_conv_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, TB=TB,
-                                               tiles=TILES, shaves=SHAVES))
+                                               tiles=TILES, shaves=SHAVES, register_conv="--register-conv" in argv,
+                                               conv_fp16="--conv-fp16" in argv))
     name = f"tl_gdn_conv_prefill_n{NP}_kh{KH}_vh{VH}_tb{TB}"
+    if "--register-conv" in argv:
+        name += "_rcv"
+    if "--conv-fp16" in argv:
+        name += "_cv16"
     if "--no-build" in argv:
         _, sha = runner.write_kernel(low.source, name)
         db = runner.DeviceBuild(build_dir=HERE / "build", exe=HERE / "build" / "Release" / "npu_run.exe",

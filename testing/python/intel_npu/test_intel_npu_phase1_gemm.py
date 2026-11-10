@@ -128,6 +128,32 @@ def test_pure_gather_loop_batches_without_changing_results(interleave):
     np.testing.assert_array_equal(output, expected)
 
 
+@needs_cxx
+def test_register_half_vector_slices_convert_to_float():
+    @T.prim_func
+    def sliced(Input: T.Tensor((2, 32), T.float16), Output: T.Tensor((1, 32), T.float32)):
+        with T.Kernel(1, threads=1):
+            memory = T.alloc_local((2, 32), T.float16)
+            vector = T.alloc_local((32,), T.float16)
+            result = T.alloc_local((1, 32), T.float32)
+            T.copy(Input, memory)
+            for lane in T.vectorized(32):
+                vector[lane] = memory[1, lane]
+            for lane in T.vectorized(16):
+                result[0, lane] = T.cast(vector[lane], T.float32)
+                result[0, 16 + lane] = T.cast(vector[16 + lane], T.float32)
+            T.copy(result, Output)
+
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off"}):
+        low = lowering.lower(sliced)
+    source = np.arange(64, dtype=np.float16).reshape(2, 32)
+    output = np.full((1, 32), np.nan, np.float32)
+    arrays = lowering.order_arrays(low, {"Input": source, "Output": output})
+    lib = host_sim.build(low.source, "register_half_slices")
+    host_sim.check_status(host_sim.run(lib, arrays, tiles=1, shaves=1))
+    np.testing.assert_array_equal(output, source[1:2].astype(np.float32))
+
+
 def _run_gemm(M, N, K, BM, BN, tiles, shaves, perturb=False):
     func = make_gemm(M, N, K, BM=BM, BN=BN, tiles=tiles, shaves=shaves)
     lib = host_sim.build(_source(func), f"gemm_{M}x{N}x{K}")

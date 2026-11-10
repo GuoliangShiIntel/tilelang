@@ -259,6 +259,18 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const BufferLoadNode *op,
     os << GetVarID(v);
     return;
   }
+  if (const auto *ramp = index.as<RampNode>()) {
+    const auto *start = ramp->base.as<IntImmNode>();
+    const auto *stride = ramp->stride.as<IntImmNode>();
+    if (start != nullptr && stride != nullptr && stride->value == 1 && start->value >= 0 &&
+        op->dtype.lanes() < lanes && start->value + op->dtype.lanes() <= lanes) {
+      os << "__builtin_shufflevector(" << GetVarID(v) << ", " << GetVarID(v);
+      for (int lane = 0; lane < op->dtype.lanes(); ++lane)
+        os << ", " << start->value + lane;
+      os << ")";
+      return;
+    }
+  }
   TVM_FFI_THROW(ValueError)
       << "intel_npu: the one-vector buffer " << op->buffer->name
       << " is read as a partial or shifted vector (" << index

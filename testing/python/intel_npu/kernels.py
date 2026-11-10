@@ -2834,6 +2834,8 @@ def make_gdn_conv_prefill(
     as_block: bool = False,
     blocked_items: bool = False,
     item_worker: str = "tile",
+    register_conv: bool = False,
+    conv_fp16: bool = False,
 ):
     """P3b: the Gated DeltaNet PREFILL phase between the input projection and the chunked scan -- a causal conv1d of
     width 4 with SiLU, then the per-head normalisations -- producing exactly what `make_gdn_scan_prefill` consumes.
@@ -2874,6 +2876,57 @@ def make_gdn_conv_prefill(
     workers = tiles * shaves
     PER = -(-SLICES // workers)
     FL, HL = 16, 32
+    register_conv = register_conv or conv_fp16
+    VL = HL if conv_fp16 else FL
+    CONV_DTYPE = T.float16 if conv_fp16 else T.float32
+
+    @T.macro
+    def register_filter(source, weights, state, saved, output, first, live):
+        weight0 = T.alloc_local((VL,), CONV_DTYPE)
+        weight1 = T.alloc_local((VL,), CONV_DTYPE)
+        weight2 = T.alloc_local((VL,), CONV_DTYPE)
+        weight3 = T.alloc_local((VL,), CONV_DTYPE)
+        state0 = T.alloc_local((VL,), CONV_DTYPE)
+        state1 = T.alloc_local((VL,), CONV_DTYPE)
+        state2 = T.alloc_local((VL,), CONV_DTYPE)
+        value = T.alloc_local((VL,), CONV_DTYPE)
+        total = T.alloc_local((VL,), CONV_DTYPE)
+        exponential = T.alloc_local((VL,), T.float16)
+        for column in T.serial(DK // VL):
+            for lane in T.vectorized(VL):
+                weight0[lane] = T.cast(weights[0, column * VL + lane], CONV_DTYPE)
+                weight1[lane] = T.cast(weights[1, column * VL + lane], CONV_DTYPE)
+                weight2[lane] = T.cast(weights[2, column * VL + lane], CONV_DTYPE)
+                weight3[lane] = T.cast(weights[3, column * VL + lane], CONV_DTYPE)
+                state0[lane] = T.cast(state[0, column * VL + lane], CONV_DTYPE)
+                state1[lane] = T.cast(state[1, column * VL + lane], CONV_DTYPE)
+                state2[lane] = T.cast(state[2, column * VL + lane], CONV_DTYPE)
+            for row in T.serial(TB):
+                for lane in T.vectorized(VL):
+                    value[lane] = T.cast(source[row, column * VL + lane], CONV_DTYPE)
+                    total[lane] = (state0[lane] * weight0[lane] + state1[lane] * weight1[lane]
+                                   + state2[lane] * weight2[lane] + value[lane] * weight3[lane])
+                    if conv_fp16:
+                        total[lane] = total[lane] * T.sigmoid(total[lane])
+                    else:
+                        exponential[lane] = T.exp(T.cast(T.float32(0) - total[lane], T.float16))
+                        output[row, column * VL + lane] = total[lane] / (T.float32(1) + T.cast(exponential[lane], T.float32))
+                    state0[lane] = state1[lane]
+                    state1[lane] = state2[lane]
+                    state2[lane] = value[lane]
+                if conv_fp16:
+                    for lane in T.vectorized(FL):
+                        output[row, column * VL + lane] = T.cast(total[lane], T.float32)
+                        output[row, column * VL + FL + lane] = T.cast(total[FL + lane], T.float32)
+                if first + row == live[0, 0] - 1:
+                    for lane in T.vectorized(VL):
+                        saved[0, column * VL + lane] = T.cast(state0[lane], T.float16)
+                        saved[1, column * VL + lane] = T.cast(state1[lane], T.float16)
+                        saved[2, column * VL + lane] = T.cast(state2[lane], T.float16)
+            for lane in T.vectorized(VL):
+                state[0, column * VL + lane] = T.cast(state0[lane], T.float16)
+                state[1, column * VL + lane] = T.cast(state1[lane], T.float16)
+                state[2, column * VL + lane] = T.cast(state2[lane], T.float16)
 
     @T.macro
     def conv_phase(Y, Ba, ConvW, ConvState, ALog, DtBias, Nt, QKo, Vo, Gb, Zo, CsOut, tile, shave, bufs=None):
@@ -2933,26 +2986,28 @@ def make_gdn_conv_prefill(
                 for tb in T.serial(NT):
                     T.copy(Y[tb * TB, cb], xb)
                     perf_begin("cvsi")
-                    for r in T.serial(TB):
-                        for c0 in T.serial(DK // FL):
-                            for v in T.vectorized(FL):
-                                acc[v] = (
-                                    T.cast(win[0, c0 * FL + v], T.float32) * T.cast(cw[0, c0 * FL + v], T.float32)
-                                    + T.cast(win[1, c0 * FL + v], T.float32) * T.cast(cw[1, c0 * FL + v], T.float32)
-                                    + T.cast(win[2, c0 * FL + v], T.float32) * T.cast(cw[2, c0 * FL + v], T.float32)
-                                    + T.cast(xb[r, c0 * FL + v], T.float32) * T.cast(cw[3, c0 * FL + v], T.float32)
-                                )
-                                eh[v] = T.exp(T.cast(T.float32(0) - acc[v], T.float16))
-                                cv[r, c0 * FL + v] = acc[v] / (T.float32(1) + T.cast(eh[v], T.float32))
-                                win[0, c0 * FL + v] = win[1, c0 * FL + v]
-                                win[1, c0 * FL + v] = win[2, c0 * FL + v]
-                                win[2, c0 * FL + v] = xb[r, c0 * FL + v]
-                        if tb * TB + r == nt[0, 0] - 1:
-                            for c0 in T.serial(DK // HL):
-                                for v in T.vectorized(HL):
-                                    keep[0, c0 * HL + v] = win[0, c0 * HL + v]
-                                    keep[1, c0 * HL + v] = win[1, c0 * HL + v]
-                                    keep[2, c0 * HL + v] = win[2, c0 * HL + v]
+                    if register_conv:
+                        register_filter(xb, cw, win, keep, cv, tb * TB, nt)
+                    else:
+                        for r in T.serial(TB):
+                            for c0 in T.serial(DK // FL):
+                                for v in T.vectorized(FL):
+                                    acc[v] = (
+                                        T.cast(win[0, c0 * FL + v], T.float32) * T.cast(cw[0, c0 * FL + v], T.float32)
+                                        + T.cast(win[1, c0 * FL + v], T.float32) * T.cast(cw[1, c0 * FL + v], T.float32)
+                                        + T.cast(win[2, c0 * FL + v], T.float32) * T.cast(cw[2, c0 * FL + v], T.float32)
+                                        + T.cast(xb[r, c0 * FL + v], T.float32) * T.cast(cw[3, c0 * FL + v], T.float32))
+                                    eh[v] = T.exp(T.cast(T.float32(0) - acc[v], T.float16))
+                                    cv[r, c0 * FL + v] = acc[v] / (T.float32(1) + T.cast(eh[v], T.float32))
+                                    win[0, c0 * FL + v] = win[1, c0 * FL + v]
+                                    win[1, c0 * FL + v] = win[2, c0 * FL + v]
+                                    win[2, c0 * FL + v] = xb[r, c0 * FL + v]
+                            if tb * TB + r == nt[0, 0] - 1:
+                                for c0 in T.serial(DK // HL):
+                                    for v in T.vectorized(HL):
+                                        keep[0, c0 * HL + v] = win[0, c0 * HL + v]
+                                        keep[1, c0 * HL + v] = win[1, c0 * HL + v]
+                                        keep[2, c0 * HL + v] = win[2, c0 * HL + v]
                     perf_end()
                     # l2 norm per token, then the slice's destination
                     perf_begin("cvnm")
@@ -5351,6 +5406,8 @@ def make_prefill_model(
     moe_slot_output: bool = False,
     separate_shared_expert: bool = False,
     moe_combine_rows: int = 1,
+    register_conv: bool = False,
+    conv_fp16: bool = False,
 ):
     """P5: a whole PREFILL chunk of `N` prompt tokens through `L` layers in ONE launch -- the prefill counterpart
     of `make_decode_model`. A device-side loop over the layers, `Kind[li, 0]` selecting the Gated DeltaNet or the
@@ -5397,6 +5454,8 @@ def make_prefill_model(
         as_block=True,
         blocked_items=conv_blocked,
         item_worker=conv_item_worker,
+        register_conv=register_conv,
+        conv_fp16=conv_fp16,
     )
     scan_phase, _ = make_gdn_scan_prefill(N=NP, KH=KH, VH=VH, DK=DK, DV=DV, C=C, tiles=tiles, shaves=shaves, eps=eps, as_block=True)
     qkv_phase, qs = make_attn_qkv_prefill(
