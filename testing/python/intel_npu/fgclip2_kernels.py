@@ -481,3 +481,208 @@ def fgclip2_layers_reference(x, weights_per_layer, heads: int, head_dim: int, ep
                                     p["wo"], p["bo"], p["ln2w"], p["ln2b"], p["w1"], p["b1"], p["w2"], p["b2"],
                                     heads, head_dim, eps)
     return x
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# V1, completed: real patch counts (DDR-resident residual stream, row-block + weight-tile + key-chunk tiling)
+# ---------------------------------------------------------------------------------------------------------------------
+# V0/V1 so far kept the whole residual stream and every projection resident in CMX across `rows` -- fine for a
+# handful of tokens, impossible at real patch counts (hundreds to ~1024: even the fp32 residual stream alone,
+# [1024, 1152], is 4.7 MB). Real scale needs what npu_dsl's `_gemm`/`_ln_rows`/`attention_c` do: H (and every
+# per-row scratch tensor) lives in DDR, and every stage streams a row-BLOCK through CMX at a time. This section
+# adds that, reusing the row-local math already written (`layernorm_bias_row`) rather than rederiving it.
+#
+# Masking note (found validating against real data): a "padding" row (patch count rounded up to a multiple of
+# the row/chunk block size) is NOT zero after LayerNorm -- LayerNorm of an all-zero row is `(0-0)*rsqrt(eps)*w+b
+# = b` (the bias alone), not zero. So every attention chunk masks out positions >= `valid` explicitly (never
+# relies on padding being harmless by construction); the GEMM projections and MLP run over padding rows too
+# (wasted work, not wrong -- their result is simply never read by anything outside the padded range).
+@T.macro
+def linear_bias_ddr(Xddr, Wddr, Bddr, Yddr, x_blk, b_cmx, y_tile, w_tile, rows: int, N: int, K: int, BR: int,
+                    TN: int, gelu: bool):
+    # Y[0:rows,0:N] = X[0:rows,0:K] . W[0:N,0:K]^T + b, optional GELU(tanh); X/Y/W/B all DDR. Streams a BR-row
+    # block of X through CMX, and within it a TN-row tile of W, storing each product tile straight back to DDR
+    # (no full-width row-block output buffer needed). Re-reads the whole weight matrix once per row block
+    # (simple, not fast; revisit once real timing says it matters). Caller passes x_blk/w_tile shaped exactly
+    # [BR,K]/[TN,K] -- shared across stages whose K matches, separate buffers otherwise.
+    T.copy(Bddr[0, 0], b_cmx)
+    for rb in T.serial(rows // BR):
+        r0 = rb * BR
+        T.copy(Xddr[r0, 0], x_blk)
+        for n0 in T.serial(N // TN):
+            T.copy(Wddr[n0 * TN, 0], w_tile)
+            T.gemm(x_blk, w_tile, y_tile, transpose_B=True, clear_accum=True)
+            for r in T.serial(BR):
+                for nn in T.serial(TN):
+                    v = T.cast(y_tile[r, nn], T.float32) + T.cast(b_cmx[0, n0 * TN + nn], T.float32)
+                    if gelu:
+                        inner = T.float32(GELU_TANH_C) * (v + T.float32(0.044715) * v * v * v)
+                        v = T.float32(0.5) * v * (T.float32(1) + T.tanh(inner))
+                    y_tile[r, nn] = T.cast(v, T.float16)
+            T.copy(y_tile, Yddr[r0, n0 * TN])
+
+
+@T.macro
+def linear_bias_resid_ddr(Xddr, Wddr, Bddr, Hddr, x_blk, b_cmx, y_tile, w_tile, h_tile, rows: int, N: int, K: int,
+                          BR: int, TN: int):
+    """H[0:rows, 0:N] += X[0:rows, 0:K] . W[0:N, 0:K]^T + b (the fp32 DDR residual stream updated in place);
+    same tiling as `linear_bias_ddr`, no GELU (o_proj / fc2 never have one)."""
+    T.copy(Bddr[0, 0], b_cmx)
+    for rb in T.serial(rows // BR):
+        r0 = rb * BR
+        T.copy(Xddr[r0, 0], x_blk)
+        for n0 in T.serial(N // TN):
+            T.copy(Wddr[n0 * TN, 0], w_tile)
+            T.gemm(x_blk, w_tile, y_tile, transpose_B=True, clear_accum=True)
+            T.copy(Hddr[r0, n0 * TN], h_tile)
+            for r in T.serial(BR):
+                for nn in T.serial(TN):
+                    h_tile[r, nn] = h_tile[r, nn] + T.cast(y_tile[r, nn], T.float32) + T.cast(b_cmx[0, n0 * TN + nn], T.float32)
+            T.copy(h_tile, Hddr[r0, n0 * TN])
+
+
+@T.macro
+def layernorm_bias_ddr(Hddr, Wddr, Bddr, Xnddr, h_blk, w_cmx, b_cmx, x_blk, rows: int, hidden: int, BR: int, eps: float):
+    """Xn[0:rows, :] = LayerNorm(H[0:rows, :]) * w + b, BR rows per block (H is the fp32 DDR residual stream,
+    Xn the fp16 DDR scratch the next GEMM reads); reuses `layernorm_bias_row` per row within the block."""
+    T.copy(Wddr[0, 0], w_cmx)
+    T.copy(Bddr[0, 0], b_cmx)
+    for rb in T.serial(rows // BR):
+        r0 = rb * BR
+        T.copy(Hddr[r0, 0], h_blk)
+        for r in T.serial(BR):
+            layernorm_bias_row(h_blk, w_cmx, b_cmx, x_blk, r, hidden, eps)
+        T.copy(x_blk, Xnddr[r0, 0])
+
+
+@T.macro
+def mha_chunked_ddr(Qddr, Kddr, Vddr, Oddr, qb, kc, vraw, vc, sc, pv, oacc, ob, m_i, l_i, m_new, corr,
+                    rows: int, valid: int, heads: int, D: int, BQ: int, C: int, scale: float):
+    """Flash (chunked online-softmax) attention, bidirectional (no causal mask), masked to `valid` real keys
+    out of `rows` DDR-resident ones -- rows past `valid`, up to the next multiple of `C`, are excluded from
+    every chunk's max/sum/accumulate regardless of their (non-zero, see the module-level note) content.
+    Q/K/V/O are DDR `[rows, heads*D]`; `rows` must be a multiple of both `BQ` and `C`. One query block (`BQ`
+    rows) at a time, every key chunk of every head; V is loaded as `[C, D]` and transposed into `vc[D, C]`
+    on the SHAVE (not the DPU-identity trick V0 used for a single resident V -- here it is one chunk at a
+    time, so a DPU transpose would cost its own workload per chunk for little saving at this size)."""
+    assert rows % BQ == 0 and rows % C == 0
+    nch = (valid + C - 1) // C
+    for h in range(heads):
+        for qblk in T.serial(rows // BQ):
+            q0 = qblk * BQ
+            T.copy(Qddr[q0, h * D], qb)
+            for r in T.serial(BQ):
+                m_i[r] = T.float32(-1e30)
+                l_i[r] = T.float32(0)
+                for d in T.serial(D):
+                    oacc[r, d] = T.float32(0)
+            for c in T.serial(nch):
+                c0 = c * C
+                cc = T.min(C, valid - c0)
+                T.copy(Kddr[c0, h * D], kc)
+                T.copy(Vddr[c0, h * D], vraw)
+                for j in T.serial(C):
+                    for d in T.serial(D):
+                        vc[d, j] = vraw[j, d]
+                T.gemm(qb, kc, sc, transpose_B=True, clear_accum=True)
+                for r in T.serial(BQ):
+                    m_new[r] = m_i[r]
+                    for j in T.serial(C):
+                        if j < cc:
+                            m_new[r] = T.max(m_new[r], T.cast(sc[r, j], T.float32) * scale)
+                    corr[r] = T.exp(m_i[r] - m_new[r])
+                    l_i[r] = l_i[r] * corr[r]
+                    for j in T.serial(C):
+                        if j < cc:
+                            p = T.exp(T.cast(sc[r, j], T.float32) * scale - m_new[r])
+                            sc[r, j] = T.cast(p, T.float16)
+                            l_i[r] = l_i[r] + p
+                        else:
+                            sc[r, j] = T.float16(0)
+                    m_i[r] = m_new[r]
+                T.gemm(sc, vc, pv, transpose_B=True, clear_accum=True)
+                for r in T.serial(BQ):
+                    for d in T.serial(D):
+                        oacc[r, d] = oacc[r, d] * corr[r] + T.cast(pv[r, d], T.float32)
+            for r in T.serial(BQ):
+                for d in T.serial(D):
+                    ob[r, d] = T.cast(oacc[r, d] / l_i[r], T.float16)
+            T.copy(ob, Oddr[q0, h * D])
+
+
+def make_fgclip2_encoder_layer_ddr(rows: int, valid: int, hidden: int, heads: int, hd_pad: int, inter_pad: int,
+                                   BR: int = 64, TN: int = 32, BQ: int = 64, C: int = 128, eps: float = 1e-6):
+    """One pre-LN FG-CLIP2 encoder layer at REAL patch/token counts: the residual stream `Hio` and every
+    per-row scratch tensor (`Xn`, `Qp`/`Kp`/`Vp`, `Ao`) are DDR, not CMX-resident -- `rows` can be the real
+    (padded) patch count (hundreds to ~1024+), not just a handful. `valid` is the real, unpadded count (a
+    compile-time Python int here -- a runtime config field is a later refinement, same as Qwen's `n_valid`).
+    `rows` must be a multiple of `BR`, `BQ` and `C`. Oracle: `encoder_layer_reference` (same math, the
+    DDR-vs-resident choice does not change the numbers; a golden comparison only needs `Hio[:valid]` to
+    match, since rows past `valid` are host padding whose output nothing downstream reads)."""
+    QW = heads * hd_pad
+    assert hidden % TN == 0 and QW % TN == 0 and inter_pad % TN == 0 and TN % 16 == 0
+    assert rows % BR == 0 and rows % BQ == 0 and rows % C == 0 and BR % 16 == 0 and BQ % 16 == 0 and C % 16 == 0
+    assert 0 < valid <= rows
+
+    @T.prim_func
+    def layer(Hio: T.Tensor((rows, hidden), T.float32),
+              Ln1W: T.Tensor((1, hidden), T.float16), Ln1B: T.Tensor((1, hidden), T.float16),
+              Wq: T.Tensor((QW, hidden), T.float16), Bq: T.Tensor((1, QW), T.float16),
+              Wk: T.Tensor((QW, hidden), T.float16), Bk: T.Tensor((1, QW), T.float16),
+              Wv: T.Tensor((QW, hidden), T.float16), Bv: T.Tensor((1, QW), T.float16),
+              Wo: T.Tensor((hidden, QW), T.float16), Bo: T.Tensor((1, hidden), T.float16),
+              Ln2W: T.Tensor((1, hidden), T.float16), Ln2B: T.Tensor((1, hidden), T.float16),
+              W1: T.Tensor((inter_pad, hidden), T.float16), B1: T.Tensor((1, inter_pad), T.float16),
+              W2: T.Tensor((hidden, inter_pad), T.float16), B2: T.Tensor((1, hidden), T.float16),
+              Xn: T.Tensor((rows, hidden), T.float16), Qp: T.Tensor((rows, QW), T.float16),
+              Kp: T.Tensor((rows, QW), T.float16), Vp: T.Tensor((rows, QW), T.float16),
+              Ao: T.Tensor((rows, QW), T.float16), Act: T.Tensor((rows, inter_pad), T.float16)):
+        with T.Kernel(1, threads=2) as tile:
+            shave = T.get_thread_binding()
+            ln1w = T.alloc_shared((1, hidden), T.float16)
+            ln1b = T.alloc_shared((1, hidden), T.float16)
+            ln2w = T.alloc_shared((1, hidden), T.float16)
+            ln2b = T.alloc_shared((1, hidden), T.float16)
+            h_blk = T.alloc_shared((BR, hidden), T.float32)
+            x_blk = T.alloc_shared((BR, hidden), T.float16)
+            # one activation / weight-tile / bias buffer per distinct K (x_*, w_*) or N (b_*) in the layer:
+            # q/k/v/fc1 read K=hidden, o_proj reads K=QW, fc2 reads K=inter_pad; o_proj/fc2 write N=hidden,
+            # q/k/v write N=QW, fc1 writes N=inter_pad -- T.copy needs the destination's own shape to match.
+            x_h = T.alloc_shared((BR, hidden), T.float16)
+            x_q = T.alloc_shared((BR, QW), T.float16)
+            x_i = T.alloc_shared((BR, inter_pad), T.float16)
+            w_h = T.alloc_shared((TN, hidden), T.float16)
+            w_q = T.alloc_shared((TN, QW), T.float16)
+            w_i = T.alloc_shared((TN, inter_pad), T.float16)
+            b_q = T.alloc_shared((1, QW), T.float16)
+            b_h = T.alloc_shared((1, hidden), T.float16)
+            b_i = T.alloc_shared((1, inter_pad), T.float16)
+            y_tile = T.alloc_shared((BR, TN), T.float16)
+            h_tile = T.alloc_shared((BR, TN), T.float32)
+            qb = T.alloc_shared((BQ, hd_pad), T.float16)
+            kc = T.alloc_shared((C, hd_pad), T.float16)
+            vraw = T.alloc_shared((C, hd_pad), T.float16)
+            vc = T.alloc_shared((hd_pad, C), T.float16)
+            sc = T.alloc_shared((BQ, C), T.float16)
+            pv = T.alloc_shared((BQ, hd_pad), T.float16)
+            oacc = T.alloc_shared((BQ, hd_pad), T.float32)
+            ob = T.alloc_shared((BQ, hd_pad), T.float16)
+            m_i = T.alloc_shared((BQ,), T.float32)
+            l_i = T.alloc_shared((BQ,), T.float32)
+            m_new = T.alloc_shared((BQ,), T.float32)
+            corr = T.alloc_shared((BQ,), T.float32)
+
+            if shave == 0:
+                layernorm_bias_ddr(Hio, Ln1W, Ln1B, Xn, h_blk, ln1w, ln1b, x_blk, rows, hidden, BR, eps)
+                linear_bias_ddr(Xn, Wq, Bq, Qp, x_h, b_q, y_tile, w_h, rows, QW, hidden, BR, TN, False)
+                linear_bias_ddr(Xn, Wk, Bk, Kp, x_h, b_q, y_tile, w_h, rows, QW, hidden, BR, TN, False)
+                linear_bias_ddr(Xn, Wv, Bv, Vp, x_h, b_q, y_tile, w_h, rows, QW, hidden, BR, TN, False)
+                mha_chunked_ddr(Qp, Kp, Vp, Ao, qb, kc, vraw, vc, sc, pv, oacc, ob, m_i, l_i, m_new, corr,
+                               rows, valid, heads, hd_pad, BQ, C, hd_pad ** -0.5)
+                linear_bias_resid_ddr(Ao, Wo, Bo, Hio, x_q, b_h, y_tile, w_q, h_tile, rows, hidden, QW, BR, TN)
+                layernorm_bias_ddr(Hio, Ln2W, Ln2B, Xn, h_blk, ln2w, ln2b, x_blk, rows, hidden, BR, eps)
+                linear_bias_ddr(Xn, W1, B1, Act, x_h, b_i, y_tile, w_h, rows, inter_pad, hidden, BR, TN, True)
+                linear_bias_resid_ddr(Act, W2, B2, Hio, x_i, b_h, y_tile, w_i, h_tile, rows, hidden, inter_pad, BR, TN)
+            T.sync_threads()
+
+    return layer
