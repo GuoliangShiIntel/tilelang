@@ -95,3 +95,37 @@ def pack_layer(ck: Checkpoint, tower: str, i: int, hd_pad: int = 80, inter_pad: 
         w1=_f16(w1p), b1=_f16(b1p.reshape(1, -1)),
         w2=_f16(pad_mlp_cols(w2, inter_pad)), b2=_f16(b2.reshape(1, -1)),
     )
+
+
+def pack_vision_head(ck: Checkpoint, hd_pad: int = 80, inter_pad: int = 4320) -> dict:
+    """The image tower's attention-pooling head (`vision_model.head.*`): one learned `probe` vector attends
+    over every patch token (post-`post_layernorm`), then out_proj + LayerNorm + GELU-MLP + residual ->
+    the image embedding (`reference.py::vision`'s tail, after the 27 encoder layers). `MapQ` is the probe's
+    query PRECOMPUTED on the host (`probe @ Wq^T + bq`, a single row -- there is nothing to gain from doing a
+    1-row GEMM on the device when the probe never changes): the one piece of "host does the constant-folding"
+    this packer allows itself, since it changes no number a device GEMM would have produced, just when it
+    runs."""
+    p = "vision_model.head."
+    ipw, ipb = ck[p + "attention.in_proj_weight"], ck[p + "attention.in_proj_bias"]
+    wq, bq = ipw[:HIDDEN], ipb[:HIDDEN]
+    wk, bk = ipw[HIDDEN:2 * HIDDEN], ipb[HIDDEN:2 * HIDDEN]
+    wv, bv = ipw[2 * HIDDEN:], ipb[2 * HIDDEN:]
+    probe = ck[p + "probe"].reshape(HIDDEN)
+    wq_pad, bq_pad = pad_head_rows(wq, hd_pad), pad_head_vec(bq, hd_pad)
+    map_q = probe @ wq_pad.T + bq_pad
+    wo, bo = ck[p + "attention.out_proj.weight"], ck[p + "attention.out_proj.bias"]
+    hlnw, hlnb = ck[p + "layernorm.weight"], ck[p + "layernorm.bias"]
+    w1, b1 = ck[p + "mlp.fc1.weight"], ck[p + "mlp.fc1.bias"]
+    w2, b2 = ck[p + "mlp.fc2.weight"], ck[p + "mlp.fc2.bias"]
+    w1p, b1p = pad_mlp_rows(w1, b1, inter_pad)
+    post_w, post_b = ck["vision_model.post_layernorm.weight"], ck["vision_model.post_layernorm.bias"]
+    return dict(
+        post_ln_w=_f16(post_w.reshape(1, -1)), post_ln_b=_f16(post_b.reshape(1, -1)),
+        map_q=_f16(map_q.reshape(1, -1)),
+        map_wk=_f16(pad_head_rows(wk, hd_pad)), map_bk=_f16(pad_head_vec(bk, hd_pad).reshape(1, -1)),
+        map_wv=_f16(pad_head_rows(wv, hd_pad)), map_bv=_f16(pad_head_vec(bv, hd_pad).reshape(1, -1)),
+        map_wo=_f16(pad_head_cols(wo, hd_pad)), map_bo=_f16(bo.reshape(1, -1)),
+        hln_w=_f16(hlnw.reshape(1, -1)), hln_b=_f16(hlnb.reshape(1, -1)),
+        map_w1=_f16(w1p), map_b1=_f16(b1p.reshape(1, -1)),
+        map_w2=_f16(pad_mlp_cols(w2, inter_pad)), map_b2=_f16(b2.reshape(1, -1)),
+    )
