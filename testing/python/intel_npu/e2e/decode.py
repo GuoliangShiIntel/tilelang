@@ -264,6 +264,10 @@ class DeviceModel:
             }
             names = {"gdn": f"tl_e2e_gdn_layer_h{c.hidden}", "attn": f"tl_e2e_attn_layer_h{c.hidden}_s{smax}",
                      "head": f"tl_e2e_head32_h{c.hidden}_v{c.vocab}"}
+        if self.prefill_n:
+            kernels["head"] = make_head(H=c.hidden, V=c.vocab, G=ck.group, tiles=TILES, shaves=SHAVES,
+                                         BN=G["head_BN"], eps=c.eps, h_dtype=T.float32)
+            names["head"] = f"tl_e2e_head32_h{c.hidden}_v{c.vocab}"
         self.names = names
         import tvm
         cfg = {"tl.intel_npu.hw_sync_grid": os.environ.get("TL_NPU_HW_SYNC", "1") != "0",
@@ -498,6 +502,22 @@ class DeviceModel:
             self.pos += len(blk)
         return dev_ms
 
+    def prefill_prompt(self, ids: list[int], separate_head: bool = False):
+        if not ids:
+            raise ValueError("prefill needs at least one prompt token")
+        if not separate_head:
+            pre_ms = self.prefill(ids[:-1]) if len(ids) > 1 else 0.0
+            token, timing = self.step(ids[-1])
+            return token, timing, pre_ms
+        pre_ms = self.prefill(ids)
+        started = time.perf_counter()
+        row = (len(ids) - 1) % self.ps["NP"]
+        hidden = self.s.download("P_Hio", np.float32, (1, self.c.hidden), offset=row * self.c.hidden * 4)
+        self.s.upload("Hio", hidden)
+        _, head_ms = self.s.launch("head", *self._bufs("head", 0))
+        token = int(self.s.download("H_Tok", np.int32, (1, 8))[0, 0])
+        return token, {"layers": 0.0, "head": head_ms, "host_wall": (time.perf_counter() - started) * 1000}, pre_ms
+
     def _upload_table(self):
         """Kind[L, 4] and Table[L, len(TABLE_COLS)]: the device addresses of every layer's weights and states, in the
         column order `make_decode_model` reads (`TABLE_COLS`, `GDN_TABLE` / `ATTN_TABLE`); unused columns 0."""
@@ -688,7 +708,10 @@ def main(argv):
                     help="layer counts to launch prefill at, ascending, from ONE session: the kernels are built in "
                          "one pass and share the weight upload, so a bisect point costs a launch instead of a "
                          "rebuild. A hang ends the session, so the sweep stops there and names the layer count")
+    ap.add_argument("--prefill-head", action="store_true", help="prefill the full prompt then launch the standalone head")
     a = ap.parse_args(argv)
+    if a.prefill_head and (not a.prefill or a.per_layer or a.prefill_only or a.prefill_sweep):
+        ap.error("--prefill-head requires --prefill and cannot be combined with --per-layer, --prefill-only or --prefill-sweep")
     if a.warmup < 0:
         ap.error("--warmup must be nonnegative")
     if a.prefill_phases is not None and (not a.prefill_only or not a.prefill):
@@ -748,9 +771,7 @@ def main(argv):
         m.reset_state()
         for iteration in range(a.warmup):
             if m.prefill_n:
-                if len(ids) > 1:
-                    m.prefill(ids[:-1])
-                m.step(ids[-1])
+                m.prefill_prompt(ids, a.prefill_head)
             else:
                 for token in ids:
                     m.step(token)
@@ -770,9 +791,7 @@ def main(argv):
             pre_ms = 0.0
             dev_trace = [] if a.per_layer else None
             if m.prefill_n:
-                if len(ids) > 1:
-                    pre_ms = m.prefill(ids[:-1])
-                dev_tok, ms = m.step(ids[-1])
+                dev_tok, ms, pre_ms = m.prefill_prompt(ids, a.prefill_head)
             else:
                 dev_tok, ms = m.step(ids[0], trace=dev_trace)
             ttft_ms = (time.perf_counter() - t0) * 1000
@@ -800,9 +819,7 @@ def main(argv):
                     trial_start = time.perf_counter()
                     pre_ms = 0.0
                     if m.prefill_n:
-                        if len(ids) > 1:
-                            pre_ms = m.prefill(ids[:-1])
-                        dev_tok, ms = m.step(ids[-1])
+                        dev_tok, ms, pre_ms = m.prefill_prompt(ids, a.prefill_head)
                     else:
                         dev_tok, ms = m.step(ids[0])
                     ttft_ms = (time.perf_counter() - trial_start) * 1000
@@ -842,7 +859,9 @@ def main(argv):
         if m.prefill_n:
             # the prompt through the prefill kernels, all but its last token; the last one goes through decode so
             # that the first output token comes out of the same path every later token does
-            if len(ids) > 1:
+            if a.prefill_head:
+                nxt, ms, pre_ms = m.prefill_prompt(ids, True)
+            elif len(ids) > 1:
                 pre_ms = m.prefill(ids[:-1])
             if a.prefill_only:
                 print(f"prefill only: {len(ids) - 1} tokens through {m.L} layers in "
@@ -853,7 +872,8 @@ def main(argv):
         else:
             for t in ids[:-1]:
                 m.step(t)
-        nxt, ms = m.step(ids[-1])
+        if not (m.prefill_n and a.prefill_head):
+            nxt, ms = m.step(ids[-1])
         ttft = time.perf_counter() - t_pre      # prompt through the model plus the first token
         for _ in range(a.new):
             out.append(nxt)
@@ -864,9 +884,11 @@ def main(argv):
         print("output:", tok.decode(out))
         print("ids:", ",".join(map(str, out)))
         if m.prefill_n:
+            prompt_rows = len(ids) if a.prefill_head else len(ids) - 1
             print(f"TTFT: {ttft:.2f} s for {len(ids)} prompt tokens + the first output "
                   f"({1e3 * ttft / len(ids):.0f} ms per prompt token; prefill kernels {pre_ms:.0f} ms device for "
-                  f"{len(ids) - 1} tokens = {pre_ms / max(1, len(ids) - 1):.1f} ms/token, plus one decode step)")
+                f"{prompt_rows} tokens = {pre_ms / max(1, prompt_rows):.1f} ms/token, "
+                f"plus {'standalone head' if a.prefill_head else 'one decode step'})")
         else:
             # the prompt replayed through the DECODE kernels, one token per step: an upper bound, not prefill's number
             print(f"TTFT: {ttft:.2f} s for {len(ids)} prompt tokens + the first output "
