@@ -129,3 +129,24 @@ def pack_vision_head(ck: Checkpoint, hd_pad: int = 80, inter_pad: int = 4320) ->
         map_w1=_f16(w1p), map_b1=_f16(b1p.reshape(1, -1)),
         map_w2=_f16(pad_mlp_cols(w2, inter_pad)), map_b2=_f16(b2.reshape(1, -1)),
     )
+
+
+def pack_text_tail(ck: Checkpoint) -> dict:
+    """The text tower's tail (`reference.py::text_short`, after the 27 encoder layers): final LayerNorm +
+    head projection. `boxtext_head` (the `box` walk's separate head) is not packed -- out of scope for now,
+    see the enablement plan."""
+    return dict(
+        final_ln_w=_f16(ck["text_model.final_layer_norm.weight"].reshape(1, -1)),
+        final_ln_b=_f16(ck["text_model.final_layer_norm.bias"].reshape(1, -1)),
+        head_w=_f16(ck["text_model.head.weight"]),
+        head_b=_f16(ck["text_model.head.bias"].reshape(1, -1)),
+    )
+
+
+def pack_text_embedding(ck: Checkpoint, ids: np.ndarray) -> np.ndarray:
+    """H0[t, :] = TokEmb[ids[t]] + PosEmb[t] for one caption's 64 token ids -- host-side gather (exact, no
+    device kernel needed; same precedent as the Qwen decode kernel's host-uploaded embedding row)."""
+    tok_emb = ck["text_model.embeddings.token_embedding.weight"]
+    pos_emb = ck["text_model.embeddings.position_embedding.weight"]
+    t = ids.shape[0]
+    return (tok_emb[ids] + pos_emb[:t]).astype(np.float32)

@@ -949,3 +949,49 @@ def make_fgclip2_pooling_head_ddr(rows: int, valid: int, hidden: int, heads: int
             T.sync_threads()
 
     return head
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# V3: the text tower's tail (final LayerNorm + head projection; token/position embedding is host-side DDR
+# gather, same precedent as the Qwen decode kernel's "the host uploads the embedding row into Hio")
+# ---------------------------------------------------------------------------------------------------------------------
+def make_fgclip2_text_tail_ddr(rows: int, hidden: int, BR: int = 64, TN: int = 32, eps: float = 1e-6):
+    """`reference.py::text_short`'s tail: `x = final_layer_norm(x)` -> `emb_all = head(x)` (every token
+    projected; the caller reads row `rows - 1`, the last token of the caption, as the real text embedding --
+    `reference.py` takes `x[-1:]` before the head, this kernel takes it after, which is the same number since
+    the head is applied per row independently). `rows` is the real caption length (64, no padding: FG-CLIP2's
+    text tower has none -- every caption is exactly 64 tokens, attention already unmasked over all of them in
+    the encoder layers before this kernel ever runs, see `fgclip2_npu_dsl_explained.md`)."""
+    assert hidden % TN == 0 and TN % 16 == 0 and rows % BR == 0 and BR % 16 == 0
+
+    @T.prim_func
+    def tail(Hio: T.Tensor((rows, hidden), T.float32), FinalLnW: T.Tensor((1, hidden), T.float16),
+             FinalLnB: T.Tensor((1, hidden), T.float16), HeadW: T.Tensor((hidden, hidden), T.float16),
+             HeadB: T.Tensor((1, hidden), T.float16), XL: T.Tensor((rows, hidden), T.float16),
+             EmbAll: T.Tensor((rows, hidden), T.float16)):
+        with T.Kernel(1, threads=2) as tile:
+            shave = T.get_thread_binding()
+            ln_w = T.alloc_shared((1, hidden), T.float16)
+            ln_b = T.alloc_shared((1, hidden), T.float16)
+            h_blk = T.alloc_shared((BR, hidden), T.float32)
+            x_blk = T.alloc_shared((BR, hidden), T.float16)
+            x_h = T.alloc_shared((BR, hidden), T.float16)
+            w_h = T.alloc_shared((TN, hidden), T.float16)
+            b_h = T.alloc_shared((1, hidden), T.float16)
+            y_tile = T.alloc_shared((BR, TN), T.float16)
+
+            if shave == 0:
+                layernorm_bias_ddr(Hio, FinalLnW, FinalLnB, XL, h_blk, ln_w, ln_b, x_blk, rows, hidden, BR, eps)
+                linear_bias_ddr(XL, HeadW, HeadB, EmbAll, x_h, b_h, y_tile, w_h, rows, hidden, hidden, BR, TN, False)
+            T.sync_threads()
+
+    return tail
+
+
+def text_tail_reference(x_final_ln_row, head_w, head_b):
+    """numpy oracle of `make_fgclip2_text_tail_ddr`'s head projection for the one row that matters (the
+    caller already applies `final_layer_norm` the same way `layernorm_bias_ddr` does -- same LN code as every
+    other LN in this file, nothing text-specific to re-derive)."""
+    import numpy as np
+
+    return head_w.astype(np.float64) @ x_final_ln_row.astype(np.float64) + head_b.astype(np.float64).reshape(-1)
