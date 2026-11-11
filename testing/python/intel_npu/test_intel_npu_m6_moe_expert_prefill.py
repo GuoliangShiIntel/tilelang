@@ -68,11 +68,17 @@ def _problem(seed: int = 0):
     return dict(x=x, gu_int=gu_int, gu_s=gu_s, d_int=d_int, d_s=d_s, wts=r["wts"], off=r["off"], slot=r["slot"])
 
 
-def _sim(p, slot_output=False, separate_shared=False, reuse_input=False):
-    low = _lower(make_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MB, BNG=BNG, BND=BND,
-                                         tiles=TILES, shaves=SHAVES, reuse_input=reuse_input,
+def _sim(p, slot_output=False, separate_shared=False, reuse_input=False, expert_mb=MB, shared_gate_up_mb=None,
+        shared_gate_up_bn=None, shared_down_mb=None, shared_down_bn=None, bndc=None, pipelined=False):
+    low = _lower(make_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=expert_mb, BNG=BNG, BND=BND,
+                                         tiles=TILES, shaves=SHAVES, reuse_input=reuse_input, BNDc=bndc,
+                                         pipelined=pipelined,
                                          **({"slot_output": True} if slot_output else {}),
-                                         **({"separate_shared": True} if separate_shared else {})))
+                                         **({"separate_shared": True} if separate_shared else {}),
+                                         **({"shared_gate_up_mb": shared_gate_up_mb,
+                                             "shared_gate_up_bn": shared_gate_up_bn,
+                                             "shared_down_mb": shared_down_mb,
+                                             "shared_down_bn": shared_down_bn} if separate_shared else {})))
     lib = host_sim.build(low.source, "tl_moe_expert_sim")
     out = np.zeros((N, H), np.float32)
     arrays = dict(X=p["x"],
@@ -98,13 +104,78 @@ def test_lowers_with_a_dequant_per_weight_chunk_and_no_merged_fc():
     assert "tl_npu_dequant_i8_row" not in src      # control: the needle still discriminates
 
 
+@needs_cxx
+def test_bndc_decouples_down_projection_compute_from_bnd():
+    """BND (64 here) still sizes the DMA fetch and scale-fetch amortization; BNDc (32, half of it) sizes
+    the SHAVE-resident dequant+GEMM tile. The result must be identical to BNDc defaulting to BND, which is what
+    the whole test suite above already pins -- this is the ONE new variable, isolated."""
+    p = _problem()
+    baseline = _sim(p)
+    narrower = _sim(p, bndc=32)
+    assert BND % 32 == 0 and 32 != BND, "the probe must actually exercise a smaller compute chunk"
+    np.testing.assert_allclose(narrower, baseline, rtol=0, atol=0)  # same math, so bit-identical, not just REL-close
+
+
+def test_bndc_fits_npu_dsl_moe_expert_geometry_within_cmx_budget():
+    """The real gap this closes: npu_dsl's routed-expert geometry (BNG=32, BND=256, MBe=88) at this checkpoint's
+    H=2048/I=512/E=256/TOPK=8/N=1152 scale. Without BNDc (it defaults to BND=256) the down-projection's
+    SHAVE-resident wd_cmx/yd_cmx alone blow the CMX budget; BNDc=64 (matching the PREVIOUS default BND=64's
+    compute-tile size, now fed by a 4x larger DMA/scale-fetch chunk) fits. Fails are a budget ValueError with a
+    `cmx_bytes` figure; a wrong failure (e.g. a shape assertion) is not evidence that BNDc is the blocker."""
+    H2, I2, E2, TOPK2, G2, N2 = 2048, 512, 256, 8, 128, 1152
+
+    def geometry(**kw):
+        return make_moe_expert_prefill(N=N2, H=H2, I=I2, E=E2, TOPK=TOPK2, G=G2, MB=88, BNG=32, BND=256,
+                                       tiles=TILES, shaves=SHAVES, slot_output=True, reuse_input=True, **kw)
+
+    with pytest.raises(Exception, match="CMX budget exceeded"):
+        _lower(geometry())
+    _lower(geometry(BNDc=64, DB=1))  # must not raise
+
+
+def test_pipelined_gate_up_loop_lowers_to_a_hardware_ring():
+    """`pipelined=True` runs the gate/up chunk loop over the FULL, un-split `CG` range as `T.Pipelined`
+    instead of `T.serial`: the mechanism a smaller `BNG` (more, smaller chunks) needs to stop regressing,
+    since each extra chunk's WguQ/WguS DMA fetch is currently paid fully serially (see kernels.py's
+    `pipelined` docstring on `make_moe_expert_prefill`, and `make_moe_expert_decode`'s identical,
+    already-pipelined CG loop). The ring itself deals chunk `n` to SHAVE `n % num_stages_gu`
+    (`docs/examples/pingpong_multitile/README.md` section 3), so the loop body must NOT also pre-split `n`
+    by shave the way the non-pipelined branches do -- an earlier version did, and it lowered fine but gave
+    WRONG results on hardware (oracle FAIL, worst rel 2.4e1, 2-layer canary at BNG=32; see evidence/INDEX.md
+    and the `pipelined` branch's comment in `kernels.py`) because the manual split and the ring's own
+    round-robin both decided slot ownership and disagreed.
+
+    Correctness here is LOWERING ONLY, not a host_sim run: host_sim's `npu::Ctx` never implemented the
+    `ring_*` methods `LowerIntelNpuPipelined` emits (`ring_begin`/`ring_fill`/`ring_slot_acquire`/
+    `ring_slot_release`/`ring_end`), the same pre-existing gap the scope_cmx ring-lifetime bug hit this
+    session -- a pipelined loop can only be validated on real hardware. A wrong lowering (a Python/shape bug)
+    still raises here; only the ring's numeric behavior is untested by this suite."""
+    func = make_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MB, BNG=BNG, BND=BND,
+                                   tiles=TILES, shaves=SHAVES, pipelined=True)
+    source = _lower(func).source
+    assert "ctx.ring_begin(" in source and "ctx.ring_fill(" in source and "ctx.ring_end(" in source
+
+
+def test_pipelined_gate_up_loop_works_even_when_cg_not_divisible_by_shaves():
+    """Unlike the non-pipelined branches (which must manually split `CG` over the SHAVEs, and the `else`
+    one -- `CG % shaves != 0` -- does it with a runtime guard `LowerIntelNpuPipelined` cannot see through),
+    `pipelined=True` always iterates the FULL `CG` range and lets the ring's own round-robin own the split
+    -- so it does not need, and does not have, a `CG % shaves != 0` special case at all."""
+    odd_bng = 2 * I // 1  # CG = 1, 1 % SHAVES (2) != 0: would hit the non-pipelined "else" branch
+    assert (2 * I) % odd_bng == 0 and (2 * I // odd_bng) % SHAVES != 0
+    func = make_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MB, BNG=odd_bng, BND=BND,
+                                   tiles=TILES, shaves=SHAVES, pipelined=True)
+    source = _lower(func).source  # must not raise
+    assert "ctx.ring_begin(" in source
+
+
 def test_compiler_derives_dequant_dpu_overlap():
     func = make_moe_expert_prefill(N=N, H=512, I=I, E=E, TOPK=TOPK, G=G, MB=MB,
                                    BNG=BNG, BND=BND, tiles=TILES, shaves=SHAVES)
     assert "ctx.dpu_matmul_start(" not in _lower(func).source
     with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.dpu_overlap": True}):
         source = lowering.lower(func).source
-    assert "ctx.dpu_matmul_start(" in source
+    assert source.count("ctx.dpu_matmul_start(") >= 2, "both gate/up and down loops are independent candidates"
     assert "ctx.dpu_matmul_wait();" in source
 
 
@@ -170,6 +241,40 @@ def _overlap_kernel_with_weight_loads(chunks=3):
     return quant_tiles
 
 
+def _two_overlap_kernel(chunks=3):
+    @T.prim_func
+    def quant_tiles(X0: T.Tensor((4, 128), T.float16), Q0: T.Tensor((chunks * 16, 64), T.uint8),
+                    S0: T.Tensor((1, chunks * 16), T.float16), Y0: T.Tensor((chunks, 4, 16), T.float16),
+                    X1: T.Tensor((4, 128), T.float16), Q1: T.Tensor((chunks * 16, 64), T.uint8),
+                    S1: T.Tensor((1, chunks * 16), T.float16), Y1: T.Tensor((chunks, 4, 16), T.float16)):
+        with T.Kernel(1, threads=1):
+            a0 = T.alloc_local((4, 128), T.float16)
+            a1 = T.alloc_local((4, 128), T.float16)
+            q0 = T.alloc_local((chunks * 16, 64), T.uint8)
+            q1 = T.alloc_local((chunks * 16, 64), T.uint8)
+            s0 = T.alloc_local((1, chunks * 16), T.float16)
+            s1 = T.alloc_local((1, chunks * 16), T.float16)
+            w0 = T.alloc_local((16, 128), T.float16)
+            w1 = T.alloc_local((16, 128), T.float16)
+            y0 = T.alloc_local((4, 16), T.float16)
+            y1 = T.alloc_local((4, 16), T.float16)
+            T.copy(X0, a0)
+            T.copy(X1, a1)
+            T.copy(Q0, q0)
+            T.copy(Q1, q1)
+            T.copy(S0, s0)
+            T.copy(S1, s1)
+            for block0 in T.serial(chunks):
+                T.dequant_i4_gm(w0, q0, s0, 128, packed_row=block0 * 16, scales_col=block0 * 16)
+                T.gemm(a0, w0, y0, transpose_B=True, clear_accum=True)
+                T.copy(y0, Y0[block0, 0, 0])
+            for block1 in T.serial(chunks):
+                T.dequant_i4_gm(w1, q1, s1, 128, packed_row=block1 * 16, scales_col=block1 * 16)
+                T.gemm(a1, w1, y1, transpose_B=True, clear_accum=True)
+                T.copy(y1, Y1[block1, 0, 0])
+    return quant_tiles
+
+
 @needs_cxx
 @pytest.mark.parametrize("chunks", [1, 3, 4])
 def test_dpu_overlap_matches_serial_with_odd_and_even_tails(chunks):
@@ -188,6 +293,29 @@ def test_dpu_overlap_matches_serial_with_odd_and_even_tails(chunks):
         outputs.append(output)
     assert np.isfinite(outputs[1]).all()
     np.testing.assert_array_equal(outputs[1], outputs[0])
+
+
+@needs_cxx
+def test_dpu_overlap_selects_multiple_disjoint_loops_in_one_function():
+    func = _two_overlap_kernel(chunks=3)
+    rng = np.random.default_rng(42)
+    arrays = {}
+    for suffix in ("0", "1"):
+        values = rng.integers(-8, 8, size=(3 * 16, 128), dtype=np.int8)
+        arrays[f"X{suffix}"] = rng.normal(size=(4, 128)).astype(np.float16)
+        arrays[f"Q{suffix}"] = pack_int4(values)
+        arrays[f"S{suffix}"] = rng.uniform(0.01, 0.1, size=(1, 3 * 16)).astype(np.float16)
+    outputs = []
+    for enabled in (False, True):
+        low = _lower(func, dpu_overlap=enabled)
+        starts = low.source.count("ctx.dpu_matmul_start(")
+        assert (starts >= 4) == enabled
+        result = {f"Y{suffix}": np.full((3, 4, 16), np.nan, np.float16) for suffix in ("0", "1")}
+        lib = host_sim.build(low.source, "dpu_overlap_two_disjoint_loops")
+        host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, {**arrays, **result}), 1, 1))
+        outputs.append(result)
+    np.testing.assert_array_equal(outputs[1]["Y0"], outputs[0]["Y0"])
+    np.testing.assert_array_equal(outputs[1]["Y1"], outputs[0]["Y1"])
 
 
 @needs_cxx
@@ -266,11 +394,12 @@ def test_blocked_combine_matches_slot_order_with_invalid_capacity(tokens, block_
 @needs_cxx
 @pytest.mark.parametrize("slot_output", [False, True])
 @pytest.mark.parametrize("reuse_input", [False, True])
-def test_matches_the_oracle(slot_output, reuse_input):
+@pytest.mark.parametrize("expert_mb", [MB, 88])
+def test_matches_the_oracle(slot_output, reuse_input, expert_mb):
     p = _problem()
     ref = moe_expert_prefill_reference(p["x"], p["gu_int"], p["gu_s"], p["d_int"], p["d_s"],
                                        p["wts"], p["off"], p["slot"], TOPK=TOPK, G=G)
-    got = _sim(p, slot_output=slot_output, reuse_input=reuse_input)
+    got = _sim(p, slot_output=slot_output, reuse_input=reuse_input, expert_mb=expert_mb)
     rel = np.abs(got - ref).max() / np.abs(ref).max()
     assert rel < REL, f"rel {rel:.3e}"
 
@@ -282,10 +411,13 @@ def test_slot_output_refuses_uneven_shave_rows():
 
 
 @needs_cxx
-def test_separate_shared_matches_grouped_output():
+@pytest.mark.parametrize("reference_blocks", [False, True])
+def test_separate_shared_matches_grouped_output(reference_blocks):
     problem = _problem(seed=9)
     expected = _sim(problem, slot_output=True)
-    actual = _sim(problem, slot_output=True, separate_shared=True)
+    blocks = ({"shared_gate_up_mb": 2, "shared_gate_up_bn": 32,
+               "shared_down_mb": 2, "shared_down_bn": 32} if reference_blocks else {})
+    actual = _sim(problem, slot_output=True, separate_shared=True, **blocks)
     assert np.isfinite(actual).all()
     assert np.abs(actual - expected).max() / max(float(np.abs(expected).max()), 1e-6) < 1e-3
 
@@ -296,7 +428,7 @@ def test_separate_shared_requires_slots_and_complete_blocks():
     with pytest.raises(AssertionError, match="requires slot-major output"):
         make_moe_expert_prefill(**kwargs)
     kwargs["N"] = N + 2
-    with pytest.raises(AssertionError, match="requires complete token blocks"):
+    with pytest.raises(AssertionError, match="requires complete projection token blocks"):
         make_moe_expert_prefill(**kwargs, slot_output=True)
 
 

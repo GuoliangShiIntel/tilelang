@@ -88,7 +88,14 @@ class DeviceModel:
                  prefill_register_tri: bool = False, prefill_gdn_live: bool = False,
                  prefill_moe_reuse_input: bool = False, prefill_phases: Path | None = None,
                  prefill_bn2: int | None = None, prefill_output_block_k: int | None = None,
-                 prefill_output_mb: int | None = None, prefill_bng: int | None = None):
+                 prefill_output_mb: int | None = None, prefill_bng: int | None = None,
+                 prefill_bnd: int | None = None,
+                 prefill_bndc: int | None = None,
+                 prefill_gdn_in_mb: int | None = None,
+                 prefill_shared_mb: int | None = None, prefill_shared_bn: int | None = None,
+                 prefill_shared_down_mb: int | None = None, prefill_shared_down_bn: int | None = None,
+                 prefill_tile_shared_experts: bool = False, prefill_short_name: str | None = None,
+                 prefill_moe_pipelined: bool = False, prefill_moe_num_stages_gu: int = 2):
         self.ck, self.c, self.log = ck, ck.cfg, log
         self.prefill_phases = prefill_phases
         c = self.c
@@ -108,6 +115,10 @@ class DeviceModel:
             pgeom["BN2"] = prefill_bn2
         if prefill_bng is not None:
             pgeom["BNG"] = prefill_bng
+        if prefill_bnd is not None:
+            pgeom["BND"] = prefill_bnd
+        if prefill_bndc is not None:
+            pgeom["BNDc"] = prefill_bndc
         if prefill_mb is not None:
             pgeom["MB"] = prefill_mb
         if prefill_mbe is not None:
@@ -189,7 +200,12 @@ class DeviceModel:
                         moe_combine_rows=prefill_combine_rows, register_conv=prefill_register_conv,
                         conv_fp16=prefill_conv_fp16, register_tri=prefill_register_tri,
                         gdn_live_chunks=prefill_gdn_live, moe_reuse_input=prefill_moe_reuse_input,
-                        output_block_k=prefill_output_block_k, output_mb=prefill_output_mb, **pgeom)
+                        output_block_k=prefill_output_block_k, output_mb=prefill_output_mb,
+                        gdn_in_mb=prefill_gdn_in_mb,
+                        moe_shared_gate_up_mb=prefill_shared_mb, moe_shared_gate_up_bn=prefill_shared_bn,
+                        moe_shared_down_mb=prefill_shared_down_mb, moe_shared_down_bn=prefill_shared_down_bn,
+                        moe_tile_shared_experts=prefill_tile_shared_experts,
+                        moe_pipelined=prefill_moe_pipelined, moe_num_stages_gu=prefill_moe_num_stages_gu, **pgeom)
                     names[f"prefill{pl}"] = (f"tl_e2e_prefill_l{pl}_n{ps['NP']}_h{c.hidden}_s{smax}"
                                              + (f"_bn{pgeom['BN1']}_mb{pgeom['MB']}" if prefill_shared or prefill_bn1 is not None or prefill_mb is not None else "")
                                              + ("_sharedproj" if prefill_shared else "")
@@ -217,6 +233,24 @@ class DeviceModel:
                                                  + f"_ob{pgeom['BN2']}_k{prefill_output_block_k or 0}_m{prefill_output_mb or pgeom['MB']}")
                     if prefill_bng is not None:
                         names[f"prefill{pl}"] += f"_bg{prefill_bng}"
+                    if prefill_bnd is not None:
+                        names[f"prefill{pl}"] += f"_bd{prefill_bnd}"
+                    if prefill_moe_pipelined:
+                        names[f"prefill{pl}"] += f"_mpl{prefill_moe_num_stages_gu}"
+                    if prefill_bndc is not None:
+                        names[f"prefill{pl}"] += f"_bdc{prefill_bndc}"
+                    if prefill_gdn_in_mb is not None:
+                        names[f"prefill{pl}"] += f"_im{prefill_gdn_in_mb}"
+                    if prefill_shared_mb is not None or prefill_shared_bn is not None or prefill_shared_down_mb is not None or prefill_shared_down_bn is not None:
+                        names[f"prefill{pl}"] += (f"_sg{prefill_shared_mb or pgeom['MBe']}x{prefill_shared_bn or pgeom['BNG']}"
+                                                  f"_sd{prefill_shared_down_mb or pgeom['MBe']}x{prefill_shared_down_bn or pgeom['BND']}")
+                    if prefill_tile_shared_experts:
+                        names[f"prefill{pl}"] += "_tse"
+                    if prefill_short_name is not None:
+                        # every flag combination above stacks its own suffix, and a long enough stack trips
+                        # Windows' ~260-char path cap in the Visual Studio generator's own .vcxproj.filters.tmp
+                        # (CMake Error: System Error: Invalid argument). Cosmetic override, not a geometry change.
+                        names[f"prefill{pl}"] = prefill_short_name
         else:
             kernels = {
                 "gdn": make_gdn_layer(H=c.hidden, KH=c.lin_kh, VH=c.lin_vh, DK=c.lin_dk, DV=c.lin_dv, I=c.moe_inter, E=c.n_experts,
@@ -633,6 +667,20 @@ def main(argv):
     ap.add_argument("--prefill-out-block-k", type=int)
     ap.add_argument("--prefill-out-mb", type=int)
     ap.add_argument("--prefill-bng", type=int)
+    ap.add_argument("--prefill-bnd", type=int)
+    ap.add_argument("--prefill-bndc", type=int, help="down-projection compute chunk, decoupled from --prefill-bnd "
+                    "(DMA/scale-fetch granularity); defaults to --prefill-bnd")
+    ap.add_argument("--prefill-gdn-in-mb", type=int)
+    ap.add_argument("--prefill-shared-mb", type=int)
+    ap.add_argument("--prefill-shared-bn", type=int)
+    ap.add_argument("--prefill-shared-down-mb", type=int)
+    ap.add_argument("--prefill-shared-down-bn", type=int)
+    ap.add_argument("--prefill-tile-shared-experts", action="store_true")
+    ap.add_argument("--prefill-moe-pipelined", action="store_true",
+                    help="pipeline the gate/up chunk loop instead of T.serial, hiding the per-chunk weight "
+                         "DMA fetch latency a smaller --prefill-bng otherwise pays serially")
+    ap.add_argument("--prefill-moe-num-stages-gu", type=int, default=2)
+    ap.add_argument("--prefill-short-name", default=None, help="override the generated kernel name (Windows path length workaround)")
     ap.add_argument("--prefill-sweep", default=None, metavar="L1,L2,...",
                     help="layer counts to launch prefill at, ascending, from ONE session: the kernels are built in "
                          "one pass and share the weight upload, so a bisect point costs a launch instead of a "
@@ -682,7 +730,12 @@ def main(argv):
                     prefill_gdn_live=a.prefill_gdn_live, prefill_moe_reuse_input=a.prefill_moe_reuse_input,
                     prefill_phases=a.prefill_phases, prefill_bn2=a.prefill_bn2,
                     prefill_output_block_k=a.prefill_out_block_k, prefill_output_mb=a.prefill_out_mb,
-                    prefill_bng=a.prefill_bng)
+                    prefill_bng=a.prefill_bng, prefill_bnd=a.prefill_bnd, prefill_bndc=a.prefill_bndc,
+                    prefill_gdn_in_mb=a.prefill_gdn_in_mb,
+                    prefill_shared_mb=a.prefill_shared_mb, prefill_shared_bn=a.prefill_shared_bn,
+                    prefill_shared_down_mb=a.prefill_shared_down_mb, prefill_shared_down_bn=a.prefill_shared_down_bn,
+                    prefill_tile_shared_experts=a.prefill_tile_shared_experts, prefill_short_name=a.prefill_short_name,
+                    prefill_moe_pipelined=a.prefill_moe_pipelined, prefill_moe_num_stages_gu=a.prefill_moe_num_stages_gu)
     if a.chunked:
         print(f"chunks: {len(m.chunks)} launches per token: " + " ".join("/".join(str(i) for i in ch) for ch in m.chunks))
     try:

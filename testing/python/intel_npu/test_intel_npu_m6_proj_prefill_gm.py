@@ -106,6 +106,64 @@ def test_tile_shared_weights_match_private_weights(scales_gm, weight_rows):
     np.testing.assert_array_equal(output, expected)
 
 
+@needs_cxx
+def test_tile_shared_projection_guards_incomplete_weight_round_with_row_base():
+    x, w_int, wq, s_row = _problem(seed=19)
+    prefix = 8
+    phase, _ = make_proj_prefill(NP=NP, M=128, K=K, BN=32, MB=16, G=G, tiles=3, shaves=2,
+                                 as_block=True, scales_gm=True, shared_weights=True, output_row_base=True)
+
+    @T.prim_func
+    def shifted(X: T.Tensor((NP, K), T.float16), Wq: T.Tensor((128, K // 2), T.uint8),
+                S: T.Tensor((KG, 128), T.float16), Y: T.Tensor((NP + prefix, 128), T.float16)):
+        with T.Kernel(3, threads=2) as tile:
+            phase(X, Wq, S, Y, tile, T.get_thread_binding(), prefix)
+
+    with tvm.transform.PassContext(config={"tl.intel_npu.multicast": True, "tl.intel_npu.plan_workloads": "off"}):
+        low = lowering.lower(shifted)
+    output = np.full((NP + prefix, 128), -7, np.float16)
+    lib = host_sim.build(low.source, "shared_projection_tail_row_base")
+    host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, {"X": x, "Wq": wq,
+                                                                         "S": np.ascontiguousarray(s_row.T),
+                                                                         "Y": output}), tiles=3, shaves=2))
+    assert np.all(output[:prefix] == -7)
+    expected = proj_prefill_reference(x, w_int, s_row, G)
+    diff = np.abs(output[prefix:].astype(np.float32) - expected)
+    error = diff.max() / max(float(np.abs(expected).max()), 1e-6)
+    index = np.unravel_index(int(diff.argmax()), diff.shape)
+    assert error < REL, f"rel {error:.2e}; index={index}; actual={output[prefix + index[0], index[1]]}; expected={expected[index]}"
+
+
+@needs_cxx
+def test_reference_m48_shared_projection_matches_oracle():
+    tokens, rows, width, group = 96, 96, 256, 128
+    rng = np.random.default_rng(31)
+    x = rng.normal(size=(tokens, width)).astype(np.float16)
+    w_int = rng.integers(-8, 8, (rows, width), dtype=np.int8)
+    packed = ((w_int[:, 0::2] & 15) | ((w_int[:, 1::2] & 15) << 4)).astype(np.uint8)
+    scales_row = (rng.normal(size=(rows, width // group)).astype(np.float16) * 0.1 + 0.2).astype(np.float16)
+    phase, _ = make_proj_prefill(NP=tokens, M=rows, K=width, BN=32, MB=48, G=group, tiles=3, shaves=2,
+                                 as_block=True, scales_gm=True, shared_weights=True, serial_shared_input=True)
+
+    @T.prim_func
+    def projection(X: T.Tensor((tokens, width), T.float16), Wq: T.Tensor((rows, width // 2), T.uint8),
+                   S: T.Tensor((width // group, rows), T.float16), Y: T.Tensor((tokens, rows), T.float16)):
+        with T.Kernel(3, threads=2) as tile:
+            phase(X, Wq, S, Y, tile, T.get_thread_binding())
+
+    with tvm.transform.PassContext(config={"tl.intel_npu.multicast": True, "tl.intel_npu.plan_workloads": "off"}):
+        low = lowering.lower(projection)
+    output = np.full((tokens, rows), np.nan, np.float16)
+    lib = host_sim.build(low.source, "reference_m48_shared_projection")
+    host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, {"X": x, "Wq": packed,
+                                                                         "S": np.ascontiguousarray(scales_row.T),
+                                                                         "Y": output}), tiles=3, shaves=2))
+    expected = proj_prefill_reference(x, w_int, scales_row, group)
+    assert np.isfinite(output).all()
+    relative = np.abs(output.astype(np.float32) - expected).max() / max(float(np.abs(expected).max()), 1e-6)
+    assert relative < REL, f"rel {relative:.2e}"
+
+
 def test_shared_weights_fit_the_reference_projection_geometry():
     kwargs = dict(NP=192, M=12288, K=2048, BN=128, MB=48, G=128, tiles=3, shaves=2, scales_gm=True)
     with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.multicast": True}):

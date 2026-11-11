@@ -124,17 +124,88 @@ One variable: the algorithm, or the schedule, or the chunk geometry, or a runtim
 changes are checked against the CMX budget on paper first (slots x bytes, both live rings when hoisted over
 the same loop) — the lowering's `CheckIntelNpuBudgets` refusal is the gate, not a surprise.
 
+**The reference geometry is a correctness/performance contract, not a knob to turn down until CMX passes.** If the
+reference's exact tile shape is rejected by `CheckIntelNpuBudgets`, treat that as a TileLang design/lifetime issue:
+compare the peak allocation set and lexical lifetimes with the reference allocator, identify buffers that are live
+only because scopes/aliases/ownership differ, and test reuse or phase scoping at the unchanged reference shape. Do
+not lower M/BN, serialize a parallel reference phase, or increase the CMX budget to make the gate green; those are
+diagnostic controls only and cannot count as parity.
+
 For schedule or geometry experiments, the control and candidate must differ in that one variable. If adding a
 capability changes which loop is selected, first prove that in generated source and run a matched control with
 the capability enabled but the target loop unchanged. Do not compare a BNG32+async arm with an older BNG64
 synchronous arm and attribute the result to either difference.
-  synchronous arm and attribute the result to either difference.
+
+**A performance regression at npu_dsl's matched shape is itself the Step 0.5 audit's output, not a verdict on
+the shape.** npu_dsl runs that exact geometry at its target cost; if TileLang is slower at the IDENTICAL shape,
+something TileLang's compiler/runtime does differently is why, and that is what gets named — not "this knob
+regresses, don't adopt it" (2026-11-10/11: BNG=32/MBe=88 was isolated as a +22 ms/layer regression and the loop
+stopped there twice, both times without asking why npu_dsl's own generated code at this geometry does NOT pay
+that cost). Re-run Step 0.5 specifically for the regressed phase/site: get npu_dsl's generated source for the
+SAME shape, read what it does at the call site that corresponds to the regressed named SHAVE site or DPU
+workload (async vs sync submit, how many fixed-cost jobs per byte, whether a buffer is dequantised once or
+re-read, whether a transpose/gather is batched), and name the exact mechanism TileLang lacks before concluding
+anything. Reverting the knob is a legitimate INTERMEDIATE state while that mechanism is being built (the
+full-model number must still reflect only retained changes, Step 4), never the conclusion of the investigation.
+A reference geometry that is numerically reachable (lowers, passes the oracle) but slower is exactly as
+unfinished as one that fails the CMX budget — both are named gaps, not accepted shapes to avoid.
 
 ## Step 3: measure under step 0's condition, then reconcile
 
 Measured gain within ~20% of the prediction: record both in the log entry and move on. Otherwise the
 prediction was wrong and the *model* is fixed before the next edit (re-read the trace or the `.s`; a wrong
 model that is kept produces the next wasted attempt). A golden failure is a stop, not a note.
+
+## Step 4: when the loop is allowed to stop (and when it is not)
+
+The goal this loop serves is **full-model TTFT at npu_dsl's shape**, stated once and not re-scoped mid-session.
+A canary, a standalone-kernel number, or one knob's isolation result is **never** the goal; it is evidence
+feeding the next step of the same loop. Two failures this section exists to prevent, both from the same
+session (2026-11-10/11): a 2-layer canary's per-phase table was treated as if it answered the top-level
+question, and a negative isolation result ("BNG=32 regresses") was written up as a closing finding instead of
+the reconciled model for the *next* iteration.
+
+**The loop stops only at one of these, never at anything else:**
+
+1. **Target reached and verified end-to-end.** Full 40-layer `e2e/decode.py` TTFT measured under Step 0's
+   condition (UNPROFILED, TURBO, cold, a named prompt/ids), compared against npu_dsl's number from the SAME
+   prompt shape. "Within measurement noise" of the target counts; "close" does not — requote both numbers.
+2. **An explicit, named blocker**, written down as: the exact bounding resource or fact (a hardware limit from
+   `intel-npu-hardware`, a CMX budget that cannot be satisfied even after the Step 2 compiler-bug check, a
+   measurement that contradicts a stated invariant), what evidence would unblock it, and the concrete next
+   step someone else would take. A blocker is not "the obvious next change looked annoying" or "a sub-result
+   came back negative" — those are reconciled Step 3 outcomes that feed Step 2 again, same session.
+
+**Between every retained change and the next one, re-run the full-model number**, not only the canary that
+diagnosed it — a canary is cheaper and faster to iterate on, which is exactly why it is not allowed to stand
+in for the thing being optimized. "Retained" means: the change compiles, passes its regression tests, and is
+not itself the thing rejected by this round's measurement (a rejected knob is reverted before the next
+full-model run, so the full-model number reflects only what is being kept).
+
+**A negative or neutral isolation result moves the loop to the NEXT line of the attribution table — it does
+not end the session.** If `gath`/`comb`/whatever site is now the named top cost, Step 1 runs again on THAT
+site (roofline, hot-loop cycle count, a prediction) before any status is reported. Finding and fixing a
+genuine compiler bug along the way (Step 0.5 / Step 2's "treat it as a TileLang design issue") is real
+progress, but it is progress WITHIN the loop, not a substitute for the loop's own exit conditions above — do
+not let "I found and fixed a bug" read as "the session's goal is served."
+
+If a session must end before either stop condition is met (context budget, explicit user instruction to
+pause), say so explicitly and name it as neither of the two conditions above — "stopped, not blocked, not
+done" — rather than writing a summary in the shape of a close-out.
+
+**Mechanical gate on ending the turn (2026-11-11): before calling the task-complete/done tool, write down
+which of the two numbered conditions above holds, quoting the actual evidence (the TTFT pair, or the
+blocker's bounding fact + unblocking evidence + next step).** If neither sentence can be written truthfully,
+do not call that tool — keep working the attribution table instead. This closes the exact failure the
+narrative version of this rule already failed to prevent TWICE (2026-11-10, 2026-11-11): a real, validated,
+positive result (a found-and-fixed compiler bug, a measured improvement) was reported, a small residual gap
+was named as "open" in prose, and the turn ended anyway — "I named the next step" is not one of the two
+conditions and does not license stopping. A result description, however accurate and however good the
+news, is not a stop condition by itself. Only "target reached" or "named blocker with unblocking evidence
+and a next step neither of which I am currently able to take" are. If a remaining gap's next step IS
+something that can be executed right now (another attribution-table pass, another A/B), that is proof the
+loop has not reached a stop condition, and the correct action is to take that next step before ending the
+turn, not to describe it and stop.
 
 ## Standing bars
 
@@ -195,3 +266,9 @@ model that is kept produces the next wasted attempt). A golden failure is a stop
   question. `trace_json` reads/materializes all launches before applying its launch filter; a subsequent PowerShell
   all-pairs interval join also exceeded the useful interactive budget. Neither was a device or compiler blocker.
   Index headers/worker counts in a streaming pass, select one launch, then use a sorted interval sweep.
+* 2026-11-11: a session fixed a real compiler bug and unlocked a CMX-blocked MoE geometry, ran a 2-layer canary
+  to isolate which of three knobs caused a regression, wrote up "don't adopt BNG=32/MBe=88, next look at
+  gath/comb" as a closing finding, and stopped — with no full 40-layer TTFT re-measured since the fixes, no
+  attribution table built for the named next site, and the stated goal (full-model TTFT at npu_dsl's shape)
+  neither reached nor named as blocked. None of the work was wrong; stopping there was. Added Step 4 so a
+  session cannot read "found a bug" or "isolated a regression" as a stopping condition by itself.

@@ -315,7 +315,7 @@ class _Planner:
 
 class _DpuPlanner(_Planner):
     def prefetch(self, loop):
-        if self.done or loop.kind != tirx.ForKind.SERIAL or loop.thread_binding is not None:
+        if loop.kind != tirx.ForKind.SERIAL or loop.thread_binding is not None:
             return loop
         if _int(loop.extent) is None or _int(loop.extent) < 2 or (loop.step is not None and _int(loop.step) != 1):
             return loop
@@ -468,7 +468,6 @@ class _DpuPlanner(_Planner):
         wait = tirx.Evaluate(tirx.call_intrin("handle", tirx.op.Op.get("tl.intel_npu_dpu_wait")))
         body = _seq([tirx.IfThenElse(valid, prepare(following), None), wait,
                      tirx.IfThenElse(valid, submit(following), None), rebase(tail, loop.loop_var)])
-        self.done += 1
         return _seq([prepare(loop.min), submit(loop.min),
                      tirx.For(loop.loop_var, loop.min, loop.extent, loop.kind, body, loop.thread_binding,
                                loop.annotations, loop.step)])

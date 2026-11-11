@@ -130,8 +130,22 @@ def _is_ddr_bind(s) -> bool:
             and getattr(s.value.op, "name", "") == "tl.intel_npu_ddr_ptr")
 
 
+def _is_ring_bind(s) -> bool:
+    """A `ring = ctx.ring_begin(...)` Bind: codegen (`VisitStmt_(const BindNode*)`) prints it as a named
+    `npu::Ctx::Ring` C++ variable at the Bind's own position, so wherever this statement ends up IS where the
+    variable's C++ scope starts. The ring's use loop and `ring_end` are almost always in LATER phases, so this
+    must never be nested inside a `lexical_alloc_scope` that one of those later phases falls outside of -- the
+    bug a ring in the SAME phase as a scoped allocation (its own backing `k_cmx`/`v_cmx`, say) used to trigger:
+    the allocation's phase-only scope is correct for the buffer, but it is not a scope the Bind may share."""
+    return (isinstance(s, tirx.Bind) and isinstance(s.value, tirx.Call)
+            and getattr(s.value.op, "name", "") == "tl.intel_npu_ring_begin")
+
+
 def _is_view_def(s, items) -> bool:
-    """A `T.ddr_view` definition: the Bind of the pointer, or a DeclBuffer over a pointer bound that way in `items`."""
+    """A `T.ddr_view` definition: the Bind of the pointer, or a DeclBuffer over a pointer bound that way in `items`.
+    (A ring's `ring_begin` bind is NOT one of these: unlike a DDR pointer, it reads a CMX buffer argument, so it
+    cannot simply move to the block's head ahead of that buffer's own (possibly phase-scoped) allocation -- see
+    `_is_ring_bind` and its use in `_phase_scope`.)"""
     if _is_ddr_bind(s):
         return True
     if isinstance(s, tirx.DeclBuffer):
@@ -237,10 +251,11 @@ class _Scoper:
         # and push the rest back to the block head, where they are summed. Measured on the n=1024 prefill model:
         # splitting on both at once took the peak from 1634944 B to 2016640 B.
         out = self._phase_scope(items, _is_sync_grid)
-        if out is None and not any(_has_ring(s) for s in items):
-            # a ring's slots and its use loop are addressed by use parity, so its block keeps its allocations
-            # where LowerIntelNpuPipelined put them (the same reason _hoist_from_loop leaves ring loops alone)
-            out = self._phase_scope(items, _is_sync_tile, need_two_owners=True)
+        if out is None:
+            # Keep a ring wholly inside its sync-delimited phase; its slots and use loop are addressed by parity.
+            # A ring in one phase can still release unrelated allocations before the next tile rendezvous.
+            has_ring = any(_has_ring(s) for s in items)
+            out = self._phase_scope(items, _is_sync_tile, need_two_owners=not has_ring)
         return out if out is not None else (_seq(items) if items else stmt)
 
     def _phase_scope(self, items: list, is_split, need_two_owners: bool = False):
@@ -274,10 +289,29 @@ class _Scoper:
                 if not _is_decl(s, keys):
                     u |= _buffers_used(s)
             uses.append(u)
+        # A ring Bind (`ring = ctx.ring_begin(...)`) prints as a named C++ variable AT ITS OWN POSITION
+        # (`VisitStmt_(const BindNode*)`), so wherever this statement lands IS where its C++ scope starts. Most
+        # rings begin, run their use loop and `ring_end` all within ONE phase (no sync_tile interrupts them) --
+        # that phase may be scoped exactly like any other, ring included, as test_ring_phase_releases_unrelated_
+        # cmx_at_tile_rendezvous relies on. A ring whose later read (a fill, a submit, `ring_end`) falls in a
+        # DIFFERENT phase from its `ring_begin` is the unsafe case (the flash-attention phase3 regression this
+        # guards): every phase that ring is read from or defined in must then be withdrawn from `home` entirely,
+        # for two reasons at once -- such a phase must not become a `lexical_alloc_scope` itself (the Ring
+        # variable would go out of scope before a later read), and no OTHER buffer those phases also read may be
+        # homed to some single later phase either (it would move after an earlier phase's read of it).
+        ring_def_phase = {hash(s.var): i for i, ph in enumerate(phases) for s in ph if _is_ring_bind(s)}
+        unsafe_phases = set()
+        for key, def_phase in ring_def_phase.items():
+            spans = {def_phase} | {i for i, u in enumerate(uses) if key in u}
+            if len(spans) > 1:
+                unsafe_phases |= spans
+        unsafe_keys = {key for i in unsafe_phases for key in uses[i]}
         home = {}
         for a in allocs:
             key = hash(a.buffer.data)
-            where = [i for i, u in enumerate(uses) if key in u]
+            if key in unsafe_keys:
+                continue
+            where = [i for i, u in enumerate(uses) if key in u and i not in unsafe_phases]
             if len(where) == 1:
                 home[id(a)] = where[0]
         if need_two_owners and len({i for i in home.values()}) < 2:

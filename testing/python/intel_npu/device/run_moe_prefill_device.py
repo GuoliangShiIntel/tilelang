@@ -190,10 +190,11 @@ def main(argv):
         gu_s = (rng.standard_normal((E + 1, 2 * I, H // G), np.float32) * 0.02).astype(np.float16)
         d_int = rng.integers(-8, 8, (E + 1, H, I), dtype=np.int8)
         d_s = (rng.standard_normal((E + 1, H, I // G), np.float32) * 0.02).astype(np.float16)
+        BNG, BND = arg(argv, "--bng", 64), arg(argv, "--bnd", 64)
         low = lowering.lower(make_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MB,
-                                                     BNG=64, BND=64, tiles=TILES, shaves=SHAVES,
+                                                     BNG=BNG, BND=BND, tiles=TILES, shaves=SHAVES,
                                                      probe_skip="dequant" if "--skip-dequant" in argv else None))
-        db = build(low.source, f"tl_moe_expert_prefill_n{N}_h{H}_i{I}_e{E}_mb{MB}"
+        db = build(low.source, f"tl_moe_expert_prefill_n{N}_h{H}_i{I}_e{E}_mb{MB}_bg{BNG}_bd{BND}"
                    + ("_nodeq" if "--skip-dequant" in argv else ""), argv)
 
         def run(gu, dw, profile=False):

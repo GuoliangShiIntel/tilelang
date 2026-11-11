@@ -130,6 +130,7 @@ def main(argv):
     MBe = arg(argv, "--mbe", MBe)
     BNG = arg(argv, "--bng", BNG)
     BND = arg(argv, "--bnd", BND)
+    BNDc = arg(argv, "--bndc", None)
     DB = arg(argv, "--db", DB)
     MB = arg(argv, "--mb", MB)       # the projections' token block: sets their DPU workload's M
     SMAX = arg(argv, "--smax", 1536)
@@ -157,7 +158,7 @@ def main(argv):
         low = lowering.lower(make_prefill_model(L=L, N=NP, H=H, KH=KH, VH=VH, DK=DK, DV=DV, NH=NH, NKV=NKV, D=D,
                                                 ROT=ROT, SMAX=SMAX, I=I, E=E, TOPK=TOPK, G=G, TB=TB, C=C, TBq=TBq,
                                                 TBF=TBF, BKV=BKV, BN1=BN1, BN2=BN2, MB=MB, BM=BM, BNR=BNR,
-                                                MBe=MBe, BNG=BNG, BND=BND, DB=DB, tiles=TILES, shaves=SHAVES, KVL=KVL,
+                                                MBe=MBe, BNG=BNG, BND=BND, DB=DB, BNDc=BNDc, tiles=TILES, shaves=SHAVES, KVL=KVL,
                                                 skip=skip, unroll_layers="--unroll" in argv,
                                                 conv_blocked="--roundrobin" not in argv,
                                                 conv_item_worker="shave" if "--shave-major" in argv else "tile",
@@ -169,8 +170,16 @@ def main(argv):
                                                 conv_fp16="--conv-fp16" in argv, register_tri="--register-tri" in argv,
                                                 gdn_live_chunks="--gdn-live" in argv,
                                                 moe_reuse_input="--moe-reuse-input" in argv,
+                                                moe_shared_gate_up_mb=arg(argv, "--shared-mb", None),
+                                                moe_shared_gate_up_bn=arg(argv, "--shared-bn", None),
+                                                moe_shared_down_mb=arg(argv, "--shared-down-mb", None),
+                                                moe_shared_down_bn=arg(argv, "--shared-down-bn", None),
+                                                moe_tile_shared_experts="--tile-shared-experts" in argv,
+                                                gdn_in_mb=arg(argv, "--in-mb", None),
                                                 output_block_k=arg(argv, "--out-block-k", None),
-                                                output_mb=arg(argv, "--out-mb", None)))
+                                                output_mb=arg(argv, "--out-mb", None),
+                                                moe_pipelined="--moe-pipelined" in argv,
+                                                moe_num_stages_gu=arg(argv, "--moe-num-stages-gu", 2)))
     print(f"lower {time.time() - t_low:.0f} s")
     name = (f"tl_prefill_model_l{L}_n{NP}_h{H}_s{SMAX}_bn{BN1}"
             + (f"_bn2{BN2}" if BN2 != BN1 else "")
@@ -213,6 +222,24 @@ def main(argv):
         name = name.replace("tl_prefill_model", "tl_pf") + f"_ok{arg(argv, '--out-block-k', 0)}_om{arg(argv, '--out-mb', MB)}"
     if "--bng" in argv:
         name = name.replace("tl_prefill_model", "tl_pf") + f"_bg{BNG}"
+    if "--bndc" in argv:
+        name = name.replace("tl_prefill_model", "tl_pf") + f"_bdc{BNDc}"
+    if "--moe-pipelined" in argv:
+        name = name.replace("tl_prefill_model", "tl_pf") + f"_mpl{arg(argv, '--moe-num-stages-gu', 2)}"
+    if "--in-mb" in argv:
+        name = name.replace("tl_prefill_model", "tl_pf") + f"_im{arg(argv, '--in-mb', 0)}"
+    if "--shared-bn" in argv or "--shared-mb" in argv or "--shared-down-bn" in argv or "--shared-down-mb" in argv:
+        name = name.replace("tl_prefill_model", "tl_pf") + (
+            f"_sg{arg(argv, '--shared-mb', MBe)}x{arg(argv, '--shared-bn', BNG)}"
+            f"_sd{arg(argv, '--shared-down-mb', MBe)}x{arg(argv, '--shared-down-bn', BND)}")
+    if "--tile-shared-experts" in argv:
+        name = name.replace("tl_prefill_model", "tl_pf") + "_tse"
+    if "--short-name" in argv:
+        # every flag combination above stacks its own suffix, and a long enough stack trips Windows' ~260-char
+        # path cap in the Visual Studio generator's own .vcxproj.filters.tmp (CMake Error: System Error: Invalid
+        # argument) well before any npu_dsl-matching geometry is unreasonable to ask for. The name is cosmetic
+        # (a cache key plus a human label); this override is a workaround for the path length, not the geometry.
+        name = argv[argv.index("--short-name") + 1]
     if "--phases" in argv:
         # instrumentation is opt-in: it costs ~5% (npu_rt_device.hpp's TL_NPU_PHASE_PROF), so the default
         # build is the one every latency number comes from

@@ -9,6 +9,7 @@ their own KV slot, and that the layer kinds may be interleaved in one launch -- 
 for decode until the caches became kernel parameters (plan question 8).
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -60,13 +61,14 @@ needs_cxx = pytest.mark.skipif(not _has_host_cxx(), reason="no host clang++ for 
 
 
 def _kernel(shared_projections=False, expert_block=MBe, moe_slot_output=False, separate_shared_expert=False,
-            combine_rows=1, moe_reuse_input=False, output_block_k=None, gate_up_block=BNG):
-    return make_prefill_model(L=L, N=N, H=H, KH=KH, VH=VH, DK=DK, DV=DV, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX,
+        combine_rows=1, moe_reuse_input=False, output_block_k=None, gate_up_block=BNG, gdn_in_mb=None,
+        tokens=N):
+    return make_prefill_model(L=L, N=tokens, H=H, KH=KH, VH=VH, DK=DK, DV=DV, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX,
                               I=I, E=E, TOPK=TOPK, G=G, TB=TB, C=C, TBq=TBq, TBF=TBF, BKV=BKV, BN1=BN1, BN2=BN2,
                               MB=MB, BM=BM, BNR=BNR, MBe=expert_block, BNG=gate_up_block, BND=BND, tiles=TILES, shaves=SHAVES,
                               KVL=KVL, shared_projections=shared_projections, moe_slot_output=moe_slot_output,
                               separate_shared_expert=separate_shared_expert, moe_combine_rows=combine_rows,
-                              moe_reuse_input=moe_reuse_input, output_block_k=output_block_k)
+                              moe_reuse_input=moe_reuse_input, output_block_k=output_block_k, gdn_in_mb=gdn_in_mb)
 
 
 def _layers(seed=0):
@@ -269,12 +271,26 @@ def test_shared_projections_preserve_model_state(expert_block):
                 np.testing.assert_array_equal(actual[3][li][name], expected[3][li][name])
 
 
-def test_model_projection_overlap_under_readonly_kind_table():
+@pytest.mark.parametrize("gdn_in_mb", [None, 48])
+def test_model_projection_overlap_under_readonly_kind_table(gdn_in_mb):
+    """GDN in-proj and QKV-proj each get their own ownership-preserving multicast ring (2 total, both
+    projections share the same table-driven weight stream mechanism) whether or not `gdn_in_mb` overrides
+    the in-proj M-block. What DOES change is the in-proj ring's slot size: it carries `gdn_in_mb` token
+    rows per chunk (default `MB`), so its slot_bytes scales by `gdn_in_mb / MB` while the QKV-proj ring
+    (unaffected by this knob) does not."""
     with tvm.transform.PassContext(config={"tl.intel_npu.multicast_overlap": True,
                                            "tl.intel_npu.plan_workloads": "off"}):
-        low = lowering.lower(_kernel(shared_projections=True))
+        low = lowering.lower(_kernel(shared_projections=True, gdn_in_mb=gdn_in_mb,
+                                     tokens=192 if gdn_in_mb is not None else N))
     assert low.source.count("ctx.ring_begin(") == 2
     assert low.source.count("ownership-preserving") >= 2
+    slot_bytes = sorted(int(m) for m in re.findall(r"ctx\.ring_begin\(\(&\(\w+\[0\]\)\), (\d+),", low.source))
+    assert len(slot_bytes) == 2
+    if gdn_in_mb is None:
+        assert slot_bytes[0] == slot_bytes[1]
+    else:
+        ratio = gdn_in_mb // MB
+        assert slot_bytes[1] == slot_bytes[0] * ratio, slot_bytes
 
 
 @needs_cxx

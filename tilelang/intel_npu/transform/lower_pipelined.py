@@ -34,6 +34,8 @@ Barrier ids are left as -1 for AssignIntelNpuBarriers.
 
 from __future__ import annotations
 
+import os
+
 import tvm
 from tvm import tirx
 from tvm.tirx.stmt_functor import ir_transform, post_order_visit, substitute
@@ -222,16 +224,39 @@ def PlanIntelNpuDistribution():
         def plan_overlap(loop):
             if not bool(ctx.config.get("tl.intel_npu.multicast_overlap", False)) or launch.tiles < 2:
                 return None
+            debug_candidate = os.environ.get("TL_NPU_DISTRIBUTION_DEBUG") == "1"
+            if os.environ.get("TL_NPU_DISTRIBUTION_DEBUG") == "1" and loop.kind == tirx.ForKind.SERIAL:
+                names = []
+
+                def collect_calls(node):
+                    if isinstance(node, tirx.Call):
+                        names.append(getattr(node.op, "name", ""))
+
+                post_order_visit(loop.body, collect_calls)
+                if DPU_MATMUL in names:
+                    body_items = list(loop.body.seq) if isinstance(loop.body, tirx.SeqStmt) else [loop.body]
+                    first = [getattr(getattr(item, "value", None), "op", None) for item in body_items]
+                    first = [getattr(op, "name", type(item).__name__) for op, item in zip(first, body_items)]
+                    print(f"[distribution] overlap candidate {loop.loop_var.name}: uniform={bool(uniform[-1])} "
+                          f"min={loop.min} extent={loop.extent} items={first}")
+            debug_candidate = (os.environ.get("TL_NPU_DISTRIBUTION_DEBUG") == "1"
+                               and loop.loop_var.name.startswith("block"))
+
+            def reject(reason):
+                if debug_candidate:
+                    print(f"[distribution] reject {loop.loop_var.name}: {reason}")
+                return None
+
             if not uniform[-1] or not is_uniform(loop.min) or not is_uniform(loop.extent):
-                return None
+                return reject("non-uniform loop bounds")
             if loop.kind != tirx.ForKind.SERIAL or _const_or(loop.min, -1) != 0:
-                return None
+                return reject("loop is not zero-based serial")
             trips = _const_or(loop.extent, 0)
             if trips < 2 or int(loop.annotations.get("num_stages", 0)) > 0:
-                return None
+                return reject("fewer than two trips or already pipelined")
             items = list(loop.body.seq) if isinstance(loop.body, tirx.SeqStmt) else [loop.body]
             if len(items) < 3 or not _is_call(items[0], DMA_COPY) or not _is_call(items[1], DPU_MATMUL):
-                return None
+                return reject("body is not fill, gemm, tail")
             fill, gemm = items[0].value, items[1].value
             stores = []
 
@@ -242,23 +267,23 @@ def PlanIntelNpuDistribution():
             tail = items[2] if len(items) == 3 else tirx.SeqStmt(items[2:])
             post_order_visit(tail, find_store)
             if len(stores) != 1:
-                return None
+                return reject(f"tail has {len(stores)} output stores")
             store = stores[0]
             if len(fill.args) != 7 or _const_or(fill.args[6], 0) != 1 or _const_or(store.args[6], 1) != 0:
-                return None
+                return reject("fill/store direction or arity")
             activation, source = _load_of(fill.args[0]), _load_of(fill.args[1])
             output, weights = _load_of(gemm.args[0]), _load_of(gemm.args[2])
             destination = _load_of(store.args[0])
             if activation.buffer.scope() != "local" or output.buffer.scope() != "local":
-                return None
+                return reject(f"activation/output scopes {activation.buffer.scope()}/{output.buffer.scope()}")
             if weights.buffer.scope() not in ("shared", "shared.dyn"):
-                return None
+                return reject(f"weights scope {weights.buffer.scope()}")
             if not _load_of(gemm.args[1]).buffer.same_as(activation.buffer):
-                return None
+                return reject("gemm input is not the filled activation")
             if not _load_of(store.args[1]).buffer.same_as(output.buffer):
-                return None
+                return reject("store input is not the gemm output")
             if source.buffer.data.same_as(destination.buffer.data):
-                return None
+                return reject("activation source aliases output destination")
             safe_tail = [True]
 
             def inspect_tail(node):
@@ -286,13 +311,13 @@ def PlanIntelNpuDistribution():
 
             post_order_visit(tail, inspect_tail)
             if not safe_tail[0]:
-                return None
+                return reject("unsafe tail side effect or external read")
             if any(_uses(weights, var) for var in (loop.loop_var, launch.shave_var)):
-                return None
+                return reject("weight address depends on loop or SHAVE")
             if not any(source.buffer.data.same_as(buf.data) for buf in func.buffer_map.values()):
-                return None
+                return reject("activation source is not a parameter buffer")
             if any(_uses(index, launch.tile_var) for index in source.indices):
-                return None
+                return reject("activation source depends on tile")
             allowed = uniform[-1] + [loop.loop_var, launch.shave_var]
             safe_address = [True]
 
@@ -307,16 +332,19 @@ def PlanIntelNpuDistribution():
             for index in source.indices:
                 post_order_visit(index, check_address)
             if not safe_address[0]:
-                return None
+                return reject("activation address has unsupported dependencies")
             from .prefetch import _full_buffer_load, _refs
 
             if not _full_buffer_load(fill, activation.buffer):
-                return None
+                return reject("fill does not overwrite the full compact activation")
             if not all(_const_or(index, -1) == 0 for index in output.indices):
-                return None
+                return reject(f"gemm output indices {output.indices}")
             for buffer in (activation.buffer, output.buffer):
                 if _refs(func.body, buffer.data) != _refs(loop.body, buffer.data):
-                    return None
+                    if debug_candidate and buffer.same_as(activation.buffer):
+                        print(f"[distribution] overlap reject {loop.loop_var.name}: activation refs "
+                              f"{_refs(func.body, buffer.data)}/{_refs(loop.body, buffer.data)}")
+                    return reject(f"buffer {buffer.name} escapes its loop")
             chunk = tirx.Var(loop.loop_var.name + "_chunk", loop.loop_var.dtype)
             sub = {loop.loop_var: tirx.floordiv(chunk, launch.shaves), launch.shave_var: tirx.floormod(chunk, launch.shaves)}
             body = substitute(loop.body, sub)
@@ -327,10 +355,16 @@ def PlanIntelNpuDistribution():
             analyzer = tvm.arith.Analyzer()
             for address in (new_source, new_destination):
                 if len(address.indices) != 2 or _uses(address.indices[1], chunk):
-                    return None
+                    if debug_candidate:
+                        print(f"[distribution] overlap reject {loop.loop_var.name}: non-row-streamed address "
+                              f"{address.indices}")
+                    return reject("streamed address is not a row stream")
                 row = address.indices[0]
                 if not analyzer.can_prove_equal(substitute(row, {chunk: chunk + 1}) - row, rows):
-                    return None
+                    if debug_candidate:
+                        print(f"[distribution] overlap reject {loop.loop_var.name}: row step is not GEMM M={rows}; "
+                              f"address={row}")
+                    return reject(f"row stride does not match GEMM M={rows}")
             shared = tirx.decl_buffer(list(activation.buffer.shape), activation.buffer.dtype, activation.buffer.name, scope="shared")
             overlap_buffers.append((activation.buffer, shared))
             annotations = dict(loop.annotations)
@@ -340,6 +374,9 @@ def PlanIntelNpuDistribution():
                 f"{activation.buffer.name}: ownership-preserving automatic multicast ring; "
                 f"{trips} uses per SHAVE, shared resident operand, no hoist across weight preparation"
             )
+            if debug_candidate:
+                print(f"[distribution] selected {loop.loop_var.name}: activation={activation.buffer.name} "
+                      f"source={source.buffer.name} rows={rows} trips={trips}")
             return tirx.For(chunk, loop.min, _i32(trips * launch.shaves), loop.kind, body, loop.thread_binding, annotations)
 
         def multicast_fill(stmt):
@@ -426,6 +463,8 @@ def PlanIntelNpuDistribution():
                 uniform.append(uniform[-1] if uniform[-1] and is_uniform(stmt.condition) else [])
                 if _uses(stmt.condition, launch.shave_var):
                     shave_branch.append(False)
+                    if os.environ.get("TL_NPU_DISTRIBUTION_DEBUG") == "1":
+                        print(f"[distribution] enter SHAVE branch: {stmt.condition}")
             elif isinstance(stmt, tirx.While):
                 uniform.append([])
             return None
@@ -487,6 +526,8 @@ def PlanIntelNpuDistribution():
                 # the author already chose which SHAVE fills, so there is nothing to split, and the sync cannot
                 # go here because the other SHAVE never reaches it: the enclosing branch emits it after itself
                 shave_branch[-1] = True
+                if os.environ.get("TL_NPU_DISTRIBUTION_DEBUG") == "1":
+                    print(f"[distribution] local fill {dst.buffer.name} kept under SHAVE branch")
                 notes.append(f"{dst.buffer.name}: filled under a SHAVE-dependent branch, tile sync after the branch")
                 return None
             if not isinstance(args[3], tirx.IntImm):

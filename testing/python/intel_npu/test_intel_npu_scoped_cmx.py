@@ -181,6 +181,40 @@ def test_a_loop_holding_a_ring_keeps_its_allocations():
     assert allocations_inside_loops(serial) == [], "the control must hoist: without a ring the loop keeps nothing"
 
 
+def test_ring_phase_releases_unrelated_cmx_at_tile_rendezvous():
+    tail_elems = 300 * 1024
+    M, N, K, BM, BN = 512, TILES * 256, 256, 32, 256
+
+    def kernel(separated: bool):
+        @T.prim_func
+        def k(X: T.Tensor((M, K), T.float16), W: T.Tensor((N, K), T.float16),
+              Tail: T.Tensor((tail_elems,), T.float16), Y: T.Tensor((M, N), T.float16),
+              Out: T.Tensor((TILES * SHAVES, tail_elems), T.float16)):
+            with T.Kernel(TILES, threads=SHAVES) as tile:
+                shave = T.get_thread_binding()
+                W_cmx = T.alloc_shared((BN, K), T.float16)
+                X_cmx = T.alloc_shared((BM, K), T.float16)
+                Y_cmx = T.alloc_local((BM, BN), T.float16)
+                T.copy(W[tile * BN, 0], W_cmx)
+                for c in T.Pipelined(M // BM, num_stages=SHAVES):
+                    T.copy(X[c * BM, 0], X_cmx)
+                    T.gemm(X_cmx, W_cmx, Y_cmx, transpose_B=True, clear_accum=True)
+                    T.copy(Y_cmx, Y[c * BM, tile * BN])
+                if separated:
+                    T.sync_threads()
+                tail = T.alloc_local((tail_elems,), T.float16)
+                T.copy(Tail[0], tail)
+                T.copy(tail, Out[tile * SHAVES + shave, 0])
+
+        return k
+
+    separated = _lower(kernel(True)).source
+    assert "ctx.ring_begin(" in separated
+    assert "ctx.sync_tile();" in separated
+    with pytest.raises(Exception, match="CMX budget exceeded"):
+        _lower(kernel(False))
+
+
 def allocations_inside_loops(src: str) -> list[tuple[str, int]]:
     """(buffer, loop depth) for every `ctx.alloc` the generated source makes inside a loop body. Those are the
     allocations question 10's defect acts on: the runtime re-runs mark / alloc / restore every iteration for an

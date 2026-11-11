@@ -1062,12 +1062,20 @@ def make_moe_expert_prefill(
     tiles: int = 3,
     shaves: int = 2,
     DB: int = 4,
+    BNDc: int | None = None,
     as_block: bool = False,
     probe_skip: str | None = None,
     slot_output: bool = False,
     separate_shared: bool = False,
     combine_rows: int = 1,
     reuse_input: bool = False,
+    shared_gate_up_mb: int | None = None,
+    shared_gate_up_bn: int | None = None,
+    shared_down_mb: int | None = None,
+    shared_down_bn: int | None = None,
+    tile_shared_experts: bool = False,
+    pipelined: bool = False,
+    num_stages_gu: int = 2,
 ):
     """P2b: the grouped expert FFN for `N` prompt tokens, over P2a's grouping.
 
@@ -1096,23 +1104,42 @@ def make_moe_expert_prefill(
     weighted combine. The default retains fp32 `[tiles, N, H]` partials. Slot mode requires MB % shaves == 0.
 
     `separate_shared`: dense projections and a batch activation process the shared expert on all workers before
-    the routed grouped loop. Requires slot output and N % MB == 0; SharedGu/SharedAct are reusable DDR scratch.
+    the routed grouped loop. Requires slot output and complete shared projection token blocks; SharedGu/SharedAct
+    are reusable DDR scratch. Shared gate/up and down M/N blocks can be chosen independently from routed MBe/BNG/BND.
 
     `reuse_input`: reuse the gathered input tile for down-projection output after gate/up and the tile rendezvous.
 
+    `BNDc`: the down-projection's dequant+GEMM compute chunk, independent of `BND`. `BND` still sizes the DMA
+    fetch and the scale-fetch amortization (npu_dsl's geometry needs BND = 256 there), but the SHAVE-resident
+    `wd_cmx`/`yd_cmx` tiles -- the buffers that actually blow the CMX budget when BND grows -- are sized by
+    `BNDc` and sub-loop within each BND-sized weight chunk. Defaults to `BND` (no behavior change).
+
     `probe_skip='dequant'`: MEASUREMENT ARM ONLY -- the weights are still read from DDR and the gemms still run,
-    but the int4 rows are not expanded (the output is wrong by design). The difference is the dequant's share."""
+    but the int4 rows are not expanded (the output is wrong by design). The difference is the dequant's share.
+
+    `pipelined`: the gate/up CHUNK loop (`CG`) runs as `T.Pipelined(num_stages=num_stages_gu)` instead of
+    `T.serial`, mirroring `make_moe_expert_decode`'s identical loop over the same `wq_cmx`/`ws_cmx` buffers
+    (kernels.py ~line 733). Unlike decode's per-single-token item, prefill's gate/up chunk fetch
+    (`T.copy(WguQ...)`, `T.copy(WguS...)`) pays its DMA latency fully serially today -- that is why a SMALLER
+    `BNG` (more, smaller chunks) regresses instead of improving: each extra chunk is an extra unhidden fetch.
+    Default False: zero behavior change for every existing caller/measurement."""
     FL, HL = 16, 32
     skip_dequant = probe_skip == "dequant"
     workers = tiles * shaves
     SLOTS = N * (TOPK + 1)
+    BNDc = BND if BNDc is None else BNDc
     CG, CD = (2 * I) // BNG, H // BND
     KGH, KGI = H // G, I // G
     assert H % G == 0 and I % G == 0 and (2 * I) % BNG == 0 and H % BND == 0
-    assert H % HL == 0 and I % HL == 0 and MB * BNG <= 8192 and MB * BND <= 8192
+    assert H % HL == 0 and I % HL == 0 and MB <= 8192 and BNG <= 8192 and BND <= 8192
     assert I % (shaves * HL) == 0 and N % shaves == 0
+    assert BND % BNDc == 0 and BNDc % HL == 0, "BNDc must divide BND and be a whole number of HL-wide vector lanes"
     if slot_output:
         assert MB % shaves == 0, "slot-output token rows must divide over the tile's SHAVEs"
+    if tile_shared_experts:
+        assert slot_output and separate_shared, "tile-shared routed experts require slot output and a separate shared expert"
+        assert MB % shaves == 0 and BND % shaves == 0
+        assert I % (BNG * shaves) == 0 and H % BND == 0
     # down chunks per DMA: at BND = 64 a job is 16 KiB and 70% of it is the 1.55 us per-job fixed cost, and the
     # PACKED buffer is 8x smaller than wd_cmx, so DMA granularity is cheap to decouple from compute granularity.
     # `DB` is an upper bound: it also sizes wqd_cmx, so a large chunk costs CMX the big prompt chunks need.
@@ -1124,14 +1151,26 @@ def make_moe_expert_prefill(
     assert combine_rows == 1 or slot_output, "blocked combine requires slot output"
     if combine_rows > 1:
         blocked_combine = make_moe_combine(N, H, E, TOPK, combine_rows, tiles, shaves, as_block=True)
+    shared_gate_up_mb = MB if shared_gate_up_mb is None else shared_gate_up_mb
+    shared_gate_up_bn = BNG if shared_gate_up_bn is None else shared_gate_up_bn
+    shared_down_mb = MB if shared_down_mb is None else shared_down_mb
+    shared_down_bn = BND if shared_down_bn is None else shared_down_bn
+    shared_expert_weights = any(value is not None for value in (
+        shared_gate_up_mb if shared_gate_up_mb != MB else None,
+        shared_gate_up_bn if shared_gate_up_bn != BNG else None,
+        shared_down_mb if shared_down_mb != MB else None,
+        shared_down_bn if shared_down_bn != BND else None,
+    ))
     if separate_shared:
         assert slot_output, "separate shared expert requires slot-major output"
-        assert N % MB == 0, "dense shared expert requires complete token blocks"
-        shared_gate_up, _ = make_proj_prefill(NP=N, M=2 * I, K=H, BN=BNG, MB=MB, G=G,
-                                             tiles=tiles, shaves=shaves, as_block=True, scales_gm=True,
+        assert N % shared_gate_up_mb == 0 and N % shared_down_mb == 0, "shared expert requires complete projection token blocks"
+        shared_gate_up, _ = make_proj_prefill(NP=N, M=2 * I, K=H, BN=shared_gate_up_bn, MB=shared_gate_up_mb, G=G,
+                                                            tiles=tiles, shaves=shaves, as_block=True, scales_gm=True,
+                                                            shared_weights=shared_expert_weights,
                                              weight_row_offset=E * 2 * I)
-        shared_down, _ = make_proj_prefill(NP=N, M=H, K=I, BN=BND, MB=MB, G=G,
-                                          tiles=tiles, shaves=shaves, as_block=True, scales_gm=True,
+        shared_down, _ = make_proj_prefill(NP=N, M=H, K=I, BN=shared_down_bn, MB=shared_down_mb, G=G,
+                                                        tiles=tiles, shaves=shaves, as_block=True, scales_gm=True,
+                                                        shared_weights=shared_expert_weights,
                                           weight_row_offset=E * H, output_row_base=True)
 
     @T.macro
@@ -1147,10 +1186,17 @@ def make_moe_expert_prefill(
         # read-only routing tables, identical on both SHAVEs: a private copy each cost 116 KB at N = 1024
         off_cmx = T.alloc_shared((E + 2,), T.int32)
         slot_cmx = T.alloc_shared((SLOTS,), T.int32)
-        wts_cmx = T.alloc_shared((N, 16), T.float32)
+        if not slot_output:
+            wts_cmx = T.alloc_shared((N, 16), T.float32)
         x_cmx = T.alloc_shared((MB, H), T.float16)  # the chunk's tokens: both SHAVEs read them
-        wq_cmx = T.alloc_local((BNG, H // 2), T.uint8)  # a SHAVE's own chunk of weights
-        ws_cmx = T.alloc_local((KGH, BNG), T.float16)
+        # `pipelined` streams this fetch through the hardware ring (README section 3), which needs the fill's
+        # destination in the tile's shared CMX pool -- the ring itself gives each SHAVE its own slot(s), so this
+        # is not actually shared DATA, only shared ADDRESS SPACE (mirrors make_moe_expert_decode's identical
+        # wq_cmx). Left `alloc_local` when unpipelined (the default): two SHAVEs write different chunks at the
+        # same loop step with no ring between them, so a literal shared buffer would race.
+        gu_alloc = T.alloc_shared if pipelined else T.alloc_local
+        wq_cmx = gu_alloc((BNG, H // 2), T.uint8)  # a SHAVE's own chunk of weights
+        ws_cmx = gu_alloc((KGH, BNG), T.float16)
         wg_cmx = T.alloc_local((BNG, H), T.float16)
         y_cmx = T.alloc_local((MB, BNG), T.float16)
         gu_cmx = T.alloc_shared((MB, 2 * I), T.float16)  # the SHAVEs write disjoint column ranges
@@ -1160,8 +1206,8 @@ def make_moe_expert_prefill(
         # hoist on the gate/up side would cost 32 KiB to save 16, and the layer kernel has no room for both.
         # Group-major, so a chunk is a COLUMN range of this and the dequant reads it in place at pitch H.
         wsd_all = T.alloc_shared((KGI, H), T.float16)
-        wd_cmx = T.alloc_local((BND, I), T.float16)
-        yd_cmx = T.alloc_local((MB, BND), T.float16)
+        wd_cmx = T.alloc_local((BNDc, I), T.float16)
+        yd_cmx = T.alloc_local((MB, BNDc), T.float16)
         if reuse_input:
             yo = x_cmx
         else:
@@ -1171,7 +1217,8 @@ def make_moe_expert_prefill(
         zr = T.alloc_local((1, H), T.float32)
         tk = T.alloc_local((2,), T.int32)  # the live token's row, read once per token rather than per element
         aw = T.alloc_local((2,), T.float32)  # and its routing weight
-        seen = T.alloc_shared((N,), T.int32)  # per token: has an expert of this TILE written its partial yet?
+        if not slot_output:
+            seen = T.alloc_shared((N,), T.int32)  # per token: has an expert of this TILE written its partial yet?
         T.copy(Off[0], off_cmx)
         T.copy(Slot[0], slot_cmx)
         if not slot_output:
@@ -1197,7 +1244,46 @@ def make_moe_expert_prefill(
                         T.copy(X[slot_cmx[T.min(off_cmx[e] + c * MB + i, off_cmx[e + 1] - 1)] // (TOPK + 1), 0], x_cmx[i : i + 1, 0:H])
                     perf_end()
                     T.sync_threads()
-                    if CG % shaves == 0:
+
+                    # TileLang's tracer does not support a nested `def` inside a traced macro body (it raised
+                    # NameError at trace time, not lowering time, the one time this was tried) -- so the three
+                    # loop forms below duplicate the body instead of sharing one closure.
+                    if pipelined:
+                        # the ring deals chunk n to SHAVE (n % num_stages_gu) ITSELF (README section 3: "the loop
+                        # is dealt round-robin, chunk c -> SHAVE c % S") -- the loop range must stay the FULL `CG`
+                        # with a PLAIN `n`, exactly like make_moe_expert_decode's identical loop. An earlier
+                        # version of this pre-split `n = ni*shaves+shave` (the `elif` branch's manual-split
+                        # formula below), which double-partitions the work: the ring's own round-robin AND the
+                        # formula both decide who touches which chunk, disagreeing on which SHAVE owns slot
+                        # state. That shipped a lowering that built fine but was WRONG on hardware (oracle FAIL,
+                        # worst rel 2.4e1, 2-layer canary at BNG=32 -- evidence/INDEX.md), caught only on device
+                        # since host_sim cannot run rings at all.
+                        for n in T.Pipelined(CG, num_stages=num_stages_gu):
+                            T.copy(WguQ[e * 2 * I + n * BNG, 0], wq_cmx)
+                            T.copy(WguS[0, e * 2 * I + n * BNG], ws_cmx)
+                            perf_begin("gdeq")
+                            if not skip_dequant:
+                                T.call_extern(
+                                    "handle",
+                                    "tl_npu_dequant_i4_gm",
+                                    T.address_of(wg_cmx[0, 0]),
+                                    T.address_of(wq_cmx[0, 0]),
+                                    T.address_of(ws_cmx[0, 0]),
+                                    BNG,
+                                    H,
+                                    G,
+                                    BNG,
+                                )
+                            perf_end()
+                            perf_begin("ggem")
+                            T.gemm(x_cmx, wg_cmx, y_cmx, transpose_B=True, clear_accum=True)
+                            perf_end()
+                            perf_begin("gcpy")
+                            for i, c0 in T.grid(MB, BNG // HL):
+                                for v in T.vectorized(HL):
+                                    gu_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
+                            perf_end()
+                    elif CG % shaves == 0:
                         for ni in T.serial(CG // shaves):
                             n = ni * shaves + shave
                             T.copy(WguQ[e * 2 * I + n * BNG, 0], wq_cmx)
@@ -1225,6 +1311,11 @@ def make_moe_expert_prefill(
                                     gu_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
                             perf_end()
                     else:
+                        # CG % shaves != 0 wraps every statement in a runtime `if n % shaves == shave:` guard
+                        # (an IfThenElse), which `LowerIntelNpuPipelined`'s fill-detection does not look inside
+                        # (it only matches a bare DMA copy at the loop body's top level) -- stays T.serial even
+                        # under `pipelined=True` until that pass learns to see through a guard. Moot here: the
+                        # `pipelined` branch above never divides by shaves, so it never needs this guard either.
                         for n in T.serial(CG):
                             if n % shaves == shave:
                                 T.copy(WguQ[e * 2 * I + n * BNG, 0], wq_cmx)
@@ -1265,19 +1356,21 @@ def make_moe_expert_prefill(
                     for nb in T.serial(CD // (DB * shaves)):
                         T.copy(WdQ[e * H + ((nb * shaves + shave) * DB) * BND, 0], wqd_cmx)
                         for j in T.serial(DB):
-                            perf_begin("ddeq")
-                            if not skip_dequant:
-                                T.dequant_i4_gm(wd_cmx, wqd_cmx, wsd_all, G, packed_row=j * BND,
-                                               scales_col=((nb * shaves + shave) * DB + j) * BND)
-                            perf_end()
-                            perf_begin("dgem")
-                            T.gemm(h_cmx, wd_cmx, yd_cmx, transpose_B=True, clear_accum=True)
-                            perf_end()
-                            perf_begin("dcpy")
-                            for i, c0 in T.grid(MB, BND // HL):
-                                for v in T.vectorized(HL):
-                                    yo[i, ((nb * shaves + shave) * DB + j) * BND + c0 * HL + v] = yd_cmx[i, c0 * HL + v]
-                            perf_end()
+                            chunk0 = ((nb * shaves + shave) * DB + j) * BND
+                            for k in T.serial(BND // BNDc):
+                                perf_begin("ddeq")
+                                if not skip_dequant:
+                                    T.dequant_i4_gm(wd_cmx, wqd_cmx, wsd_all, G, packed_row=j * BND + k * BNDc,
+                                                   scales_col=chunk0 + k * BNDc)
+                                perf_end()
+                                perf_begin("dgem")
+                                T.gemm(h_cmx, wd_cmx, yd_cmx, transpose_B=True, clear_accum=True)
+                                perf_end()
+                                perf_begin("dcpy")
+                                for i, c0 in T.grid(MB, BNDc // HL):
+                                    for v in T.vectorized(HL):
+                                        yo[i, chunk0 + k * BNDc + c0 * HL + v] = yd_cmx[i, c0 * HL + v]
+                                perf_end()
                     T.sync_threads()
                     # one read-modify-write of the whole row per live token: the chunk-wise form cost CD of
                     # them, and at BND = 64 those are 256-byte DDR jobs whose count dominated the phase
@@ -1358,28 +1451,117 @@ def make_moe_expert_prefill(
                 perf_end()
 
     @T.macro
+    def tile_shared_expert_phase(X, WguQ, WguS, WdQ, WdS, Off, Slot, Part, tile, shave):
+        rows_per_shave = MB // shaves
+        half_down = BND // shaves
+        off_cmx = T.alloc_shared((E + 2,), T.int32)
+        slot_cmx = T.alloc_shared((SLOTS,), T.int32)
+        x_cmx = T.alloc_local((rows_per_shave, H), T.float16)
+        wq_cmx = T.alloc_local((BNG, H // 2), T.uint8)
+        ws_cmx = T.alloc_local((KGH, BNG), T.float16)
+        wg_tile = T.alloc_shared((BNG * shaves, H), T.float16)
+        y_cmx = T.alloc_local((rows_per_shave, BNG * shaves), T.float16)
+        gate_cmx = T.alloc_local((rows_per_shave, I), T.float16)
+        up_cmx = T.alloc_local((rows_per_shave, I), T.float16)
+        wqd_cmx = T.alloc_local((half_down, I // 2), T.uint8)
+        wd_tile = T.alloc_shared((BND, I), T.float16)
+        yd_cmx = T.alloc_local((rows_per_shave, BND), T.float16)
+        if reuse_input:
+            yo = x_cmx
+        else:
+            yo = T.alloc_local((rows_per_shave, H), T.float16)
+        wsd_all = T.alloc_shared((KGI, H), T.float16)
+        T.copy(Off[0], off_cmx)
+        T.copy(Slot[0], slot_cmx)
+        for ei in T.serial(EPT):
+            e = ei * tiles + tile
+            if e < EXPERTS:
+                T.copy(WdS[0, e * H], wsd_all)
+                for c in T.serial(T.ceildiv(off_cmx[e + 1] - off_cmx[e], MB)):
+                    perf_begin("gath")
+                    for row in T.serial(rows_per_shave):
+                        index = off_cmx[e] + c * MB + shave * rows_per_shave + row
+                        source = slot_cmx[T.min(index, off_cmx[e + 1] - 1)] // (TOPK + 1)
+                        T.copy(X[source, 0], x_cmx[row : row + 1, 0:H])
+                    perf_end()
+                    for block in T.serial(I // (BNG * shaves)):
+                        for projection in T.serial(2):
+                            row = e * 2 * I + projection * I + block * BNG * shaves + shave * BNG
+                            T.copy(WguQ[row, 0], wq_cmx)
+                            T.copy(WguS[0, row], ws_cmx)
+                            perf_begin("gdeq")
+                            T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wg_tile[shave * BNG, 0]),
+                                          T.address_of(wq_cmx[0, 0]), T.address_of(ws_cmx[0, 0]), BNG, H, G, BNG)
+                            perf_end()
+                            T.sync_threads()
+                            perf_begin("ggem")
+                            T.gemm(x_cmx, wg_tile, y_cmx, transpose_B=True, clear_accum=True)
+                            perf_end()
+                            perf_begin("gcpy")
+                            for row, column in T.grid(rows_per_shave, BNG * shaves // HL):
+                                for lane in T.vectorized(HL):
+                                    if projection == 0:
+                                        gate_cmx[row, block * BNG * shaves + column * HL + lane] = y_cmx[row, column * HL + lane]
+                                    else:
+                                        up_cmx[row, block * BNG * shaves + column * HL + lane] = y_cmx[row, column * HL + lane]
+                            perf_end()
+                            T.sync_threads()
+                    perf_begin("swig")
+                    for row, column in T.grid(rows_per_shave, I // HL):
+                        for lane in T.vectorized(HL):
+                            gate = gate_cmx[row, column * HL + lane]
+                            gate_cmx[row, column * HL + lane] = gate * T.sigmoid(gate) * up_cmx[row, column * HL + lane]
+                    perf_end()
+                    for block in T.serial(H // BND):
+                        weight_row = e * H + block * BND + shave * half_down
+                        T.copy(WdQ[weight_row, 0], wqd_cmx)
+                        perf_begin("ddeq")
+                        T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wd_tile[shave * half_down, 0]),
+                                      T.address_of(wqd_cmx[0, 0]), T.address_of(wsd_all[0, weight_row]),
+                                      half_down, I, G, H)
+                        perf_end()
+                        T.sync_threads()
+                        perf_begin("dgem")
+                        T.gemm(gate_cmx, wd_tile, yd_cmx, transpose_B=True, clear_accum=True)
+                        perf_end()
+                        perf_begin("dcpy")
+                        for row, column in T.grid(rows_per_shave, BND // HL):
+                            for lane in T.vectorized(HL):
+                                yo[row, block * BND + column * HL + lane] = yd_cmx[row, column * HL + lane]
+                        perf_end()
+                        T.sync_threads()
+                    live_rows = T.min(rows_per_shave,
+                                      T.max(0, off_cmx[e + 1] - off_cmx[e] - c * MB - shave * rows_per_shave))
+                    if live_rows > 0:
+                        begin = off_cmx[e] + c * MB + shave * rows_per_shave
+                        T.copy(yo[0:live_rows, 0:H], Part[begin:begin + live_rows, 0:H])
+
+    @T.macro
     def split_expert_phase(X, WguQ, WguS, WdQ, WdS, Wts, Off, Slot, Part, Out, tile, shave, SharedGu, SharedAct):
         shared_gate_up(X, WguQ, WguS, SharedGu, tile, shave)
         T.sync_grid()
-        gu_batch = T.alloc_local((MB, 2 * I), T.float16)
-        act_batch = T.alloc_local((MB, I), T.float16)
+        gu_batch = T.alloc_local((shared_gate_up_mb, 2 * I), T.float16)
+        act_batch = T.alloc_local((shared_gate_up_mb, I), T.float16)
         worker = tile * shaves + shave
-        for it in T.serial(T.ceildiv(N // MB, workers)):
+        for it in T.serial(T.ceildiv(N // shared_gate_up_mb, workers)):
             block = it * workers + worker
-            if block < N // MB:
-                T.copy(SharedGu[block * MB, 0], gu_batch)
-                for row, col in T.grid(MB, I // HL):
+            if block < N // shared_gate_up_mb:
+                T.copy(SharedGu[block * shared_gate_up_mb, 0], gu_batch)
+                for row, col in T.grid(shared_gate_up_mb, I // HL):
                     for lane in T.vectorized(HL):
                         act_batch[row, col * HL + lane] = (
                             gu_batch[row, col * HL + lane] * T.sigmoid(gu_batch[row, col * HL + lane])
                             * gu_batch[row, I + col * HL + lane])
-                T.copy(act_batch, SharedAct[block * MB, 0])
+                T.copy(act_batch, SharedAct[block * shared_gate_up_mb, 0])
         T.sync_grid()
         shared_start = T.alloc_shared((1,), T.int32)
         T.copy(Off[E:E + 1], shared_start)
         shared_down(SharedAct, WdQ, WdS, Part, tile, shave, shared_start[0])
         T.sync_grid()
-        expert_phase(X, WguQ, WguS, WdQ, WdS, Wts, Off, Slot, Part, Out, tile, shave)
+        if tile_shared_experts:
+            tile_shared_expert_phase(X, WguQ, WguS, WdQ, WdS, Off, Slot, Part, tile, shave)
+        else:
+            expert_phase(X, WguQ, WguS, WdQ, WdS, Wts, Off, Slot, Part, Out, tile, shave)
 
     selected_phase = split_expert_phase if separate_shared else expert_phase
     if as_block:
@@ -2882,9 +3064,6 @@ def prefill_ba_block(H: int, VH: int, NP: int, MB: int, tiles: int, shaves: int)
         w = T.alloc_local((RB, H), T.float16)
         x = T.alloc_local((MB, H), T.float16)
         y = T.alloc_local((MB, RB), T.float16)
-        w[0, 0] = T.float16(0)  # pins the scope at kernel level (question 10)
-        x[0, 0] = T.float16(0)
-        y[0, 0] = T.float16(0)
         for it in T.serial(T.ceildiv(NCH, workers)):
             n = it * workers + worker
             if n < NCH:
@@ -3252,6 +3431,7 @@ def make_proj_prefill(
     weight_row_offset: int = 0,
     output_row_base: bool = False,
     block_k: int | None = None,
+    serial_shared_input: bool = False,
 ):
     """P4 step 4: a PREFILL projection -- `Yout[NP, M] = X[NP, K] . dequant(Wq[M, K])^T`, int4 symmetric with one
     fp16 scale per group of G along K.
@@ -3270,7 +3450,7 @@ def make_proj_prefill(
     distribution pass can broadcast the activation with PassContext `tl.intel_npu.multicast=True`.
 
     `weight_row_offset` selects weights/scales after a fixed row prefix. With `as_block=True`,
-    `output_row_base=True` returns the private-weight macro with a final runtime output-row-origin argument.
+    `output_row_base=True` returns a macro with a final runtime output-row-origin argument.
 
     `block_k`: tile-shared projections may split K into complete group-aligned blocks; fp16 partials are added
     in fp32 and rounded to fp16 after each block. Incomplete output tile rounds execute without storing padding.
@@ -3281,7 +3461,8 @@ def make_proj_prefill(
     keeps the VPUX assembly by transposing a chunk's scales first. `False` is the ROW-MAJOR `[M, K/G]` form.
     Oracle: `proj_prefill_reference`."""
     assert M % BN == 0 and NP % MB == 0 and K % G == 0 and K % 32 == 0
-    assert not output_row_base or (as_block and not shared_weights)
+    assert not output_row_base or as_block
+    assert not serial_shared_input or shared_weights, "serial shared input requires a tile-shared weight projection"
     KG = K // G
     NCH, NTB = M // BN, NP // MB
     workers = tiles * shaves
@@ -3289,7 +3470,6 @@ def make_proj_prefill(
     assert MB <= 8192 and BN <= 8192 and K <= 8192, "every workload dimension is bounded by 8192 (dpu.md 4.6)"
     if shared_weights:
         assert BN % shaves == 0, "shared weight rows must divide over the tile's SHAVEs"
-        assert NCH % tiles == 0 or block_k is not None, "shared weights currently require complete tile rounds"
         assert NTB % shaves == 0, "shared weights currently require complete SHAVE token rounds"
     BK = K if block_k is None else block_k
     if block_k is not None:
@@ -3335,44 +3515,63 @@ def make_proj_prefill(
                         T.copy(result, Yout[token, row])
 
     @T.macro
-    def shared_proj_phase(X, Wq, S, Yout, tile, shave):
+    def shared_proj_phase(X, Wq, S, Yout, tile, shave, row_base):
         wq_half = T.alloc_local((HALF, K // 2), T.uint8)
         s_half = T.alloc_local((KG, HALF) if scales_gm else (HALF, KG), T.float16)
         weight_tile = T.alloc_shared((BN, K), T.float16)
-        activation = T.alloc_local((MB, K), T.float16)
+        if serial_shared_input:
+            activation = T.alloc_shared((MB, K), T.float16)
+        else:
+            activation = T.alloc_local((MB, K), T.float16)
         result = T.alloc_local((MB, BN), T.float16)
-        for it in T.serial(NCH // tiles):
+        for it in T.serial(T.ceildiv(NCH, tiles)):
+            n = it * tiles + tile
             T.sync_threads()
-            T.copy(Wq[weight_row_offset + (it * tiles + tile) * BN + shave * HALF, 0], wq_half)
-            if scales_gm:
-                T.copy(S[0, weight_row_offset + (it * tiles + tile) * BN + shave * HALF], s_half)
-                T.call_extern(
-                    "handle",
-                    "tl_npu_dequant_i4_gm",
-                    T.address_of(weight_tile[shave * HALF, 0]),
-                    T.address_of(wq_half[0, 0]),
-                    T.address_of(s_half[0, 0]),
-                    HALF,
-                    K,
-                    G,
-                )
+            if n < NCH:
+                T.copy(Wq[weight_row_offset + n * BN + shave * HALF, 0], wq_half)
+                if scales_gm:
+                    T.copy(S[0, weight_row_offset + n * BN + shave * HALF], s_half)
+                    T.call_extern(
+                        "handle",
+                        "tl_npu_dequant_i4_gm",
+                        T.address_of(weight_tile[shave * HALF, 0]),
+                        T.address_of(wq_half[0, 0]),
+                        T.address_of(s_half[0, 0]),
+                        HALF,
+                        K,
+                        G,
+                    )
+                else:
+                    T.copy(S[weight_row_offset + n * BN + shave * HALF, 0], s_half)
+                    T.call_extern(
+                        "handle",
+                        "tl_npu_dequant_i4_block",
+                        T.address_of(weight_tile[shave * HALF, 0]),
+                        T.address_of(wq_half[0, 0]),
+                        T.address_of(s_half[0, 0]),
+                        HALF,
+                        K,
+                        G,
+                    )
             else:
-                T.copy(S[weight_row_offset + (it * tiles + tile) * BN + shave * HALF, 0], s_half)
-                T.call_extern(
-                    "handle",
-                    "tl_npu_dequant_i4_block",
-                    T.address_of(weight_tile[shave * HALF, 0]),
-                    T.address_of(wq_half[0, 0]),
-                    T.address_of(s_half[0, 0]),
-                    HALF,
-                    K,
-                    G,
-                )
+                for weight_row, column in T.grid(HALF, K // HL):
+                    for lane in T.vectorized(HL):
+                        weight_tile[shave * HALF + weight_row, column * HL + lane] = T.float16(0)
             T.sync_threads()
-            for block in T.serial(NTB // shaves):
-                T.copy(X[(block * shaves + shave) * MB, 0], activation)
-                T.gemm(activation, weight_tile, result, transpose_B=True, clear_accum=True)
-                T.copy(result, Yout[(block * shaves + shave) * MB, (it * tiles + tile) * BN])
+            if serial_shared_input:
+                for block in T.serial(NTB):
+                    if shave == 0:
+                        T.copy(X[block * MB, 0], activation)
+                        if n < NCH:
+                            T.gemm(activation, weight_tile, result, transpose_B=True, clear_accum=True)
+                            T.copy(result, Yout[row_base + block * MB, n * BN])
+                    T.sync_threads()
+            else:
+                for block in T.serial(NTB // shaves):
+                    T.copy(X[(block * shaves + shave) * MB, 0], activation)
+                    T.gemm(activation, weight_tile, result, transpose_B=True, clear_accum=True)
+                    if n < NCH:
+                        T.copy(result, Yout[row_base + (block * shaves + shave) * MB, n * BN])
 
     @T.macro
     def private_proj_phase(X, Wq, S, Yout, tile, shave, row_base):
@@ -3428,10 +3627,18 @@ def make_proj_prefill(
 
     @T.macro
     def proj_phase(X, Wq, S, Yout, tile, shave):
-        private_proj_phase(X, Wq, S, Yout, tile, shave, 0)
+        if shared_weights:
+            shared_proj_phase(X, Wq, S, Yout, tile, shave, 0)
+        else:
+            private_proj_phase(X, Wq, S, Yout, tile, shave, 0)
+
+    @T.macro
+    def shared_proj_row_base(X, Wq, S, Yout, tile, shave, row_base):
+        shared_proj_phase(X, Wq, S, Yout, tile, shave, row_base)
 
     selected_phase = (blocked_proj_phase if block_k is not None else
-                      private_proj_phase if output_row_base else shared_proj_phase if shared_weights else proj_phase)
+                      shared_proj_row_base if output_row_base and shared_weights else
+                      private_proj_phase if output_row_base else proj_phase)
     if as_block:
         return selected_phase, dict(NCH=NCH, NTB=NTB, KG=KG)
 
@@ -5564,6 +5771,7 @@ def make_prefill_model(
     BNG: int = 64,
     BND: int = 64,
     DB: int = 4,
+    BNDc: int | None = None,
     tiles: int = 3,
     shaves: int = 2,
     eps: float = 1e-6,
@@ -5584,6 +5792,14 @@ def make_prefill_model(
     moe_reuse_input: bool = False,
     output_block_k: int | None = None,
     output_mb: int | None = None,
+    gdn_in_mb: int | None = None,
+    moe_shared_gate_up_mb: int | None = None,
+    moe_shared_gate_up_bn: int | None = None,
+    moe_shared_down_mb: int | None = None,
+    moe_shared_down_bn: int | None = None,
+    moe_tile_shared_experts: bool = False,
+    moe_pipelined: bool = False,
+    moe_num_stages_gu: int = 2,
 ):
     """P5: a whole PREFILL chunk of `N` prompt tokens through `L` layers in ONE launch -- the prefill counterpart
     of `make_decode_model`. A device-side loop over the layers, `Kind[li, 0]` selecting the Gated DeltaNet or the
@@ -5645,7 +5861,8 @@ def make_prefill_model(
     NIN_pad = -(-NIN // BN1) * BN1
     NQKV_pad = -(-qs["NQKV"] // BN1) * BN1
     YW, OW = max(NIN_pad, NQKV_pad), max(VC, KO)
-    in_proj, _ = make_proj_prefill(NP=NP, M=NIN_pad, K=H, BN=BN1, MB=MB, G=G, tiles=tiles, shaves=shaves, as_block=True,
+    in_proj, _ = make_proj_prefill(NP=NP, M=NIN_pad, K=H, BN=BN1, MB=MB if gdn_in_mb is None else gdn_in_mb,
+                                   G=G, tiles=tiles, shaves=shaves, as_block=True,
                                    scales_gm=True, shared_weights=shared_projections)
     output_projection = dict(shared_weights=True, block_k=output_block_k) if output_block_k is not None else {}
     output_tokens = MB if output_mb is None else output_mb
@@ -5657,9 +5874,12 @@ def make_prefill_model(
                                 as_block=True, scales_gm=True, **output_projection)
     route_phase, rs = make_moe_route_prefill(N=NP, H=H, E=E, TOPK=TOPK, BM=BM, BNR=BNR, tiles=tiles, shaves=shaves, as_block=True)
     expert_phase, _ = make_moe_expert_prefill(
-        N=NP, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MBe, BNG=BNG, BND=BND, DB=DB, tiles=tiles, shaves=shaves,
+        N=NP, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MBe, BNG=BNG, BND=BND, DB=DB, BNDc=BNDc, tiles=tiles, shaves=shaves,
         as_block=True, slot_output=moe_slot_output, separate_shared=separate_shared_expert,
-        combine_rows=moe_combine_rows, reuse_input=moe_reuse_input
+        combine_rows=moe_combine_rows, reuse_input=moe_reuse_input,
+        shared_gate_up_mb=moe_shared_gate_up_mb, shared_gate_up_bn=moe_shared_gate_up_bn,
+        shared_down_mb=moe_shared_down_mb, shared_down_bn=moe_shared_down_bn,
+        tile_shared_experts=moe_tile_shared_experts, pipelined=moe_pipelined, num_stages_gu=moe_num_stages_gu
     )
     RR, SLOTS = rs["RR"], rs["SLOTS"]
     part_shape = (SLOTS, H) if moe_slot_output else (tiles, NP, H)
@@ -5800,6 +6020,7 @@ def make_prefill_model(
                     if "gdn" not in skip:
                         perf_phase_begin("ginp")
                         in_proj(Xs, WinQ, WinS, Ys, tile, shave)
+                        T.sync_threads()
                         ba_phase(Xs, Wba, BAs, tile, shave)
                         perf_phase_end("ginp")
                         T.sync_grid()

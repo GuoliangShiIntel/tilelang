@@ -63,7 +63,8 @@ def test_pipelined_phase_lowers_to_two_rings_over_one_loop():
     # general body: each gemm reads its ring's slot, waits, then the issuer fills use u+1
     assert re.search(r"ring_dpu_submit\(ring, u, \(&\(s_cmx\[0\]\)\), \(&\(q_cmx\[0\]\)\), ctx\.ring_slot<half>\(ring, u\), 32, 128, 64", src)
     assert re.search(r"ring_dpu_submit\(ring_1, u, \(&\(pv_cmx\[0\]\)\), \(&\(s_cmx\[0\]\)\), ctx\.ring_slot<half>\(ring_1, u\), 32, 64, 128", src)
-    assert "ctx.ring_dpu_wait(ring, u);\n  ctx.ring_fill(ring, (u + 1)," in src.replace("    ", "  ")
+    assert re.search(r"ctx\.ring_dpu_wait\(ring, u\);\s*ctx\.ring_fill\(ring, \(u \+ 1\),", src)  # indent-agnostic:
+    # o_acc/m_i's own lexical_alloc_scope (ScopeIntelNpuCmx, unrelated to this ring) adds a nesting level here
     assert src.count("ctx.ring_end(") == 2
     assert "ring: READY 8..11, FREE 12..15; ring_1: READY 16..19, FREE 20..23" in src
     assert "by reuse" not in src                                             # both live at once: no sharing

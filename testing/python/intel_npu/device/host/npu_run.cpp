@@ -325,7 +325,16 @@ int session(const std::string &dir, int tiles, int shaves) {
             continue;
           }
           std::ofstream f(path, std::ios::binary);
+          if (!f) {
+            reply("error cannot write " + file);
+            continue;
+          }
           f.write(static_cast<const char *>(it->second.dev) + off, (std::streamsize)n);
+          f.close();
+          if (!f) {
+            reply("error short write " + file);
+            continue;
+          }
           reply("ok " + std::to_string(n));
         }
       } else if (cmd == "zero") {
