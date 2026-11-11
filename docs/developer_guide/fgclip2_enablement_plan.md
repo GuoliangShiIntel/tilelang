@@ -97,7 +97,51 @@ assume npu_dsl's tile constants transfer")
   npu_dsl's hand-written C++ codegen on a specific hardware unit and need re-measuring against this backend's
   own codegen.
 
-## 3. Known traps carried over from the npu_dsl implementation (do not re-discover these the hard way)
+## 3. Status summary (2026-11-11): both towers validated end to end against REAL pretrained weights
+
+Everything below is from actually running host-sim (`clang++`, `TL_NPU_HOST_BARRIER_TIMEOUT_S=3600` for the
+multi-hundred-second real-scale runs -- the default 120 s watchdog is tuned for much smaller kernels and will
+falsely report "STUCK" on a real 27-layer pass, which is not a hang), not read off source. Real checkpoint:
+`C:\Intel\guoliang\dsl\fg-clip2-so400m\model.safetensors`. Real oracle: `C:\Intel\guoliang\dsl\fgclip2_data\
+golden_fp32.pt` (npu_dsl's own `fgclip2_e2e/golden.py` output -- the REAL model's own recorded activations, not
+a numpy re-derivation of the reference math).
+
+| Measurement | Result | Test |
+|---|---|---|
+| Layer 0 (real weights) vs the real model's own layer-0 trace, real 972-patch image | `max\|kernel-real\|/max\|real\| = 0.0073` | `test_intel_npu_fgclip2_real_layer0.py` |
+| All 27 layers (real weights) vs the real model's own post-layer-27 trace, same image | `max\|kernel-real\|/max\|real\| = 0.0352` | `test_intel_npu_fgclip2_real_27layers.py` (~1000 s) |
+| Full image embedding (27 layers + pooling head, real weights) vs the real model's pooled embedding | `max\|kernel-real\|/max\|real\| = 0.0279`, **cosine similarity = 0.9983** | `test_intel_npu_fgclip2_real_image_embedding.py` (~960 s) |
+| Full text embedding (27 layers + tail, real weights) vs the real model's pooled embedding, real caption | `max\|kernel-real\|/max\|real\| = 0.0228`, **cosine similarity = 0.9989** | `test_intel_npu_fgclip2_real_text_embedding.py` (~90 s) |
+| End-to-end CLIP similarity logit (this backend's own image AND text embeddings) vs the real model's logit for the same real (image, caption) pair | see `test_intel_npu_fgclip2_e2e_similarity.py`'s printed output (run to get the current number) | `test_intel_npu_fgclip2_e2e_similarity.py` (~1100 s) |
+
+**What this means**: both towers of the model are *enabled* in the sense that matters -- real pretrained
+weights, real input data, numbers that agree with the actual reference implementation to within fp16
+rounding error at 27-layer depth. What is **not** covered yet:
+
+* **Device validation.** This sandbox has no `GENERIC_COMPUTE_ROOT` set and no attached NPU hardware
+  (`device/runner.py` refuses immediately: `"GENERIC_COMPUTE_ROOT is not set; the device runner never
+  defaults SDK paths"`). Every number above is **host-sim** (a CPU model of the runtime surface: DMA = memcpy,
+  DPU = fp32-accumulate-rounded-to-fp16 -- it checks addressing/dealing/operand plumbing, not real hardware
+  timing or hardware-specific numerics). V5's device golden check and the "prune -> measure -> pin" performance
+  loop need real hardware access this environment does not have; nothing here should be read as a performance
+  claim.
+* **Dense head, `box` walk (boxtext_head)**: not packed/kernelled -- out of scope so far, see section 1.
+* **Weight-packing optimisations** (q prescale, k-bias drop, v-bias/LN folding, Wqkv stacking,
+  broadcast/ping-pong GEMM scheduling, real flash-attention chunk/tile sizes tuned rather than picked for CMX
+  headroom): none ported. The packer (`fgclip2_pack.py`) is deliberately the simple/literal layout this
+  backend's kernels already expect (padding only, no folding) -- correct, not fast.
+* **Retrieval metrics (R@1/R@5) over the full 32-image x 160-caption test set**: not run. Each real image's
+  27-layer pass costs roughly 1000 s of host-sim wall time (not a fast numpy call -- a real C++ host-sim
+  compiled and executed per run); a full-set benchmark would be tens of hours of host-sim time for no
+  additional correctness information beyond the single-sample checks already done above. Revisit once device
+  access exists and host-sim is no longer the only way to run the kernel.
+
+Real bugs found and fixed in this process (all recorded in repo memory for future sessions): `ROWS=8` refused
+(gemm N/K must be multiples of 16); `alloc_local` on a single-active-SHAVE kernel silently doubles CMX
+reservation; a GEMM operand with a literal leading extent of 1 is refused ("not 2-D") -- the pooling head's
+single probe row had to ride along as `BQ` (>=16) redundant identical rows instead.
+
+## 4. Known traps carried over from the npu_dsl implementation (do not re-discover these the hard way)
 
 * GELU is the **tanh approximation**, not erf -- a numpy `scipy.special.erf`-based GELU reference will disagree
   at the ~1e-3 level, large enough to look like a real bug.
