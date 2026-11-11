@@ -483,6 +483,43 @@ def fgclip2_layers_reference(x, weights_per_layer, heads: int, head_dim: int, ep
     return x
 
 
+def pooling_head_reference(x_post_ln, map_q, map_wk, map_bk, map_wv, map_bv, map_wo, map_bo, hln_w, hln_b,
+                           map_w1, map_b1, map_w2, map_b2, heads: int, head_dim: int, valid: int, eps: float = 1e-6):
+    """numpy oracle of `make_fgclip2_pooling_head_ddr`: `reference.py::vision`'s tail (one learned query attends
+    over the `valid` real patches of the already-post-LayerNorm `x_post_ln`, then out_proj + LN + GELU-MLP +
+    residual). Returns the `[hidden]` image embedding."""
+    import numpy as np
+
+    def f16(a):
+        return a.astype(np.float16).astype(np.float64)
+
+    def layer_norm(v, w, b):
+        mu = v.mean(-1, keepdims=True)
+        var = ((v - mu) ** 2).mean(-1, keepdims=True)
+        return (v - mu) / np.sqrt(var + eps) * w + b
+
+    def gelu_tanh(v):
+        return 0.5 * v * (1.0 + np.tanh(GELU_TANH_C * (v + 0.044715 * v ** 3)))
+
+    x = x_post_ln[:valid].astype(np.float64)
+    k = f16(x) @ f16(map_wk).T + map_bk.astype(np.float64).reshape(-1)
+    v = f16(x) @ f16(map_wv).T + map_bv.astype(np.float64).reshape(-1)
+    d = head_dim
+    kh = k.reshape(valid, heads, d).transpose(1, 0, 2)
+    vh = v.reshape(valid, heads, d).transpose(1, 0, 2)
+    q = map_q.astype(np.float64).reshape(heads, d)
+    s = np.einsum("hd,hvd->hv", f16(q), f16(kh)) * d ** -0.5
+    s = s - s.max(-1, keepdims=True)
+    p = np.exp(s)
+    p /= p.sum(-1, keepdims=True)
+    o = np.einsum("hv,hvd->hd", f16(p), f16(vh)).reshape(1, -1)
+    a = f16(o) @ f16(map_wo).T + map_bo.astype(np.float64).reshape(-1)
+    h = layer_norm(a, hln_w.astype(np.float64).reshape(-1), hln_b.astype(np.float64).reshape(-1))
+    mlp = f16(gelu_tanh(f16(h) @ f16(map_w1).T + map_b1.astype(np.float64).reshape(-1))) @ f16(map_w2).T \
+        + map_b2.astype(np.float64).reshape(-1)
+    return (a + mlp)[0]
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # V1, completed: real patch counts (DDR-resident residual stream, row-block + weight-tile + key-chunk tiling)
 # ---------------------------------------------------------------------------------------------------------------------
@@ -686,3 +723,214 @@ def make_fgclip2_encoder_layer_ddr(rows: int, valid: int, hidden: int, heads: in
             T.sync_threads()
 
     return layer
+
+
+def make_fgclip2_encoder_layers_ddr(n_layers: int, rows: int, valid: int, hidden: int, heads: int, hd_pad: int,
+                                    inter_pad: int, BR: int = 32, TN: int = 32, BQ: int = 64, C: int = 128,
+                                    eps: float = 1e-6):
+    """`n_layers` copies of `make_fgclip2_encoder_layer_ddr`'s single (DDR-resident, real-patch-count) layer, in
+    ONE launch, as a device-side loop over `FGCLIP2_TABLE_COLS` (the same table/`T.ddr_view` design as
+    `make_fgclip2_encoder_layers_v1`, just over the real-scale single-layer body instead of the small
+    fully-resident one)."""
+    QW = heads * hd_pad
+    assert hidden % TN == 0 and QW % TN == 0 and inter_pad % TN == 0 and TN % 16 == 0
+    assert rows % BR == 0 and rows % BQ == 0 and rows % C == 0 and BR % 16 == 0 and BQ % 16 == 0 and C % 16 == 0
+    assert 0 < valid <= rows
+    NCOL = len(FGCLIP2_TABLE_COLS)
+    col = {n: i for i, n in enumerate(FGCLIP2_TABLE_COLS)}
+
+    @T.prim_func
+    def layers(Hio: T.Tensor((rows, hidden), T.float32), Table: T.Tensor((n_layers, NCOL), T.int64),
+              Xn: T.Tensor((rows, hidden), T.float16), Qp: T.Tensor((rows, QW), T.float16),
+              Kp: T.Tensor((rows, QW), T.float16), Vp: T.Tensor((rows, QW), T.float16),
+              Ao: T.Tensor((rows, QW), T.float16), Act: T.Tensor((rows, inter_pad), T.float16)):
+        with T.Kernel(1, threads=2) as tile:
+            shave = T.get_thread_binding()
+            ln1w = T.alloc_shared((1, hidden), T.float16)
+            ln1b = T.alloc_shared((1, hidden), T.float16)
+            ln2w = T.alloc_shared((1, hidden), T.float16)
+            ln2b = T.alloc_shared((1, hidden), T.float16)
+            h_blk = T.alloc_shared((BR, hidden), T.float32)
+            x_blk = T.alloc_shared((BR, hidden), T.float16)
+            x_h = T.alloc_shared((BR, hidden), T.float16)
+            x_q = T.alloc_shared((BR, QW), T.float16)
+            x_i = T.alloc_shared((BR, inter_pad), T.float16)
+            w_h = T.alloc_shared((TN, hidden), T.float16)
+            w_q = T.alloc_shared((TN, QW), T.float16)
+            w_i = T.alloc_shared((TN, inter_pad), T.float16)
+            b_q = T.alloc_shared((1, QW), T.float16)
+            b_h = T.alloc_shared((1, hidden), T.float16)
+            b_i = T.alloc_shared((1, inter_pad), T.float16)
+            y_tile = T.alloc_shared((BR, TN), T.float16)
+            h_tile = T.alloc_shared((BR, TN), T.float32)
+            qb = T.alloc_shared((BQ, hd_pad), T.float16)
+            kc = T.alloc_shared((C, hd_pad), T.float16)
+            vraw = T.alloc_shared((C, hd_pad), T.float16)
+            vc = T.alloc_shared((hd_pad, C), T.float16)
+            sc = T.alloc_shared((BQ, C), T.float16)
+            pv = T.alloc_shared((BQ, hd_pad), T.float16)
+            oacc = T.alloc_shared((BQ, hd_pad), T.float32)
+            ob = T.alloc_shared((BQ, hd_pad), T.float16)
+            m_i = T.alloc_shared((BQ,), T.float32)
+            l_i = T.alloc_shared((BQ,), T.float32)
+            m_new = T.alloc_shared((BQ,), T.float32)
+            corr = T.alloc_shared((BQ,), T.float32)
+
+            if shave == 0:
+                for li in T.serial(n_layers):
+                    Ln1W = T.ddr_view(Table[li, col["Ln1W"]], (1, hidden), T.float16)
+                    Ln1B = T.ddr_view(Table[li, col["Ln1B"]], (1, hidden), T.float16)
+                    Wq = T.ddr_view(Table[li, col["Wq"]], (QW, hidden), T.float16)
+                    Bq = T.ddr_view(Table[li, col["Bq"]], (1, QW), T.float16)
+                    Wk = T.ddr_view(Table[li, col["Wk"]], (QW, hidden), T.float16)
+                    Bk = T.ddr_view(Table[li, col["Bk"]], (1, QW), T.float16)
+                    Wv = T.ddr_view(Table[li, col["Wv"]], (QW, hidden), T.float16)
+                    Bv = T.ddr_view(Table[li, col["Bv"]], (1, QW), T.float16)
+                    Wo = T.ddr_view(Table[li, col["Wo"]], (hidden, QW), T.float16)
+                    Bo = T.ddr_view(Table[li, col["Bo"]], (1, hidden), T.float16)
+                    Ln2W = T.ddr_view(Table[li, col["Ln2W"]], (1, hidden), T.float16)
+                    Ln2B = T.ddr_view(Table[li, col["Ln2B"]], (1, hidden), T.float16)
+                    W1 = T.ddr_view(Table[li, col["W1"]], (inter_pad, hidden), T.float16)
+                    B1 = T.ddr_view(Table[li, col["B1"]], (1, inter_pad), T.float16)
+                    W2 = T.ddr_view(Table[li, col["W2"]], (hidden, inter_pad), T.float16)
+                    B2 = T.ddr_view(Table[li, col["B2"]], (1, hidden), T.float16)
+
+                    layernorm_bias_ddr(Hio, Ln1W, Ln1B, Xn, h_blk, ln1w, ln1b, x_blk, rows, hidden, BR, eps)
+                    linear_bias_ddr(Xn, Wq, Bq, Qp, x_h, b_q, y_tile, w_h, rows, QW, hidden, BR, TN, False)
+                    linear_bias_ddr(Xn, Wk, Bk, Kp, x_h, b_q, y_tile, w_h, rows, QW, hidden, BR, TN, False)
+                    linear_bias_ddr(Xn, Wv, Bv, Vp, x_h, b_q, y_tile, w_h, rows, QW, hidden, BR, TN, False)
+                    mha_chunked_ddr(Qp, Kp, Vp, Ao, qb, kc, vraw, vc, sc, pv, oacc, ob, m_i, l_i, m_new, corr,
+                                   rows, valid, heads, hd_pad, BQ, C, hd_pad ** -0.5)
+                    linear_bias_resid_ddr(Ao, Wo, Bo, Hio, x_q, b_h, y_tile, w_q, h_tile, rows, hidden, QW, BR, TN)
+                    layernorm_bias_ddr(Hio, Ln2W, Ln2B, Xn, h_blk, ln2w, ln2b, x_blk, rows, hidden, BR, eps)
+                    linear_bias_ddr(Xn, W1, B1, Act, x_h, b_i, y_tile, w_h, rows, inter_pad, hidden, BR, TN, True)
+                    linear_bias_resid_ddr(Act, W2, B2, Hio, x_i, b_h, y_tile, w_i, h_tile, rows, hidden, inter_pad, BR, TN)
+            T.sync_threads()
+
+    return layers
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# V2: the attention-pooling head (one learned "probe" query attends over every patch) -> the image embedding
+# ---------------------------------------------------------------------------------------------------------------------
+@T.macro
+def mha_probe_ddr(Qddr, Kddr, Vddr, Oddr, qb, kc, vraw, vc, sc, pv, oacc, ob, m_i, l_i, m_new, corr,
+                  valid: int, heads: int, D: int, C: int, scale: float):
+    """Single-query flash attention (the pooling head's probe) over `heads`, keys chunked (`C`) from DDR-resident
+    K/V (masked to `valid` real patches). Qddr/Oddr are `[1, heads*D]`; Kddr/Vddr `[rows, heads*D]` (`rows` a
+    multiple of `C`, read only up to `valid`'s chunk boundary)."""
+    nch = (valid + C - 1) // C
+    for h in range(heads):
+        T.copy(Qddr[0, h * D], qb)
+        m_i[0] = T.float32(-1e30)
+        l_i[0] = T.float32(0)
+        for d in T.serial(D):
+            oacc[0, d] = T.float32(0)
+        for c in T.serial(nch):
+            c0 = c * C
+            cc = T.min(C, valid - c0)
+            T.copy(Kddr[c0, h * D], kc)
+            T.copy(Vddr[c0, h * D], vraw)
+            for j in T.serial(C):
+                for d in T.serial(D):
+                    vc[d, j] = vraw[j, d]
+            T.gemm(qb, kc, sc, transpose_B=True, clear_accum=True)
+            m_new[0] = m_i[0]
+            for j in T.serial(C):
+                if j < cc:
+                    m_new[0] = T.max(m_new[0], T.cast(sc[0, j], T.float32) * scale)
+            corr[0] = T.exp(m_i[0] - m_new[0])
+            l_i[0] = l_i[0] * corr[0]
+            for j in T.serial(C):
+                if j < cc:
+                    p = T.exp(T.cast(sc[0, j], T.float32) * scale - m_new[0])
+                    sc[0, j] = T.cast(p, T.float16)
+                    l_i[0] = l_i[0] + p
+                else:
+                    sc[0, j] = T.float16(0)
+            m_i[0] = m_new[0]
+            T.gemm(sc, vc, pv, transpose_B=True, clear_accum=True)
+            for d in T.serial(D):
+                oacc[0, d] = oacc[0, d] * corr[0] + T.cast(pv[0, d], T.float32)
+        for d in T.serial(D):
+            ob[0, d] = T.cast(oacc[0, d] / l_i[0], T.float16)
+        T.copy(ob[0:1, 0:D], Oddr[0, h * D])
+
+
+def make_fgclip2_pooling_head_ddr(rows: int, valid: int, hidden: int, heads: int, hd_pad: int, inter_pad: int,
+                                  BR: int = 32, TN: int = 32, C: int = 128, eps: float = 1e-6):
+    """`reference.py::vision`'s tail: `x = post_layernorm(x)` (DDR-resident, real patch count) -> the
+    attention-pooling head (one constant query `MapQ`, precomputed on the host -- `fgclip2_pack.pack_vision_head`
+    -- attends over every patch) -> out_proj -> LayerNorm -> GELU-MLP -> residual -> the image embedding `Emb`
+    (fp32, `[1, hidden]`). The post-attention stages (out_proj/LN/MLP) are a single row but STILL go through the
+    DDR-tiled macros (`BR=1`/`TN`-tiled weight reads) -- a first attempt loaded the whole `[inter_pad, hidden]`
+    fc1 matrix resident to keep the row-count-1 code simple and blew CMX by ~8x (a weight matrix does not get
+    smaller just because there is one row of activation); fixed by tiling the weight the same way every other
+    stage does, with `BR=1` row-blocking (a 1-iteration loop, not a special case)."""
+    QW = heads * hd_pad
+    assert hidden % TN == 0 and QW % TN == 0 and inter_pad % TN == 0 and TN % 16 == 0
+    assert rows % BR == 0 and rows % C == 0 and BR % 16 == 0 and C % 16 == 0
+    assert 0 < valid <= rows
+
+    @T.prim_func
+    def head(Hio: T.Tensor((rows, hidden), T.float32), PostLnW: T.Tensor((1, hidden), T.float16),
+             PostLnB: T.Tensor((1, hidden), T.float16), MapQ: T.Tensor((1, QW), T.float16),
+             MapWk: T.Tensor((QW, hidden), T.float16), MapBk: T.Tensor((1, QW), T.float16),
+             MapWv: T.Tensor((QW, hidden), T.float16), MapBv: T.Tensor((1, QW), T.float16),
+             MapWo: T.Tensor((hidden, QW), T.float16), MapBo: T.Tensor((1, hidden), T.float16),
+             HLnW: T.Tensor((1, hidden), T.float16), HLnB: T.Tensor((1, hidden), T.float16),
+             MapW1: T.Tensor((inter_pad, hidden), T.float16), MapB1: T.Tensor((1, inter_pad), T.float16),
+             MapW2: T.Tensor((hidden, inter_pad), T.float16), MapB2: T.Tensor((1, hidden), T.float16),
+             Xn: T.Tensor((rows, hidden), T.float16), Ks: T.Tensor((rows, QW), T.float16),
+             Vs: T.Tensor((rows, QW), T.float16), Ao: T.Tensor((1, QW), T.float16),
+             ALn: T.Tensor((1, hidden), T.float16), Act1: T.Tensor((1, inter_pad), T.float16),
+             Emb: T.Tensor((1, hidden), T.float32)):
+        with T.Kernel(1, threads=2) as tile:
+            shave = T.get_thread_binding()
+            ln_w = T.alloc_shared((1, hidden), T.float16)
+            ln_b = T.alloc_shared((1, hidden), T.float16)
+            h_blk = T.alloc_shared((BR, hidden), T.float32)
+            x_blk = T.alloc_shared((BR, hidden), T.float16)
+            x_h = T.alloc_shared((BR, hidden), T.float16)
+            w_h = T.alloc_shared((TN, hidden), T.float16)
+            b_q = T.alloc_shared((1, QW), T.float16)
+            y_tile = T.alloc_shared((BR, TN), T.float16)
+            qb = T.alloc_shared((1, hd_pad), T.float16)
+            kc = T.alloc_shared((C, hd_pad), T.float16)
+            vraw = T.alloc_shared((C, hd_pad), T.float16)
+            vc = T.alloc_shared((hd_pad, C), T.float16)
+            sc = T.alloc_shared((1, C), T.float16)
+            pv = T.alloc_shared((1, hd_pad), T.float16)
+            oacc = T.alloc_shared((1, hd_pad), T.float32)
+            ob = T.alloc_shared((1, hd_pad), T.float16)
+            m_i = T.alloc_shared((1,), T.float32)
+            l_i = T.alloc_shared((1,), T.float32)
+            m_new = T.alloc_shared((1,), T.float32)
+            corr = T.alloc_shared((1,), T.float32)
+            # single-row (BR=1) tail stages: their own small buffers (shapes differ from the BR-row-block ones above)
+            x_1h = T.alloc_shared((1, hidden), T.float16)
+            x_1q = T.alloc_shared((1, QW), T.float16)
+            x_1i = T.alloc_shared((1, inter_pad), T.float16)
+            w_1h = T.alloc_shared((TN, hidden), T.float16)
+            w_1q = T.alloc_shared((TN, QW), T.float16)
+            w_1i = T.alloc_shared((TN, inter_pad), T.float16)
+            b_1h = T.alloc_shared((1, hidden), T.float16)
+            b_1i = T.alloc_shared((1, inter_pad), T.float16)
+            y_1tile = T.alloc_shared((1, TN), T.float16)
+            h_1tile = T.alloc_shared((1, TN), T.float32)
+            h_1blk = T.alloc_shared((1, hidden), T.float32)
+            x_1blk = T.alloc_shared((1, hidden), T.float16)
+
+            if shave == 0:
+                layernorm_bias_ddr(Hio, PostLnW, PostLnB, Xn, h_blk, ln_w, ln_b, x_blk, rows, hidden, BR, eps)
+                linear_bias_ddr(Xn, MapWk, MapBk, Ks, x_h, b_q, y_tile, w_h, rows, QW, hidden, BR, TN, False)
+                linear_bias_ddr(Xn, MapWv, MapBv, Vs, x_h, b_q, y_tile, w_h, rows, QW, hidden, BR, TN, False)
+                mha_probe_ddr(MapQ, Ks, Vs, Ao, qb, kc, vraw, vc, sc, pv, oacc, ob, m_i, l_i, m_new, corr,
+                             valid, heads, hd_pad, C, hd_pad ** -0.5)
+                linear_bias_resid_ddr(Ao, MapWo, MapBo, Emb, x_1q, b_1h, y_1tile, w_1q, h_1tile, 1, hidden, QW, 1, TN)
+                layernorm_bias_ddr(Emb, HLnW, HLnB, ALn, h_1blk, ln_w, ln_b, x_1blk, 1, hidden, 1, eps)
+                linear_bias_ddr(ALn, MapW1, MapB1, Act1, x_1h, b_1i, y_1tile, w_1h, 1, inter_pad, hidden, 1, TN, True)
+                linear_bias_resid_ddr(Act1, MapW2, MapB2, Emb, x_1i, b_1h, y_1tile, w_1i, h_1tile, 1, hidden, inter_pad, 1, TN)
+            T.sync_threads()
+
+    return head
