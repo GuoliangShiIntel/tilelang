@@ -112,7 +112,7 @@ a numpy re-derivation of the reference math).
 | All 27 layers (real weights) vs the real model's own post-layer-27 trace, same image | `max\|kernel-real\|/max\|real\| = 0.0352` | `test_intel_npu_fgclip2_real_27layers.py` (~1000 s) |
 | Full image embedding (27 layers + pooling head, real weights) vs the real model's pooled embedding | `max\|kernel-real\|/max\|real\| = 0.0279`, **cosine similarity = 0.9983** | `test_intel_npu_fgclip2_real_image_embedding.py` (~960 s) |
 | Full text embedding (27 layers + tail, real weights) vs the real model's pooled embedding, real caption | `max\|kernel-real\|/max\|real\| = 0.0228`, **cosine similarity = 0.9989** | `test_intel_npu_fgclip2_real_text_embedding.py` (~90 s) |
-| End-to-end CLIP similarity logit (this backend's own image AND text embeddings) vs the real model's logit for the same real (image, caption) pair | see `test_intel_npu_fgclip2_e2e_similarity.py`'s printed output (run to get the current number) | `test_intel_npu_fgclip2_e2e_similarity.py` (~1100 s) |
+| End-to-end CLIP similarity logit (this backend's own image AND text embeddings) vs the real model's logit for the same real (image, caption) pair | **kernel = 8.2944, real model = 8.1210, abs diff = 0.17** (on a scale where this real pair's true logit is a strongly positive ~8.1 -- a confident correct match, reproduced end to end) | `test_intel_npu_fgclip2_e2e_similarity.py` (~1225 s) |
 
 **What this means**: both towers of the model are *enabled* in the sense that matters -- real pretrained
 weights, real input data, numbers that agree with the actual reference implementation to within fp16
