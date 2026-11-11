@@ -59,8 +59,18 @@ assume npu_dsl's tile constants transfer")
   K=16 must be multiples of 16" -- the attention GEMMs use `rows` as their N or K dimension, not just `hidden`/
   `head_dim`); fixed by using `ROWS=16`. See
   [fgclip2_tilelang_pipeline_explained.md](fgclip2_tilelang_pipeline_explained.md) for the full pipeline
-  walkthrough with real captured TIR/C++ from this exact kernel. V1 (real model shapes, 27-layer device loop)
-  has not been started.
+  walkthrough with real captured TIR/C++ from this exact kernel.
+
+  **V1 progress (2026-11-11): the channel-width half is done, the token-count half is not.**
+  `make_fgclip2_encoder_layer_v1` (same file) runs one layer at real hidden=1152 / 16 heads of hd_pad=80 /
+  inter_pad=4320, with every linear layer streaming TN-row weight tiles from DDR (`linear_bias_tiled`) instead
+  of loading the whole matrix resident -- the real weight matrices no longer fit CMX whole. Host-sim validated,
+  stable over repeats (`test_intel_npu_fgclip2_v1.py`). Real bug found and fixed: every scratch buffer was
+  `alloc_local` (reserved PER SHAVE even though only `shave==0` uses any of it), which doubled the CMX
+  footprint and blew the budget (1,995,136 B needed > 1,473,536 B available) -- switched to `alloc_shared`
+  (one copy per tile). Still open for V1: the device-side 27-layer loop with a weight table (`T.ddr_view`,
+  reusing the GDN_TABLE pattern from Qwen's M5), and real patch/token counts (which will need attention
+  chunking again, since V0/V1's plain softmax assumes all keys resident at once).
 * **V1: 27-layer vision tower, single launch, no pooling/dense head.** Device-side layer loop (weight table),
   patch embedding + position embedding as kernel inputs (host-prepared), fp32 residual stream in DDR. Oracle:
   `reference.py::vision(..., trace=False)` up to `post_layernorm`, no pooling head yet.
