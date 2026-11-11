@@ -357,3 +357,127 @@ def make_fgclip2_encoder_layer_v1(rows: int, hidden: int, heads: int, hd_pad: in
             T.sync_threads()
 
     return layer
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# V1, continued: a device-side loop over N layers through a weight table (the other half of V1 -- see
+# fgclip2_enablement_plan.md). Reuses Qwen's layer-table design (`kernels.py`'s `TABLE_COLS`/`GDN_TABLE`/
+# `T.ddr_view`, `make_decode_model`) rather than re-deriving it: one `Table[n_layers, NCOL]` of device
+# addresses, the host fills one row per layer, the kernel loops `for li in T.serial(n_layers):` and reads
+# `T.ddr_view(Table[li, col["Wq"]], ...)` for that layer's weights -- a static Python unroll of 27 copies of
+# the layer body would also work but bloats `.text` for no benefit (every layer is the identical op sequence,
+# only the weight addresses differ), which is exactly why Qwen's M5 did it this way for its 40 layers.
+# ---------------------------------------------------------------------------------------------------------------------
+FGCLIP2_TABLE_COLS = ["Ln1W", "Ln1B", "Wq", "Bq", "Wk", "Bk", "Wv", "Bv", "Wo", "Bo", "Ln2W", "Ln2B", "W1", "B1", "W2", "B2"]
+
+
+def make_fgclip2_encoder_layers_v1(n_layers: int, rows: int, hidden: int, heads: int, hd_pad: int, inter_pad: int,
+                                   tn: int = 32, eps: float = 1e-6):
+    """`n_layers` copies of `make_fgclip2_encoder_layer_v1`'s single layer, in ONE launch, as a device-side loop
+    over a weight table (`Table[n_layers, len(FGCLIP2_TABLE_COLS)]`, one int64 device address per cell, host-filled
+    the way `Session.address` would for a real model). Every layer shares the same CMX scratch (declared once,
+    outside the loop) and reads its own row's `T.ddr_view`s inside it. Still: real channel widths (hidden=1152,
+    heads*hd_pad=1280, inter_pad=4320), small `rows`, one working SHAVE, plain (non-chunked) softmax -- real
+    patch/token counts and the attention-pooling/dense heads are later increments."""
+    QW = heads * hd_pad
+    assert hidden % tn == 0 and QW % tn == 0 and inter_pad % tn == 0 and tn % 16 == 0 and rows % 16 == 0
+    NCOL = len(FGCLIP2_TABLE_COLS)
+    col = {n: i for i, n in enumerate(FGCLIP2_TABLE_COLS)}
+
+    @T.prim_func
+    def layers(Hio: T.Tensor((rows, hidden), T.float32), Table: T.Tensor((n_layers, NCOL), T.int64)):
+        with T.Kernel(1, threads=2) as tile:
+            shave = T.get_thread_binding()
+            h32 = T.alloc_shared((rows, hidden), T.float32)
+            xn = T.alloc_shared((rows, hidden), T.float16)
+            ln1w = T.alloc_shared((1, hidden), T.float16)
+            ln1b = T.alloc_shared((1, hidden), T.float16)
+            ln2w = T.alloc_shared((1, hidden), T.float16)
+            ln2b = T.alloc_shared((1, hidden), T.float16)
+            bq = T.alloc_shared((1, QW), T.float16)
+            bk = T.alloc_shared((1, QW), T.float16)
+            bv = T.alloc_shared((1, QW), T.float16)
+            bo = T.alloc_shared((1, hidden), T.float16)
+            b1 = T.alloc_shared((1, inter_pad), T.float16)
+            b2 = T.alloc_shared((1, hidden), T.float16)
+            qp = T.alloc_shared((rows, QW), T.float16)
+            kp = T.alloc_shared((rows, QW), T.float16)
+            vp = T.alloc_shared((rows, QW), T.float16)
+            ao = T.alloc_shared((rows, QW), T.float16)
+            aop = T.alloc_shared((rows, hidden), T.float16)
+            act = T.alloc_shared((rows, inter_pad), T.float16)
+            mlp_out = T.alloc_shared((rows, hidden), T.float16)
+            w_tile_h = T.alloc_shared((tn, hidden), T.float16)
+            w_tile_q = T.alloc_shared((tn, QW), T.float16)
+            w_tile_i = T.alloc_shared((tn, inter_pad), T.float16)
+            y_tile = T.alloc_shared((rows, tn), T.float16)
+            s_cmx = T.alloc_shared((rows, rows), T.float16)
+            qh = T.alloc_shared((rows, hd_pad), T.float16)
+            kh = T.alloc_shared((rows, hd_pad), T.float16)
+            vth = T.alloc_shared((hd_pad, rows), T.float16)
+            oh = T.alloc_shared((rows, hd_pad), T.float16)
+            mx = T.alloc_shared((1,), T.float32)
+            sm = T.alloc_shared((1,), T.float32)
+
+            if shave == 0:
+                T.copy(Hio[0, 0], h32)
+                for li in T.serial(n_layers):
+                    Ln1W = T.ddr_view(Table[li, col["Ln1W"]], (1, hidden), T.float16)
+                    Ln1B = T.ddr_view(Table[li, col["Ln1B"]], (1, hidden), T.float16)
+                    Wq = T.ddr_view(Table[li, col["Wq"]], (QW, hidden), T.float16)
+                    Bq = T.ddr_view(Table[li, col["Bq"]], (1, QW), T.float16)
+                    Wk = T.ddr_view(Table[li, col["Wk"]], (QW, hidden), T.float16)
+                    Bk = T.ddr_view(Table[li, col["Bk"]], (1, QW), T.float16)
+                    Wv = T.ddr_view(Table[li, col["Wv"]], (QW, hidden), T.float16)
+                    Bv = T.ddr_view(Table[li, col["Bv"]], (1, QW), T.float16)
+                    Wo = T.ddr_view(Table[li, col["Wo"]], (hidden, QW), T.float16)
+                    Bo = T.ddr_view(Table[li, col["Bo"]], (1, hidden), T.float16)
+                    Ln2W = T.ddr_view(Table[li, col["Ln2W"]], (1, hidden), T.float16)
+                    Ln2B = T.ddr_view(Table[li, col["Ln2B"]], (1, hidden), T.float16)
+                    W1 = T.ddr_view(Table[li, col["W1"]], (inter_pad, hidden), T.float16)
+                    B1 = T.ddr_view(Table[li, col["B1"]], (1, inter_pad), T.float16)
+                    W2 = T.ddr_view(Table[li, col["W2"]], (hidden, inter_pad), T.float16)
+                    B2 = T.ddr_view(Table[li, col["B2"]], (1, hidden), T.float16)
+
+                    T.copy(Ln1W[0, 0], ln1w)
+                    T.copy(Ln1B[0, 0], ln1b)
+                    T.copy(Ln2W[0, 0], ln2w)
+                    T.copy(Ln2B[0, 0], ln2b)
+                    T.copy(Bq[0, 0], bq)
+                    T.copy(Bk[0, 0], bk)
+                    T.copy(Bv[0, 0], bv)
+                    T.copy(Bo[0, 0], bo)
+                    T.copy(B1[0, 0], b1)
+                    T.copy(B2[0, 0], b2)
+
+                    for r in T.serial(rows):
+                        layernorm_bias_row(h32, ln1w, ln1b, xn, r, hidden, eps)
+                    linear_bias_tiled(xn, Wq, bq, qp, w_tile_h, y_tile, rows, QW, hidden, tn, False)
+                    linear_bias_tiled(xn, Wk, bk, kp, w_tile_h, y_tile, rows, QW, hidden, tn, False)
+                    linear_bias_tiled(xn, Wv, bv, vp, w_tile_h, y_tile, rows, QW, hidden, tn, False)
+                    mha_full(qp, kp, vp, ao, s_cmx, qh, kh, vth, oh, mx, sm, rows, heads, hd_pad, hd_pad ** -0.5)
+                    linear_bias_tiled(ao, Wo, bo, aop, w_tile_q, y_tile, rows, hidden, QW, tn, False)
+                    residual_add_fp32(h32, aop, rows, hidden)
+
+                    for r in T.serial(rows):
+                        layernorm_bias_row(h32, ln2w, ln2b, xn, r, hidden, eps)
+                    linear_bias_tiled(xn, W1, b1, act, w_tile_h, y_tile, rows, inter_pad, hidden, tn, True)
+                    linear_bias_tiled(act, W2, b2, mlp_out, w_tile_i, y_tile, rows, hidden, inter_pad, tn, False)
+                    residual_add_fp32(h32, mlp_out, rows, hidden)
+
+                T.copy(h32, Hio[0, 0])
+            T.sync_threads()
+
+    return layers
+
+
+def fgclip2_layers_reference(x, weights_per_layer, heads: int, head_dim: int, eps: float = 1e-6):
+    """numpy oracle of `make_fgclip2_encoder_layers_v1`: `encoder_layer_reference` applied once per entry of
+    `weights_per_layer` (each a dict with keys ln1w/ln1b/wq/bq/wk/bk/wv/bv/wo/bo/ln2w/ln2b/w1/b1/w2/b2), in
+    order, each layer's output feeding the next -- the same thing the device-side loop does one `Table` row
+    at a time."""
+    for p in weights_per_layer:
+        x = encoder_layer_reference(x, p["ln1w"], p["ln1b"], p["wq"], p["bq"], p["wk"], p["bk"], p["wv"], p["bv"],
+                                    p["wo"], p["bo"], p["ln2w"], p["ln2b"], p["w1"], p["b1"], p["w2"], p["b2"],
+                                    heads, head_dim, eps)
+    return x
