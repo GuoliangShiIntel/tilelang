@@ -69,10 +69,13 @@ def _problem(seed: int = 0):
 
 
 def _sim(p, slot_output=False, separate_shared=False, reuse_input=False, expert_mb=MB, shared_gate_up_mb=None,
-        shared_gate_up_bn=None, shared_down_mb=None, shared_down_bn=None, bndc=None, pipelined=False):
+    shared_gate_up_bn=None, shared_down_mb=None, shared_down_bn=None, bndc=None, pipelined=False,
+    tile_shared_experts=False):
     low = _lower(make_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=expert_mb, BNG=BNG, BND=BND,
                                          tiles=TILES, shaves=SHAVES, reuse_input=reuse_input, BNDc=bndc,
                                          pipelined=pipelined,
+                                         tile_shared_experts=tile_shared_experts,
+                                         combine_rows=4 if tile_shared_experts else 1,
                                          **({"slot_output": True} if slot_output else {}),
                                          **({"separate_shared": True} if separate_shared else {}),
                                          **({"shared_gate_up_mb": shared_gate_up_mb,
@@ -186,6 +189,57 @@ def test_moe_extern_gate_up_dequant_is_async_only_when_enabled():
     async_source = _lower(func, dpu_overlap=True).source
     assert "ctx.dpu_matmul_start(" not in serial
     assert re.search(r"ctx\.dpu_matmul_start\([^\n]*, 4, 32, 512,", async_source)
+
+
+@pytest.mark.parametrize("release_sync", [False, True])
+@pytest.mark.parametrize("fused_activation", [False, True])
+@pytest.mark.parametrize("dynamic_rows", [False, True])
+def test_shared_dequant_dpu_overlap_requires_a_release_rendezvous(release_sync, fused_activation, dynamic_rows):
+    @T.prim_func
+    def cooperative_weights(X: T.Tensor((2, 512), T.float16),
+                            Q: T.Tensor((3, 64, 256), T.uint8),
+                            S: T.Tensor((3, 4, 64), T.float16),
+                            Limit: T.Tensor((1,), T.int32),
+                            Y: T.Tensor((3, 4, 64), T.float16)):
+        with T.Kernel(1, threads=2):
+            shave = T.get_thread_binding()
+            activation = T.alloc_local((2, 512), T.float16)
+            packed = T.alloc_local((32, 256), T.uint8)
+            scales = T.alloc_local((4, 32), T.float16)
+            weights = T.alloc_shared((64, 512), T.float16)
+            result = T.alloc_local((2, 64), T.float16)
+            limit = T.alloc_local((1,), T.int32)
+            T.copy(X, activation)
+            T.copy(Limit, limit)
+            for block in T.serial(3):
+                T.copy(Q[block, shave * 32, 0], packed)
+                T.copy(S[block, 0, shave * 32], scales)
+                T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(weights[shave * 32, 0]),
+                              T.address_of(packed[0, 0]), T.address_of(scales[0, 0]), 32, 512, 128, 32)
+                T.sync_threads()
+                if dynamic_rows:
+                    T.gemm_rows(activation, weights, result, limit[0])
+                else:
+                    T.gemm(activation, weights, result, transpose_B=True, clear_accum=True)
+                if fused_activation:
+                    for row, column in T.grid(2, 64):
+                        Y[block, shave * 2 + row, column] = result[row, column] * T.sigmoid(result[row, column])
+                else:
+                    T.copy(result, Y[block, shave * 2, 0])
+                if release_sync:
+                    T.sync_threads()
+
+    source = _lower(cooperative_weights, dpu_overlap=True).source
+    assert ("ctx.dpu_matmul_start(" in source) == release_sync
+    assert ("ctx.sync_tile_dpu_async();" in source) == release_sync
+    assert ("ctx.dma_load_async(" in source) == release_sync
+    if release_sync:
+        assert "packed = ctx.alloc<uint8_t>(16384)" in source
+        with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off",
+                                               "tl.intel_npu.dpu_overlap": True}):
+            limited = lowering.lower(cooperative_weights, target={"kind": "intel_npu", "cmx_bytes": 230000}).source
+        assert "packed = ctx.alloc<uint8_t>(8192)" in limited
+        assert "ctx.dma_load_async(" in limited
 
 
 def _overlap_kernel(chunks=3, rewrite_input=False, escape=False, dependent_index=False):
@@ -420,6 +474,22 @@ def test_separate_shared_matches_grouped_output(reference_blocks):
     actual = _sim(problem, slot_output=True, separate_shared=True, **blocks)
     assert np.isfinite(actual).all()
     assert np.abs(actual - expected).max() / max(float(np.abs(expected).max()), 1e-6) < 1e-3
+
+
+@needs_cxx
+@pytest.mark.parametrize("seed", [0, 9])
+@pytest.mark.parametrize("edge_routing", [False, True])
+def test_tile_shared_experts_match_private_weight_tiles(seed, edge_routing):
+    problem = _problem(seed)
+    if edge_routing:
+        problem["off"][1:3] = 1
+        problem["off"][3:E + 1] = N * TOPK
+        counts = np.diff(problem["off"][:E + 1])
+        assert 0 in counts and 1 in counts and counts.max() > MB
+    expected = _sim(problem, slot_output=True, separate_shared=True)
+    actual = _sim(problem, slot_output=True, separate_shared=True, tile_shared_experts=True)
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
 
 
 def test_separate_shared_requires_slots_and_complete_blocks():

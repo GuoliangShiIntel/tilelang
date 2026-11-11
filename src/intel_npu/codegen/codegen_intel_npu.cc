@@ -396,6 +396,10 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op, std::ostream &os) {
     os << "ctx.dpu_matmul_wait()";
     return;
   }
+  if (op->op.same_as(tl::intel_npu_dpu_async_sync())) {
+    os << "ctx.sync_tile_dpu_async()";
+    return;
+  }
   if (op->op.same_as(tl::intel_npu_dequant_i4_gm())) {
     os << "tl_npu_dequant_i4_gm(" << args(0, 7) << ")";
     return;

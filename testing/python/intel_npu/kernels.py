@@ -1149,7 +1149,7 @@ def make_moe_expert_prefill(
     part_shape = (SLOTS, H) if slot_output else (tiles, N, H)
     part_dtype = T.float16 if slot_output else T.float32
     assert combine_rows == 1 or slot_output, "blocked combine requires slot output"
-    if combine_rows > 1:
+    if combine_rows > 1 or tile_shared_experts:
         blocked_combine = make_moe_combine(N, H, E, TOPK, combine_rows, tiles, shaves, as_block=True)
     shared_gate_up_mb = MB if shared_gate_up_mb is None else shared_gate_up_mb
     shared_gate_up_bn = BNG if shared_gate_up_bn is None else shared_gate_up_bn
@@ -1214,7 +1214,8 @@ def make_moe_expert_prefill(
             yo = T.alloc_shared((MB, H), T.float16)  # the chunk's whole down output, so Part is touched once per token
         pw = T.alloc_local((1, H), T.float32)
         pa = T.alloc_local((1, H), T.float32)
-        zr = T.alloc_local((1, H), T.float32)
+        if not slot_output:
+            zr = T.alloc_local((1, H), T.float32)
         tk = T.alloc_local((2,), T.int32)  # the live token's row, read once per token rather than per element
         aw = T.alloc_local((2,), T.float32)  # and its routing weight
         if not slot_output:
@@ -1223,9 +1224,9 @@ def make_moe_expert_prefill(
         T.copy(Slot[0], slot_cmx)
         if not slot_output:
             T.copy(Wts[0, 0], wts_cmx)
-        for c0 in T.serial(H // FL):
-            for v in T.vectorized(FL):
-                zr[0, c0 * FL + v] = T.float32(0)
+            for c0 in T.serial(H // FL):
+                for v in T.vectorized(FL):
+                    zr[0, c0 * FL + v] = T.float32(0)
         if not slot_output:
             for t in T.serial(N):
                 if t % shaves == shave:
@@ -1462,7 +1463,6 @@ def make_moe_expert_prefill(
         wg_tile = T.alloc_shared((BNG * shaves, H), T.float16)
         y_cmx = T.alloc_local((rows_per_shave, BNG * shaves), T.float16)
         gate_cmx = T.alloc_local((rows_per_shave, I), T.float16)
-        up_cmx = T.alloc_local((rows_per_shave, I), T.float16)
         wqd_cmx = T.alloc_local((half_down, I // 2), T.uint8)
         wd_tile = T.alloc_shared((BND, I), T.float16)
         yd_cmx = T.alloc_local((rows_per_shave, BND), T.float16)
@@ -1478,62 +1478,62 @@ def make_moe_expert_prefill(
             if e < EXPERTS:
                 T.copy(WdS[0, e * H], wsd_all)
                 for c in T.serial(T.ceildiv(off_cmx[e + 1] - off_cmx[e], MB)):
+                    chunk_rows = T.min(MB, off_cmx[e + 1] - off_cmx[e] - c * MB)
+                    shard_rows = T.ceildiv(chunk_rows, shaves)
+                    live_rows = T.max(0, T.min(shard_rows, chunk_rows - shave * shard_rows))
                     perf_begin("gath")
-                    for row in T.serial(rows_per_shave):
-                        index = off_cmx[e] + c * MB + shave * rows_per_shave + row
-                        source = slot_cmx[T.min(index, off_cmx[e + 1] - 1)] // (TOPK + 1)
+                    for row in T.serial(live_rows):
+                        index = off_cmx[e] + c * MB + shave * shard_rows + row
+                        source = slot_cmx[index] // (TOPK + 1)
                         T.copy(X[source, 0], x_cmx[row : row + 1, 0:H])
                     perf_end()
-                    for block in T.serial(I // (BNG * shaves)):
-                        for projection in T.serial(2):
-                            row = e * 2 * I + projection * I + block * BNG * shaves + shave * BNG
-                            T.copy(WguQ[row, 0], wq_cmx)
-                            T.copy(WguS[0, row], ws_cmx)
-                            perf_begin("gdeq")
-                            T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wg_tile[shave * BNG, 0]),
-                                          T.address_of(wq_cmx[0, 0]), T.address_of(ws_cmx[0, 0]), BNG, H, G, BNG)
-                            perf_end()
-                            T.sync_threads()
-                            perf_begin("ggem")
-                            T.gemm(x_cmx, wg_tile, y_cmx, transpose_B=True, clear_accum=True)
-                            perf_end()
-                            perf_begin("gcpy")
-                            for row, column in T.grid(rows_per_shave, BNG * shaves // HL):
-                                for lane in T.vectorized(HL):
-                                    if projection == 0:
-                                        gate_cmx[row, block * BNG * shaves + column * HL + lane] = y_cmx[row, column * HL + lane]
-                                    else:
-                                        up_cmx[row, block * BNG * shaves + column * HL + lane] = y_cmx[row, column * HL + lane]
-                            perf_end()
-                            T.sync_threads()
-                    perf_begin("swig")
-                    for row, column in T.grid(rows_per_shave, I // HL):
-                        for lane in T.vectorized(HL):
-                            gate = gate_cmx[row, column * HL + lane]
-                            gate_cmx[row, column * HL + lane] = gate * T.sigmoid(gate) * up_cmx[row, column * HL + lane]
-                    perf_end()
+                    for chunk in T.serial(2 * I // (BNG * shaves)):
+                        block = chunk // 2
+                        projection = chunk % 2
+                        row = e * 2 * I + projection * I + block * BNG * shaves + shave * BNG
+                        T.copy(WguQ[row, 0], wq_cmx)
+                        T.copy(WguS[0, row], ws_cmx)
+                        perf_begin("gdeq")
+                        T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wg_tile[shave * BNG, 0]),
+                                      T.address_of(wq_cmx[0, 0]), T.address_of(ws_cmx[0, 0]), BNG, H, G, BNG)
+                        perf_end()
+                        T.sync_threads()
+                        perf_begin("ggem")
+                        T.gemm_rows(x_cmx, wg_tile, y_cmx, live_rows)
+                        perf_end()
+                        perf_begin("gcpy")
+                        for row, column in T.grid(live_rows, BNG * shaves // HL):
+                            for lane in T.vectorized(HL):
+                                if projection == 0:
+                                    gate_cmx[row, block * BNG * shaves + column * HL + lane] = y_cmx[row, column * HL + lane]
+                                else:
+                                    gate = gate_cmx[row, block * BNG * shaves + column * HL + lane]
+                                    gate_cmx[row, block * BNG * shaves + column * HL + lane] = (
+                                        gate * T.sigmoid(gate) * y_cmx[row, column * HL + lane])
+                        perf_end()
+                        T.sync_threads()
+                    T.sync_threads()
                     for block in T.serial(H // BND):
                         weight_row = e * H + block * BND + shave * half_down
                         T.copy(WdQ[weight_row, 0], wqd_cmx)
                         perf_begin("ddeq")
                         T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wd_tile[shave * half_down, 0]),
-                                      T.address_of(wqd_cmx[0, 0]), T.address_of(wsd_all[0, weight_row]),
+                                      T.address_of(wqd_cmx[0, 0]),
+                                      T.address_of(wsd_all[0, block * BND + shave * half_down]),
                                       half_down, I, G, H)
                         perf_end()
                         T.sync_threads()
                         perf_begin("dgem")
-                        T.gemm(gate_cmx, wd_tile, yd_cmx, transpose_B=True, clear_accum=True)
+                        T.gemm_rows(gate_cmx, wd_tile, yd_cmx, live_rows)
                         perf_end()
                         perf_begin("dcpy")
-                        for row, column in T.grid(rows_per_shave, BND // HL):
+                        for row, column in T.grid(live_rows, BND // HL):
                             for lane in T.vectorized(HL):
                                 yo[row, block * BND + column * HL + lane] = yd_cmx[row, column * HL + lane]
                         perf_end()
                         T.sync_threads()
-                    live_rows = T.min(rows_per_shave,
-                                      T.max(0, off_cmx[e + 1] - off_cmx[e] - c * MB - shave * rows_per_shave))
                     if live_rows > 0:
-                        begin = off_cmx[e] + c * MB + shave * rows_per_shave
+                        begin = off_cmx[e] + c * MB + shave * shard_rows
                         T.copy(yo[0:live_rows, 0:H], Part[begin:begin + live_rows, 0:H])
 
     @T.macro
@@ -1560,6 +1560,8 @@ def make_moe_expert_prefill(
         T.sync_grid()
         if tile_shared_experts:
             tile_shared_expert_phase(X, WguQ, WguS, WdQ, WdS, Off, Slot, Part, tile, shave)
+            T.sync_grid()
+            blocked_combine(Part, Slot, Wts, Off, Out, tile, shave)
         else:
             expert_phase(X, WguQ, WguS, WdQ, WdS, Wts, Off, Slot, Part, Out, tile, shave)
 

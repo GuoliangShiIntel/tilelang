@@ -86,6 +86,40 @@ def test_dynamic_dma_rows_preserve_unwritten_output(count, shared):
     np.testing.assert_array_equal(output, expected)
 
 
+@needs_cxx
+@pytest.mark.parametrize("count", [0, 3, 8])
+def test_dynamic_gemm_rows_preserve_unwritten_output(count):
+    @T.prim_func
+    def row_gemm(A: T.Tensor((8, 64), T.float16), B: T.Tensor((64, 64), T.float16),
+                 Limit: T.Tensor((1,), T.int32), Y: T.Tensor((8, 64), T.float16)):
+        with T.Kernel(1, threads=1):
+            activation = T.alloc_local((8, 64), T.float16)
+            weights = T.alloc_local((64, 64), T.float16)
+            result = T.alloc_local((8, 64), T.float16)
+            limit = T.alloc_local((1,), T.int32)
+            T.copy(A, activation)
+            T.copy(B, weights)
+            T.copy(Limit, limit)
+            rows = T.max(0, T.min(8, limit[0]))
+            T.gemm_rows(activation, weights, result, rows)
+            T.copy(result[0:rows, 0:64], Y[0:rows, 0:64])
+
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off"}):
+        low = lowering.lower(row_gemm)
+    rng = np.random.default_rng(42)
+    source = rng.standard_normal((8, 64)).astype(np.float16)
+    weights = rng.standard_normal((64, 64)).astype(np.float16)
+    output = np.full((8, 64), -123, np.float16)
+    lib = host_sim.build(low.source, "dynamic_gemm_rows")
+    arrays = lowering.order_arrays(low, {"A": source, "B": weights,
+                                         "Limit": np.array([count], np.int32), "Y": output})
+    host_sim.check_status(host_sim.run(lib, arrays, tiles=1, shaves=1))
+    expected = np.full_like(output, -123)
+    expected[:count] = (source[:count].astype(np.float32) @ weights.astype(np.float32).T).astype(np.float16)
+    np.testing.assert_allclose(output[:count], expected[:count], rtol=2e-3, atol=2e-3)
+    np.testing.assert_array_equal(output[count:], expected[count:])
+
+
 def test_dynamic_dma_width_is_still_refused():
     @T.prim_func
     def width_copy(A: T.Tensor((8, 64), T.float16), Limit: T.Tensor((1,), T.int32)):
@@ -98,8 +132,11 @@ def test_dynamic_dma_width_is_still_refused():
 
 
 @needs_cxx
-@pytest.mark.parametrize("shared, interleave", [(False, False), (False, True), (True, False)])
-def test_pure_gather_loop_batches_without_changing_results(shared, interleave):
+@pytest.mark.parametrize("shared, interleave, bindings", [
+    (False, False, False), (False, True, False), (True, False, False),
+    (False, False, True), (False, True, True), (True, False, True),
+])
+def test_pure_gather_loop_batches_without_changing_results(shared, interleave, bindings):
     shaves = 2 if shared else 1
 
     @T.prim_func
@@ -113,14 +150,19 @@ def test_pure_gather_loop_batches_without_changing_results(shared, interleave):
                 gathered = T.alloc_local((6, 64), T.float16)
             T.copy(Index, positions)
             for row in T.serial(6):
-                T.copy(A[positions[row], 0:64], gathered[row, 0:64])
+                if bindings:
+                    source_row = positions[row]
+                    T.copy(A[source_row, 0:64], gathered[row, 0:64])
+                else:
+                    T.copy(A[positions[row], 0:64], gathered[row, 0:64])
                 if interleave:
                     gathered[row, 0] = gathered[row, 0] + T.float16(1)
             T.copy(gathered, B)
 
     with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.batch_dma": True}):
         low = lowering.lower(gather_rows)
-    assert ("ctx.dma_batch_add(" in low.source) == (not interleave)
+    expected_batch = not interleave and not (shared and bindings)
+    assert ("ctx.dma_batch_add(" in low.source) == expected_batch
     source = np.arange(384, dtype=np.float16).reshape(6, 64)
     order = np.array([4, 1, 5, 0, 3, 2], np.int32)
     output = np.full_like(source, np.nan)

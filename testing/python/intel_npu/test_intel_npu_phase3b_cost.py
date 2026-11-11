@@ -77,6 +77,31 @@ def test_default_spatial_mirrors_runtime():
     assert vpunn.default_spatial_x(9) == 1
 
 
+@needs_vpunn
+@pytest.mark.parametrize("explicit", [False, True])
+def test_bounded_dynamic_rows_use_legal_row_specific_configurations(explicit):
+    rows = tvm.tirx.Var("rows", "int32")
+    count = tvm.tirx.max(0, tvm.tirx.min(8, rows))
+    call = tvm.tirx.call_intrin("handle", tvm.ir.Op.get("tl.intel_npu_dpu_matmul"),
+                              0, 0, 0, count, 64, 128, 1 if explicit else 0, -1)
+    func = tvm.tirx.PrimFunc([rows], tvm.tirx.Evaluate(call))
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "require"}):
+        mod = plan_workloads.PlanIntelNpuWorkloads()(tvm.IRModule.from_expr(func))
+    calls = []
+    tvm.tirx.stmt_functor.post_order_visit(mod["main"].body,
+        lambda node: calls.append(node) if isinstance(node, tvm.tirx.Call)
+        and node.op.same_as(tvm.ir.Op.get("tl.intel_npu_dpu_matmul")) else None)
+    analyzer = tvm.arith.Analyzer()
+    for value in (0, 1, 3, 8):
+        actual = [int(analyzer.simplify(tvm.tirx.stmt_functor.substitute(arg,
+                       {rows: tvm.tirx.IntImm("int32", value)}))) for arg in calls[0].args[6:8]]
+        if explicit or value == 0:
+            assert actual == [1 if explicit else 0, -1]
+        else:
+            mpe, spatial, _ = plan_workloads.plan_gemm(value, 64, 128)
+            assert actual == [spatial, plan_workloads.MPE_CODE[mpe]]
+
+
 def _dpu_call(cfg):
     func = make_gemm_repeat(64, 64, 512, repeat=2, tiles=1, shaves=2)
     with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", **cfg}):

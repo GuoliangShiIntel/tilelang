@@ -89,6 +89,7 @@ TVM_DLL const Op &intel_npu_axpy();
  */
 TVM_DLL const Op &intel_npu_dpu_matmul();
 TVM_DLL const Op &intel_npu_dpu_wait();
+TVM_DLL const Op &intel_npu_dpu_async_sync();
 TVM_DLL const Op &intel_npu_dequant_i4_gm();
 
 /*!

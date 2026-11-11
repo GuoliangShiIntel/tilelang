@@ -37,7 +37,10 @@ def main(argv):
     ap.add_argument("--new", type=int, default=16)
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--expert-cache", type=int, default=64)
+    ap.add_argument("--prefill-batch", type=int, default=1)
     a = ap.parse_args(argv)
+    if a.prefill_batch < 1:
+        ap.error("--prefill-batch must be positive")
     root = os.environ.get("NPU_DSL_ROOT")
     if not root:
         print("NPU_DSL_ROOT is not set (the libraries.npu.dsl checkout: its qwen36_e2e.reference is the oracle)")
@@ -67,8 +70,10 @@ def main(argv):
         trace_moe = np.stack([t["moe"][0].numpy() for t in trace]).astype(np.float32)
         trace_out = np.stack([t["out"][0].numpy() for t in trace]).astype(np.float32)
         del trace
-        for t in ids[1:]:
-            logits = ref.forward([t], st, layers=layers)
+        for start in range(1, len(ids), a.prefill_batch):
+            logits = ref.forward(ids[start:start + a.prefill_batch], st, layers=layers)
+            if a.prefill_batch > 1:
+                print(f"reference prompt {min(start + a.prefill_batch, len(ids))}/{len(ids)} tokens", flush=True)
         print(f"prefill {len(ids)} tokens: {time.time() - t0:.0f} s", flush=True)
         all_logits, out = [logits.numpy().astype(np.float16)], []
         for _ in range(a.new):

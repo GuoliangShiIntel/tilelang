@@ -23,6 +23,7 @@ the launch(es) plus the host wall of the whole step (file transfers included).
 """
 
 import argparse
+import hashlib
 import os
 import sys
 import time
@@ -635,6 +636,8 @@ def main(argv):
     ap.add_argument("--trials", type=int, default=1,
                     help="repeat the teacher-forced comparison N times and report n/N; one run cannot tell a "
                          "correct kernel from one that is right four times in five (plan question 10)")
+    ap.add_argument("--warmup", type=int, default=0,
+                    help="complete prompt-to-first-token runs before measurement; reset model state between runs")
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--per-layer", action="store_true", help="one launch per layer + head (the A/B baseline) instead of one per token")
     ap.add_argument("--layer-ids", default=None, help="run only these checkpoint layers, in order (e.g. 3 or 0,1,3): device bisection")
@@ -686,6 +689,8 @@ def main(argv):
                          "one pass and share the weight upload, so a bisect point costs a launch instead of a "
                          "rebuild. A hang ends the session, so the sweep stops there and names the layer count")
     a = ap.parse_args(argv)
+    if a.warmup < 0:
+        ap.error("--warmup must be nonnegative")
     if a.prefill_phases is not None and (not a.prefill_only or not a.prefill):
         ap.error("--prefill-phases requires --prefill and --prefill-only; instrumented runs are not timings")
     if not a.ckpt or not a.pack_dir:
@@ -716,7 +721,8 @@ def main(argv):
         ids = tok.encode(text, add_special_tokens=False).ids
     assert len(ids) + a.new <= a.smax, "prompt + new tokens must fit the KV window (--smax)"
     mode = "one launch per layer" if a.per_layer else ("one launch per chunk" if a.chunked else "one launch per token")
-    print(f"prompt: {len(ids)} tokens; layers {layers} of {ck.cfg.layers}; new {a.new}; {mode}")
+    prompt_sha = hashlib.sha256(np.asarray(ids, dtype="<u4").tobytes()).hexdigest()[:16]
+    print(f"prompt: {len(ids)} tokens; ids sha256 {prompt_sha}; layers {layers} of {ck.cfg.layers}; new {a.new}; {mode}")
     m = DeviceModel(ck, Path(a.pack_dir), layers, a.smax, build=not a.no_build, single=not a.per_layer,
                     layer_ids=[int(x) for x in a.layer_ids.split(",")] if a.layer_ids else None, chunked=a.chunked,
                     prefill=a.prefill if not a.per_layer else 0,
@@ -740,6 +746,16 @@ def main(argv):
         print(f"chunks: {len(m.chunks)} launches per token: " + " ".join("/".join(str(i) for i in ch) for ch in m.chunks))
     try:
         m.reset_state()
+        for iteration in range(a.warmup):
+            if m.prefill_n:
+                if len(ids) > 1:
+                    m.prefill(ids[:-1])
+                m.step(ids[-1])
+            else:
+                for token in ids:
+                    m.step(token)
+            print(f"warmup {iteration + 1}/{a.warmup} complete (excluded from TTFT)", flush=True)
+            m.reset_state()
         if a.prefill_sweep:
             for pl in m.prefill_ls:
                 m.reset_state()
@@ -751,13 +767,15 @@ def main(argv):
             return 0
         if gold is not None:
             t0 = time.perf_counter()
+            pre_ms = 0.0
             dev_trace = [] if a.per_layer else None
             if m.prefill_n:
                 if len(ids) > 1:
-                    m.prefill(ids[:-1])
+                    pre_ms = m.prefill(ids[:-1])
                 dev_tok, ms = m.step(ids[-1])
             else:
                 dev_tok, ms = m.step(ids[0], trace=dev_trace)
+            ttft_ms = (time.perf_counter() - t0) * 1000
             if dev_trace is not None:
                 print("layer-by-layer, first prompt token: max |h_dev - h_ref| / max |h_ref| after the layer:")
                 worst = 0.0
@@ -779,15 +797,24 @@ def main(argv):
             for trial in range(a.trials):
                 if trial:
                     m.reset_state()
+                    trial_start = time.perf_counter()
+                    pre_ms = 0.0
                     if m.prefill_n:
                         if len(ids) > 1:
-                            m.prefill(ids[:-1])
+                            pre_ms = m.prefill(ids[:-1])
                         dev_tok, ms = m.step(ids[-1])
                     else:
                         dev_tok, ms = m.step(ids[0])
+                    ttft_ms = (time.perf_counter() - trial_start) * 1000
                 if not m.prefill_n:
                     for t in ids[1:]:
                         dev_tok, ms = m.step(t)
+                if m.prefill_n:
+                    capture = "PROFILED" if os.environ.get("TL_NPU_SESSION_PROFILE") == "1" else "UNPROFILED"
+                    warm = f"warm={a.warmup}" if a.warmup else "warmup=0"
+                    print(f"  trial {trial}: TTFT {ttft_ms:.2f} ms for {len(ids)} prompt tokens; "
+                          f"prefill kernels {pre_ms:.2f} ms device; "
+                          f"[{capture}, {'TURBO' if m.s.turbo else 'NO TURBO'}, {warm}]", flush=True)
                 agree, worst = 0, 0.0
                 dev_logits = m.head_logits()
                 for k, r in enumerate(out_ids):

@@ -259,7 +259,7 @@ class _Scoper:
         return out if out is not None else (_seq(items) if items else stmt)
 
     def _phase_scope(self, items: list, is_split, need_two_owners: bool = False):
-        """Put each allocation used by exactly one of `items`' phases into that phase's `lexical_alloc_scope`.
+        """Scope allocations over non-crossing intervals of rendezvous-separated phases.
         None when `is_split` finds no boundary, so the caller can try a coarser rendezvous."""
         phases, cur = [], []
         for s in items:
@@ -299,34 +299,54 @@ class _Scoper:
         # for two reasons at once -- such a phase must not become a `lexical_alloc_scope` itself (the Ring
         # variable would go out of scope before a later read), and no OTHER buffer those phases also read may be
         # homed to some single later phase either (it would move after an earlier phase's read of it).
-        ring_def_phase = {hash(s.var): i for i, ph in enumerate(phases) for s in ph if _is_ring_bind(s)}
+        binding_def_phase = {hash(s.var): i for i, ph in enumerate(phases) for s in ph
+                     if isinstance(s, tirx.Bind)}
         unsafe_phases = set()
-        for key, def_phase in ring_def_phase.items():
+        for key, def_phase in binding_def_phase.items():
             spans = {def_phase} | {i for i, u in enumerate(uses) if key in u}
             if len(spans) > 1:
                 unsafe_phases |= spans
         unsafe_keys = {key for i in unsafe_phases for key in uses[i]}
         home = {}
+        intervals = set()
         for a in allocs:
             key = hash(a.buffer.data)
             if key in unsafe_keys:
                 continue
             where = [i for i, u in enumerate(uses) if key in u and i not in unsafe_phases]
-            if len(where) == 1:
-                home[id(a)] = where[0]
-        if need_two_owners and len({i for i in home.values()}) < 2:
+            if not where:
+                continue
+            first, last = where[0], where[-1]
+            if any(first <= i <= last for i in unsafe_phases):
+                continue
+            if first != last and any(_has_ring(s) for ph in phases[first:last + 1] for s in ph):
+                continue
+            if any(first < start <= last < end or start < first <= end < last
+                   for start, end in intervals):
+                continue
+            home[id(a)] = (first, last)
+            intervals.add((first, last))
+        owners = intervals | {(i, i) for i, ph in enumerate(phases)
+                      if any(_alloc_keys(s) for s in ph if not _is_decl(s, keys))}
+        if need_two_owners and not any(end < other_start
+                   for start, end in owners
+                   for other_start, other_end in owners):
             # nothing to overlap, so scoping would move allocations INTO a loop body for no CMX at all -- and that
             # is the state question 10 was about. Only pay it where two groups actually share the bytes.
             return None
         out = []
+        stack = [out]
         for i, ph in enumerate(phases):
-            moved = [a for a in allocs if home.get(id(a)) == i]
-            body = [s for s in ph if not _is_decl(s, keys)]
-            if moved:
+            for interval in sorted((span for span in intervals if span[0] == i), key=lambda span: -span[1]):
+                moved = [a for a in allocs if home.get(id(a)) == interval]
                 self.moved += sum(isinstance(a, tirx.AllocBuffer) for a in moved)
-                out.append(tirx.AttrStmt(tirx.IntImm("int32", 0), LEXICAL_SCOPE, tirx.IntImm("int32", 1), _seq(moved + body)))
-            else:
-                out.extend(body)
+                stack.append(moved)
+            body = [s for s in ph if not _is_decl(s, keys)]
+            stack[-1].extend(body)
+            for interval in sorted((span for span in intervals if span[1] == i), key=lambda span: -span[0]):
+                scoped = stack.pop()
+                stack[-1].append(tirx.AttrStmt(tirx.IntImm("int32", 0), LEXICAL_SCOPE,
+                                             tirx.IntImm("int32", 1), _seq(scoped)))
         # allocations that stay in this block come first, where they were
         kept = [a for a in allocs if id(a) not in home]
         return _seq(views + kept + out)

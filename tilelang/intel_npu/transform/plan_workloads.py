@@ -118,6 +118,23 @@ def PlanIntelNpuWorkloads():
                 return None
             op, m = hit
             args = list(stmt.value.args)
+            if not isinstance(args[m], tirx.IntImm):
+                bound = tvm.arith.Analyzer().const_int_bound(args[m])
+                if (int(args[m + 3].value) != 0 or int(args[m + 4].value) != -1
+                        or bound.min_value < 0 or bound.max_value > 64):
+                    planned.append("dynamic M: kept bounded-row runtime configuration")
+                    return None
+                spatial, stencil = args[m + 3], args[m + 4]
+                for rows in range(1, bound.max_value + 1):
+                    try:
+                        mpe, x, _ = plan_gemm(rows, int(args[m + 1].value), int(args[m + 2].value))
+                    except (ValueError, RuntimeError):
+                        continue
+                    spatial = tirx.Select(args[m] == rows, tirx.IntImm("int32", x), spatial)
+                    stencil = tirx.Select(args[m] == rows, tirx.IntImm("int32", MPE_CODE[mpe]), stencil)
+                args[m + 3], args[m + 4] = spatial, stencil
+                planned.append(f"dynamic M[0,{bound.max_value}]: VPUNN row-specific configurations")
+                return tirx.Evaluate(tirx.Call(stmt.value.dtype, op, args))
             M, N, K = (int(args[i].value) for i in (m, m + 1, m + 2))
             if int(args[m + 3].value) != 0 or int(args[m + 4].value) != -1:
                 planned.append(f"{M}x{N}x{K}: kept author/config knobs x={int(args[m + 3].value)} mpe={int(args[m + 4].value)}")

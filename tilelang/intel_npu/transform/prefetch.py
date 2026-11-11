@@ -314,12 +314,32 @@ class _Planner:
 
 
 class _DpuPlanner(_Planner):
+    def __init__(self, func, early_packed=()):
+        super().__init__(func)
+        self.early_packed = set(early_packed)
+        self.packed_candidates = []
+
     def prefetch(self, loop):
         if loop.kind != tirx.ForKind.SERIAL or loop.thread_binding is not None:
             return loop
         if _int(loop.extent) is None or _int(loop.extent) < 2 or (loop.step is not None and _int(loop.step) != 1):
             return loop
-        items = _items(loop.body)
+        declarations, items = [], []
+
+        def linearize(stmt):
+            if isinstance(stmt, tirx.SeqStmt):
+                for child in stmt.seq:
+                    linearize(child)
+            elif isinstance(stmt, tirx.AttrStmt) and stmt.attr_key == "lexical_alloc_scope":
+                linearize(stmt.body)
+            elif isinstance(stmt, (tirx.AllocBuffer, tirx.DeclBuffer)):
+                declarations.append(stmt)
+            else:
+                items.append(stmt)
+
+        linearize(loop.body)
+        if any(any(_int(dim) is None for dim in stmt.buffer.shape) for stmt in declarations):
+            return loop
         groups = []
         index = 0
 
@@ -327,6 +347,12 @@ class _DpuPlanner(_Planner):
             call = _call(stmt)
             return (call is not None and getattr(call.op, "name", "") == "tirx.call_extern"
                     and call.args and isinstance(call.args[0], tirx.StringImm) and call.args[0].value == name)
+
+        def tile_sync(stmt):
+            call = _call(stmt)
+            return (call is not None and getattr(call.op, "name", "").split(".")[-1] == "tvm_storage_sync"
+                and len(call.args) == 1 and isinstance(call.args[0], tirx.StringImm)
+                and call.args[0].value == "shared")
 
         def dequant_call(group):
             call = _call(group[0][group[1]])
@@ -358,7 +384,9 @@ class _DpuPlanner(_Planner):
             return loop
         dequant_index, dequant_group, (dequant, dequant_args) = dequant_groups[0]
         gemm_index, gemm_group = gemm_groups[0]
-        if gemm_index != dequant_index + 1 or gemm_index + 1 == len(groups):
+        cooperative = (gemm_index == dequant_index + 2
+                   and tile_sync(groups[dequant_index + 1][0][groups[dequant_index + 1][1]]))
+        if (gemm_index != dequant_index + 1 and not cooperative) or gemm_index + 1 == len(groups):
             return loop
         gemm = _call(gemm_group[0][gemm_group[1]])
         if gemm is None or getattr(gemm.op, "name", "") != "tl.intel_npu_dpu_matmul" or len(gemm.args) != 8:
@@ -383,20 +411,48 @@ class _DpuPlanner(_Planner):
         output = _dst_buffer(gemm)
         if weights is None or output is None or not _reads(gemm.args[2], weights.data):
             return loop
+        if cooperative:
+            if weights.scope() != "shared" or not tile_sync(groups[-1][0][groups[-1][1]]):
+                return loop
+            threads = []
+
+            def find_threads(node):
+                if (isinstance(node, tirx.AttrStmt) and node.attr_key == "thread_extent"
+                        and node.node.thread_tag == "threadIdx.x"):
+                    threads.append((node.node.var, _int(node.value)))
+
+            post_order_visit(self.func.body, find_threads)
+            if len(threads) != 1 or threads[0][1] is None:
+                return loop
+            rows, width = (_int(value) for value in dequant_args[3:5])
+            if rows is None or width is None or rows * threads[0][1] != _int(weights.shape[0]):
+                return loop
+            indices = dequant_args[0].args[0].indices
+            analyzer = tvm.arith.Analyzer()
+            if (len(indices) != 2 or not analyzer.can_prove_equal(indices[0], threads[0][0] * rows)
+                    or _int(indices[1]) != 0 or width != _int(weights.shape[1])):
+                return loop
         if weights.data.same_as(output.data) or _reads(gemm.args[1], weights.data):
             return loop
         for buffer in (weights, output):
-            if buffer.scope() != "local" or not _is_compact(buffer) or len(buffer.shape) != 2:
+            allowed_scope = "shared" if cooperative and buffer.data.same_as(weights.data) else "local"
+            if buffer.scope() != allowed_scope or not _is_compact(buffer) or len(buffer.shape) != 2:
                 return loop
             if any(_int(dim) is None for dim in buffer.shape):
                 return loop
             if _refs(self.func.body, buffer.data) != _refs(loop.body, buffer.data):
                 return loop
-        if [_int(arg) for arg in dequant_args[3:5]] != [_int(dim) for dim in weights.shape]:
+        if not cooperative and [_int(arg) for arg in dequant_args[3:5]] != [_int(dim) for dim in weights.shape]:
             return loop
-        if [_int(arg) for arg in gemm.args[3:5]] != [_int(dim) for dim in output.shape]:
+        if _int(gemm.args[4]) != _int(output.shape[1]):
+            return loop
+        row_bound = tvm.arith.Analyzer().const_int_bound(gemm.args[3])
+        if (row_bound.min_value < 0 or row_bound.max_value > _int(output.shape[0])
+                or _uses_var(gemm.args[3], loop.loop_var)):
             return loop
         for address in (dequant_args[0], gemm.args[0]):
+            if cooperative and address.same_as(dequant_args[0]):
+                continue
             load = address.args[0]
             if not all(_int(value) == 0 for value in load.indices):
                 return loop
@@ -416,6 +472,7 @@ class _DpuPlanner(_Planner):
             if isinstance(node, tirx.BufferLoad) and not node.buffer.data.same_as(weights.data):
                 protected.append(node.buffer.data)
         post_order_visit(gemm.args[2], protect_weight_indices)
+        post_order_visit(gemm.args[3], protect_weight_indices)
         if any(data.same_as(weights.data) or data.same_as(output.data) for data in protected):
             return loop
         safe = [True]
@@ -426,6 +483,8 @@ class _DpuPlanner(_Planner):
                     safe[0] = False
             elif isinstance(node, tirx.Call):
                 name = getattr(node.op, "name", "")
+                if cooperative and tile_sync(tirx.Evaluate(node)):
+                    return
                 if name == "tirx.call_extern":
                     if not (isinstance(node.args[0], tirx.StringImm)
                             and node.args[0].value in ("ctx.task_begin", "ctx.task_end")):
@@ -436,11 +495,29 @@ class _DpuPlanner(_Planner):
                             or any(destination.data.same_as(data) for data in protected + [output.data, weights.data])):
                         safe[0] = False
                 elif name != "tirx.address_of":
-                    safe[0] = False
+                    if (not isinstance(node.op, tvm.ir.Op)
+                            or _int(node.op.get_attr("TCallEffectKind")) != tirx.CallEffectKind.Pure.value):
+                        safe[0] = False
 
         post_order_visit(tail, inspect)
         if not safe[0]:
             return loop
+        pipeline_sync = tirx.Evaluate(tirx.call_intrin(
+            "handle", tirx.op.Op.get("tl.intel_npu_dpu_async_sync"))) if cooperative else None
+        if cooperative:
+            tail = _seq([stmt for group, _ in groups[gemm_index + 1:-1] for stmt in group] + [pipeline_sync])
+        packed_prefetch = (cooperative and bool(tvm.transform.PassContext.current().config.get(
+            "tl.intel_npu.prefetch", True)) and bool(preamble)
+            and _dst_buffer(_is_load(preamble[0])).data.same_as(packed_buffers[0].data)
+            and _full_buffer_load(_is_load(preamble[0]), packed_buffers[0]))
+        early_packed = packed_prefetch and hash(loop.loop_var) in self.early_packed
+        if packed_prefetch:
+            self.packed_candidates.append(hash(loop.loop_var))
+        if early_packed:
+            packed = packed_buffers[0]
+            wide_packed = tirx.decl_buffer([packed.shape[0] * 2] + list(packed.shape[1:]), packed.dtype,
+                                           packed.name, data=packed.data, scope=packed.scope())
+            self.widened[hash(packed.data)] = wide_packed
         wide_weights = tirx.decl_buffer([weights.shape[0] * 2, weights.shape[1]], weights.dtype,
                                         weights.name, data=weights.data, scope=weights.scope())
         wide_output = tirx.decl_buffer([output.shape[0] * 2, output.shape[1]], output.dtype,
@@ -452,10 +529,19 @@ class _DpuPlanner(_Planner):
             parity = (value - loop.min) % 2
             stmt = _subst(stmt, loop.loop_var, value)
             stmt = _Rebase(weights.data, wide_weights, weights.shape[0], parity)(stmt)
+            if early_packed:
+                stmt = _Rebase(packed.data, wide_packed, packed.shape[0], parity)(stmt)
             return _Rebase(output.data, wide_output, output.shape[0], parity)(stmt)
 
         def prepare(value):
-            return rebase(_seq(preamble + dequant_group[0]), value)
+            rendezvous = [pipeline_sync] if cooperative else []
+            if packed_prefetch:
+                ahead = tirx.IfThenElse(value + 1 < loop.min + loop.extent,
+                                        rebase(_async(_is_load(preamble[0])), value + 1), None)
+                work = rebase(_seq(dequant_group[0] + rendezvous), value)
+                return _seq([_wait()] + [rebase(stmt, value) for stmt in preamble[1:]]
+                            + ([ahead, work] if early_packed else [work, ahead]))
+            return rebase(_seq(preamble + dequant_group[0] + rendezvous), value)
 
         def submit(value):
             group = list(gemm_group[0])
@@ -468,9 +554,14 @@ class _DpuPlanner(_Planner):
         wait = tirx.Evaluate(tirx.call_intrin("handle", tirx.op.Op.get("tl.intel_npu_dpu_wait")))
         body = _seq([tirx.IfThenElse(valid, prepare(following), None), wait,
                      tirx.IfThenElse(valid, submit(following), None), rebase(tail, loop.loop_var)])
-        return _seq([prepare(loop.min), submit(loop.min),
-                     tirx.For(loop.loop_var, loop.min, loop.extent, loop.kind, body, loop.thread_binding,
-                               loop.annotations, loop.step)])
+        initial = [rebase(_async(_is_load(preamble[0])), loop.min)] if packed_prefetch else []
+        scheduled = _seq(declarations + initial + [prepare(loop.min), submit(loop.min),
+                          tirx.For(loop.loop_var, loop.min, loop.extent, loop.kind, body, loop.thread_binding,
+                                    loop.annotations, loop.step)])
+        if cooperative:
+            scheduled = _seq([scheduled, groups[-1][0][groups[-1][1]]])
+            return tirx.AttrStmt(tirx.IntImm("int32", 0), "lexical_alloc_scope", tirx.IntImm("int32", 1), scheduled)
+        return scheduled
 
 
 def PlanIntelNpuDmaBatch():
@@ -491,10 +582,15 @@ def PlanIntelNpuDmaBatch():
                 return None
             if node.thread_binding is not None or (node.step is not None and _int(node.step) != 1):
                 return None
-            body, conditions = node.body, []
+            body, conditions, bindings = node.body, [], {}
             while True:
                 if isinstance(body, tirx.SeqStmt) and len(body.seq) == 1:
                     body = body.seq[0]
+                elif (isinstance(body, tirx.SeqStmt) and len(body.seq) > 1
+                      and all(isinstance(stmt, tirx.Bind) for stmt in body.seq[:-1])):
+                    for stmt in body.seq[:-1]:
+                        bindings[stmt.var] = tirx.stmt_functor.substitute(stmt.value, bindings)
+                    body = body.seq[-1]
                 elif isinstance(body, tirx.IfThenElse) and body.else_case is None:
                     conditions.append(body.condition)
                     body = body.then_case
@@ -503,6 +599,9 @@ def PlanIntelNpuDmaBatch():
             fill = _is_load(body)
             if fill is None:
                 return None
+            original_fill = fill
+            fill = tirx.stmt_functor.substitute(fill, bindings)
+            conditions = [tirx.stmt_functor.substitute(condition, bindings) for condition in conditions]
             dst = _dst_buffer(fill)
             source = fill.args[1]
             if dst is None or dst.scope() not in ("local", "shared") or len(dst.shape) != 2 or not _is_compact(dst):
@@ -528,15 +627,16 @@ def PlanIntelNpuDmaBatch():
                 elif isinstance(expr, tirx.BufferLoad) and expr.buffer.data.same_as(dst.data):
                     safe[0] = False
 
-            for expr in conditions + list(source.args[0].indices) + list(address.indices) + [node.min, node.extent]:
+            for expr in (conditions + list(bindings.values()) + list(source.args[0].indices)
+                         + list(address.indices) + [node.min, node.extent]):
                 post_order_visit(expr, inspect)
             if not safe[0]:
                 return None
 
             def batch(stmt):
-                if isinstance(stmt, tirx.Evaluate) and stmt.value.same_as(fill):
+                if isinstance(stmt, tirx.Evaluate) and stmt.value.same_as(original_fill):
                     return tirx.Evaluate(tirx.call_intrin("handle", tirx.op.Op.get("tl.intel_npu_dma_batch"),
-                                                         *list(fill.args[:6])))
+                                                         *list(original_fill.args[:6])))
                 return None
 
             transformed = tirx.stmt_functor.ir_transform(node.body, None, batch, ["tirx.Evaluate"])
@@ -556,7 +656,21 @@ def PlanIntelNpuDpuOverlap():
         if not bool(ctx.config.get("tl.intel_npu.dpu_overlap", False)):
             return func
         planner = _DpuPlanner(func)
-        return func.with_body(planner.widen_allocations(planner.body(func.body)))
+        result = func.with_body(planner.widen_allocations(planner.body(func.body)))
+        selected = set()
+        check_budget = tvm.get_global_func("tl.intel_npu.transform.CheckIntelNpuBudgets")()
+        for key in planner.packed_candidates:
+            candidate = _DpuPlanner(func, selected | {key})
+            proposed = func.with_body(candidate.widen_allocations(candidate.body(func.body)))
+            try:
+                check_budget(tvm.IRModule.from_expr(proposed))
+            except Exception as error:
+                if "intel_npu: CMX budget exceeded" not in str(error):
+                    raise
+            else:
+                selected.add(key)
+                result = proposed
+        return result
 
     return prim_func_pass(transform, opt_level=0, name="tl.PlanIntelNpuDpuOverlap")
 

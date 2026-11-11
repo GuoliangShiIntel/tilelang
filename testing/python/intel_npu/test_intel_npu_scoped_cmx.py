@@ -43,7 +43,7 @@ def _has_host_cxx() -> bool:
         return False
 
 
-def make_two_phase(n: int):
+def make_two_phase(n: int, revisit: bool = False):
     @T.prim_func
     def two(A: T.Tensor((n,), T.float16), B: T.Tensor((n,), T.float16), Y: T.Tensor((2, n), T.float16)):
         with T.Kernel(TILES, threads=SHAVES) as tile:
@@ -54,6 +54,9 @@ def make_two_phase(n: int):
                 a_cmx[i] = a_cmx[i] * T.float16(2)
             T.copy(a_cmx, Y[0, 0])
             T.sync_grid()
+            if revisit:
+                T.copy(a_cmx, Y[0, 0])
+                T.sync_grid()
             T.copy(B[0], b_cmx)
             for i in T.serial(n):
                 b_cmx[i] = b_cmx[i] + T.float16(1)
@@ -62,14 +65,36 @@ def make_two_phase(n: int):
     return two
 
 
-def test_two_phases_share_cmx_and_the_sum_is_refused_without_scoping():
-    src = _lower(make_two_phase(BIG // SHAVES)).source
+@pytest.mark.parametrize("revisit", [False, True])
+def test_two_phases_share_cmx_and_the_sum_is_refused_without_scoping(revisit):
+    src = _lower(make_two_phase(BIG // SHAVES, revisit)).source
     # each phase is a C++ block that allocates and releases its buffer
     assert src.count("npu::Ctx::CmxScope") == 2
     assert re.search(r"\{\n\s+npu::Ctx::CmxScope cmx_scope_0\(ctx\);\n\s+half\* __restrict a_cmx = ctx.alloc<half>\(196608\);", src)
     assert re.search(r"\{\n\s+npu::Ctx::CmxScope cmx_scope_1\(ctx\);\n\s+half\* __restrict b_cmx = ctx.alloc<half>\(196608\);", src)
     with pytest.raises(Exception, match="CMX budget exceeded"):
-        _lower(make_two_phase(BIG // SHAVES), **{"tl.intel_npu.scoped_cmx": False})
+        _lower(make_two_phase(BIG // SHAVES, revisit), **{"tl.intel_npu.scoped_cmx": False})
+
+
+def test_tile_phase_reuses_an_already_scoped_successor():
+    n = BIG // SHAVES
+
+    @T.prim_func
+    def kernel(A: T.Tensor((n,), T.float16), B: T.Tensor((n,), T.float16),
+               Y: T.Tensor((2, n), T.float16)):
+        with T.Kernel(TILES, threads=SHAVES):
+            earlier = T.alloc_local((n,), T.float16)
+            T.copy(A, earlier)
+            T.copy(earlier, Y[0, 0])
+            T.sync_threads()
+            with T.attr(0, "lexical_alloc_scope", 1):
+                later = T.alloc_local((n,), T.float16)
+                T.copy(B, later)
+                T.copy(later, Y[1, 0])
+
+    _lower(kernel, **{"tl.intel_npu.derive_global_sync": False})
+    with pytest.raises(Exception, match="CMX budget exceeded"):
+        _lower(kernel, **{"tl.intel_npu.scoped_cmx": False, "tl.intel_npu.derive_global_sync": False})
 
 
 def test_allocation_under_a_shave_branch_is_hoisted():

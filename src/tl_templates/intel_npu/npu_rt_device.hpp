@@ -620,6 +620,8 @@ public:
                                  std::int32_t mpe = -1) {
     dpu_matmul_wait(); // the pending workload owns the descriptor set
                        // dpu_prepare would re-prepare
+    if (M == 0)
+      return;
     if (!dpu_prepare(M, N, K, spatialX, mpe))
       return;
     // No barriers on a synchronous workload (a ring use may have set them).
@@ -642,6 +644,8 @@ public:
                                        std::uint32_t spatialX = 0,
                                        std::int32_t mpe = -1) {
     dpu_matmul_wait();
+    if (M == 0)
+      return;
     if (!dpu_prepare(M, N, K, spatialX, mpe))
       return;
     mm_->setConsumerBarriers(0, 0);
@@ -1455,6 +1459,17 @@ public:
   TL_NPU_HW_CALL void sync_tile() {
     TL_NPU_PROF_T0();
     qg_flush();
+    TL_NPU_COMPILER_BARRIER();
+    flushCmxWrites();
+    sync::memoryFence();
+    sync_.waitLocal();
+    TL_NPU_COMPILER_BARRIER();
+    TL_NPU_PROF_BAR();
+  }
+
+  TL_NPU_HW_CALL void sync_tile_dpu_async() {
+    TL_NPU_PROF_T0();
+    dma_load_wait_impl();
     TL_NPU_COMPILER_BARRIER();
     flushCmxWrites();
     sync::memoryFence();
