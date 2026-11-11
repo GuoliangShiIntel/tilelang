@@ -227,3 +227,133 @@ def encoder_layer_reference(x, ln1w, ln1b, wq, bq, wk, bk, wv, bv, wo, bo, ln2w,
     x = x + linear(a, wo, bo)
     h = layer_norm(x, ln2w.astype(np.float64), ln2b.astype(np.float64))
     return x + linear(gelu_tanh(linear(h, w1, b1)), w2, b2)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# V1 (plan: docs/developer_guide/fgclip2_enablement_plan.md): real model proportions, one layer
+# ---------------------------------------------------------------------------------------------------------------------
+@T.macro
+def linear_bias_tiled(x_cmx, Wddr, b_cmx, y_cmx, w_tile, y_tile, rows: int, N: int, K: int, TN: int, gelu: bool):
+    """y[0:rows, 0:N] = x[0:rows, 0:K] . W[0:N, 0:K]^T + b (b_cmx is [1, N], resident -- bias is small enough
+    not to need tiling), optionally GELU(tanh). V1's difference from V0's `linear_bias`: at real model widths
+    (hidden=1152, Q/K/V width 16*80=1280, inter_pad=4320) the weight matrix no longer fits CMX resident whole,
+    so it streams TN-row tiles from DDR one at a time through `w_tile` ([TN, K], caller-allocated so the same
+    buffer is reused across every linear layer whose K matches). No K-tiling yet (every K here still fits
+    resident as part of the activation block) -- that is only needed once CMX is tighter than this (real NVL
+    budget) or K grows further (not expected for this model)."""
+    for n0 in T.serial(N // TN):
+        T.copy(Wddr[n0 * TN, 0], w_tile)
+        T.gemm(x_cmx, w_tile, y_tile, transpose_B=True, clear_accum=True)
+        for r in T.serial(rows):
+            for nn in T.serial(TN):
+                v = T.cast(y_tile[r, nn], T.float32) + T.cast(b_cmx[0, n0 * TN + nn], T.float32)
+                if gelu:
+                    inner = T.float32(GELU_TANH_C) * (v + T.float32(0.044715) * v * v * v)
+                    v = T.float32(0.5) * v * (T.float32(1) + T.tanh(inner))
+                y_cmx[r, n0 * TN + nn] = T.cast(v, T.float16)
+
+
+def make_fgclip2_encoder_layer_v1(rows: int, hidden: int, heads: int, hd_pad: int, inter_pad: int, tn: int = 32,
+                                  eps: float = 1e-6):
+    """One pre-LN FG-CLIP2 encoder layer at REAL model proportions (hidden=1152, heads=16, hd_pad=80, inter_pad=4320
+    are the intended callers; `rows` stays small -- a handful of tokens -- because V1 is about real CHANNEL widths,
+    not real token counts yet, and attention here is still the same plain (non-chunked) softmax as V0, which needs
+    all `rows` keys resident at once).
+
+    `hd_pad` is the kernel's only notion of head dimension: it never sees the real head_dim=72, only the
+    DPU-aligned pad to 80 (see fgclip2_npu_dsl_explained.md section 6). Zero-padding the extra 8 channels so this
+    is numerically IDENTICAL to a real head_dim=72 model is pack.py's job (V4), not tested here -- this kernel
+    and its oracle both operate on the padded width end to end, so this test validates the real-shape TILED GEMM
+    plumbing (the new thing since V0), not the padding-is-exact claim.
+
+    V0 -> V1's one structural change: every linear layer (`linear_bias` -> `linear_bias_tiled`) streams its
+    weight in row tiles from DDR instead of loading the whole matrix resident -- required once CMX can no
+    longer hold a [1152, 1152] or [4320, 1152] fp16 matrix whole. Q/K/V/attention-output width (`QW =
+    heads * hd_pad = 1280`) is now distinct from the residual width `hidden` (1152); `linear_bias`/`mha_full`
+    already supported this (the oracle, `encoder_layer_reference`, already does -- it never assumed square
+    weights). Still one layer, one tile, one working SHAVE; the device-side 27-layer loop is the next increment.
+
+    All scratch is `alloc_shared`, not `alloc_local`: only `shave == 0` ever touches it, but `local` reserves
+    its bytes PER SHAVE regardless of which branch runs, so declaring these buffers `local` silently doubled
+    the CMX footprint and blew the budget on the first real run here (`CheckIntelNpuBudgets`: 1,995,136 B
+    needed > 1,473,536 B available, because the per-SHAVE total was counted twice). `shared` is one copy per
+    tile, which is what a single-active-SHAVE kernel actually needs.
+    """
+    QW = heads * hd_pad
+    assert hidden % tn == 0 and QW % tn == 0 and inter_pad % tn == 0 and tn % 16 == 0 and rows % 16 == 0
+
+    @T.prim_func
+    def layer(Hio: T.Tensor((rows, hidden), T.float32),
+              Ln1W: T.Tensor((1, hidden), T.float16), Ln1B: T.Tensor((1, hidden), T.float16),
+              Wq: T.Tensor((QW, hidden), T.float16), Bq: T.Tensor((1, QW), T.float16),
+              Wk: T.Tensor((QW, hidden), T.float16), Bk: T.Tensor((1, QW), T.float16),
+              Wv: T.Tensor((QW, hidden), T.float16), Bv: T.Tensor((1, QW), T.float16),
+              Wo: T.Tensor((hidden, QW), T.float16), Bo: T.Tensor((1, hidden), T.float16),
+              Ln2W: T.Tensor((1, hidden), T.float16), Ln2B: T.Tensor((1, hidden), T.float16),
+              W1: T.Tensor((inter_pad, hidden), T.float16), B1: T.Tensor((1, inter_pad), T.float16),
+              W2: T.Tensor((hidden, inter_pad), T.float16), B2: T.Tensor((1, hidden), T.float16)):
+        with T.Kernel(1, threads=2) as tile:
+            shave = T.get_thread_binding()
+            h32 = T.alloc_shared((rows, hidden), T.float32)
+            ln1w = T.alloc_shared((1, hidden), T.float16)
+            ln1b = T.alloc_shared((1, hidden), T.float16)
+            ln2w = T.alloc_shared((1, hidden), T.float16)
+            ln2b = T.alloc_shared((1, hidden), T.float16)
+            xn = T.alloc_shared((rows, hidden), T.float16)
+            bq = T.alloc_shared((1, QW), T.float16)
+            bk = T.alloc_shared((1, QW), T.float16)
+            bv = T.alloc_shared((1, QW), T.float16)
+            bo = T.alloc_shared((1, hidden), T.float16)
+            b1 = T.alloc_shared((1, inter_pad), T.float16)
+            b2 = T.alloc_shared((1, hidden), T.float16)
+            qp = T.alloc_shared((rows, QW), T.float16)
+            kp = T.alloc_shared((rows, QW), T.float16)
+            vp = T.alloc_shared((rows, QW), T.float16)
+            ao = T.alloc_shared((rows, QW), T.float16)
+            aop = T.alloc_shared((rows, hidden), T.float16)
+            act = T.alloc_shared((rows, inter_pad), T.float16)
+            mlp_out = T.alloc_shared((rows, hidden), T.float16)
+            w_tile_h = T.alloc_shared((tn, hidden), T.float16)       # K == hidden: q/k/v/fc1
+            w_tile_q = T.alloc_shared((tn, QW), T.float16)           # K == QW: o_proj
+            w_tile_i = T.alloc_shared((tn, inter_pad), T.float16)    # K == inter_pad: fc2
+            y_tile = T.alloc_shared((rows, tn), T.float16)
+            s_cmx = T.alloc_shared((rows, rows), T.float16)
+            qh = T.alloc_shared((rows, hd_pad), T.float16)
+            kh = T.alloc_shared((rows, hd_pad), T.float16)
+            vth = T.alloc_shared((hd_pad, rows), T.float16)
+            oh = T.alloc_shared((rows, hd_pad), T.float16)
+            mx = T.alloc_shared((1,), T.float32)
+            sm = T.alloc_shared((1,), T.float32)
+
+            if shave == 0:
+                T.copy(Hio[0, 0], h32)
+                T.copy(Ln1W[0, 0], ln1w)
+                T.copy(Ln1B[0, 0], ln1b)
+                T.copy(Ln2W[0, 0], ln2w)
+                T.copy(Ln2B[0, 0], ln2b)
+                T.copy(Bq[0, 0], bq)
+                T.copy(Bk[0, 0], bk)
+                T.copy(Bv[0, 0], bv)
+                T.copy(Bo[0, 0], bo)
+                T.copy(B1[0, 0], b1)
+                T.copy(B2[0, 0], b2)
+
+                for r in T.serial(rows):
+                    layernorm_bias_row(h32, ln1w, ln1b, xn, r, hidden, eps)
+                linear_bias_tiled(xn, Wq, bq, qp, w_tile_h, y_tile, rows, QW, hidden, tn, False)
+                linear_bias_tiled(xn, Wk, bk, kp, w_tile_h, y_tile, rows, QW, hidden, tn, False)
+                linear_bias_tiled(xn, Wv, bv, vp, w_tile_h, y_tile, rows, QW, hidden, tn, False)
+                mha_full(qp, kp, vp, ao, s_cmx, qh, kh, vth, oh, mx, sm, rows, heads, hd_pad, hd_pad ** -0.5)
+                linear_bias_tiled(ao, Wo, bo, aop, w_tile_q, y_tile, rows, hidden, QW, tn, False)
+                residual_add_fp32(h32, aop, rows, hidden)
+
+                for r in T.serial(rows):
+                    layernorm_bias_row(h32, ln2w, ln2b, xn, r, hidden, eps)
+                linear_bias_tiled(xn, W1, b1, act, w_tile_h, y_tile, rows, inter_pad, hidden, tn, True)
+                linear_bias_tiled(act, W2, b2, mlp_out, w_tile_i, y_tile, rows, hidden, inter_pad, tn, False)
+                residual_add_fp32(h32, mlp_out, rows, hidden)
+
+                T.copy(h32, Hio[0, 0])
+            T.sync_threads()
+
+    return layer
