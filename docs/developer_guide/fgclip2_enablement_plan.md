@@ -68,9 +68,17 @@ assume npu_dsl's tile constants transfer")
   stable over repeats (`test_intel_npu_fgclip2_v1.py`). Real bug found and fixed: every scratch buffer was
   `alloc_local` (reserved PER SHAVE even though only `shave==0` uses any of it), which doubled the CMX
   footprint and blew the budget (1,995,136 B needed > 1,473,536 B available) -- switched to `alloc_shared`
-  (one copy per tile). Still open for V1: the device-side 27-layer loop with a weight table (`T.ddr_view`,
-  reusing the GDN_TABLE pattern from Qwen's M5), and real patch/token counts (which will need attention
-  chunking again, since V0/V1's plain softmax assumes all keys resident at once).
+  (one copy per tile). Still open for V1: real patch/token counts (which will need attention chunking again,
+  since V0/V1's plain softmax assumes all keys resident at once), patch embedding, and the pooling/dense heads.
+
+  **V1 progress, part 2 (2026-11-11): the device-side layer loop is done.**
+  `make_fgclip2_encoder_layers_v1` runs N copies of the single-layer kernel in ONE launch, reading each layer's
+  weights through `T.ddr_view(Table[li, col["Wq"]], ...)` (`FGCLIP2_TABLE_COLS`), reusing Qwen's M5 layer-table
+  design verbatim rather than re-deriving it. Host-sim validated at `n_layers=3`, stable over 3 repeats
+  (`test_intel_npu_fgclip2_layers_v1.py`), including the "every layer reads its own row" negative control
+  (mirrors `test_intel_npu_m6_prefill_model.py`'s own version of that check). No new bugs found on the first
+  run this time -- the layer-table mechanics transferred cleanly once the CMX budget lesson from part 1 was
+  already applied (every buffer `alloc_shared`, declared once outside the loop).
 * **V1: 27-layer vision tower, single launch, no pooling/dense head.** Device-side layer loop (weight table),
   patch embedding + position embedding as kernel inputs (host-prepared), fp32 residual stream in DDR. Oracle:
   `reference.py::vision(..., trace=False)` up to `post_layernorm`, no pooling head yet.
