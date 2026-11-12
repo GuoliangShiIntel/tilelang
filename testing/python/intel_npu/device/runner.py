@@ -138,9 +138,17 @@ def build_all(sources: dict[str, str], build_dir: Path | None = None, log=print,
     cmake = find_cmake()
     env = dict(os.environ)
     # Always configure: the kernel list is a CMake glob, so a new generated/<kernel>.cpp needs a re-run.
+    # Generator is overridable: machines with a newer/older Visual Studio than 2022 installed
+    # (e.g. "Visual Studio 18 2026") need TL_NPU_CMAKE_GENERATOR set, or "" to let cmake auto-detect.
+    generator = os.environ.get("TL_NPU_CMAKE_GENERATOR", "Visual Studio 17 2022")
+    gen_args = ["-G", generator, "-A", "x64"] if generator else []
+    # NPU generation to build kernel ELFs for (CMakeLists.txt's TL_NPU_DEVICES cache var, e.g. "5010"
+    # for PTL/NPU5, "6010" for NVL/NPU6); overridable for machines with different attached hardware.
+    devices = os.environ.get("TL_NPU_DEVICES")
+    device_args = [f"-DTL_NPU_DEVICES={devices}"] if devices else []
     r = subprocess.run(
-        [cmake, "-G", "Visual Studio 17 2022", "-A", "x64", "-S", str(HERE), "-B", str(build_dir),
-         f"-DGENERIC_COMPUTE_ROOT={gc_root}", f"-DMV_TOOLS_PATH={mv_tools}"],
+        [cmake, *gen_args, "-S", str(HERE), "-B", str(build_dir),
+         f"-DGENERIC_COMPUTE_ROOT={gc_root}", f"-DMV_TOOLS_PATH={mv_tools}", *device_args],
         capture_output=True, text=True, env=env)
     if r.returncode:
         raise RuntimeError(f"cmake configure failed:\n{r.stdout[-4000:]}\n{r.stderr[-4000:]}")
