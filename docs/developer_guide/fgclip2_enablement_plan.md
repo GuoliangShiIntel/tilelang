@@ -141,7 +141,39 @@ Real bugs found and fixed in this process (all recorded in repo memory for futur
 reservation; a GEMM operand with a literal leading extent of 1 is refused ("not 2-D") -- the pooling head's
 single probe row had to ride along as `BQ` (>=16) redundant identical rows instead.
 
-## 4. Known traps carried over from the npu_dsl implementation (do not re-discover these the hard way)
+## 3b. Device validation attempt (2026-11-11 follow-up): infra works, FGCLIP2 itself is BLOCKED by a real-hardware bug
+
+Section 3's "no GENERIC_COMPUTE_ROOT, no NPU hardware" claim above no longer describes every environment this
+plan might run in -- a later session on a machine with a real NVL (NPU6) card and local `generic_compute` /
+MoviTools SDK checkouts got the device build/runner working (see repo memory
+`intel_npu_backend_overview.md`'s "Real NPU device execution" + "OPEN BUG" sections for the full account).
+Headline results:
+
+* **Device infra confirmed working**: after three portability fixes (CMake generator, `TL_NPU_DEVICES` for
+  NPU6, a guarded `npu40xx` reference for int4 quant that doesn't exist on NPU6), `run_gemm_device.py` ran for
+  real on the NVL/NPU6 card: all SHAVEs OK, rel error 3.24e-04, PASS. This is the first non-host-sim execution
+  of any TileLang Intel NPU kernel in this backend.
+* **FGCLIP2 itself cannot currently be validated on this NPU6 hardware**: every FGCLIP2 kernel tried for real
+  (`device/run_fgclip2_v0_device.py` at the smallest V0 shape, `run_fgclip2_ddr_synthetic_device.py` at V1's
+  real channel width, `run_fgclip2_layer0_device.py` at the real checkpoint's real shape) hits the identical
+  `BARRIER_TIMEOUT` (status 6, detail 13) on real hardware. Bisection with five minimal probe kernels (all kept
+  in `device/run_*_probe_device.py`) found the exact cause: **a plain scalar (non-DPU) loop executed on the
+  single active SHAVE** -- present in LayerNorm/softmax/GELU/bias-add/residual-add, i.e. almost every op this
+  backend's kernels use outside the GEMM itself -- reliably reproduces the hang within 1-3 repeated launches,
+  while DPU-matmul-only kernels (any shape, any call count, any sequence of different shapes) were robust
+  across 20+ repeated launches with zero failures. This looks like an NPU6-specific runtime/hardware issue in
+  this generic_compute revision (`dc/dsl_barrier`/`6bb585c`, which per `device/evidence/INDEX.md` was developed
+  and evidenced only against NPU5/PTL hardware), not a TileLang codegen bug -- fixing it needs either a newer,
+  NPU6-validated generic_compute revision or real hardware debug tooling (moviDebug2/JTAG trace) beyond source
+  inspection.
+* **All of section 3's host-sim numbers above remain exactly as valid as before** -- host-sim is a CPU model
+  that never exercises real SHAVE hardware, so it was never going to reproduce (or be affected by) this bug.
+  Do not re-run the host-sim suite expecting a change; the open item is device validation only.
+* If resuming device work: re-run `device/run_scalar_loop_probe_device.py` first as a quick health check (cheap,
+  ~30s build) before investing time in a bigger kernel -- if it still fails, FGCLIP2 (and any other
+  scalar-op-using kernel) is still blocked on this hardware/SDK combination.
+
+
 
 * GELU is the **tanh approximation**, not erf -- a numpy `scipy.special.erf`-based GELU reference will disagree
   at the ~1e-3 level, large enough to look like a real bug.
