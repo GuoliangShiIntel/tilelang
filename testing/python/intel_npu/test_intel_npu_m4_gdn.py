@@ -152,3 +152,26 @@ def test_small_instance_matches_the_oracle_in_host_sim():
     out2 = arrays2["Out"][0, :H].astype(np.float32)
     assert np.abs(out2 - ref).max() / scale > 2e-2
 
+
+@needs_cxx
+def test_dpu_ba_projection_preserves_gdn_output_and_state():
+    problem = gdn_problem(7, **SMALL)
+    packed = gdn_pack(problem, SMALL["BN1"], SMALL["BN2"])
+    results = []
+    for ba_dpu in (False, True):
+        low = _lower(make_gdn_decode(pipelined=False, ba_dpu=ba_dpu, **SMALL))
+        lib = host_sim.build(low.source, f"tl_gdn_ba_{int(ba_dpu)}")
+        arrays = gdn_arrays(problem, packed, **SMALL)
+        host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, arrays), TILES, SHAVES))
+        results.append(arrays)
+    baseline, candidate = results
+    np.testing.assert_allclose(candidate["BA"][0, :2 * SMALL["VH"]], baseline["BA"][0, :2 * SMALL["VH"]], rtol=2e-3, atol=1e-3)
+    np.testing.assert_allclose(candidate["Out"], baseline["Out"], rtol=2e-2, atol=2e-3)
+    np.testing.assert_array_equal(candidate["ConvState"], baseline["ConvState"])
+    np.testing.assert_allclose(candidate["Ssm"], baseline["Ssm"], rtol=2e-2, atol=1e-3)
+
+
+def test_dpu_ba_rejects_unaligned_output_rows():
+    with pytest.raises(AssertionError, match="requires a multiple of 16 rows"):
+        make_gdn_decode(ba_dpu=True, **dict(SMALL, VH=4))
+

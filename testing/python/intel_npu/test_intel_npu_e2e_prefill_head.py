@@ -9,6 +9,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "e2e"))
 from decode import DeviceModel
 
 
+def test_decode_ba_dpu_rejects_per_layer_mode():
+    from decode import main
+
+    with pytest.raises(SystemExit) as error:
+        main(["--decode-gdn-ba-dpu", "--per-layer"])
+    assert error.value.code == 2
+
+
 @pytest.mark.parametrize("count", [1, 4, 5, 9])
 def test_standalone_head_reads_last_live_row_without_decode(count):
     model = DeviceModel.__new__(DeviceModel)

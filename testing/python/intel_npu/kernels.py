@@ -1722,6 +1722,7 @@ def make_gdn_decode(
     eps: float = 1e-6,
     pipelined: bool = True,
     probe_skip: str | None = None,
+    ba_dpu: bool = False,
 ):
     """M4 decode: one token through a Gated DeltaNet mixer layer in ONE launch (Qwen3.6's shape by default: hidden H,
     KH k-heads and VH v-heads of DK = DV = 128, conv kernel 4, int4 g128 projections).
@@ -1744,7 +1745,8 @@ def make_gdn_decode(
     Scratch (DDR): Y [1, YLEN], BA [1, BA_LEN] (b then a), CV [1, CVLEN], O [1, workers x HPW x DV] (padded so the last worker's whole-block
     row loads stay in bounds; a DDR read past a buffer hangs the device). Packing: `pack_gdn`; sizes: `gdn_sizes`.
     `probe_skip`: MEASUREMENT ARM ONLY (output wrong by design): 'conv' leaves out the conv SHAVE loop, 'scan' the
-    per-head delta rule and gated norm, 'gemv' both GEMVs' DPU workloads (the rings still stream)."""
+    per-head delta rule and gated norm, 'gemv' both GEMVs' DPU workloads (the rings still stream).
+    `ba_dpu`: use one fp16 DPU GEMM for b/a instead of fp32 SHAVE dot products; requires 2 * VH to be 16-aligned."""
     gdn_mixer, sz = gdn_block(
         H=H,
         KH=KH,
@@ -1765,6 +1767,7 @@ def make_gdn_decode(
         pipelined=pipelined,
         probe_skip=probe_skip,
         res_add=True,
+        ba_dpu=ba_dpu,
     )
     CONV, NIN_pad, NOUT_pad, HG1, KG2, VC = sz["CONV"], sz["NIN_pad"], sz["NOUT_pad"], sz["HG1"], sz["KG2"], sz["VC"]
     WBA_pad, YLEN, BA_LEN, CVLEN, OPAD = sz["WBA_pad"], sz["YLEN"], sz["BA_LEN"], sz["CVLEN"], sz["OPAD"]
@@ -1819,11 +1822,13 @@ def gdn_block(
     pipelined: bool = True,
     probe_skip: str | None = None,
     res_add: bool = True,
+    ba_dpu: bool = False,
 ):
     """The Gated DeltaNet mixer as a `T.macro` (make_gdn_decode's docstring): `gdn_mixer(x_cmx, WinQ, WinS, Wba, ConvW,
     ALog, DtBias, GNorm, ConvState, Ssm, WoutQ, WoutS, Y, BA, CV, O, Res, Out, tile, shave)` takes the normed token in
     tile-shared CMX
-    and writes the mixer output (+ Res when `res_add`) to Out, every tile its third of the rows. Returns (macro, sizes)."""
+    and writes the mixer output (+ Res when `res_add`) to Out, every tile its third of the rows. `ba_dpu` selects
+    the optional fp16 DPU projection for b/a. Returns (macro, sizes)."""
     assert DK == DV and VH % KH == 0 and H % G == 0 and CB % 16 == 0
     REP = VH // KH
     QK, VC = KH * DK, VH * DV
@@ -1838,6 +1843,7 @@ def gdn_block(
     workers = tiles * shaves
     RBA = -(-2 * VH // workers)  # b / a rows per worker
     assert RBA <= BN1
+    assert not ba_dpu or (2 * VH) % 16 == 0, "b/a DPU projection requires a multiple of 16 rows"
     WBA_pad = workers * RBA
     HPW = -(-VH // workers)
     HPW += (-HPW) % REP  # whole k-heads per worker
@@ -2005,7 +2011,11 @@ def gdn_block(
         w1_cmx = T.alloc_shared((BN1, H // 2), T.uint8)
         s1_cmx = T.alloc_shared((HG1, BN1), T.float16)
         y1_cmx = T.alloc_local((1, BN1), T.float16)
-        wba_cmx = T.alloc_local((RBA, H), T.float16)
+        if ba_dpu:
+            wba_dpu = T.alloc_shared((2 * VH, H), T.float16)
+            yba_dpu = T.alloc_local((1, 2 * VH), T.float16)
+        else:
+            wba_cmx = T.alloc_local((RBA, H), T.float16)
         cs_cmx = T.alloc_local((3, CB), T.float16)
         cw_cmx = T.alloc_local((4, CB), T.float16)
         cx_cmx = T.alloc_local((1, CB), T.float16)
@@ -2056,16 +2066,25 @@ def gdn_block(
                     T.gemm_i4(x_cmx, w1_cmx, s1_cmx, y1_cmx, group=G, row0=sub * R1, rows=R1, scales_major="group")
             T.copy(y1_cmx, Y[0, (tile * C1 + n) * BN1])
         perf_end()
+        if ba_dpu:
+            T.sync_threads()
         perf_begin("dgba")
-        T.copy(Wba[worker * RBA, 0], wba_cmx)
-        for r in T.serial(RBA):
-            for v in T.vectorized(FL):
-                ls[v] = T.float32(0)
-            for d0 in T.serial(H // FL):
+        if ba_dpu:
+            if tile == 0:
+                T.copy(Wba[0:2 * VH, 0:H], wba_dpu)
+                if shave == 0:
+                    T.gemm(x_cmx, wba_dpu, yba_dpu, transpose_B=True, clear_accum=True)
+                    T.copy(yba_dpu, BA[0, 0])
+        else:
+            T.copy(Wba[worker * RBA, 0], wba_cmx)
+            for r in T.serial(RBA):
                 for v in T.vectorized(FL):
-                    ls[v] = ls[v] + T.cast(x_cmx[0, d0 * FL + v], T.float32) * T.cast(wba_cmx[r, d0 * FL + v], T.float32)
-            y1_cmx[0, r] = T.cast(T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL]), T.float16)
-        T.copy(y1_cmx[0:1, 0:RBA], BA[0, worker * RBA])
+                    ls[v] = T.float32(0)
+                for d0 in T.serial(H // FL):
+                    for v in T.vectorized(FL):
+                        ls[v] = ls[v] + T.cast(x_cmx[0, d0 * FL + v], T.float32) * T.cast(wba_cmx[r, d0 * FL + v], T.float32)
+                y1_cmx[0, r] = T.cast(T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL]), T.float16)
+            T.copy(y1_cmx[0:1, 0:RBA], BA[0, worker * RBA])
         T.sync_grid()
         perf_end()
         # --- B1. causal conv1d (k = 4) + SiLU over the CONV channels, blocks of CB dealt over the workers -------
