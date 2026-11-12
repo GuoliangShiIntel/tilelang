@@ -262,20 +262,26 @@ def gemma4_qkv_prefill_reference(y, qnorm_w, knorm_w, cos_sin, pos0: int, n: int
     return Q, kc, vt
 
 
-def gemma4_prefill_norm_block(H: int, NP: int, workers: int, eps: float = 1e-6, FL: int = 16):
-    """The prefill layer's PLAIN (non-zero-centered) weighted RMSNorm over `NP` DDR-resident fp32 residual
-    rows, tokens dealt over the workers -- `kernels.prefill_norm_block`'s counterpart, `w` not `1 + w`.
-    `Hio` is the fp32 residual stream, `Xs` the fp16 normed output a projection reads next."""
+def gemma4_prefill_norm_block(H: int, NP: int, workers: int, eps: float = 1e-6, FL: int = 16,
+                              in_dtype=T.float32, weighted: bool = True):
+    """The prefill layer's PLAIN (non-zero-centered) RMSNorm over `NP` DDR-resident `in_dtype` rows,
+    tokens dealt over the workers -- `kernels.prefill_norm_block`'s counterpart, `w` not `1 + w`.
+    `Hio` is the residual stream (fp32 for the seven weighted residual-site norms; fp16 for `post_ffn_1`,
+    which norms the dense FFN's fp16 output directly, not a copy promoted to fp32 first), `Xs` the fp16
+    normed output a projection reads next. `weighted=False` is the router's `rms_norm(h1, None, eps) *
+    router_scale` step -- same arithmetic, `Wnorm` still provided (it IS `router_scale`, just applied
+    without being folded into a per-norm-site weight the way every other site's weight already is)."""
     assert NP % workers == 0 and H % FL == 0
 
     @T.macro
     def norm_tokens(Hio, Wnorm, Xs, worker):
         nw = T.alloc_local((1, H), T.float16)
-        hrow = T.alloc_local((1, H), T.float32)
+        hrow = T.alloc_local((1, H), in_dtype)
         xrow = T.alloc_local((1, H), T.float16)
         ls = T.alloc_local((FL,), T.float32)
         st = T.alloc_local((1,), T.float32)
-        T.copy(Wnorm[0, 0], nw)
+        if weighted:
+            T.copy(Wnorm[0, 0], nw)
         for it in T.serial(NP // workers):
             t = it * workers + worker
             T.copy(Hio[t, 0], hrow)
@@ -283,11 +289,12 @@ def gemma4_prefill_norm_block(H: int, NP: int, workers: int, eps: float = 1e-6, 
                 ls[v] = T.float32(0)
             for d0 in T.serial(H // FL):
                 for v in T.vectorized(FL):
-                    ls[v] = ls[v] + hrow[0, d0 * FL + v] * hrow[0, d0 * FL + v]
+                    ls[v] = ls[v] + T.cast(hrow[0, d0 * FL + v], T.float32) * T.cast(hrow[0, d0 * FL + v], T.float32)
             st[0] = T.float32(1) / T.sqrt(T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL]) / T.float32(H) + T.float32(eps))
             for d0 in T.serial(H // FL):
                 for v in T.vectorized(FL):
-                    xrow[0, d0 * FL + v] = T.cast(hrow[0, d0 * FL + v] * st[0] * T.cast(nw[0, d0 * FL + v], T.float32), T.float16)
+                    scale = st[0] * T.cast(nw[0, d0 * FL + v], T.float32) if weighted else st[0]
+                    xrow[0, d0 * FL + v] = T.cast(T.cast(hrow[0, d0 * FL + v], T.float32) * scale, T.float16)
             T.copy(xrow, Xs[t, 0])
 
     return norm_tokens
@@ -325,6 +332,41 @@ def gemma4_residual_block(H: int, NP: int, workers: int, FL: int = 16):
             T.copy(hrow, Hio[t, 0])
 
     return add_tokens, scale_tokens
+
+
+def gemma4_add_norm_block(H: int, NP: int, workers: int, eps: float = 1e-6, FL: int = 16):
+    """`combined = rmsnorm(dense_normed + moe_normed, post_ffn_norm)`: the one layer site that sums two
+    fp16 DDR tensors (in fp32) before the plain weighted RMSNorm, instead of normalising a single
+    residual-stream row. Returns `add_norm(A, B, Wnorm, Xs, worker)`."""
+    assert NP % workers == 0 and H % FL == 0
+
+    @T.macro
+    def add_norm(A, B, Wnorm, Xs, worker):
+        nw = T.alloc_local((1, H), T.float16)
+        arow = T.alloc_local((1, H), T.float16)
+        brow = T.alloc_local((1, H), T.float16)
+        srow = T.alloc_local((1, H), T.float32)
+        xrow = T.alloc_local((1, H), T.float16)
+        ls = T.alloc_local((FL,), T.float32)
+        st = T.alloc_local((1,), T.float32)
+        T.copy(Wnorm[0, 0], nw)
+        for it in T.serial(NP // workers):
+            t = it * workers + worker
+            T.copy(A[t, 0], arow)
+            T.copy(B[t, 0], brow)
+            for v in T.vectorized(FL):
+                ls[v] = T.float32(0)
+            for d0 in T.serial(H // FL):
+                for v in T.vectorized(FL):
+                    srow[0, d0 * FL + v] = T.cast(arow[0, d0 * FL + v], T.float32) + T.cast(brow[0, d0 * FL + v], T.float32)
+                    ls[v] = ls[v] + srow[0, d0 * FL + v] * srow[0, d0 * FL + v]
+            st[0] = T.float32(1) / T.sqrt(T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL]) / T.float32(H) + T.float32(eps))
+            for d0 in T.serial(H // FL):
+                for v in T.vectorized(FL):
+                    xrow[0, d0 * FL + v] = T.cast(srow[0, d0 * FL + v] * st[0] * T.cast(nw[0, d0 * FL + v], T.float32), T.float16)
+            T.copy(xrow, Xs[t, 0])
+
+    return add_norm
 
 
 def make_gemma4_geglu_activation(N: int, FI: int, tiles: int = 3, shaves: int = 2, as_block: bool = False, FL: int = 16):
@@ -899,3 +941,184 @@ def gemma4_attn_prefill_reference(q, kc, vt, pos0: int, window: int | None = Non
                 h = g * GQ + hh
                 out[t, h * D : (h + 1) * D] = v @ pr
     return out
+
+
+def make_gemma4_layer_prefill(
+    N: int, H: int, NH: int, NKV: int, D: int, FI: int, E: int, TOPK: int, I: int,
+    G: int = 64, SMAX: int = 256, full: bool = False, window: "int | None" = None,
+    TB: int = 4, BKV: int = 128, BN: int = 32, MB_expert: int = 4,
+    tiles: int = 3, shaves: int = 2, eps: float = 1e-6,
+):
+    """A WHOLE Gemma4 decoder layer in ONE launch, V0: one of the two layer KINDS (`full` selects which),
+    composed from every macro above -- `Gemma4Ref.decoder_layer`'s exact phase order:
+
+      x = rmsnorm(H, input_norm) -> qkv proj -> qkv_phase (norm/RoPE/V-derivation) -> flash attention
+          -> o_proj -> h1 = H + rmsnorm(attn_o, post_attn_norm)
+      dense_in = rmsnorm(h1, pre_ffn_norm) -> dense FFN -> dense_n = rmsnorm(dense, post_ffn_1_norm)
+      route_in = rmsnorm(h1, router_scale) -> router logits -> route (top-k, per_expert_scale)
+      moe_in = rmsnorm(h1, pre_ffn_2_norm) -> grouped expert FFN -> combine -> moe_n = rmsnorm(moe, post_ffn_2_norm)
+      combined = rmsnorm(dense_n + moe_n, post_ffn_norm)
+      H = (h1 + combined) * layer_scalar
+
+    Every phase deals its work differently, so every boundary is a grid barrier (`DeriveIntelNpuGlobalSync`
+    derives them from the DDR read/write dependencies below -- no manual `T.sync_grid()` in this macro).
+    `CosSin` must be the full-width `[cos(D) | sin(D)]` duplicated-half table (see
+    `make_gemma4_qkv_prefill`'s docstring). `H` is read AND written (the fp32 residual stream, mutated
+    through the layer exactly as `Gemma4Ref.decoder_layer` mutates `hidden`/`h1` in place).
+    Oracle: `gemma4_decoder_layer_reference`."""
+    workers = tiles * shaves
+    GQ = NH // NKV
+    KO = NH * D
+    from kernels import make_proj_prefill
+
+    qkv_phase, qs = make_gemma4_qkv_prefill(N=N, NH=NH, NKV=NKV, D=D, SMAX=SMAX, full=full, TB=TB,
+                                            tiles=tiles, shaves=shaves, eps=eps, as_block=True)
+    NQKV = qs["NQKV"]
+    attn_phase, _ = make_gemma4_attn_prefill(N=N, NKV=NKV, GQ=GQ, D=D, SMAX=SMAX, window=window, TB=TB,
+                                             BKV=BKV, tiles=tiles, shaves=shaves, as_block=True)
+    qkv_proj, _ = make_proj_prefill(NP=N, M=NQKV, K=H, BN=BN, MB=N, G=G, tiles=tiles, shaves=shaves,
+                                    as_block=True, scales_gm=True)
+    o_proj, _ = make_proj_prefill(NP=N, M=H, K=KO, BN=BN, MB=N, G=G, tiles=tiles, shaves=shaves,
+                                  as_block=True, scales_gm=True)
+    dense_ffn = make_gemma4_dense_ffn_prefill(N=N, H=H, FI=FI, G=G, BN=BN, MB=N, tiles=tiles, shaves=shaves, as_block=True)
+    router_proj = gemma4_fp16_proj_prefill(NP=N, M=E, K=H, BN=BN, MB=N, tiles=tiles, shaves=shaves, as_block=True)
+    route_phase, rs = make_gemma4_moe_route_prefill(N=N, E=E, TOPK=TOPK, tiles=tiles, shaves=shaves, as_block=True)
+    SLOTS = rs["SLOTS"]
+    expert_phase, es = make_gemma4_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MB_expert,
+                                                      tiles=tiles, shaves=shaves, as_block=True)
+    KGH_e, KGI_e = es["KGH"], es["KGI"]
+    combine_phase = make_gemma4_moe_combine(N=N, H=H, tiles=tiles, shaves=shaves, as_block=True)
+
+    norm_f32 = gemma4_prefill_norm_block(H, N, workers, eps, in_dtype=T.float32)
+    norm_f16 = gemma4_prefill_norm_block(H, N, workers, eps, in_dtype=T.float16)
+    add_tokens, scale_tokens = gemma4_residual_block(H, N, workers)
+    add_norm = gemma4_add_norm_block(H, N, workers, eps)
+
+    @T.macro
+    def layer(
+        Hio, InNorm, QNorm, KNorm, CosSin, PostAttnNorm, PreFfnNorm, PostFfn1Norm, PreFfn2Norm, PostFfn2Norm,
+        PostFfnNorm, RouterScale, WqkvQ, WqkvS, WoQ, WoS, WgateQ, WgateS, WupQ, WupS, WdownQ, WdownS,
+        WR, EWgateQ, EWgateS, EWupQ, EWupS, EWdownQ, EWdownS, PerExpertScale, LayerScalar, Kc, Vt, Pos, Nt,
+        Xn, Ys, Q, AttnO, AttnP, PostAttnN, Xdense, Dense, DenseN, Gate, Up, Act,
+        Xroute, Logits, Ids, Wts, Off, Slot, Xmoe, MoePart, MoeOut, MoeN, Combined,
+        tile, shave,
+    ):
+        worker = tile * shaves + shave
+        norm_f32(Hio, InNorm, Xn, worker)
+        qkv_proj(Xn, WqkvQ, WqkvS, Ys, tile, shave)
+        qkv_phase(Ys, QNorm, KNorm, CosSin, Pos, Nt, Q, Kc, Vt, tile, shave)
+        attn_phase(Q, Kc, Vt, Pos, AttnO, tile, shave, None, 0)
+        o_proj(AttnO, WoQ, WoS, AttnP, tile, shave)
+        norm_f16(AttnP, PostAttnNorm, PostAttnN, worker)
+        add_tokens(Hio, PostAttnN, worker)  # Hio now holds h1
+
+        norm_f32(Hio, PreFfnNorm, Xdense, worker)
+        dense_ffn(Xdense, WgateQ, WgateS, WupQ, WupS, WdownQ, WdownS, Gate, Up, Act, Dense, tile, shave)
+        norm_f16(Dense, PostFfn1Norm, DenseN, worker)
+
+        norm_f32(Hio, RouterScale, Xroute, worker)
+        router_proj(Xroute, WR, Logits, tile, shave)
+        route_phase(Logits, PerExpertScale, Ids, Wts, Off, Slot, tile, shave)
+
+        norm_f32(Hio, PreFfn2Norm, Xmoe, worker)
+        expert_phase(Xmoe, EWgateQ, EWgateS, EWupQ, EWupS, EWdownQ, EWdownS, Wts, Off, Slot, MoePart, tile, shave)
+        combine_phase(MoePart, MoeOut, tile, shave)
+        norm_f32(MoeOut, PostFfn2Norm, MoeN, worker)  # MoeOut is fp32 -- norm_f32 reads it directly
+
+        add_norm(DenseN, MoeN, PostFfnNorm, Combined, worker)
+        add_tokens(Hio, Combined, worker)
+        scale_tokens(Hio, LayerScalar, worker)
+
+    return layer, dict(NQKV=NQKV, GQ=GQ, KO=KO, SLOTS=SLOTS, KGH_e=KGH_e, KGI_e=KGI_e, workers=workers)
+
+
+def gemma4_decoder_layer_reference(
+    h, weights: dict, NH: int, NKV: int, D: int, full: bool, window: "int | None", eps: float = 1e-6,
+):
+    """numpy oracle of `make_gemma4_layer_prefill` (fp32) -- `Gemma4Ref.decoder_layer`'s exact math, with
+    the model's OvIr-backed weight loading replaced by a plain `weights` dict of already-fp32 arrays (no
+    OvIr/torch dependency, so this runs standalone against synthetic weights). `h` is `[N, H]`. Weight
+    keys: `input_norm, post_attn_norm, pre_ffn_norm, post_ffn_1_norm, pre_ffn_2_norm, post_ffn_2_norm,
+    post_ffn_norm, q_norm, k_norm, router_scale` (vectors); `wq [NH*D+(1|2)*NKV*D, H], wv [NKV*D, H]`
+    (sliding only), `wo [H, NH*D]`, `wg [FI, H], wu [FI, H], wd [H, FI]`, `router_proj [E, H]`,
+    `ewg [E, I, H], ewu [E, I, H], ewd [E, H, I]`, `per_expert_scale [E]`; `layer_scalar` (float);
+    `cos_sin [N, 2 * D]` (full-width, duplicated-half, pos0 = 0 always here -- V0 has no KV-cache prefix)."""
+    import numpy as np
+
+    def rms(x, w=None):
+        s = x * (1.0 / np.sqrt((x * x).mean(-1, keepdims=True) + eps))
+        return s if w is None else s * w.reshape(1, -1)
+
+    def rope(x, cs):
+        # x: [N, D]; cs: [N, 2D] (cos(D) | sin(D), duplicated-half)
+        half = D // 2
+        cos, sin = cs[:, :D], cs[:, D:]
+        r1, r2 = x[:, :half], x[:, half:]
+        out = np.empty_like(x)
+        out[:, :half] = r1 * cos[:, :half] - r2 * sin[:, :half]
+        out[:, half:] = r2 * cos[:, half:] + r1 * sin[:, half:]
+        return out
+
+    def gelu_tanh(x):
+        return 0.5 * x * (1.0 + np.tanh(0.7978845608028654 * (x + 0.044715 * x**3)))
+
+    N = h.shape[0]
+    GQ = NH // NKV
+    w = weights
+    xin = rms(h, w["input_norm"])
+    q_all = (xin @ w["wq"][: NH * D].T).reshape(N, NH, D)
+    raw_k = (xin @ w["wq"][NH * D : NH * D + NKV * D].T).reshape(N, NKV, D)
+    if full:
+        raw_v = raw_k
+    else:
+        raw_v = (xin @ w["wq"][NH * D + NKV * D : NH * D + 2 * NKV * D].T).reshape(N, NKV, D)
+    q = np.stack([rope(rms(q_all[:, hh], w["q_norm"]), w["cos_sin"]) for hh in range(NH)], axis=1)
+    k = np.stack([rope(rms(raw_k[:, g], w["k_norm"]), w["cos_sin"]) for g in range(NKV)], axis=1)
+    v = np.stack([rms(raw_v[:, g]) for g in range(NKV)], axis=1)
+    k_rep = np.repeat(k, GQ, axis=1)
+    v_rep = np.repeat(v, GQ, axis=1)
+    context = np.zeros((N, NH, D), np.float32)
+    for t in range(N):
+        lo = 0 if window is None else max(0, t - window + 1)
+        for hh in range(NH):
+            s = k_rep[lo : t + 1, hh] @ q[t, hh] / np.sqrt(D)
+            pr = np.exp(s - s.max())
+            pr /= pr.sum()
+            context[t, hh] = v_rep[lo : t + 1, hh].T @ pr
+    attn_o = context.reshape(N, NH * D) @ w["wo"].T
+    h1 = h + rms(attn_o, w["post_attn_norm"])
+
+    dense_in = rms(h1, w["pre_ffn_norm"])
+    gate = gelu_tanh(dense_in @ w["wg"].T)
+    up = dense_in @ w["wu"].T
+    dense = (gate * up) @ w["wd"].T
+    dense_n = rms(dense, w["post_ffn_1_norm"])
+
+    route_in = rms(h1, None) * w["router_scale"].reshape(1, -1)
+    logits = route_in @ w["router_proj"].T
+    E = logits.shape[1]
+    moe_in = rms(h1, w["pre_ffn_2_norm"])
+    moe = np.zeros((N, h.shape[1]), np.float32)
+    for t in range(N):
+        row = logits[t].copy()
+        TOPK = w["ids_topk"]
+        ids = []
+        vals = []
+        for _ in range(TOPK):
+            i = int(np.argmax(row))
+            ids.append(i)
+            vals.append(row[i])
+            row[i] = -1e30
+        vals = np.array(vals)
+        wts = np.exp(vals - vals[0])
+        wts = wts / wts.sum() * w["per_expert_scale"][ids]
+        for k_, e in enumerate(ids):
+            g_ = gelu_tanh(moe_in[t] @ w["ewg"][e].T)
+            u_ = moe_in[t] @ w["ewu"][e].T
+            y_ = (g_ * u_) @ w["ewd"][e].T
+            moe[t] += wts[k_] * y_
+    moe_n = rms(moe, w["post_ffn_2_norm"])
+
+    combined = rms(dense_n + moe_n, w["post_ffn_norm"])
+    return (h1 + combined) * w["layer_scalar"]
+

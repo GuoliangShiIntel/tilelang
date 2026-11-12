@@ -252,4 +252,32 @@ have an analogous int8-embedding gather (M6 `e2e`); check for reuse before writi
   WINDOWED oracle and provably disagrees with the plain-causal oracle (dead-test guard); a perturbed key
   fails the golden. Next: the QKV projection phase (including full-attention's `V = rmsnorm(raw K)` special
   case) and the dense-FFN / router changes (section 2.2-2.4), then a full single-layer host-sim test against
-  `Gemma4Ref.decoder_layer` with synthetic weights (V0's actual closing milestone).
+  `Gemma4Ref.decoder_layer` with synthetic weights (V0's actual closing milestone).- 2026-11-11 continued, same session: QKV prefill phase (`make_gemma4_qkv_prefill`, plain per-head norm,
+  full-width rotate-half RoPE, always-unweighted V derivation), the dense FFN (`make_gemma4_dense_ffn_prefill`,
+  reusing `kernels.make_proj_prefill` for the int4 GEMMs + a fresh gelu-tanh activation -- **correction**:
+  Qwen3.6's expert FFN is SiLU-based, not GELU, so the activation had to be written from scratch, only the
+  GEMM/dequant structure transfers), the MoE router (`make_gemma4_moe_route_prefill`, no shared-expert row,
+  `per_expert_scale` gather, verified mathematically identical to Gemma4Ref's softmax-then-top-k order), the
+  V0-grade MoE expert FFN + combine (`make_gemma4_moe_expert_prefill`/`make_gemma4_moe_combine`, every WORKER
+  owns whole experts round-robin, no tile-sharing) were all written and unit-tested in isolation (18 tests
+  total across 4 test files, all passing) before assembly.
+- 2026-11-11 continued: **V0 AND V1 BOTH CLOSED in one shot.** `make_gemma4_layer_prefill` composes every
+  phase above into ONE launch (`Gemma4Ref.decoder_layer`'s exact order: input norm -> qkv proj -> qkv phase
+  -> flash attention -> o_proj -> residual -> dense FFN -> router -> expert FFN -> combine -> final combine
+  norm -> residual -> layer_scalar), tested against `gemma4_decoder_layer_reference` (a from-scratch numpy
+  port of `Gemma4Ref.decoder_layer`, no torch/OvIr dependency) at a small synthetic shape
+  (H=64, NH=4, NKV=2, D=32, FI=64, E=32, TOPK=4, I=64, G=64, N=8 tokens). **3/3 parametrised cases PASS on
+  the first real attempt of the full composition**: sliding without a window, sliding with a window=6 (the
+  window genuinely changes the answer, not a dead case), and full-attention (V-from-raw-K, no window, wider
+  head_dim/fewer kv heads) -- all three reusing the IDENTICAL `make_gemma4_layer_prefill` factory, just with
+  `full`/`window` arguments. This means the plan's original V0/V1 split (sliding first, full-attention as a
+  separate follow-up milestone) collapsed into one milestone in practice: the `full` flag threaded through
+  `make_gemma4_qkv_prefill` from the start made the two layer kinds nearly free to both support.
+  Found and fixed one real `T.copy` semantics bug along the way (now in repo memory): a gather copy where
+  NEITHER operand is a bare buffer silently copies a single scalar element instead of a whole row unless
+  BOTH sides use an explicit `0:H` slice.
+- **Deliberate simplifications still in place, to revisit for performance (not correctness) later**: gate/up
+  are separate projections, not `pack.py`'s tile-interleaved layout; MoE routing/grouping is single-worker
+  serial, not load-balanced; the expert FFN has every worker own whole experts (no tile-sharing, no
+  pipelining); the attention window does not yet skip whole key-chunks before the window, only masks loaded
+  ones. None of these affect correctness; all are noted in the gap table (section 3) and code docstrings.
