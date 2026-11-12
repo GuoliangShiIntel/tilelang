@@ -43,6 +43,8 @@ static constexpr const char *kIntelNpuScopedCmx = "tl.intel_npu.scoped_cmx";
 static constexpr const char *kIntelNpuPrefetch = "tl.intel_npu.prefetch";
 static constexpr const char *kIntelNpuBatchDma = "tl.intel_npu.batch_dma";
 static constexpr const char *kIntelNpuDpuOverlap = "tl.intel_npu.dpu_overlap";
+static constexpr const char *kIntelNpuPrefetchBatch =
+    "tl.intel_npu.prefetch_batch";
 static constexpr const char *kIntelNpuMulticast = "tl.intel_npu.multicast";
 static constexpr const char *kIntelNpuMulticastOverlap =
     "tl.intel_npu.multicast_overlap";
@@ -74,6 +76,7 @@ TVM_DLL const Op &intel_npu_dma_copy();
  */
 TVM_DLL const Op &intel_npu_dma_wait();
 TVM_DLL const Op &intel_npu_dma_batch();
+TVM_DLL const Op &intel_npu_dma_batch_start();
 TVM_DLL const Op &intel_npu_dma_batch_flush();
 TVM_DLL const Op &intel_npu_axpy();
 

@@ -272,10 +272,34 @@ class _Scoper:
         phases.append(cur)
         if len(phases) == 1:
             return None
+        local_keys = _alloc_keys(_seq(items))
+        binding_keys = {hash(s.var) for s in items if isinstance(s, tirx.Bind)}
+        mutable_keys = set()
+
+        def find_mutations(node):
+            if isinstance(node, tirx.BufferStore):
+                mutable_keys.add(hash(node.buffer.data))
+            elif isinstance(node, tirx.Call):
+                for arg in node.args:
+                    if arg.dtype == "handle":
+                        mutable_keys.update(_buffers_used(arg))
+
+        for stmt in items:
+            post_order_visit(stmt, find_mutations)
+
+        def immutable_scalar(stmt):
+            if not isinstance(stmt, tirx.Bind) or stmt.var.dtype == "handle":
+                return False
+            if _buffers_used(stmt.value) & (local_keys | binding_keys | mutable_keys):
+                return False
+            calls = []
+            post_order_visit(stmt.value, lambda node: calls.append(node) if isinstance(node, tirx.Call) else None)
+            return not calls
+
         # DDR views (`T.ddr_view`: a Bind of a ddr_ptr call and its DeclBuffer) go to the block's head: a phase
         # becomes its own C++ block, and a view declared inside one would be out of scope for the next. Their
         # values read only kernel parameters and loop variables, all defined at the block's start.
-        views = [s for s in items if _is_view_def(s, items)]
+        views = [s for s in items if _is_view_def(s, items) or immutable_scalar(s)]
         if views:
             view_ids = {id(s) for s in views}
             items = [s for s in items if id(s) not in view_ids]

@@ -57,6 +57,40 @@ def test_gemm_source_has_dma_and_dpu_calls():
 
 
 @needs_cxx
+def test_async_gemm_starts_then_waits_before_output_is_read():
+    @T.prim_func
+    def async_gemm(A: T.Tensor((16, 64), T.float16), B: T.Tensor((16, 64), T.float16),
+                   C: T.Tensor((16, 16), T.float16)):
+        with T.Kernel(1, threads=1):
+            a = T.alloc_local((16, 64), T.float16)
+            b = T.alloc_local((16, 64), T.float16)
+            c = T.alloc_local((16, 16), T.float16)
+            T.copy(A, a)
+            T.copy(B, b)
+            T.gemm_async(a, b, c, transpose_B=True, clear_accum=True)
+            T.dpu_wait()
+            T.copy(c, C)
+
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off"}):
+        low = lowering.lower(async_gemm)
+    src = low.source
+    start = src.index("ctx.dpu_matmul_start(")
+    wait = src.index("ctx.dpu_matmul_wait()")
+    consume = src.index("ctx.dma_store(")
+    assert start < wait < consume
+
+    rng = np.random.default_rng(2026)
+    a = rng.standard_normal((16, 64)).astype(np.float16)
+    b = rng.standard_normal((16, 64)).astype(np.float16)
+    c = np.zeros((16, 16), np.float16)
+    lib = host_sim.build(low.source, "async_gemm")
+    arrays = lowering.order_arrays(low, {"A": a, "B": b, "C": c})
+    host_sim.check_status(host_sim.run(lib, arrays, tiles=1, shaves=1))
+    expected = (a.astype(np.float32) @ b.astype(np.float32).T).astype(np.float16)
+    np.testing.assert_allclose(c, expected, rtol=2e-3, atol=2e-3)
+
+
+@needs_cxx
 @pytest.mark.parametrize("count", [0, 3, 8])
 @pytest.mark.parametrize("shared", [False, True])
 def test_dynamic_dma_rows_preserve_unwritten_output(count, shared):

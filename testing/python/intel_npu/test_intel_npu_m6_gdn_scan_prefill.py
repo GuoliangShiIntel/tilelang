@@ -81,10 +81,11 @@ def test_lowers_with_the_eleven_chunk_matmuls():
     assert f", {DK}, {DV}, {C}," in src                 # dS: 128 x 128 output values from a K of 64
     # the chunk loop must carry eleven, and S0's transpose must stay OUT of it -- one per head, not per chunk.
     # Nesting depth is what separates them, so hoisting or sinking a matmul by mistake shows up here.
-    depths = [len(m.group(1)) for m in re.finditer(r"^(\s*)ctx\.dpu_matmul\(", src, re.M)]
+    depths = [len(m.group(1)) for m in re.finditer(r"^(\s*)ctx\.dpu_matmul(?:_start)?\(", src, re.M)]
     assert len(depths) == 12, f"matmuls emitted: {len(depths)}"
     assert depths.count(min(depths)) == 1, "exactly one matmul sits above the chunk loop (the S0 transpose)"
     assert depths.count(max(depths)) == 11, f"per-chunk matmuls: {depths.count(max(depths))}"
+    assert "ctx.dpu_matmul_start(" not in src
     assert "ctx.dpu_matmul_not_a_real_symbol(" not in src    # control: the needle still discriminates
 
 

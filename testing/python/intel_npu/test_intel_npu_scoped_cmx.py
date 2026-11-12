@@ -76,6 +76,31 @@ def test_two_phases_share_cmx_and_the_sum_is_refused_without_scoping(revisit):
         _lower(make_two_phase(BIG // SHAVES, revisit), **{"tl.intel_npu.scoped_cmx": False})
 
 
+def test_scalar_binding_across_phases_keeps_phase_buffers_reusable():
+    n = BIG // SHAVES
+
+    @T.prim_func
+    def kernel(A: T.Tensor((n,), T.float16), B: T.Tensor((n,), T.float16),
+               Scale: T.Tensor((1,), T.float16), Y: T.Tensor((2, n), T.float16)):
+        with T.Kernel(TILES, threads=SHAVES):
+            earlier = T.alloc_local((n,), T.float16)
+            later = T.alloc_local((n,), T.float16)
+            factor = Scale[0]
+            T.copy(A, earlier)
+            for index in T.serial(n):
+                earlier[index] = earlier[index] * factor
+            T.copy(earlier, Y[0, 0])
+            T.sync_grid()
+            T.copy(B, later)
+            for index in T.serial(n):
+                later[index] = later[index] + factor
+            T.copy(later, Y[1, 0])
+
+    _lower(kernel)
+    with pytest.raises(Exception, match="CMX budget exceeded"):
+        _lower(kernel, **{"tl.intel_npu.scoped_cmx": False})
+
+
 def test_tile_phase_reuses_an_already_scoped_successor():
     n = BIG // SHAVES
 

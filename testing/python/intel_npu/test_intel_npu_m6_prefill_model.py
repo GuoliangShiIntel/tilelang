@@ -62,13 +62,14 @@ needs_cxx = pytest.mark.skipif(not _has_host_cxx(), reason="no host clang++ for 
 
 def _kernel(shared_projections=False, expert_block=MBe, moe_slot_output=False, separate_shared_expert=False,
         combine_rows=1, moe_reuse_input=False, output_block_k=None, gate_up_block=BNG, gdn_in_mb=None,
-        tokens=N):
+    tokens=N, shared_down_serial_input=False):
     return make_prefill_model(L=L, N=tokens, H=H, KH=KH, VH=VH, DK=DK, DV=DV, NH=NH, NKV=NKV, D=D, ROT=ROT, SMAX=SMAX,
                               I=I, E=E, TOPK=TOPK, G=G, TB=TB, C=C, TBq=TBq, TBF=TBF, BKV=BKV, BN1=BN1, BN2=BN2,
                               MB=MB, BM=BM, BNR=BNR, MBe=expert_block, BNG=gate_up_block, BND=BND, tiles=TILES, shaves=SHAVES,
                               KVL=KVL, shared_projections=shared_projections, moe_slot_output=moe_slot_output,
                               separate_shared_expert=separate_shared_expert, moe_combine_rows=combine_rows,
-                              moe_reuse_input=moe_reuse_input, output_block_k=output_block_k, gdn_in_mb=gdn_in_mb)
+                              moe_reuse_input=moe_reuse_input, output_block_k=output_block_k, gdn_in_mb=gdn_in_mb,
+                              moe_shared_down_serial_input=shared_down_serial_input)
 
 
 def _layers(seed=0):
@@ -141,12 +142,13 @@ def _host_arrays(layers):
 
 def _run(layers, h, pos0=0, n=N, shared_projections=False, expert_block=MBe, moe_slot_output=False,
          separate_shared_expert=False, dpu_overlap=False, combine_rows=1, batch_dma=False, moe_reuse_input=False,
-         output_block_k=None, gate_up_block=BNG):
+         output_block_k=None, gate_up_block=BNG, shared_down_serial_input=False):
     with tvm.transform.PassContext(config={"tl.intel_npu.multicast": shared_projections,
                                            "tl.intel_npu.dpu_overlap": dpu_overlap,
                                            "tl.intel_npu.batch_dma": batch_dma}):
         low = lowering.lower(_kernel(shared_projections, expert_block, moe_slot_output, separate_shared_expert,
-                                     combine_rows, moe_reuse_input, output_block_k, gate_up_block))
+                                     combine_rows, moe_reuse_input, output_block_k, gate_up_block,
+                                     shared_down_serial_input=shared_down_serial_input))
     if batch_dma:
         assert "ctx.dma_batch_add(" in low.source
     if dpu_overlap:
@@ -184,6 +186,7 @@ def _run(layers, h, pos0=0, n=N, shared_projections=False, expert_block=MBe, moe
               "MoeOut": np.zeros((N, H), np.float32), "SharedGu": np.full((N, 2 * I), np.nan, np.float16),
               "SharedAct": np.full((N, I), np.nan, np.float16)}
     host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, arrays), tiles=TILES, shaves=SHAVES))
+    assert int(arrays["Off"][-1]) == n * (TOPK + 1)
     return hio, kc, vt, rows, keep
 
 
@@ -215,6 +218,25 @@ def test_the_model_does_not_reintroduce_question_10():
     assert len(rows) >= 17, f"{len(rows)} weights bound from the layer table"
     stride = f"* {len(PREFILL_TABLE_COLS)})"   # every one indexed by the layer variable, i.e. inside the loop
     assert all(stride in ln for ln in rows), [ln.strip()[:90] for ln in rows if stride not in ln]
+
+
+def test_reference_moe_geometry_fits_full_model_cmx():
+    func = make_prefill_model(
+        L=40, N=1152, SMAX=1536, KVL=10, HW=2112, BN1=128, BN2=128,
+        MBe=88, BNG=32, BND=256, BNDc=64, DB=1, shared_projections=True,
+        moe_slot_output=True, separate_shared_expert=True, moe_combine_rows=4,
+        conv_fp16=True, register_tri=True, gdn_live_chunks=True, moe_reuse_input=True,
+        output_block_k=2048, output_mb=48, gdn_in_mb=48, moe_shared_gate_up_mb=48,
+        moe_shared_down_mb=192, moe_shared_down_bn=512, moe_shared_down_serial_input=True,
+    )
+    config = {"tl.intel_npu.multicast": True, "tl.intel_npu.multicast_overlap": True,
+              "tl.intel_npu.dpu_overlap": True, "tl.intel_npu.batch_dma": True}
+    with tvm.transform.PassContext(config=config):
+        with pytest.raises(ValueError, match="CMX budget exceeded"):
+            lowering.lower(func, target={"kind": "intel_npu", "cmx_bytes": 1024 * 1024})
+        source = lowering.lower(func).source
+    assert "ctx.dpu_matmul_start(" in source
+    assert any("ctx.dma_batch_add(" in line and "Xs[" in line for line in source.splitlines())
 
 
 @needs_cxx
@@ -294,15 +316,19 @@ def test_model_projection_overlap_under_readonly_kind_table(gdn_in_mb):
 
 
 @needs_cxx
-@pytest.mark.parametrize("separate_shared_expert,dpu_overlap,combine_rows,reuse_input",
-                         [(False, False, 1, False), (True, False, 1, False), (True, True, 1, False), (True, False, 4, True)])
-def test_slot_outputs_preserve_live_model_state(separate_shared_expert, dpu_overlap, combine_rows, reuse_input):
+@pytest.mark.parametrize("separate_shared_expert,dpu_overlap,combine_rows,reuse_input,shared_down_serial_input",
+                         [(False, False, 1, False, False), (True, False, 1, False, False),
+                          (True, True, 1, False, False), (True, False, 4, True, False),
+                          (True, False, 1, False, True)])
+def test_slot_outputs_preserve_live_model_state(separate_shared_expert, dpu_overlap, combine_rows, reuse_input,
+                                                shared_down_serial_input):
     layers = _layers(seed=7)
     h = np.random.default_rng(7).normal(size=(N, H)).astype(np.float32)
     expected = _run(layers, h, n=N - TB, shared_projections=True, expert_block=32)
     actual = _run(layers, h, n=N - TB, shared_projections=True, expert_block=32, moe_slot_output=True,
                   separate_shared_expert=separate_shared_expert, dpu_overlap=dpu_overlap,
-                  combine_rows=combine_rows, batch_dma=combine_rows > 1, moe_reuse_input=reuse_input)
+                  combine_rows=combine_rows, batch_dma=combine_rows > 1, moe_reuse_input=reuse_input,
+                  shared_down_serial_input=shared_down_serial_input)
     for got, ref in zip(actual[:3], expected[:3]):
         assert np.isfinite(got).all()
         error = np.abs(got.astype(np.float32) - ref.astype(np.float32)).max()

@@ -511,6 +511,10 @@ class _DpuPlanner(_Planner):
             and _dst_buffer(_is_load(preamble[0])).data.same_as(packed_buffers[0].data)
             and _full_buffer_load(_is_load(preamble[0]), packed_buffers[0]))
         early_packed = packed_prefetch and hash(loop.loop_var) in self.early_packed
+        batch_prefetch = (early_packed and bool(tvm.transform.PassContext.current().config.get(
+            "tl.intel_npu.prefetch_batch", True)) and len(preamble) > 1 and all(
+            _full_buffer_load(_is_load(stmt), _dst_buffer(_is_load(stmt))) for stmt in preamble))
+        prefetch_buffers = [_dst_buffer(_is_load(stmt)) for stmt in preamble] if batch_prefetch else []
         if packed_prefetch:
             self.packed_candidates.append(hash(loop.loop_var))
         if early_packed:
@@ -518,6 +522,10 @@ class _DpuPlanner(_Planner):
             wide_packed = tirx.decl_buffer([packed.shape[0] * 2] + list(packed.shape[1:]), packed.dtype,
                                            packed.name, data=packed.data, scope=packed.scope())
             self.widened[hash(packed.data)] = wide_packed
+            for buffer in prefetch_buffers:
+                self.widened[hash(buffer.data)] = tirx.decl_buffer(
+                    [buffer.shape[0] * 2] + list(buffer.shape[1:]), buffer.dtype,
+                    buffer.name, data=buffer.data, scope=buffer.scope())
         wide_weights = tirx.decl_buffer([weights.shape[0] * 2, weights.shape[1]], weights.dtype,
                                         weights.name, data=weights.data, scope=weights.scope())
         wide_output = tirx.decl_buffer([output.shape[0] * 2, output.shape[1]], output.dtype,
@@ -531,10 +539,22 @@ class _DpuPlanner(_Planner):
             stmt = _Rebase(weights.data, wide_weights, weights.shape[0], parity)(stmt)
             if early_packed:
                 stmt = _Rebase(packed.data, wide_packed, packed.shape[0], parity)(stmt)
+            for buffer in prefetch_buffers:
+                if not buffer.data.same_as(packed_buffers[0].data):
+                    stmt = _Rebase(buffer.data, self.widened[hash(buffer.data)], buffer.shape[0], parity)(stmt)
             return _Rebase(output.data, wide_output, output.shape[0], parity)(stmt)
+
+        def issue_batch(value):
+            loads = [tirx.Evaluate(tirx.call_intrin("handle", tirx.op.Op.get("tl.intel_npu_dma_batch"),
+                      *list(_is_load(stmt).args[:6]), tirx.IntImm("int32", 1))) for stmt in preamble]
+            start = tirx.Evaluate(tirx.call_intrin("handle", tirx.op.Op.get("tl.intel_npu_dma_batch_start")))
+            return rebase(_seq(loads + [start]), value)
 
         def prepare(value):
             rendezvous = [pipeline_sync] if cooperative else []
+            if batch_prefetch:
+                ahead = tirx.IfThenElse(value + 1 < loop.min + loop.extent, issue_batch(value + 1), None)
+                return _seq([_wait(), ahead, rebase(_seq(dequant_group[0] + rendezvous), value)])
             if packed_prefetch:
                 ahead = tirx.IfThenElse(value + 1 < loop.min + loop.extent,
                                         rebase(_async(_is_load(preamble[0])), value + 1), None)
@@ -554,7 +574,8 @@ class _DpuPlanner(_Planner):
         wait = tirx.Evaluate(tirx.call_intrin("handle", tirx.op.Op.get("tl.intel_npu_dpu_wait")))
         body = _seq([tirx.IfThenElse(valid, prepare(following), None), wait,
                      tirx.IfThenElse(valid, submit(following), None), rebase(tail, loop.loop_var)])
-        initial = [rebase(_async(_is_load(preamble[0])), loop.min)] if packed_prefetch else []
+        initial = ([issue_batch(loop.min)] if batch_prefetch else
+               [rebase(_async(_is_load(preamble[0])), loop.min)] if packed_prefetch else [])
         scheduled = _seq(declarations + initial + [prepare(loop.min), submit(loop.min),
                           tirx.For(loop.loop_var, loop.min, loop.extent, loop.kind, body, loop.thread_binding,
                                     loop.annotations, loop.step)])

@@ -348,9 +348,10 @@ public:
   void dma_load_wait() {}
   template <class T>
   void dma_batch_add(T *dst, Ddr<T> src, std::uint32_t width, std::uint32_t rows,
-                      std::uint32_t dstStride, std::uint32_t srcStride) {
+                      std::uint32_t dstStride, std::uint32_t srcStride, bool = false) {
     dma_load(dst, src, width, rows, dstStride, srcStride);
   }
+  void dma_batch_start() {}
   void dma_batch_flush() {}
   template <class T>
   void dma_load_multicast(T *dst, Ddr<T> src, std::uint32_t width,

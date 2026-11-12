@@ -375,7 +375,11 @@ void CodeGenTileLangIntelNpu::VisitExpr_(const CallNode *op, std::ostream &os) {
     return;
   }
   if (op->op.same_as(tl::intel_npu_dma_batch())) {
-    os << "ctx.dma_batch_add(" << args(0, 6) << ")";
+    os << "ctx.dma_batch_add(" << args(0, op->args.size()) << ")";
+    return;
+  }
+  if (op->op.same_as(tl::intel_npu_dma_batch_start())) {
+    os << "ctx.dma_batch_start()";
     return;
   }
   if (op->op.same_as(tl::intel_npu_dma_batch_flush())) {

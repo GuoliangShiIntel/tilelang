@@ -38,9 +38,11 @@ SLOTS = N * (TOPK + 1)
 REL = 4e-2   # int4 weights, fp16 gemms and an fp32 accumulate over TOPK + 1 experts
 
 
-def _lower(func, dpu_overlap=False):
-    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off",
-                                           "tl.intel_npu.dpu_overlap": dpu_overlap}):
+def _lower(func, dpu_overlap=False, prefetch_batch=None):
+    config = {"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.dpu_overlap": dpu_overlap}
+    if prefetch_batch is not None:
+        config["tl.intel_npu.prefetch_batch"] = prefetch_batch
+    with tvm.transform.PassContext(config=config):
         return lowering.lower(func)
 
 
@@ -70,9 +72,9 @@ def _problem(seed: int = 0):
 
 def _sim(p, slot_output=False, separate_shared=False, reuse_input=False, expert_mb=MB, shared_gate_up_mb=None,
     shared_gate_up_bn=None, shared_down_mb=None, shared_down_bn=None, bndc=None, pipelined=False,
-    tile_shared_experts=False):
+    tile_shared_experts=False, db=4):
     low = _lower(make_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=expert_mb, BNG=BNG, BND=BND,
-                                         tiles=TILES, shaves=SHAVES, reuse_input=reuse_input, BNDc=bndc,
+                                         tiles=TILES, shaves=SHAVES, reuse_input=reuse_input, DB=db, BNDc=bndc,
                                          pipelined=pipelined,
                                          tile_shared_experts=tile_shared_experts,
                                          combine_rows=4 if tile_shared_experts else 1,
@@ -117,6 +119,14 @@ def test_bndc_decouples_down_projection_compute_from_bnd():
     narrower = _sim(p, bndc=32)
     assert BND % 32 == 0 and 32 != BND, "the probe must actually exercise a smaller compute chunk"
     np.testing.assert_allclose(narrower, baseline, rtol=0, atol=0)  # same math, so bit-identical, not just REL-close
+
+
+@needs_cxx
+def test_down_staging_depth_preserves_the_expert_result():
+    p = _problem(seed=17)
+    baseline = _sim(p)
+    shallower = _sim(p, db=2)
+    np.testing.assert_allclose(shallower, baseline, rtol=0, atol=0)
 
 
 def test_bndc_fits_npu_dsl_moe_expert_geometry_within_cmx_budget():
@@ -232,9 +242,14 @@ def test_shared_dequant_dpu_overlap_requires_a_release_rendezvous(release_sync, 
     source = _lower(cooperative_weights, dpu_overlap=True).source
     assert ("ctx.dpu_matmul_start(" in source) == release_sync
     assert ("ctx.sync_tile_dpu_async();" in source) == release_sync
-    assert ("ctx.dma_load_async(" in source) == release_sync
+    assert ("ctx.dma_batch_start(" in source) == release_sync
     if release_sync:
         assert "packed = ctx.alloc<uint8_t>(16384)" in source
+        assert "scales = ctx.alloc<half>(256)" in source
+        sync_scales = _lower(cooperative_weights, dpu_overlap=True, prefetch_batch=False).source
+        assert "ctx.dpu_matmul_start(" in sync_scales
+        assert "ctx.dma_load_async(" in sync_scales
+        assert "ctx.dma_batch_start(" not in sync_scales
         with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off",
                                                "tl.intel_npu.dpu_overlap": True}):
             limited = lowering.lower(cooperative_weights, target={"kind": "intel_npu", "cmx_bytes": 230000}).source
@@ -456,6 +471,14 @@ def test_matches_the_oracle(slot_output, reuse_input, expert_mb):
     got = _sim(p, slot_output=slot_output, reuse_input=reuse_input, expert_mb=expert_mb)
     rel = np.abs(got - ref).max() / np.abs(ref).max()
     assert rel < REL, f"rel {rel:.3e}"
+
+
+@needs_cxx
+def test_reused_gate_buffer_matches_separate_activation_buffer():
+    problem = _problem(seed=23)
+    expected = _sim(problem, slot_output=True, expert_mb=88)
+    actual = _sim(problem, slot_output=True, reuse_input=True, expert_mb=88)
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_slot_output_refuses_uneven_shave_rows():

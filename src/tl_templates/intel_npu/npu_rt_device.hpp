@@ -552,13 +552,15 @@ public:
   template <class T>
   __attribute__((always_inline)) void dma_batch_add(T *dst, Ddr<T> src, std::uint32_t width,
                                     std::uint32_t rows, std::uint32_t dstStride,
-                                    std::uint32_t srcStride) {
+                                    std::uint32_t srcStride, bool prefetch = false) {
     if (!ok_ || width == 0 || rows == 0)
       return;
     if (batchCount_ == 2 * kRingMaxDepth * kRingPool)
       dma_batch_flush();
     if (batchCount_ == 0) {
-      qg_flush();
+      dma_load_wait_impl();
+      if (!prefetch)
+        qg_flush();
       port_retire(0);
       port_retire(1);
     }
@@ -572,24 +574,21 @@ public:
       descriptor[-1].link_address = reinterpret_cast<std::uint32_t>(descriptor);
     ++batchCount_;
   }
-  TL_NPU_HW_CALL void dma_batch_flush() {
+  TL_NPU_HW_CALL void dma_batch_start() {
     if (!ok_ || batchCount_ == 0)
       return;
     DmaDescriptor *tail = ringFill_ + batchCount_ - 1;
     batchCount_ = 0;
     TL_NPU_COMPILER_BARRIER();
-#if TL_NPU_PHASE_PROF
-    const std::uint32_t started = perf_ticks();
-#endif
-    dma_.start(ringFill_, tail, DmaSource::DDR);
-    dma_.wait(tail);
-    TL_NPU_COMPILER_BARRIER();
-#if TL_NPU_PHASE_PROF
-    const std::uint32_t ended = perf_ticks();
-    dmaTicks_ += ended - started;
-    ++dmaCalls_;
-    task_add(kTaskDmaLoad, started, ended);
-#endif
+  asyncT0_ = perf_ticks();
+  const int port = shave_id() % 2;
+  dma_.start(ringFill_, tail, DmaSource::DDR, port);
+  lastOnPort_[port] = tail;
+  asyncPending_ = true;
+  }
+  TL_NPU_HW_CALL void dma_batch_flush() {
+  dma_batch_start();
+  dma_load_wait_impl();
   }
   template <class T>
   void dma_load_multicast(T *dst, Ddr<T> src, std::uint32_t width,

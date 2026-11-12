@@ -271,9 +271,20 @@ private:
                                    "(CUBOID_16x16)";
     }
     auto i32 = [](int64_t v) { return IntImm(DataType::Int(32), v); };
+    const auto async_annotation = call->annotations.Get("intel_npu_async");
+    const bool is_async = async_annotation.has_value();
+    if (is_async) {
+      const auto *async_imm = async_annotation.value().as<IntImmNode>();
+      ICHECK(async_imm != nullptr && async_imm->value == 1)
+          << "intel_npu: intel_npu_async must be the integer 1";
+    }
+    ffi::Array<PrimExpr> args = {AddressOf(c), AddressOf(a), AddressOf(b), i32(M), i32(N), i32(K),
+                   i32(spatial_x_), i32(mpe_)};
+    if (is_async) {
+      args.push_back(i32(1));
+    }
     return Evaluate(Call(DataType::Handle(), intel_npu_dpu_matmul(),
-                         {AddressOf(c), AddressOf(a), AddressOf(b), i32(M), i32(N), i32(K),
-                          i32(spatial_x_), i32(mpe_)}));
+                         args));
   }
 
   int64_t dpu_z_align_;

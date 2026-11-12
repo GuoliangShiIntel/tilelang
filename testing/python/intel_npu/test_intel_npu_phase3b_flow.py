@@ -103,6 +103,47 @@ def test_serial_multicast_is_opt_in_and_skips_shave_branches():
     assert "ctx.dma_load_multicast(" not in src
 
 
+def _shared_serial_projection(guarded=False):
+    @T.prim_func
+    def projection(X: T.Tensor((64, 64), T.float16), W: T.Tensor((32, 64), T.float16),
+                   Y: T.Tensor((64, 32), T.float16)):
+        with T.Kernel(2, threads=2) as tile:
+            shave = T.get_thread_binding()
+            weights = T.alloc_shared((32, 64), T.float16)
+            activation = T.alloc_shared((16, 64), T.float16)
+            result = T.alloc_local((16, 32), T.float16)
+            T.copy(W[0, 0], weights)
+            T.sync_threads()
+            for block in T.serial(4):
+                if guarded:
+                    if shave == 0:
+                        T.copy(X[block * 16, 0], activation)
+                else:
+                    T.copy(X[block * 16, 0], activation)
+                T.sync_threads()
+                if shave == 0:
+                    T.gemm(activation, weights, result, transpose_B=True, clear_accum=True)
+                    T.copy(result, Y[block * 16, 0])
+                T.sync_threads()
+
+    return projection
+
+
+@pytest.mark.parametrize("guarded", [False, True])
+def test_shared_dpu_input_multicast_requires_uniform_worker_participation(guarded):
+    with tvm.transform.PassContext(
+        config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.multicast": True}
+    ):
+        src = tilelang.lower(_shared_serial_projection(guarded), target="intel_npu").kernel_source
+    relevant = "\n".join(line for line in src.splitlines()
+                            if "distribution:" in line or "activation" in line
+                            or "dma_load_multicast" in line or "sync_grid" in line)
+    assert ("ctx.dma_load_multicast((&(activation[0]))" in src) == (not guarded), relevant
+    if not guarded:
+        assert "tile-invariant shared DPU input multicast by tile 0 SHAVE 0" in src
+        assert "ctx.sync_grid();" in src
+
+
 def test_serial_overlap_derives_a_ring_without_changing_token_ownership():
     with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.multicast_overlap": True}):
         src = tilelang.lower(_serial_projection(), target="intel_npu").kernel_source
@@ -371,3 +412,58 @@ def test_a_loop_of_unsplittable_fills_is_dealt_over_the_shaves():
     same_row = _src(make(False)).split("kernel_entry")[0]
     assert "if ((i & 1) == shave)" not in same_row, "iterations that alias must stay serialized"
     assert "if (shave == 0)" in same_row
+
+
+def test_guarded_shared_gather_batches_only_with_shared_limit():
+    def make(shared_limit, alias_rows=False):
+        @T.prim_func
+        def guarded_gather(A: T.Tensor((16, 64), T.float16), Limit: T.Tensor((2,), T.int32),
+                           Y: T.Tensor((16, 64), T.float16)):
+            with T.Kernel(1, threads=2):
+                shave = T.get_thread_binding()
+                gathered = T.alloc_shared((16, 64), T.float16)
+                if shared_limit:
+                    bound = T.alloc_shared((2,), T.int32)
+                else:
+                    bound = T.alloc_local((2,), T.int32)
+                T.copy(Limit, bound)
+                for row in T.serial(16):
+                    if row < bound[0]:
+                        T.copy(A[row, 0:64], gathered[row % 2 if alias_rows else row, 0:64])
+                T.copy(gathered, Y)
+        return guarded_gather
+
+    with tvm.transform.PassContext(config={"tl.intel_npu.batch_dma": True, "tl.intel_npu.plan_workloads": "off"}):
+        shared = tilelang.lower(make(True), target="intel_npu").kernel_source
+        private = tilelang.lower(make(False), target="intel_npu").kernel_source
+        aliased = tilelang.lower(make(True, True), target="intel_npu").kernel_source
+    assert "ctx.dma_batch_add(" in shared, shared
+    assert "ctx.dma_batch_add(" not in private
+    assert "if ((row & 1) == shave)" not in aliased
+
+
+@pytest.mark.parametrize("live", [0, 1, 7, 16])
+def test_guarded_shared_gather_preserves_inactive_rows(live):
+    @T.prim_func
+    def guarded_gather(A: T.Tensor((16, 64), T.float16), Limit: T.Tensor((1,), T.int32),
+                       Y: T.Tensor((16, 64), T.float16)):
+        with T.Kernel(1, threads=2):
+            gathered = T.alloc_shared((16, 64), T.float16)
+            bound = T.alloc_shared((1,), T.int32)
+            T.copy(Y, gathered)
+            T.copy(Limit, bound)
+            for row in T.serial(16):
+                if row < bound[0]:
+                    T.copy(A[row, 0:64], gathered[row, 0:64])
+            T.copy(gathered, Y)
+
+    with tvm.transform.PassContext(config={"tl.intel_npu.batch_dma": True, "tl.intel_npu.plan_workloads": "off"}):
+        low = lowering.lower(guarded_gather)
+    assert "ctx.dma_batch_add(" in low.source
+    source = np.arange(16 * 64, dtype=np.float16).reshape(16, 64)
+    output = np.full((16, 64), -1, np.float16)
+    lib = host_sim.build(low.source, "guarded_shared_gather")
+    host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, {"A": source, "Limit": np.array([live], np.int32),
+                                                                       "Y": output}), tiles=1, shaves=2))
+    np.testing.assert_array_equal(output[:live], source[:live])
+    np.testing.assert_array_equal(output[live:], -1)

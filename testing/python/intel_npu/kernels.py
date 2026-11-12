@@ -842,7 +842,7 @@ def make_moe_route_prefill(
     assert TOPK + 1 <= 16, "the per-token choice buffers are one 16-wide vector"
 
     @T.macro
-    def route_phase(X, Wr, Logits, Ids, Wts, Cnt, Off, Slot, tile, shave):
+    def route_phase(X, Wr, Logits, Ids, Wts, Cnt, Off, Slot, tile, shave, n_tokens=N):
         """The phase as a macro so a layer kernel can call it; `make_moe_route_prefill` is the standalone wrapper."""
         worker = tile * shaves + shave
         x_cmx = T.alloc_shared((BM, H), T.float16)
@@ -872,7 +872,7 @@ def make_moe_route_prefill(
         # --- B. top-k per token, the tokens dealt over the workers -----------------------------------
         for it in T.serial(T.ceildiv(N, workers)):
             t = it * workers + worker
-            if t < N:
+            if t < n_tokens:
                 T.copy(Logits[t, 0], lg_cmx)
                 for k in T.serial(TOPK):
                     for v in T.vectorized(HL):
@@ -911,15 +911,15 @@ def make_moe_route_prefill(
             T.copy(Ids[0, 0], ids_all)
             for e in T.serial(E + 1):
                 cnt_cmx[e] = 0
-            for t in T.serial(N):
+            for t in T.serial(n_tokens):
                 for k in T.serial(TOPK):
                     cnt_cmx[ids_all[t, k]] = cnt_cmx[ids_all[t, k]] + 1
-            cnt_cmx[E] = N  # every token also goes to the shared expert
+            cnt_cmx[E] = n_tokens  # every token also goes to the shared expert
             off_cmx[0] = 0
             for e in T.serial(E + 1):
                 off_cmx[e + 1] = off_cmx[e] + cnt_cmx[e]
                 cur_cmx[e] = off_cmx[e]
-            for t in T.serial(N):
+            for t in T.serial(n_tokens):
                 for k in T.serial(TOPK):
                     slot_cmx[cur_cmx[ids_all[t, k]]] = t * (TOPK + 1) + k
                     cur_cmx[ids_all[t, k]] = cur_cmx[ids_all[t, k]] + 1
@@ -1073,6 +1073,7 @@ def make_moe_expert_prefill(
     shared_gate_up_bn: int | None = None,
     shared_down_mb: int | None = None,
     shared_down_bn: int | None = None,
+    shared_down_serial_input: bool = False,
     tile_shared_experts: bool = False,
     pipelined: bool = False,
     num_stages_gu: int = 2,
@@ -1140,6 +1141,7 @@ def make_moe_expert_prefill(
         assert slot_output and separate_shared, "tile-shared routed experts require slot output and a separate shared expert"
         assert MB % shaves == 0 and BND % shaves == 0
         assert I % (BNG * shaves) == 0 and H % BND == 0
+    assert not shared_down_serial_input or separate_shared, "serial shared-down input requires a separate shared expert"
     # down chunks per DMA: at BND = 64 a job is 16 KiB and 70% of it is the 1.55 us per-job fixed cost, and the
     # PACKED buffer is 8x smaller than wd_cmx, so DMA granularity is cheap to decouple from compute granularity.
     # `DB` is an upper bound: it also sizes wqd_cmx, so a large chunk costs CMX the big prompt chunks need.
@@ -1170,7 +1172,8 @@ def make_moe_expert_prefill(
                                              weight_row_offset=E * 2 * I)
         shared_down, _ = make_proj_prefill(NP=N, M=H, K=I, BN=shared_down_bn, MB=shared_down_mb, G=G,
                                                         tiles=tiles, shaves=shaves, as_block=True, scales_gm=True,
-                                                        shared_weights=shared_expert_weights,
+                                                        shared_weights=shared_expert_weights or shared_down_serial_input,
+                                                        serial_shared_input=shared_down_serial_input,
                                           weight_row_offset=E * H, output_row_base=True)
 
     @T.macro
@@ -1199,8 +1202,12 @@ def make_moe_expert_prefill(
         ws_cmx = gu_alloc((KGH, BNG), T.float16)
         wg_cmx = T.alloc_local((BNG, H), T.float16)
         y_cmx = T.alloc_local((MB, BNG), T.float16)
-        gu_cmx = T.alloc_shared((MB, 2 * I), T.float16)  # the SHAVEs write disjoint column ranges
-        h_cmx = T.alloc_shared((MB, I), T.float16)
+        if reuse_input:
+            h_cmx = T.alloc_shared((MB, I), T.float16)
+            up_cmx = T.alloc_shared((MB, I), T.float16)
+        else:
+            gu_cmx = T.alloc_shared((MB, 2 * I), T.float16)  # the SHAVEs write disjoint column ranges
+            h_cmx = T.alloc_shared((MB, I), T.float16)
         wqd_cmx = T.alloc_local((DB * BND, I // 2), T.uint8)
         # the expert's down scales in one DMA instead of one per chunk: CD = 32 jobs for 16 KiB, where the same
         # hoist on the gate/up side would cost 32 KiB to save 16, and the layer kernel has no room for both.
@@ -1239,10 +1246,10 @@ def make_moe_expert_prefill(
                 # under a SHAVE-dependent branch: guarding one would leave the other waiting at that sync
                 T.copy(WdS[0, e * H], wsd_all)
                 for c in T.serial(T.ceildiv(off_cmx[e + 1] - off_cmx[e], MB)):
-                    # gather the chunk's token rows; a short tail keeps the last row, whose result is dropped
                     perf_begin("gath")
                     for i in T.serial(MB):
-                        T.copy(X[slot_cmx[T.min(off_cmx[e] + c * MB + i, off_cmx[e + 1] - 1)] // (TOPK + 1), 0], x_cmx[i : i + 1, 0:H])
+                        if i < off_cmx[e + 1] - off_cmx[e] - c * MB:
+                            T.copy(X[slot_cmx[off_cmx[e] + c * MB + i] // (TOPK + 1), 0], x_cmx[i : i + 1, 0:H])
                     perf_end()
                     T.sync_threads()
 
@@ -1282,7 +1289,13 @@ def make_moe_expert_prefill(
                             perf_begin("gcpy")
                             for i, c0 in T.grid(MB, BNG // HL):
                                 for v in T.vectorized(HL):
-                                    gu_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
+                                    if reuse_input:
+                                        if n * BNG + c0 * HL + v < I:
+                                            h_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
+                                        else:
+                                            up_cmx[i, n * BNG + c0 * HL + v - I] = y_cmx[i, c0 * HL + v]
+                                    else:
+                                        gu_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
                             perf_end()
                     elif CG % shaves == 0:
                         for ni in T.serial(CG // shaves):
@@ -1309,7 +1322,13 @@ def make_moe_expert_prefill(
                             perf_begin("gcpy")
                             for i, c0 in T.grid(MB, BNG // HL):
                                 for v in T.vectorized(HL):
-                                    gu_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
+                                    if reuse_input:
+                                        if n * BNG + c0 * HL + v < I:
+                                            h_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
+                                        else:
+                                            up_cmx[i, n * BNG + c0 * HL + v - I] = y_cmx[i, c0 * HL + v]
+                                    else:
+                                        gu_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
                             perf_end()
                     else:
                         # CG % shaves != 0 wraps every statement in a runtime `if n % shaves == shave:` guard
@@ -1341,17 +1360,30 @@ def make_moe_expert_prefill(
                                 perf_begin("gcpy")
                                 for i, c0 in T.grid(MB, BNG // HL):
                                     for v in T.vectorized(HL):
-                                        gu_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
+                                        if reuse_input:
+                                            if n * BNG + c0 * HL + v < I:
+                                                h_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
+                                            else:
+                                                up_cmx[i, n * BNG + c0 * HL + v - I] = y_cmx[i, c0 * HL + v]
+                                        else:
+                                            gu_cmx[i, n * BNG + c0 * HL + v] = y_cmx[i, c0 * HL + v]
                                 perf_end()
                     T.sync_threads()
                     perf_begin("swig")
                     for i, c0 in T.grid(MB, I // shaves // HL):
                         for v in T.vectorized(HL):
-                            h_cmx[i, shave * (I // shaves) + c0 * HL + v] = (
-                                gu_cmx[i, shave * (I // shaves) + c0 * HL + v]
-                                * T.sigmoid(gu_cmx[i, shave * (I // shaves) + c0 * HL + v])
-                                * gu_cmx[i, I + shave * (I // shaves) + c0 * HL + v]
-                            )
+                            if reuse_input:
+                                h_cmx[i, shave * (I // shaves) + c0 * HL + v] = (
+                                    h_cmx[i, shave * (I // shaves) + c0 * HL + v]
+                                    * T.sigmoid(h_cmx[i, shave * (I // shaves) + c0 * HL + v])
+                                    * up_cmx[i, shave * (I // shaves) + c0 * HL + v]
+                                )
+                            else:
+                                h_cmx[i, shave * (I // shaves) + c0 * HL + v] = (
+                                    gu_cmx[i, shave * (I // shaves) + c0 * HL + v]
+                                    * T.sigmoid(gu_cmx[i, shave * (I // shaves) + c0 * HL + v])
+                                    * gu_cmx[i, I + shave * (I // shaves) + c0 * HL + v]
+                                )
                     perf_end()
                     T.sync_threads()
                     for nb in T.serial(CD // (DB * shaves)):
@@ -3562,8 +3594,9 @@ def make_proj_prefill(
             T.sync_threads()
             if serial_shared_input:
                 for block in T.serial(NTB):
+                    T.copy(X[block * MB, 0], activation)
+                    T.sync_threads()
                     if shave == 0:
-                        T.copy(X[block * MB, 0], activation)
                         if n < NCH:
                             T.gemm(activation, weight_tile, result, transpose_B=True, clear_accum=True)
                             T.copy(result, Yout[row_base + block * MB, n * BN])
@@ -5799,6 +5832,7 @@ def make_prefill_model(
     moe_shared_gate_up_bn: int | None = None,
     moe_shared_down_mb: int | None = None,
     moe_shared_down_bn: int | None = None,
+    moe_shared_down_serial_input: bool = False,
     moe_tile_shared_experts: bool = False,
     moe_pipelined: bool = False,
     moe_num_stages_gu: int = 2,
@@ -5881,7 +5915,8 @@ def make_prefill_model(
         combine_rows=moe_combine_rows, reuse_input=moe_reuse_input,
         shared_gate_up_mb=moe_shared_gate_up_mb, shared_gate_up_bn=moe_shared_gate_up_bn,
         shared_down_mb=moe_shared_down_mb, shared_down_bn=moe_shared_down_bn,
-        tile_shared_experts=moe_tile_shared_experts, pipelined=moe_pipelined, num_stages_gu=moe_num_stages_gu
+        shared_down_serial_input=moe_shared_down_serial_input,
+        tile_shared_experts=moe_tile_shared_experts, pipelined=moe_pipelined, num_stages_gu=moe_num_stages_gu,
     )
     RR, SLOTS = rs["RR"], rs["SLOTS"]
     part_shape = (SLOTS, H) if moe_slot_output else (tiles, NP, H)
@@ -6076,7 +6111,7 @@ def make_prefill_model(
                 T.sync_grid()
                 if "moe" not in skip:
                     perf_phase_begin("mrot")
-                    route_phase(Xs, Wr, Logits, Ids, Wts, Cnt, Off, Slot, tile, shave)
+                    route_phase(Xs, Wr, Logits, Ids, Wts, Cnt, Off, Slot, tile, shave, nt[0, 0])
                     perf_phase_end("mrot")
                     # the grouping is worker 0's alone and the expert phase's first act is to read it back;
                     # DeriveIntelNpuGlobalSync only sees the TOP-LEVEL phase sequence, so inside the layer loop

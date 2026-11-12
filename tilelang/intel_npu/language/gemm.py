@@ -2,13 +2,48 @@
 
 from __future__ import annotations
 
+from tilelang._typing import BufferLikeType
+from tilelang.language.gemm_op import _gemm_impl
+from tilelang.tileop.base import GemmWarpPolicy
 from tvm import tirx
 from tvm.tirx import Buffer
 
 from ..hw_facts import fact
 from .quant import _addr
 
-__all__ = ["gemm_rows"]
+__all__ = ["gemm_async", "gemm_rows", "dpu_wait"]
+
+
+def gemm_async(
+    A: BufferLikeType,
+    B: BufferLikeType,
+    C: BufferLikeType,
+    transpose_A: bool = False,
+    transpose_B: bool = False,
+    policy: GemmWarpPolicy = GemmWarpPolicy.Square,
+    clear_accum: bool = False,
+    annotations: dict | None = None,
+):
+    """Issue an FP16 DPU GEMM without waiting; join it with `dpu_wait` before reading its output."""
+    async_annotations = dict(annotations or {})
+    async_annotations["intel_npu_async"] = tirx.IntImm("int32", 1)
+    return _gemm_impl(
+        "tl.tileop.gemm",
+        A,
+        B,
+        C,
+        transpose_A,
+        transpose_B,
+        policy,
+        clear_accum,
+        None,
+        annotations=async_annotations,
+    )
+
+
+def dpu_wait():
+    """Wait for the in-flight FP16 DPU GEMM before consuming its output."""
+    return tirx.call_intrin("handle", tirx.op.Op.get("tl.intel_npu_dpu_wait"))
 
 
 def gemm_rows(activation: Buffer, weights: Buffer, output: Buffer, rows):

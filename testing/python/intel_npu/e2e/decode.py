@@ -52,7 +52,7 @@ TILES, SHAVES = 3, 2
 # `make_prefill_model`'s block geometry. Only the token count N reaches a buffer SHAPE; the rest are scheduling,
 # and none of them reach the packed weights any more (pack.PAD_KEYS), so a sweep here costs a rebuild, not a repack.
 PREFILL_GEOM = dict(TB=32, C=64, TBq=8, TBF=16, BKV=128, BN1=32, BN2=32, MB=16, BM=64, BNR=16, MBe=16,
-                    BNG=64, BND=64)
+                    BNG=64, BND=64, DB=4)
 
 
 def prefill_sizes(c, n: int, G: dict) -> dict:
@@ -92,9 +92,11 @@ class DeviceModel:
                  prefill_output_mb: int | None = None, prefill_bng: int | None = None,
                  prefill_bnd: int | None = None,
                  prefill_bndc: int | None = None,
+                 prefill_db: int | None = None,
                  prefill_gdn_in_mb: int | None = None,
                  prefill_shared_mb: int | None = None, prefill_shared_bn: int | None = None,
                  prefill_shared_down_mb: int | None = None, prefill_shared_down_bn: int | None = None,
+                 prefill_shared_down_serial_input: bool = False,
                  prefill_tile_shared_experts: bool = False, prefill_short_name: str | None = None,
                  prefill_moe_pipelined: bool = False, prefill_moe_num_stages_gu: int = 2):
         self.ck, self.c, self.log = ck, ck.cfg, log
@@ -108,7 +110,7 @@ class DeviceModel:
         self.prefill_n = prefill
         self.prefill_moe_slots = prefill_moe_slots
         self.prefill_shared_expert = prefill_shared_expert
-        prefill_shared = prefill_shared or prefill_overlap
+        prefill_shared = prefill_shared or prefill_overlap or prefill_shared_down_serial_input
         pgeom = dict(PREFILL_GEOM)
         if prefill_bn1 is not None:
             pgeom["BN1"] = prefill_bn1
@@ -120,6 +122,8 @@ class DeviceModel:
             pgeom["BND"] = prefill_bnd
         if prefill_bndc is not None:
             pgeom["BNDc"] = prefill_bndc
+        if prefill_db is not None:
+            pgeom["DB"] = prefill_db
         if prefill_mb is not None:
             pgeom["MB"] = prefill_mb
         if prefill_mbe is not None:
@@ -205,6 +209,7 @@ class DeviceModel:
                         gdn_in_mb=prefill_gdn_in_mb,
                         moe_shared_gate_up_mb=prefill_shared_mb, moe_shared_gate_up_bn=prefill_shared_bn,
                         moe_shared_down_mb=prefill_shared_down_mb, moe_shared_down_bn=prefill_shared_down_bn,
+                        moe_shared_down_serial_input=prefill_shared_down_serial_input,
                         moe_tile_shared_experts=prefill_tile_shared_experts,
                         moe_pipelined=prefill_moe_pipelined, moe_num_stages_gu=prefill_moe_num_stages_gu, **pgeom)
                     names[f"prefill{pl}"] = (f"tl_e2e_prefill_l{pl}_n{ps['NP']}_h{c.hidden}_s{smax}"
@@ -240,6 +245,8 @@ class DeviceModel:
                         names[f"prefill{pl}"] += f"_mpl{prefill_moe_num_stages_gu}"
                     if prefill_bndc is not None:
                         names[f"prefill{pl}"] += f"_bdc{prefill_bndc}"
+                    if prefill_db is not None:
+                        names[f"prefill{pl}"] += f"_db{prefill_db}"
                     if prefill_gdn_in_mb is not None:
                         names[f"prefill{pl}"] += f"_im{prefill_gdn_in_mb}"
                     if prefill_shared_mb is not None or prefill_shared_bn is not None or prefill_shared_down_mb is not None or prefill_shared_down_bn is not None:
@@ -247,6 +254,8 @@ class DeviceModel:
                                                   f"_sd{prefill_shared_down_mb or pgeom['MBe']}x{prefill_shared_down_bn or pgeom['BND']}")
                     if prefill_tile_shared_experts:
                         names[f"prefill{pl}"] += "_tse"
+                    if prefill_shared_down_serial_input:
+                        names[f"prefill{pl}"] += "_sdsi"
                     if prefill_short_name is not None:
                         # every flag combination above stacks its own suffix, and a long enough stack trips
                         # Windows' ~260-char path cap in the Visual Studio generator's own .vcxproj.filters.tmp
@@ -272,6 +281,8 @@ class DeviceModel:
         import tvm
         cfg = {"tl.intel_npu.hw_sync_grid": os.environ.get("TL_NPU_HW_SYNC", "1") != "0",
                "tl.intel_npu.scoped_cmx": os.environ.get("TL_NPU_SCOPED_CMX", "1") != "0"}
+        if os.environ.get("TL_NPU_PREFETCH_BATCH") == "0":
+            cfg["tl.intel_npu.prefetch_batch"] = False
         if os.environ.get("TL_NPU_PLAN_WORKLOADS") == "off":
             cfg["tl.intel_npu.plan_workloads"] = "off"
         self.low = {}
@@ -693,11 +704,13 @@ def main(argv):
     ap.add_argument("--prefill-bnd", type=int)
     ap.add_argument("--prefill-bndc", type=int, help="down-projection compute chunk, decoupled from --prefill-bnd "
                     "(DMA/scale-fetch granularity); defaults to --prefill-bnd")
+    ap.add_argument("--prefill-db", type=int, help="down-projection packed-weight staging depth (default 4)")
     ap.add_argument("--prefill-gdn-in-mb", type=int)
     ap.add_argument("--prefill-shared-mb", type=int)
     ap.add_argument("--prefill-shared-bn", type=int)
     ap.add_argument("--prefill-shared-down-mb", type=int)
     ap.add_argument("--prefill-shared-down-bn", type=int)
+    ap.add_argument("--prefill-shared-down-serial-input", action="store_true")
     ap.add_argument("--prefill-tile-shared-experts", action="store_true")
     ap.add_argument("--prefill-moe-pipelined", action="store_true",
                     help="pipeline the gate/up chunk loop instead of T.serial, hiding the per-chunk weight "
@@ -760,9 +773,11 @@ def main(argv):
                     prefill_phases=a.prefill_phases, prefill_bn2=a.prefill_bn2,
                     prefill_output_block_k=a.prefill_out_block_k, prefill_output_mb=a.prefill_out_mb,
                     prefill_bng=a.prefill_bng, prefill_bnd=a.prefill_bnd, prefill_bndc=a.prefill_bndc,
+                    prefill_db=a.prefill_db,
                     prefill_gdn_in_mb=a.prefill_gdn_in_mb,
                     prefill_shared_mb=a.prefill_shared_mb, prefill_shared_bn=a.prefill_shared_bn,
                     prefill_shared_down_mb=a.prefill_shared_down_mb, prefill_shared_down_bn=a.prefill_shared_down_bn,
+                    prefill_shared_down_serial_input=a.prefill_shared_down_serial_input,
                     prefill_tile_shared_experts=a.prefill_tile_shared_experts, prefill_short_name=a.prefill_short_name,
                     prefill_moe_pipelined=a.prefill_moe_pipelined, prefill_moe_num_stages_gu=a.prefill_moe_num_stages_gu)
     if a.chunked:

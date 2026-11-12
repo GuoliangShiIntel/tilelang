@@ -181,6 +181,7 @@ def PlanIntelNpuDistribution():
         notes = []
         pipelined_depth = [0]
         loop_depth = [0]
+        active_loops = []
         shave_branch = []  # one flag per enclosing SHAVE-dependent branch: did it fill a shared buffer?
         multicast = bool(ctx.config.get("tl.intel_npu.multicast", False)) and launch.tiles > 1
         uniform = [list(func.params)]
@@ -382,13 +383,14 @@ def PlanIntelNpuDistribution():
         def multicast_fill(stmt):
             args = stmt.value.args
             dst, src = _load_of(args[0]), _load_of(args[1])
-            if not multicast or len(args) != 7 or not uniform[-1]:
+            if not multicast or len(args) != 7 or not uniform[-1] or shave_branch:
                 return None
-            if dst.buffer.scope() != "local" or not any(dst.buffer.data.same_as(var) for var in dpu_inputs):
+            scope = dst.buffer.scope()
+            if scope not in ("local", "shared") or not any(dst.buffer.data.same_as(var) for var in dpu_inputs):
                 return None
             if not any(src.buffer.data.same_as(buf.data) for buf in func.buffer_map.values()):
                 return None
-            allowed = uniform[-1] + [launch.shave_var]
+            allowed = uniform[-1] + ([] if scope == "shared" else [launch.shave_var])
             for expr in list(dst.indices) + list(src.indices) + list(args[2:6]):
                 bad = [False]
 
@@ -405,6 +407,11 @@ def PlanIntelNpuDistribution():
                     return None
             fill = tirx.Evaluate(tirx.Call(stmt.value.dtype, stmt.value.op, list(args) + [_i32(0), _i32(1)]))
             sync = tirx.Evaluate(tirx.Call("int32", _op("tl.sync_grid"), []))
+            if scope == "shared":
+                issuer = tirx.And(launch.tile_var == _i32(0), launch.shave_var == _i32(0))
+                fill = tirx.IfThenElse(issuer, fill, None)
+                notes.append(f"{dst.buffer.name}: tile-invariant shared DPU input multicast by tile 0 SHAVE 0")
+                return tirx.SeqStmt([sync, fill, sync])
             notes.append(f"{dst.buffer.name}: MULTICAST (serial, worker ownership unchanged)")
             return tirx.SeqStmt([sync, fill, sync])
 
@@ -425,6 +432,12 @@ def PlanIntelNpuDistribution():
             body = stmt.body
             while isinstance(body, tirx.SeqStmt) and len(body.seq) == 1:
                 body = body.seq[0]
+            condition = None
+            if isinstance(body, tirx.IfThenElse) and body.else_case is None:
+                condition = body.condition
+                body = body.then_case
+                while isinstance(body, tirx.SeqStmt) and len(body.seq) == 1:
+                    body = body.seq[0]
             if not _is_call(body, DMA_COPY):
                 return None
             args = body.value.args
@@ -439,10 +452,32 @@ def PlanIntelNpuDistribution():
                 return None  # every iteration writes the same rows: a real serial chain
             if _uses(body.value, launch.shave_var):
                 return None  # the author already chose which SHAVE fills
+            if condition is not None:
+                if len(dst.indices) != 2 or _uses(dst.indices[1], stmt.loop_var):
+                    return None
+                row_step = substitute(dst.indices[0], {stmt.loop_var: stmt.loop_var + 1}) - dst.indices[0]
+                if not tvm.arith.Analyzer().can_prove_equal(row_step, args[3]):
+                    return None
+                valid = [True]
+                allowed = list(func.params) + active_loops + [stmt.loop_var, launch.tile_var]
+
+                def check_condition(node):
+                    if isinstance(node, tirx.BufferLoad):
+                        if node.buffer.scope() not in ("shared", "shared.dyn") or node.buffer.data.same_as(dst.buffer.data):
+                            valid[0] = False
+                        allowed.append(node.buffer.data)
+                    elif isinstance(node, tirx.Call):
+                        valid[0] = False
+
+                post_order_visit(condition, check_condition)
+                if not valid[0] or any(not any(var.same_as(candidate) for candidate in allowed) for var in _vars_of(condition)):
+                    return None
             notes.append(
                 f"{dst.buffer.name}: unsplittable fill, the loop's {int(stmt.extent)} iterations dealt "
                 f"over the tile's SHAVEs, tile sync before and after the loop"
             )
+            if condition is not None:
+                body = tirx.IfThenElse(condition, body, None)
             guarded = tirx.IfThenElse(tirx.floormod(stmt.loop_var, _i32(launch.shaves)) == launch.shave_var, body, None)
             loop = tirx.For(stmt.loop_var, stmt.min, stmt.extent, stmt.kind, guarded, stmt.thread_binding, stmt.annotations)
             return tirx.SeqStmt([_storage_sync_shared(), loop, _storage_sync_shared()])
@@ -457,6 +492,7 @@ def PlanIntelNpuDistribution():
                     return dealt
                 uniform.append(uniform[-1] + [stmt.loop_var] if uniform[-1] and is_uniform(stmt.min) and is_uniform(stmt.extent) else [])
                 loop_depth[0] += 1
+                active_loops.append(stmt.loop_var)
                 if int(stmt.annotations.get("num_stages", 0)) > 0:
                     pipelined_depth[0] += 1
             elif isinstance(stmt, tirx.IfThenElse):
@@ -473,6 +509,7 @@ def PlanIntelNpuDistribution():
             if isinstance(stmt, tirx.For):
                 uniform.pop()
                 loop_depth[0] -= 1
+                active_loops.pop()
                 if int(stmt.annotations.get("num_stages", 0)) > 0:
                     pipelined_depth[0] -= 1
                 return None
@@ -497,11 +534,11 @@ def PlanIntelNpuDistribution():
             src_expr = src.indices
             src_tile = any(_uses(i, launch.tile_var) for i in src_expr)
             src_shave = any(_uses(i, launch.shave_var) for i in src_expr)
+            if pipelined_depth[0] == 0:
+                fill = multicast_fill(stmt)
+                if fill is not None:
+                    return fill
             if dst_scope == "local":
-                if pipelined_depth[0] == 0:
-                    fill = multicast_fill(stmt)
-                    if fill is not None:
-                        return fill
                 if not src_tile and not src_shave and pipelined_depth[0] == 0:
                     # The same DDR bytes read once per worker (a bias, a probe's operand): legal, and
                     # said in the source so a large one is noticed; the flow's operands are shared.
