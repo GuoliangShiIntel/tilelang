@@ -172,6 +172,17 @@ Headline results:
 * If resuming device work: re-run `device/run_scalar_loop_probe_device.py` first as a quick health check (cheap,
   ~30s build) before investing time in a bigger kernel -- if it still fails, FGCLIP2 (and any other
   scalar-op-using kernel) is still blocked on this hardware/SDK combination.
+* **Mitigation attempts tried (2026-11-11), all failed** -- do not re-try without new information: (1) a 10x
+  larger barrier spin budget just moves the failure to the HOST's own Level Zero event-wait timeout instead
+  (proves it is a genuine stall, not a timing budget); (2) giving BOTH SHAVEs symmetric work instead of leaving
+  one idle still hangs (rules out "idle worker waits too long for a busy partner"); (3) shrinking the scalar
+  loop to a single iteration, or even a single bare scalar store with no loop at all, still hangs (rules out
+  loop volume/duration); (4) a dummy DPU matmul inserted right after the scalar store does not clear whatever
+  bad state it leaves. The trigger is the mere presence of a plain scalar store to a CMX buffer before
+  `ctx.sync_grid()`, independent of size, symmetry, or timeout. See repo memory's "Mitigation attempts tried and
+  FAILED" note and `device/run_scalar_loop_symmetric_probe_device.py` for the probe kernels. Root-causing this
+  further needs real hardware debug tooling (moviDebug2/JTAG) or SDK-owner engineering support, not more
+  source-level reading or black-box device experiments.
 
 
 
