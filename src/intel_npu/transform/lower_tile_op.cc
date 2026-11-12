@@ -51,7 +51,8 @@ bool IsCmx(const Buffer &buf) {
   return scope == "shared" || scope == "shared.dyn" || scope == "local";
 }
 
-RegionInfo ParseRegion(const PrimExpr &e, const char *what, bool allow_dynamic_rows = false) {
+RegionInfo ParseRegion(const PrimExpr &e, const char *what, bool allow_dynamic_rows = false,
+                       size_t min_dims = 1) {
   const auto *call = e.as<CallNode>();
   if (call == nullptr || !call->op.same_as(tl::region())) {
     TVM_FFI_THROW(ValueError)
@@ -79,7 +80,7 @@ RegionInfo ParseRegion(const PrimExpr &e, const char *what, bool allow_dynamic_r
   }
   // A [1, ..., 1, R, C] region of a higher-rank tensor is a 2-D tile.
   size_t lead = 0;
-  while (lead + 1 < info.full_extents.size() && info.full_extents[lead] == 1)
+  while (lead + min_dims < info.full_extents.size() && info.full_extents[lead] == 1)
     ++lead;
   info.extents.assign(info.full_extents.begin() + lead, info.full_extents.end());
   return info;
@@ -196,9 +197,9 @@ private:
   }
 
   Stmt LowerGemm(const CallNode *call) {
-    RegionInfo a = ParseRegion(call->args[0], "gemm A");
-    RegionInfo b = ParseRegion(call->args[1], "gemm B");
-    RegionInfo c = ParseRegion(call->args[2], "gemm C");
+    RegionInfo a = ParseRegion(call->args[0], "gemm A", false, 2);
+    RegionInfo b = ParseRegion(call->args[1], "gemm B", false, 2);
+    RegionInfo c = ParseRegion(call->args[2], "gemm C", false, 2);
     const bool trans_a = call->args[3].as<IntImmNode>() && call->args[3].as<IntImmNode>()->value != 0;
     const bool trans_b = call->args[4].as<IntImmNode>() && call->args[4].as<IntImmNode>()->value != 0;
     const int64_t M = ConstDim(call->args[5], c.buffer, "M");

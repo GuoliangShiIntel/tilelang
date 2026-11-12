@@ -57,6 +57,33 @@ def test_gemm_source_has_dma_and_dpu_calls():
 
 
 @needs_cxx
+def test_gemm_with_one_activation_row():
+    @T.prim_func
+    def single_row(A: T.Tensor((1, 64), T.float16), B: T.Tensor((16, 64), T.float16),
+                   C: T.Tensor((1, 16), T.float16)):
+        with T.Kernel(1, threads=1):
+            activation = T.alloc_local((1, 64), T.float16)
+            weights = T.alloc_local((16, 64), T.float16)
+            result = T.alloc_local((1, 16), T.float16)
+            T.copy(A, activation)
+            T.copy(B, weights)
+            T.gemm(activation, weights, result, transpose_B=True, clear_accum=True)
+            T.copy(result, C)
+
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off"}):
+        low = lowering.lower(single_row)
+    rng = np.random.default_rng(42)
+    activation = rng.standard_normal((1, 64)).astype(np.float16)
+    weights = rng.standard_normal((16, 64)).astype(np.float16)
+    result = np.zeros((1, 16), np.float16)
+    lib = host_sim.build(low.source, "single_row_gemm")
+    arrays = lowering.order_arrays(low, {"A": activation, "B": weights, "C": result})
+    host_sim.check_status(host_sim.run(lib, arrays, tiles=1, shaves=1))
+    expected = (activation.astype(np.float32) @ weights.astype(np.float32).T).astype(np.float16)
+    np.testing.assert_allclose(result, expected, rtol=2e-3, atol=2e-3)
+
+
+@needs_cxx
 def test_async_gemm_starts_then_waits_before_output_is_read():
     @T.prim_func
     def async_gemm(A: T.Tensor((16, 64), T.float16), B: T.Tensor((16, 64), T.float16),

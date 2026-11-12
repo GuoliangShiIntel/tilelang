@@ -55,6 +55,17 @@ PREFILL_GEOM = dict(TB=32, C=64, TBq=8, TBF=16, BKV=128, BN1=32, BN2=32, MB=16, 
                     BNG=64, BND=64, DB=4)
 
 
+def decode_gdn_input_block(cfg, requested, packed):
+    block = packed if requested is None else requested
+    if block <= 0 or block % 64:
+        raise ValueError("decode GDN input block must be a positive multiple of 64")
+    actual = gdn_sizes(cfg.hidden, cfg.lin_kh, cfg.lin_vh, cfg.lin_dk, tiles=TILES, shaves=SHAVES, BN1=block)["NIN_pad"]
+    expected = gdn_sizes(cfg.hidden, cfg.lin_kh, cfg.lin_vh, cfg.lin_dk, tiles=TILES, shaves=SHAVES, BN1=packed)["NIN_pad"]
+    if actual != expected:
+        raise ValueError("decode GDN input block changes packed input row padding")
+    return block
+
+
 def prefill_sizes(c, n: int, G: dict) -> dict:
     """The padded token count and every scratch extent `make_prefill_model` declares, derived the same way the
     kernel derives them -- a mismatch here is a DDR read past a buffer, which hangs the device rather than
@@ -98,7 +109,8 @@ class DeviceModel:
                  prefill_shared_down_mb: int | None = None, prefill_shared_down_bn: int | None = None,
                  prefill_shared_down_serial_input: bool = False,
                  prefill_tile_shared_experts: bool = False, prefill_short_name: str | None = None,
-                 prefill_moe_pipelined: bool = False, prefill_moe_num_stages_gu: int = 2):
+                 prefill_moe_pipelined: bool = False, prefill_moe_num_stages_gu: int = 2,
+                 decode_gdn_bn1: int | None = None):
         self.ck, self.c, self.log = ck, ck.cfg, log
         self.prefill_phases = prefill_phases
         c = self.c
@@ -131,6 +143,9 @@ class DeviceModel:
         # launch units: the whole model, or (chunked) runs of up to 3 GDN layers and single attention layers, the head in the last
         self.chunks = self._chunks() if (single and chunked) else [self.layer_ids]
         G = pack.GEOM
+        if decode_gdn_bn1 is not None and not single:
+            raise ValueError("decode GDN input block requires the single-kernel decode path")
+        decode_bn1 = decode_gdn_input_block(c, decode_gdn_bn1, G["gdn_BN1"])
         moe_kw = dict(BNR=G["moe_BNR"], BNG=G["moe_BNG"], BND=G["moe_BND"])
         if os.environ.get("TL_NPU_MOE_NSG"):   # gate/up ring depth (slots), independent of the down ring's
             moe_kw["num_stages_g"] = int(os.environ["TL_NPU_MOE_NSG"])
@@ -151,7 +166,7 @@ class DeviceModel:
                                                  TOPK=c.top_k, V=c.vocab, G=ck.group, tiles=TILES, shaves=SHAVES, eps=c.eps,
                                                  pipelined=os.environ.get("TL_NPU_PIPELINED", "1") != "0",
                                                  skip=skip,
-                                                 gdn_kw=dict(BN1=G["gdn_BN1"], BN2=G["gdn_BN2"], **r2),
+                                                 gdn_kw=dict(BN1=decode_bn1, BN2=G["gdn_BN2"], **r2),
                                                  attn_kw=dict(BN1=G["attn_BN1"], BN2=G["attn_BN2"], **r2,
                                                               pipelined=os.environ.get("TL_NPU_ATTN_SERIAL") != "1",
                                                               gemv_pipelined=os.environ.get("TL_NPU_ATTN_GEMV_SERIAL") != "1",
@@ -160,7 +175,7 @@ class DeviceModel:
                                                               kv_stages=int(os.environ.get("TL_NPU_DBG_KV_STAGES", "2")),
                                                               stages=os.environ.get("TL_NPU_DBG_ATTN_STAGES", "ABCDE")), moe_kw=moe_kw,
                                                  head_kw=dict(BN=G["head_BN"]))
-                names[key] = f"tl_e2e_{key}_h{c.hidden}_s{smax}"
+                names[key] = f"tl_e2e_{key}_h{c.hidden}_s{smax}" + (f"_gib{decode_bn1}" if decode_gdn_bn1 is not None else "")
             if self.prefill_n:
                 # the prompt through the PREFILL kernels instead of token by token through decode. It reads the
                 # same weight tensors decode already uploaded -- that is what the shared group-major scale layout
@@ -663,6 +678,7 @@ def main(argv):
     ap.add_argument("--raw", action="store_true", help="no chat template")
     ap.add_argument("--new", type=int, default=16)
     ap.add_argument("--smax", type=int, default=1536)
+    ap.add_argument("--decode-gdn-bn1", type=int, help="GDN decode input weight block, preserving packed row padding")
     ap.add_argument("--golden", default=None, help="reference_golden.py's .npz: teacher-forced comparison (prompt and layers from it)")
     ap.add_argument("--trials", type=int, default=1,
                     help="repeat the teacher-forced comparison N times and report n/N; one run cannot tell a "
@@ -727,6 +743,8 @@ def main(argv):
         ap.error("--prefill-head requires --prefill and cannot be combined with --per-layer, --prefill-only or --prefill-sweep")
     if a.warmup < 0:
         ap.error("--warmup must be nonnegative")
+    if a.decode_gdn_bn1 is not None and a.per_layer:
+        ap.error("--decode-gdn-bn1 requires the single-kernel decode path")
     if a.prefill_phases is not None and (not a.prefill_only or not a.prefill):
         ap.error("--prefill-phases requires --prefill and --prefill-only; instrumented runs are not timings")
     if not a.ckpt or not a.pack_dir:
@@ -779,7 +797,8 @@ def main(argv):
                     prefill_shared_down_mb=a.prefill_shared_down_mb, prefill_shared_down_bn=a.prefill_shared_down_bn,
                     prefill_shared_down_serial_input=a.prefill_shared_down_serial_input,
                     prefill_tile_shared_experts=a.prefill_tile_shared_experts, prefill_short_name=a.prefill_short_name,
-                    prefill_moe_pipelined=a.prefill_moe_pipelined, prefill_moe_num_stages_gu=a.prefill_moe_num_stages_gu)
+                    prefill_moe_pipelined=a.prefill_moe_pipelined, prefill_moe_num_stages_gu=a.prefill_moe_num_stages_gu,
+                    decode_gdn_bn1=a.decode_gdn_bn1)
     if a.chunked:
         print(f"chunks: {len(m.chunks)} launches per token: " + " ".join("/".join(str(i) for i in ch) for ch in m.chunks))
     try:

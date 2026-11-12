@@ -2045,6 +2045,7 @@ def gdn_block(
         s2_cmx = T.alloc_shared((KG2, BN2), T.float16)
         y2_cmx = T.alloc_local((1, BN2), T.float16)
         # --- A. in_proj GEMV: rows [q | k | v | z | pad] split over the tiles; b | a on the SHAVE ------------
+        perf_begin("dgin")
         for n in T.Pipelined(C1, num_stages=num_stages) if pipelined else T.serial(C1):
             T.copy(WinQ[(tile * C1 + n) * BN1, 0], w1_cmx)
             T.copy(WinS[0, (tile * C1 + n) * BN1], s1_cmx)
@@ -2054,6 +2055,8 @@ def gdn_block(
                 for sub in T.serial(BN1 // R1):
                     T.gemm_i4(x_cmx, w1_cmx, s1_cmx, y1_cmx, group=G, row0=sub * R1, rows=R1, scales_major="group")
             T.copy(y1_cmx, Y[0, (tile * C1 + n) * BN1])
+        perf_end()
+        perf_begin("dgba")
         T.copy(Wba[worker * RBA, 0], wba_cmx)
         for r in T.serial(RBA):
             for v in T.vectorized(FL):
@@ -2064,7 +2067,9 @@ def gdn_block(
             y1_cmx[0, r] = T.cast(T.call_extern(T.float32, "tl_npu_vsum", ls[0:FL]), T.float16)
         T.copy(y1_cmx[0:1, 0:RBA], BA[0, worker * RBA])
         T.sync_grid()
+        perf_end()
         # --- B1. causal conv1d (k = 4) + SiLU over the CONV channels, blocks of CB dealt over the workers -------
+        perf_begin("dgcv")
         for it in T.serial(T.ceildiv(NB, workers)):
             blk = it * workers + worker
             if blk < NB:
@@ -2090,7 +2095,9 @@ def gdn_block(
                 T.copy(cv_cmx, CV[0, blk * CB])
                 T.copy(cs_cmx, ConvState[0, blk * CB])
         T.sync_grid()
+        perf_end()
         # --- B2. the delta rule per v-head: worker w takes heads [w * HPW, w * HPW + HPW) ------------------------
+        perf_begin("dgsc")
         T.copy(GNorm[0, 0], gn_cmx)
         T.copy(ALog[0, 0], al_cmx)
         T.copy(DtBias[0, 0], db_cmx)
@@ -2141,7 +2148,9 @@ def gdn_block(
                 T.copy(S_cmx, Ssm[worker * HPW + j, 0, 0])
         T.copy(on_cmx, O[0, worker * HPW * DV])
         T.sync_grid()
+        perf_end()
         # --- C. out_proj GEMV (+ residual), rows split over the tiles ---------------------------------------
+        perf_begin("dgou")
         if res_add:
             for c in T.serial(NOUT_pad - H):
                 if shave == 0:
@@ -2159,6 +2168,7 @@ def gdn_block(
                         T.cast(y2_cmx[0, c], T.float32) + T.cast(res_cmx[0, (tile * C2 + n) * BN2 + c], T.float32), T.float16
                     )
             T.copy(y2_cmx, Out[0, (tile * C2 + n) * BN2])
+        perf_end()
 
     return gdn_mixer, sizes
 
@@ -5651,6 +5661,7 @@ def make_decode_model(
                     ConvState = T.ddr_view(Table[li, col["S0"]], (3, CONV), T.float16)
                     Ssm = T.ddr_view(Table[li, col["S1"]], (VH, DK, DV), T.float32)
                     if "gdn" not in skip:
+                        perf_phase_begin("dgdn")
                         gdn_mixer(
                             x_cmx,
                             WinQ,
@@ -5677,6 +5688,7 @@ def make_decode_model(
                         T.sync_grid()
                         T.copy(Mix[0:1, 0:H], mix_cmx[0:1, 0:H])
                         perf_end()
+                        perf_phase_end("dgdn")
                     else:
                         if shave == 0:
                             for c in T.serial(H):
@@ -5690,6 +5702,7 @@ def make_decode_model(
                     WoQ = T.ddr_view(Table[li, col["W4"]], (NOUTa, KO // 2), T.uint8)
                     WoS = T.ddr_view(Table[li, col["W5"]], (KG2a, NOUTa), T.float16)
                     if "attn" not in skip:
+                        perf_phase_begin("datt")
                         attn_mixer(
                             x_cmx,
                             WqkvQ,
@@ -5715,6 +5728,7 @@ def make_decode_model(
                         )
                         T.sync_grid()
                         T.copy(MixA[0:1, 0:H], mix_cmx[0:1, 0:H])
+                        perf_phase_end("datt")
                     else:
                         if shave == 0:
                             for c in T.serial(H):
@@ -5727,17 +5741,21 @@ def make_decode_model(
                     rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
                 perf_end()
                 if "moe" not in skip:
+                    perf_phase_begin("dmoe")
                     moe_phases(x_cmx, Wr, WguQ, WguS, WdQ, WdS, Logits, PartM, tile, shave)
                     perf_begin("lprt")
                     T.copy(PartM[0, 0], p_cmx)
                     add_parts(h32, p_cmx, tiles, shave)
                     perf_end()
+                    perf_phase_end("dmoe")
             # a grid barrier closes the layer loop's CMX phase before the head's ring (the lm_head ring is 1 MB)
             T.sync_grid()
             T.copy(NormW[0, 0], nw_cmx)
             rmsnorm_zc(h32, nw_cmx, x_cmx, shave)
             if "head" not in skip:
+                perf_phase_begin("dhed")
                 head_phases(x_cmx, WlmQ, WlmS, HLogits, HPart, Tok, tile, shave)
+                perf_phase_end("dhed")
             if tile == 0:
                 if shave == 0:
                     T.copy(h32, Hio[0, 0])

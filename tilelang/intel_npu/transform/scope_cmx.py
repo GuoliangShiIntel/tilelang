@@ -369,6 +369,10 @@ class _Scoper:
             stack[-1].extend(body)
             for interval in sorted((span for span in intervals if span[1] == i), key=lambda span: -span[0]):
                 scoped = stack.pop()
+                if is_split is _is_sync_grid and interval[0] == interval[1]:
+                    refined = self._phase_scope(scoped, _is_sync_tile, need_two_owners=True)
+                    if refined is not None:
+                        scoped = [refined]
                 stack[-1].append(tirx.AttrStmt(tirx.IntImm("int32", 0), LEXICAL_SCOPE,
                                              tirx.IntImm("int32", 1), _seq(scoped)))
         # allocations that stay in this block come first, where they were

@@ -14,6 +14,7 @@ row count (otherwise the test would pass by accident).
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -103,6 +104,19 @@ def test_a_chunk_size_sweep_keeps_the_cache_key():
     p = _problem()
     g = dict(e2e_pack.GEOM, moe_BNG=256, moe_BND=512)
     assert _same(_pack_all(p, dict(e2e_pack.GEOM)), _pack_all(p, g))
+
+
+def test_decode_gdn_input_block_checks_packed_padding():
+    from decode import decode_gdn_input_block
+
+    cfg = SimpleNamespace(hidden=2048, lin_kh=16, lin_vh=32, lin_dk=128)
+    assert decode_gdn_input_block(cfg, None, 128) == 128
+    assert decode_gdn_input_block(cfg, 256, 128) == 256
+    with pytest.raises(ValueError, match="positive multiple of 64"):
+        decode_gdn_input_block(cfg, 96, 128)
+    incompatible = SimpleNamespace(hidden=2048, lin_kh=2, lin_vh=2, lin_dk=128)
+    with pytest.raises(ValueError, match="changes packed input row padding"):
+        decode_gdn_input_block(incompatible, 256, 128)
 
 
 def test_a_cache_packed_under_another_padding_is_refused(tmp_path):

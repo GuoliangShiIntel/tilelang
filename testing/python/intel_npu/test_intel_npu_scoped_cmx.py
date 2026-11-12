@@ -122,6 +122,44 @@ def test_tile_phase_reuses_an_already_scoped_successor():
         _lower(kernel, **{"tl.intel_npu.scoped_cmx": False, "tl.intel_npu.derive_global_sync": False})
 
 
+def test_tile_phases_within_grid_phase_require_a_rendezvous():
+    n = BIG // SHAVES
+
+    def kernel(separated):
+        @T.prim_func
+        def nested(A: T.Tensor((n,), T.float16), B: T.Tensor((n,), T.float16),
+                   C: T.Tensor((n,), T.float16), Y: T.Tensor((3, TILES * SHAVES, n), T.float16)):
+            with T.Kernel(TILES, threads=SHAVES) as tile:
+                worker = tile * SHAVES + T.get_thread_binding()
+                first = T.alloc_local((n,), T.float16)
+                second = T.alloc_local((n,), T.float16)
+                third = T.alloc_local((n,), T.float16)
+                T.copy(A, first)
+                T.copy(first, Y[0, worker, 0])
+                if separated:
+                    T.sync_threads()
+                T.copy(B, second)
+                T.copy(second, Y[1, worker, 0])
+                T.sync_grid()
+                T.copy(C, third)
+                T.copy(third, Y[2, worker, 0])
+        return nested
+
+    _lower(kernel(True), **{"tl.intel_npu.derive_global_sync": False})
+    with pytest.raises(ValueError, match="CMX budget exceeded"):
+        _lower(kernel(False), **{"tl.intel_npu.derive_global_sync": False})
+
+
+def test_decode_router_reuses_cmx_with_reference_input_geometry():
+    from kernels import make_decode_model
+
+    model = make_decode_model(L=40, KVL=10, gdn_kw={"BN1": 256})
+    source = _lower(model).source
+    assert "ctx.ring_begin(" in source
+    with pytest.raises(ValueError, match="CMX budget exceeded"):
+        _lower(model, **{"tl.intel_npu.scoped_cmx": False})
+
+
 def test_allocation_under_a_shave_branch_is_hoisted():
     @T.prim_func
     def k(A: T.Tensor((64,), T.float16), Y: T.Tensor((TILES * SHAVES, 64), T.float16)):
