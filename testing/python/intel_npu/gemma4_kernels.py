@@ -571,6 +571,171 @@ def gemma4_moe_route_prefill_reference(logits, per_expert_scale, E: int, TOPK: i
     return ids, wts
 
 
+def make_gemma4_moe_expert_prefill(N: int, H: int, I: int, E: int, TOPK: int, G: int = 64, MB: int = 16,
+                                   tiles: int = 3, shaves: int = 2, as_block: bool = False, FL: int = 16):
+    """The grouped expert FFN for `N` prompt tokens, after `make_gemma4_moe_route_prefill`'s grouping
+    (`Off`/`Slot`). V0-grade simplification vs `kernels.make_moe_expert_prefill` (see the plan doc section
+    4): every WORKER (not every tile) owns whole experts round-robin -- no tile-shared weight buffers, no
+    pipelining, no slot-major output -- so every buffer is `T.alloc_local` and no SHAVE-to-SHAVE
+    coordination is needed at all within the expert loop. Correctness over performance.
+
+    A token's `TOPK` choices land on different experts and therefore (generally) on different workers, so
+    each worker accumulates its own expert(s)' contribution into a PRIVATE fp32 partial `Part[worker, N, H]`
+    (zeroed at the start of this phase); `make_gemma4_moe_combine` sums the `workers` partials afterwards.
+    Oracle: `gemma4_moe_expert_prefill_reference`."""
+    assert H % G == 0 and I % G == 0 and H % FL == 0 and I % FL == 0
+    workers = tiles * shaves
+    EPT = -(-E // workers)
+    KGH, KGI = H // G, I // G
+    SLOTS = N * TOPK
+
+    @T.macro
+    def expert_phase(X, WgateQ, WgateS, WupQ, WupS, WdownQ, WdownS, Wts, Off, Slot, Part, tile, shave):
+        worker = tile * shaves + shave
+        off_cmx = T.alloc_local((E + 1,), T.int32)
+        slot_cmx = T.alloc_local((SLOTS,), T.int32)
+        wts_cmx = T.alloc_local((N, TOPK), T.float32)
+        T.copy(Off, off_cmx)
+        T.copy(Slot, slot_cmx)
+        T.copy(Wts[0, 0], wts_cmx)
+        zero_row = T.alloc_local((1, H), T.float32)
+        for d0 in T.serial(H // FL):
+            for v in T.vectorized(FL):
+                zero_row[0, d0 * FL + v] = T.float32(0)
+        for t in T.serial(N):
+            T.copy(zero_row, Part[worker, t, 0])
+        wgq_cmx = T.alloc_local((I, H // 2), T.uint8)
+        wgs_cmx = T.alloc_local((KGH, I), T.float16)
+        wg_cmx = T.alloc_local((I, H), T.float16)
+        wuq_cmx = T.alloc_local((I, H // 2), T.uint8)
+        wus_cmx = T.alloc_local((KGH, I), T.float16)
+        wu_cmx = T.alloc_local((I, H), T.float16)
+        wdq_cmx = T.alloc_local((H, I // 2), T.uint8)
+        wds_cmx = T.alloc_local((KGI, H), T.float16)
+        wd_cmx = T.alloc_local((H, I), T.float16)
+        x_cmx = T.alloc_local((MB, H), T.float16)
+        gate_cmx = T.alloc_local((MB, I), T.float16)
+        up_cmx = T.alloc_local((MB, I), T.float16)
+        act_cmx = T.alloc_local((MB, I), T.float16)
+        y_cmx = T.alloc_local((MB, H), T.float16)
+        acc = T.alloc_local((1, H), T.float32)
+        for ei in T.serial(EPT):
+            e = ei * workers + worker
+            if e < E:
+                T.copy(WgateQ[e, 0, 0], wgq_cmx)
+                T.copy(WgateS[e, 0, 0], wgs_cmx)
+                T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wg_cmx[0, 0]),
+                             T.address_of(wgq_cmx[0, 0]), T.address_of(wgs_cmx[0, 0]), I, H, G)
+                T.copy(WupQ[e, 0, 0], wuq_cmx)
+                T.copy(WupS[e, 0, 0], wus_cmx)
+                T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wu_cmx[0, 0]),
+                             T.address_of(wuq_cmx[0, 0]), T.address_of(wus_cmx[0, 0]), I, H, G)
+                T.copy(WdownQ[e, 0, 0], wdq_cmx)
+                T.copy(WdownS[e, 0, 0], wds_cmx)
+                T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wd_cmx[0, 0]),
+                             T.address_of(wdq_cmx[0, 0]), T.address_of(wds_cmx[0, 0]), H, I, G)
+                for c in T.serial(T.ceildiv(off_cmx[e + 1] - off_cmx[e], MB)):
+                    for r in T.serial(MB):
+                        idx = off_cmx[e] + c * MB + r
+                        if idx < off_cmx[e + 1]:
+                            T.copy(X[slot_cmx[idx] // TOPK, 0:H], x_cmx[r, 0:H])
+                        else:
+                            for d0 in T.serial(H // FL):
+                                for v in T.vectorized(FL):
+                                    x_cmx[r, d0 * FL + v] = T.float16(0)
+                    T.gemm(x_cmx, wg_cmx, gate_cmx, transpose_B=True, clear_accum=True)
+                    T.gemm(x_cmx, wu_cmx, up_cmx, transpose_B=True, clear_accum=True)
+                    for r in T.serial(MB):
+                        for d0 in T.serial(I // FL):
+                            for v in T.vectorized(FL):
+                                g = T.cast(gate_cmx[r, d0 * FL + v], T.float32)
+                                z2 = T.float32(1.5957691216057308) * (g + T.float32(0.044715) * g * g * g)
+                                e_ = T.exp(T.float32(0) - z2)
+                                act_cmx[r, d0 * FL + v] = T.cast(
+                                    g / (T.float32(1) + e_) * T.cast(up_cmx[r, d0 * FL + v], T.float32), T.float16
+                                )
+                    T.gemm(act_cmx, wd_cmx, y_cmx, transpose_B=True, clear_accum=True)
+                    for r in T.serial(MB):
+                        idx = off_cmx[e] + c * MB + r
+                        if idx < off_cmx[e + 1]:
+                            tok = slot_cmx[idx] // TOPK
+                            kk = slot_cmx[idx] % TOPK
+                            T.copy(Part[worker, tok, 0], acc)
+                            for d0 in T.serial(H // FL):
+                                for v in T.vectorized(FL):
+                                    acc[0, d0 * FL + v] = acc[0, d0 * FL + v] + T.cast(y_cmx[r, d0 * FL + v], T.float32) * wts_cmx[tok, kk]
+                            T.copy(acc, Part[worker, tok, 0])
+
+    if as_block:
+        return expert_phase, dict(EPT=EPT, KGH=KGH, KGI=KGI)
+
+    @T.prim_func
+    def moe_expert(
+        X: T.Tensor((N, H), T.float16),
+        WgateQ: T.Tensor((E, I, H // 2), T.uint8), WgateS: T.Tensor((E, KGH, I), T.float16),
+        WupQ: T.Tensor((E, I, H // 2), T.uint8), WupS: T.Tensor((E, KGH, I), T.float16),
+        WdownQ: T.Tensor((E, H, I // 2), T.uint8), WdownS: T.Tensor((E, KGI, H), T.float16),
+        Wts: T.Tensor((N, TOPK), T.float32), Off: T.Tensor((E + 1,), T.int32), Slot: T.Tensor((SLOTS,), T.int32),
+        Part: T.Tensor((workers, N, H), T.float32),
+    ):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            expert_phase(X, WgateQ, WgateS, WupQ, WupS, WdownQ, WdownS, Wts, Off, Slot, Part, tile, T.get_thread_binding())
+
+    return moe_expert
+
+
+def gemma4_moe_expert_prefill_reference(x, ids, wts, gate_w, up_w, down_w):
+    """numpy oracle of `make_gemma4_moe_expert_prefill` (fp32): `gate_w`/`up_w` are `[E, I, H]`, `down_w` is
+    `[E, H, I]` (already dequantised); `ids`/`wts` are `[N, TOPK]`. `out[n] = sum_k wts[n,k] *
+    down_{ids[n,k]}(gelu_tanh(gate_{ids[n,k]}(x[n])) * up_{ids[n,k]}(x[n]))`."""
+    import numpy as np
+
+    N, H = x.shape
+    out = np.zeros((N, H), np.float32)
+    for n in range(N):
+        for k in range(ids.shape[1]):
+            e = int(ids[n, k])
+            gate = x[n].astype(np.float32) @ gate_w[e].astype(np.float32).T
+            up = x[n].astype(np.float32) @ up_w[e].astype(np.float32).T
+            act = gemma4_geglu_reference(gate.astype(np.float16), up.astype(np.float16)).astype(np.float32)
+            y = act @ down_w[e].astype(np.float32).T
+            out[n] += wts[n, k] * y
+    return out
+
+
+def make_gemma4_moe_combine(N: int, H: int, tiles: int = 3, shaves: int = 2, as_block: bool = False, FL: int = 16):
+    """Sum the `workers` private partials from `make_gemma4_moe_expert_prefill` into `Out[N, H]` fp32,
+    tokens dealt over the workers."""
+    workers = tiles * shaves
+    assert H % FL == 0
+
+    @T.macro
+    def combine_phase(Part, Out, tile, shave):
+        worker = tile * shaves + shave
+        acc = T.alloc_local((1, H), T.float32)
+        row = T.alloc_local((1, H), T.float32)
+        for it in T.serial(T.ceildiv(N, workers)):
+            t = it * workers + worker
+            if t < N:
+                T.copy(Part[0, t, 0], acc)
+                for w in T.serial(1, workers):
+                    T.copy(Part[w, t, 0], row)
+                    for d0 in T.serial(H // FL):
+                        for v in T.vectorized(FL):
+                            acc[0, d0 * FL + v] = acc[0, d0 * FL + v] + row[0, d0 * FL + v]
+                T.copy(acc, Out[t, 0])
+
+    if as_block:
+        return combine_phase
+
+    @T.prim_func
+    def combine(Part: T.Tensor((workers, N, H), T.float32), Out: T.Tensor((N, H), T.float32)):
+        with T.Kernel(tiles, threads=shaves) as tile:
+            combine_phase(Part, Out, tile, T.get_thread_binding())
+
+    return combine
+
+
 def make_gemma4_attn_prefill(
     N: int,
     NKV: int,
