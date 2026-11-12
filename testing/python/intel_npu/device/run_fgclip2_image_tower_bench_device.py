@@ -55,9 +55,9 @@ def _lower(func):
         return lowering.lower(func)
 
 
-def _padded_rows(valid: int) -> int:
+def _padded_rows(valid: int, c: int) -> int:
     rows = -(-valid // BQ_LAYERS) * BQ_LAYERS
-    return -(-rows // C) * C
+    return -(-rows // c) * c
 
 
 def main(argv):
@@ -66,17 +66,19 @@ def main(argv):
         return 2
     valid = arg(argv, "--valid", 1024)
     trials = arg(argv, "--trials", 10)
-    rows = _padded_rows(valid)
-    print(f"valid={valid} rows(n_pad)={rows}")
+    n_layers = arg(argv, "--layers", N_LAYERS)
+    c = arg(argv, "--chunk", C)
+    rows = _padded_rows(valid, c)
+    print(f"valid={valid} rows(n_pad)={rows} n_layers={n_layers} chunk={c} chunks_per_layer={rows // c}")
 
-    layers_func = make_fgclip2_encoder_layers_ddr(N_LAYERS, rows, valid, HIDDEN, HEADS, HD_PAD, INTER_PAD,
-                                                  BR=BR, TN=TN, BQ=BQ_LAYERS, C=C)
+    layers_func = make_fgclip2_encoder_layers_ddr(n_layers, rows, valid, HIDDEN, HEADS, HD_PAD, INTER_PAD,
+                                                  BR=BR, TN=TN, BQ=BQ_LAYERS, C=c)
     head_func = make_fgclip2_pooling_head_ddr(rows, valid, HIDDEN, HEADS, HD_PAD, INTER_PAD,
-                                              BR=BR, TN=TN, BQ=BQ_HEAD, C=C)
+                                              BR=BR, TN=TN, BQ=BQ_HEAD, C=c)
     low_layers = _lower(layers_func)
     low_head = _lower(head_func)
-    name_layers = f"tl_fgclip2_image_layers_{rows}"
-    name_head = f"tl_fgclip2_image_head_{rows}"
+    name_layers = f"tl_fgclip2_image_layers_{rows}_l{n_layers}_c{c}"
+    name_head = f"tl_fgclip2_image_head_{rows}_c{c}"
 
     build_dir = Path("X:/build") if Path("X:/").exists() else None
     if "--no-build" in argv:
@@ -93,8 +95,8 @@ def main(argv):
 
     ck = Checkpoint(MODEL_ROOT)
     t0 = time.time()
-    table = np.zeros((N_LAYERS, len(FGCLIP2_TABLE_COLS)), np.int64)
-    for li in range(N_LAYERS):
+    table = np.zeros((n_layers, len(FGCLIP2_TABLE_COLS)), np.int64)
+    for li in range(n_layers):
         w = pack_layer(ck, "vision_model", li, hd_pad=HD_PAD, inter_pad=INTER_PAD)
         for name, key in (("Ln1W", "ln1w"), ("Ln1B", "ln1b"), ("Wq", "wq"), ("Bq", "bq"), ("Wk", "wk"), ("Bk", "bk"),
                           ("Wv", "wv"), ("Bv", "bv"), ("Wo", "wo"), ("Bo", "bo"), ("Ln2W", "ln2w"), ("Ln2B", "ln2b"),
@@ -103,7 +105,7 @@ def main(argv):
             table[li, COL[name]] = s.address(f"L{li}_{name}")
     s.upload("Table", table)
     head_w = pack_vision_head(ck, hd_pad=HD_PAD, inter_pad=INTER_PAD)
-    print(f"weights uploaded in {time.time() - t0:.0f} s (27 layers + head)")
+    print(f"weights uploaded in {time.time() - t0:.0f} s ({n_layers} layers + head)")
 
     rng = np.random.default_rng(0)
     embed = (rng.standard_normal((valid, HIDDEN)) * 0.3).astype(np.float32)
