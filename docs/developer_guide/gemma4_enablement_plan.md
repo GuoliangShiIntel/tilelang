@@ -421,3 +421,44 @@ real hardware debug tooling (moviDebug2, a captured barrier/task trace, or bisec
 kernel's parameters one at a time) that this session did not have time to carry out. The three
 device test scripts (`run_gemma4_layer_device.py`, `run_gemma4_attn_device.py`) are kept in the repo,
 alongside the infrastructure fixes, for whoever continues this.
+
+### V5 follow-up: Problem 2 is NOT Gemma4-specific -- it's flash-attention-on-NVL in general
+
+A focused bisection session (new probe scripts in `testing/python/intel_npu/device/`:
+`probe_dma_passthrough_device.py`, `probe_dma_bisect_device.py`, `probe_dma_loopguard_device.py`,
+`probe_dma_3param_device.py`, `probe_gemm_singleshot_device.py`, `probe_gemm_k_bisect_device.py`,
+`probe_qwen_attn_tiny_device.py`, `probe_qwen_attn_bkv128_device.py`) ruled out, in order:
+windowing, the loop/guard wrapper structure, the mere presence of a DPU call, 2-vs-3 DDR parameters,
+and small GEMM tile sizes (`kernels.make_gemm`'s real factory passes correctly on this NVL machine
+down to `BM=BN=16, K=64`, with correct per-worker block indexing -- the earlier "rel≈1.0" result from
+a hand-rolled single-shot GEMM probe was traced to a bug in the PROBE's own hand-written block-index
+arithmetic, not a hardware fault; a separate "all-zero" result from a pure-DMA-passthrough probe was
+traced to feeding uninitialized CMX rows into a real `T.gemm` call -- both are self-inflicted test bugs,
+recorded here as a caution for future synthetic device probes).
+
+**The decisive test**: `kernels.make_attn_prefill` -- Qwen's OWN flash-attention kernel, not a line of
+Gemma4 code -- was run directly on this NVL/NPU6 machine at `N=96, NKV=2, GQ=8, D=64, SMAX=1024, BKV=128`,
+the EXACT shape `device/evidence/INDEX.md` documents as repeatedly PASSING on real device
+(`tl_flash_phase_q96_kv1024_d64`, rel≈6e-4). On THIS machine it reproduces the same
+`ZE_RESULT_ERROR_DEVICE_LOST` hang as Gemma4's attention kernel. The device was confirmed healthy both
+immediately before and after via `run_gemm_device.py` (clean PASS, rel 3.24e-4), ruling out a
+degraded-device artifact.
+
+**Conclusion: Problem 2 is not a Gemma4 bug.** The flash-attention kernel skeleton shared by both
+`kernels.make_attn_prefill` and `gemma4_kernels.make_gemma4_attn_prefill` does not run successfully on
+this NVL/NPU6 hardware at all -- even at a shape extensively validated elsewhere. `make_gemm`'s pure
+DPU+DMA kernel is solid on this same machine at every size tried, including very small tiles. The two
+kernel families differ in one conspicuous way: flash attention uses SHAVE vector-extern reduction calls
+(`T.call_extern(..., "tl_npu_vmax", ...)`, `"tl_npu_vsum"`) and heavy `T.exp`/`T.vectorized` SHAVE math
+inside a `T.serial(ck)` loop with no barrier between kv-chunk iterations; GEMM uses none of that. This
+points at either (a) flash attention never having been exercised on the NVL/NPU6 generation before (its
+device evidence may all predate this hardware), surfacing a genuine compiler-or-runtime gap for this
+kernel pattern on NVL specifically, or (b) a bug in one of those SHAVE vector-extern primitives on this
+hardware generation that GEMM's code path never touches.
+
+**Recommended next step** (not yet executed): build two more minimal isolation probes --
+(1) a kernel using only `T.exp`/`T.vectorized` SHAVE math (no `tl_npu_vmax`/`tl_npu_vsum`, no DPU), and
+(2) a kernel using only the `tl_npu_vmax`/`tl_npu_vsum` call_extern reductions (no `T.exp`, no DPU) --
+to find which SHAVE primitive flash attention depends on is the one broken or untested on NVL/NPU6.
+This reframes Problem 2 as a backend/runtime investigation, not something fixable by tuning Gemma4's
+own kernel parameters (tile sizes, windowing, etc. were all ruled out as factors this session).
