@@ -357,3 +357,67 @@ have an analogous int8-embedding gather (M6 `e2e`); check for reuse before writi
   generated kernel code (host-simulated, not yet real NVL hardware -- see the V5 entry below for that
   attempt), reproducing an independently-written reference to 0.03% relative error and perfect cosine
   similarity. No shape was shrunk, no weight was faked, no tolerance was loosened to force a pass.
+
+## V5: infrastructure confirmed working; Gemma4-specific kernels hit two NOT-YET-ROOT-CAUSED real-device
+## issues, distinct from the already-known/fixed NPU6 sync_grid hang
+The user supplied the real paths this machine's device SDK actually lives at (not found by search):
+`GENERIC_COMPUTE_ROOT=C:\Intel\guoliang\dsl\gc_dsl_barrier` (a worktree already at the exact required
+commit `6bb585c`, branch `dc/dsl_barrier`) and `MV_TOOLS_PATH=C:\Intel\guoliang\dsl\26.09.2-internal`
+(a MoviTools release, `win64\bin\moviCompile.exe` confirmed present). With these set, plus
+`TL_NPU_DEVICES=6010` and `TL_NPU_CMAKE_GENERATOR="Visual Studio 18 2026"` (this machine only has VS2026,
+not the VS2022 `runner.py` hardcoded), three real, fixable build/environment problems were found and
+fixed (all committed, see the device-portability commit):
+1. `runner.py`'s `build_all()` hardcoded `-G "Visual Studio 17 2022"` -- now reads
+   `TL_NPU_CMAKE_GENERATOR` if set.
+2. `runner.py`'s `build_all()` never forwarded `TL_NPU_DEVICES` to CMake at all -- now does, if set.
+3. `src/tl_templates/intel_npu/npu_rt_device.hpp`'s `dpu_matmul_qg` referenced `npu40xx::` unconditionally;
+   guarded with `#if (__npu_major__ >= 4 && __npu_major__ <= 5)` for NPU6/later (`kStatusUnsupported`
+   otherwise) -- the same fix repo memory already documents from an earlier session, re-applied here
+   since it was not present on this branch.
+4. (Local cleanup, not committed, gitignored) a set of stale `generated/*.cpp` files left over from an
+   unrelated past FGCLIP2 session broke the build via the device project's source glob -- removed.
+
+**Confirmed working**: `run_gemm_device.py` builds and runs successfully on this machine's real NVL/NPU6
+card with these fixes -- all 4 SHAVE statuses OK, median 0.105 ms, rel error 3.24e-04, PASS. This is
+the first confirmed real-hardware execution of ANY TileLang Intel NPU kernel in this session/checkout,
+and establishes that the device toolchain itself is healthy on this machine.
+
+**Gemma4-specific kernels, however, do NOT yet pass on real device** -- two separate, NOT-YET-ROOT-CAUSED
+problems, found trying `run_gemma4_layer_device.py` (the full fused layer, real dimensions, synthetic
+weights) and a new `run_gemma4_attn_device.py` (the standalone attention phase alone):
+
+1. **The full fused layer (61 DDR parameters) crashes at device LAUNCH**, host-side,
+   `STATUS_STACK_BUFFER_OVERRUN` (Windows exception code `0xC0000409`) -- the SAME exception code
+   documented in repo memory's FGCLIP2 27-layer crash, but triggered here by a SINGLE layer with many
+   DDR parameters rather than many chained layers. The generated kernel entry function takes all 61
+   logical tensors as separate top-level `npu::Ddr<T>` arguments (confirmed by reading the generated
+   `.cpp`); the most likely cause is a parameter-count ceiling somewhere in generic_compute's host-side
+   `Kernel::submit()` path (not this repo's code, so not fixable here without that SDK's source) -- this
+   is a strong, concrete argument for the REAL device-side layer-TABLE architecture (grouping many
+   logical tensors into few big DDR blobs addressed via `T.ddr_view`, exactly what V2/V3's deferred
+   "real runtime layer table" work was already going to need for a 30-layer model, see the V2 entry
+   above) rather than one-DDR-parameter-per-logical-tensor. NOT YET fixed; would need either consolidating
+   this kernel's DDR parameters into fewer tensors, or confirming/raising whatever limit exists in
+   generic_compute's submit path.
+2. **The standalone attention phase alone (5 DDR parameters: `Q, Kc, Vt, Pos, O`), at modest Gemma4-sliding
+   dimensions (`NKV=8, D=256, window=1024`), causes a genuine DEVICE HANG**:
+   `ZE_RESULT_ERROR_DEVICE_LOST: device hung, reset, was removed, or driver update occurred`. Confirmed
+   this is NOT the already-fixed `sync_grid` hang: the generated source for this exact kernel contains
+   ZERO occurrences of any sync/barrier call at all (grepped directly) -- `make_gemma4_attn_prefill`'s
+   single-launch, no-cross-tile-dependency structure never calls `T.sync_grid()`. The device DID recover
+   on its own (confirmed: re-running the already-proven-good `run_gemm_device.py` immediately afterward,
+   `--no-build`, passed cleanly) -- so this is a kernel-triggered hang with an automatic driver-level
+   recovery, not a persistently broken device. **A much SMALLER shape of the same kernel (`N=8, NKV=2,
+   D=32, SMAX=64`) did NOT hang** -- it ran successfully (all 4 SHAVE statuses OK) -- but its OUTPUT was
+   essentially uncorrelated with the host-sim-validated-correct oracle (`rel_err ≈ 1.0`, not a rounding
+   issue), a THIRD, separate real finding: a host-sim-vs-real-device NUMERICAL discrepancy in this kernel
+   that host-sim's correctness checks (all passing) cannot see by construction, since host-sim is its own
+   C++ reference implementation of the same ops, not the real DPU/SHAVE hardware path.
+**None of this is a correctness bug found in the KERNEL's MATH** (host-sim + the real checkpoint
+validation in V4 both confirm the algorithm is right) -- these are three distinct, concrete, NOT-YET-
+UNDERSTOOD device-execution-layer problems (a likely parameter-count ceiling, a new hang distinct from
+the known one, and a real numeric device/host-sim mismatch), each warranting focused follow-up with
+real hardware debug tooling (moviDebug2, a captured barrier/task trace, or bisecting the attention
+kernel's parameters one at a time) that this session did not have time to carry out. The three
+device test scripts (`run_gemma4_layer_device.py`, `run_gemma4_attn_device.py`) are kept in the repo,
+alongside the infrastructure fixes, for whoever continues this.
