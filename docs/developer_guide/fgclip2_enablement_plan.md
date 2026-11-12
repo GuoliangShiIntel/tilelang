@@ -180,9 +180,53 @@ Headline results:
   loop volume/duration); (4) a dummy DPU matmul inserted right after the scalar store does not clear whatever
   bad state it leaves. The trigger is the mere presence of a plain scalar store to a CMX buffer before
   `ctx.sync_grid()`, independent of size, symmetry, or timeout. See repo memory's "Mitigation attempts tried and
-  FAILED" note and `device/run_scalar_loop_symmetric_probe_device.py` for the probe kernels. Root-causing this
-  further needs real hardware debug tooling (moviDebug2/JTAG) or SDK-owner engineering support, not more
-  source-level reading or black-box device experiments.
+  FAILED" note and `device/run_scalar_loop_symmetric_probe_device.py` for the probe kernels.
+
+## 3c. RESOLVED (2026-11-11, same day): root cause found and fixed -- a one-line pass config
+
+The "needs real hardware debug tooling" conclusion in 3b was wrong. Comparing against the prior `npu_dsl`
+project's OWN generic_compute kernel tests (`C:\Intel\guoliang\dsl\libraries.npu.dsl`) found the fix directly:
+generic_compute's own `tests/kernels/layernorm` (real SHAVE scalar mean/variance/normalize work, the same kind
+of code that hangs in every TileLang probe) was built and run standalone on this exact NPU6 hardware -- **all 23
+shape variants PASSED**. Reading its kernel source (`kernels/layernorm/kernel_layernorm.cpp`) showed the
+difference: it never calls any barrier/sync primitive at all (every SHAVE does independent work into its own
+private CMX buffer and returns), whereas TileLang's kernel-exit protocol ALWAYS calls `ctx.sync_grid()`
+unconditionally, even for a trivial 1-tile kernel with no real cross-tile rendezvous need.
+
+The backend already has a pass config for exactly this: `tl.intel_npu.hw_sync_grid` (default `true`) selects
+between a HARDWARE barrier-register dance (`hw_sync_grid()`, the thing that hangs on this NPU6/SDK combination)
+and a pure SOFTWARE rendezvous (`sync_.waitGlobal()`) for `ctx.sync_grid()`. Passing
+`"tl.intel_npu.hw_sync_grid": False` in the `tvm.transform.PassContext` config used when lowering **fixes the
+hang completely** -- verified on real hardware:
+
+| Kernel | Result |
+|---|---|
+| `run_scalar_loop_probe_device.py` (bare scalar store repro) | 6/6 repeated invocations (24 launches), zero failures, exact rel err 0.0 |
+| `run_fgclip2_v0_device.py` (small shape) | rel err 2.62e-4, PASS, 0.45 ms device median |
+| `run_fgclip2_ddr_synthetic_device.py` (real channel width) | rel err 4.63e-4, PASS, 262 ms device median |
+| `run_fgclip2_layer0_device.py` (**REAL checkpoint, REAL 972-patch image**) | **rel err 0.0073 (0.73%), matching the host-sim number almost exactly -- PASS**, 2754 ms device median |
+
+This is confirmed to work against BOTH the original `dc/dsl_barrier`/`6bb585c` generic_compute pin (no API
+porting needed, the device build already targets this) and the newer `ed84660` pin `npu_dsl` uses -- the fix is
+independent of generic_compute revision, a TileLang-side pass config only.
+
+**Action for any future NPU6 device kernel/test**: add `"tl.intel_npu.hw_sync_grid": False` to the lowering
+`PassContext` config (same pattern as `"tl.intel_npu.plan_workloads": "off"`, already done in all three
+`run_fgclip2_*_device.py` scripts). Do not change the global default -- NPU5 (PTL) validation already passed
+everything with hardware barriers on (`device/evidence/INDEX.md`), and software rendezvous is presumably slower
+(not measured); this is a targeted NPU6 workaround, not a general fix, until the underlying HGL-barrier/SHAVE-
+scalar-store hardware interaction is fixed upstream in generic_compute.
+
+**Unrelated gotcha hit while chasing this**: MSBuild's FileTracker tlog paths blow Windows' MAX_PATH (260
+chars) for long kernel names (e.g. `tl_fgclip2_encoder_ddr_synth`), producing a flaky-looking `MSB3501` error
+that looks like a parallel-build race but isn't (confirmed via `npu_dsl`'s own `platform_nvl.md` "Short paths"
+note). Fix: `subst X: <path to testing/python/intel_npu/device>` once per session, pass
+`build_dir=Path("X:/build")` to `runner.build()`. Does not survive a reboot.
+
+With this fix, FGCLIP2's real-weights, real-data layer-0 is now validated on BOTH host-sim (0.73% error) AND
+real NPU6 hardware (0.73% error, essentially identical) -- the device-validation gap from section 3 is closed
+for at least this one kernel. Extending this to the full 27-layer tower, pooling head, and text tower on real
+hardware (the remaining FGCLIP2 device milestones) is future work, not yet attempted this session.
 
 
 

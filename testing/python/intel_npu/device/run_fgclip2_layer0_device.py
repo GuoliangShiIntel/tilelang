@@ -41,7 +41,7 @@ KERNEL = "tl_fgclip2_real_layer0"
 
 
 def _lower(func):
-    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off"}):
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.hw_sync_grid": False}):
         return lowering.lower(func)
 
 
@@ -66,12 +66,15 @@ def main(argv):
 
     func = make_fgclip2_encoder_layer_ddr(rows, valid, HIDDEN, HEADS, HD_PAD, INTER_PAD, BR=BR, TN=TN, BQ=BQ, C=C)
     low = _lower(func)
+    # MSBuild's FileTracker tlog paths blow MAX_PATH for a kernel name this long; build under a
+    # subst'd short drive letter if one points at this folder (`subst X: <this dir>`).
+    build_dir = Path("X:/build") if Path("X:/").exists() else None
     if "--no-build" in argv:
         _, sha = runner.write_kernel(low.source, KERNEL)
-        db = runner.DeviceBuild(build_dir=HERE / "build", exe=HERE / "build" / "Release" / "npu_run.exe", kernel=KERNEL, source_sha256=sha)
+        db = runner.DeviceBuild(build_dir=build_dir or (HERE / "build"), exe=(build_dir or (HERE / "build")) / "Release" / "npu_run.exe", kernel=KERNEL, source_sha256=sha)
     else:
         t0 = time.time()
-        db = runner.build(low.source, KERNEL)
+        db = runner.build(low.source, KERNEL, build_dir=build_dir)
         print(f"build {time.time() - t0:.0f} s")
 
     qw = HEADS * HD_PAD

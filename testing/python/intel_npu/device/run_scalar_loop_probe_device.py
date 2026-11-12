@@ -32,7 +32,7 @@ KERNEL = "tl_scalar_loop_probe"
 
 
 def _lower(func):
-    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off"}):
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.hw_sync_grid": False}):
         return lowering.lower(func)
 
 

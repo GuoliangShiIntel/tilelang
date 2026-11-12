@@ -39,7 +39,7 @@ KERNEL = "tl_fgclip2_encoder_ddr_synth"
 
 
 def _lower(func):
-    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off"}):
+    with tvm.transform.PassContext(config={"tl.intel_npu.plan_workloads": "off", "tl.intel_npu.hw_sync_grid": False}):
         return lowering.lower(func)
 
 
@@ -62,12 +62,16 @@ def _weights(rng):
 def main(argv):
     func = make_fgclip2_encoder_layer_ddr(ROWS, VALID, HIDDEN, HEADS, HD_PAD, INTER_PAD, BR=BR, TN=TN, BQ=BQ, C=C)
     low = _lower(func)
+    # MSBuild's FileTracker tlog paths nest build/x64/Release/compile_<kernel>_<kernel>/compile_.<hash>.tlog/...
+    # and blow MAX_PATH for a kernel name this long; subst a short drive letter onto this folder first
+    # (`subst X: <this dir>`) and build there (see npu_dsl's docs/design/platform_nvl.md "Short paths").
+    build_dir = Path("X:/build") if Path("X:/").exists() else None
     if "--no-build" in argv:
         _, sha = runner.write_kernel(low.source, KERNEL)
-        db = runner.DeviceBuild(build_dir=HERE / "build", exe=HERE / "build" / "Release" / "npu_run.exe", kernel=KERNEL, source_sha256=sha)
+        db = runner.DeviceBuild(build_dir=build_dir or (HERE / "build"), exe=(build_dir or (HERE / "build")) / "Release" / "npu_run.exe", kernel=KERNEL, source_sha256=sha)
     else:
         t0 = time.time()
-        db = runner.build(low.source, KERNEL)
+        db = runner.build(low.source, KERNEL, build_dir=build_dir)
         print(f"build {time.time() - t0:.0f} s")
 
     rng = np.random.default_rng(0)
