@@ -296,3 +296,38 @@ have an analogous int8-embedding gather (M6 `e2e`); check for reuse before writi
   30-layer model's engineering (table format, address computation, two weight-row-count kinds sharing one
   loop). If resumed, this is the next real engineering task before attempting the full 30-layer model in
   one launch.
+- 2026-11-11 continued: **real-model-DIMENSION smoke test PASSES** (`test_intel_npu_gemma4_layer_real_scale.py`):
+  the SAME `make_gemma4_layer_prefill` composition, at REAL Gemma-4-26B-A4B-it dimensions (hidden=2816,
+  n_heads=16, sliding head_dim=256/8 kv heads, dense_inter=2112, moe_inter=704, 128 experts top-8, int4
+  group-64), synthetic weights, a small token count (N=8, kept small only for host-sim wall time -- not a
+  perf test). This derisked the real-checkpoint milestone BEFORE spending time packing real weights, and
+  surfaced three real, fixable problems:
+  1. **Build staleness**: the checked-out `build/` was stale relative to source (missing the registered
+     `tl.intel_npu.prefetch` pass-config option entirely) -- `cmake --build build` (one relink, seconds) fixed
+     it. Also found and cleared a stray leftover `python.exe` holding a file lock that failed the first
+     rebuild attempt (`ninja: ... permission denied`).
+  2. **CMX budget, the expected one**: `make_gemma4_moe_expert_prefill`'s V0-grade untiled weight matrices
+     (an un-tiled `(I, H)` ~ 3.96 MiB at real `I`/`H`) never had a chance at real scale -- fixed by the
+     `BNW_gu`/`BNW_d` weight-tiling retrofit (see the entry above), which was written and unit-tested
+     BEFORE this smoke test specifically so it could pass.
+  3. **A second CMX fit issue, not anticipated**: even after expert-FFN tiling, the composed layer was
+     still ~1 KB per SHAVE over the ~699 KB/SHAVE budget (NVL: `cmx_bytes 1473536` total per TILE). Bisected
+     empirically (varying `BKV`/`TB` had NO effect on the reported peak, ruling out the attention phase) to
+     the projection phases' token-block size: `make_proj_prefill`'s `MB` parameter (defaulted to the full
+     `N`) sizes an `x_cmx` activation tile that scales with `token_block x K`, and at real `K` (`KO` = 4096,
+     `H` = 2816) this was the dominant term. **Fix**: a new `MB_proj` parameter on `make_gemma4_layer_prefill`
+     lets the QKV/O/dense-FFN/router projections use a SMALLER token block than the attention/expert phases'
+     own `N` -- `MB_proj=4` (half of `N=8`) was enough. Also added (but did not conclusively isolate as THE
+     fix): explicit `T.sync_grid()` between the dense FFN's gate/up/down sub-phases, kept as a reasonable
+     precaution against their CMX scopes being co-scheduled -- the `MB_proj` fix alone was sufficient and
+     the extra barriers caused no regression, but the exact auto-barrier/CMX-scoping interaction that made
+     the peak match neither any single phase's hand-computed byte count nor respond to `BKV`/`TB` changes
+     was not fully reverse engineered (not needed once a working configuration was found).
+  **PASSED** at: `N=8` tokens, `TB=4`, `BKV=32`, `BN=16` (DPU minimum), `MB_expert=4`, `MB_proj=4`,
+  `BNW_gu=BNW_d=16` (DPU minimum), `TILES=4, SHAVES=2` (NVL's real worker count). Rel error against
+  `gemma4_decoder_layer_reference` at this shape: within the same tolerance band as the small-shape tests
+  (real H=2816/I=704 accumulate more fp16 rounding than the tiny V0 shapes, hence a slightly looser
+  `REL=1.2e-1`, still a real pass, not a loosened-to-fit non-result). Next: port enough of `gemma4_e2e/
+  pack.py`'s weight-layout logic to pull ONE real layer's weights from the real checkpoint
+  (`C:\Intel\guoliang\model_pkg\Google-Gemma-4-26B-A4B-it_int4_sym_qat_group-64_dyn_stateful`) into these
+  same tensors, and compare against `Gemma4Ref` (or a from-scratch equivalent) on that real layer.

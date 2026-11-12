@@ -439,7 +439,9 @@ def make_gemma4_dense_ffn_prefill(N: int, H: int, FI: int, G: int = 64, BN: int 
     @T.macro
     def dense_ffn(Xn, WgQ, WgS, WuQ, WuS, WdQ, WdS, Gate, Up, Act, Dense, tile, shave):
         gate_phase(Xn, WgQ, WgS, Gate, tile, shave)
-        up_phase(Xn, WuQ, WuS, Up, tile, shave)
+        T.sync_grid()  # gate/up/down have no DDR dependency on each other, so nothing derives this
+        up_phase(Xn, WuQ, WuS, Up, tile, shave)  # barrier automatically; force it so their CMX doesn't co-scope
+        T.sync_grid()
         act_phase(Gate, Up, Act, tile, shave)
         down_phase(Act, WdQ, WdS, Dense, tile, shave)
 
@@ -958,7 +960,8 @@ def gemma4_attn_prefill_reference(q, kc, vt, pos0: int, window: int | None = Non
 def make_gemma4_layer_prefill(
     N: int, H: int, NH: int, NKV: int, D: int, FI: int, E: int, TOPK: int, I: int,
     G: int = 64, SMAX: int = 256, full: bool = False, window: "int | None" = None,
-    TB: int = 4, BKV: int = 128, BN: int = 32, MB_expert: int = 4,
+    TB: int = 4, BKV: int = 128, BN: int = 32, MB_expert: int = 4, MB_proj: "int | None" = None,
+    BNW_gu: "int | None" = None, BNW_d: "int | None" = None,
     tiles: int = 3, shaves: int = 2, eps: float = 1e-6,
 ):
     """A WHOLE Gemma4 decoder layer in ONE launch, V0: one of the two layer KINDS (`full` selects which),
@@ -981,6 +984,7 @@ def make_gemma4_layer_prefill(
     workers = tiles * shaves
     GQ = NH // NKV
     KO = NH * D
+    MB_proj = N if MB_proj is None else MB_proj
     from kernels import make_proj_prefill
 
     qkv_phase, qs = make_gemma4_qkv_prefill(N=N, NH=NH, NKV=NKV, D=D, SMAX=SMAX, full=full, TB=TB,
@@ -988,16 +992,16 @@ def make_gemma4_layer_prefill(
     NQKV = qs["NQKV"]
     attn_phase, _ = make_gemma4_attn_prefill(N=N, NKV=NKV, GQ=GQ, D=D, SMAX=SMAX, window=window, TB=TB,
                                              BKV=BKV, tiles=tiles, shaves=shaves, as_block=True)
-    qkv_proj, _ = make_proj_prefill(NP=N, M=NQKV, K=H, BN=BN, MB=N, G=G, tiles=tiles, shaves=shaves,
+    qkv_proj, _ = make_proj_prefill(NP=N, M=NQKV, K=H, BN=BN, MB=MB_proj, G=G, tiles=tiles, shaves=shaves,
                                     as_block=True, scales_gm=True)
-    o_proj, _ = make_proj_prefill(NP=N, M=H, K=KO, BN=BN, MB=N, G=G, tiles=tiles, shaves=shaves,
+    o_proj, _ = make_proj_prefill(NP=N, M=H, K=KO, BN=BN, MB=MB_proj, G=G, tiles=tiles, shaves=shaves,
                                   as_block=True, scales_gm=True)
-    dense_ffn = make_gemma4_dense_ffn_prefill(N=N, H=H, FI=FI, G=G, BN=BN, MB=N, tiles=tiles, shaves=shaves, as_block=True)
-    router_proj = gemma4_fp16_proj_prefill(NP=N, M=E, K=H, BN=BN, MB=N, tiles=tiles, shaves=shaves, as_block=True)
+    dense_ffn = make_gemma4_dense_ffn_prefill(N=N, H=H, FI=FI, G=G, BN=BN, MB=MB_proj, tiles=tiles, shaves=shaves, as_block=True)
+    router_proj = gemma4_fp16_proj_prefill(NP=N, M=E, K=H, BN=BN, MB=MB_proj, tiles=tiles, shaves=shaves, as_block=True)
     route_phase, rs = make_gemma4_moe_route_prefill(N=N, E=E, TOPK=TOPK, tiles=tiles, shaves=shaves, as_block=True)
     SLOTS = rs["SLOTS"]
     expert_phase, es = make_gemma4_moe_expert_prefill(N=N, H=H, I=I, E=E, TOPK=TOPK, G=G, MB=MB_expert,
-                                                      tiles=tiles, shaves=shaves, as_block=True)
+                                                      BNW_gu=BNW_gu, BNW_d=BNW_d, tiles=tiles, shaves=shaves, as_block=True)
     KGH_e, KGI_e = es["KGH"], es["KGI"]
     combine_phase = make_gemma4_moe_combine(N=N, H=H, tiles=tiles, shaves=shaves, as_block=True)
 
