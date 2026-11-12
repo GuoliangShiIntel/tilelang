@@ -139,10 +139,12 @@ def build_all(sources: dict[str, str], build_dir: Path | None = None, log=print,
     cmake = find_cmake()
     env = dict(os.environ)
     # Always configure: the kernel list is a CMake glob, so a new generated/<kernel>.cpp needs a re-run.
-    r = subprocess.run(
-        [cmake, "-G", "Visual Studio 17 2022", "-A", "x64", "-S", str(HERE), "-B", str(build_dir),
-         f"-DGENERIC_COMPUTE_ROOT={gc_root}", f"-DMV_TOOLS_PATH={mv_tools}"],
-        capture_output=True, text=True, env=env)
+    configure_args = [cmake, "-G", os.environ.get("TL_NPU_CMAKE_GENERATOR") or "Visual Studio 17 2022", "-A", "x64",
+                      "-S", str(HERE), "-B", str(build_dir),
+                      f"-DGENERIC_COMPUTE_ROOT={gc_root}", f"-DMV_TOOLS_PATH={mv_tools}"]
+    if os.environ.get("TL_NPU_DEVICES"):
+        configure_args.append(f"-DTL_NPU_DEVICES={os.environ['TL_NPU_DEVICES']}")
+    r = subprocess.run(configure_args, capture_output=True, text=True, env=env)
     if r.returncode:
         raise RuntimeError(f"cmake configure failed:\n{r.stdout[-4000:]}\n{r.stderr[-4000:]}")
     r = subprocess.run([cmake, "--build", str(build_dir), "--config", "Release", "--", "/m", "/v:minimal"],

@@ -803,9 +803,16 @@ public:
           w[3] = 0;
         }
       i4Mm_->initMixedDescOnly(M * ng, C, G); // sets the int8 weight mode
-      if (bits == 4)
+      if (bits == 4) {
+#if (__npu_major__ >= 4 && __npu_major__ <= 5)
         i4Desc_->invariant.tensor_mode.tensor_mode_bf.wmode =
             static_cast<std::uint32_t>(npu40xx::VpuInputTensorDType::I4);
+#else
+        // int4 quantised matmul isn't wired up at the generic_compute level past NPU5 either.
+        fail(kStatusUnsupported, bits);
+        return;
+#endif
+      }
       i4Key_ = key;
     }
     i4Mm_->setConsumerBarriers(0, 0);
