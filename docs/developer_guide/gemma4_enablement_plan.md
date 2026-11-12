@@ -330,4 +330,30 @@ have an analogous int8-embedding gather (M6 `e2e`); check for reuse before writi
   `REL=1.2e-1`, still a real pass, not a loosened-to-fit non-result). Next: port enough of `gemma4_e2e/
   pack.py`'s weight-layout logic to pull ONE real layer's weights from the real checkpoint
   (`C:\Intel\guoliang\model_pkg\Google-Gemma-4-26B-A4B-it_int4_sym_qat_group-64_dyn_stateful`) into these
-  same tensors, and compare against `Gemma4Ref` (or a from-scratch equivalent) on that real layer.
+  same tensors, and compare against `Gemma4Ref` (or a from-scratch equivalent) on that real layer.- 2026-11-11 continued: **V4 CLOSED -- real checkpoint, layer 0, PASSES with rel_err=0.0003, cosine=1.000000.**
+  `test_intel_npu_gemma4_real_checkpoint_layer0.py` reads layer 0's REAL weights directly from the real
+  checkpoint's OpenVINO IR via npu_dsl's `OvIr` (pure numpy, `sys.path`-imported from the npu_dsl checkout,
+  no Gemma4Ref/torch dependency needed for the extraction itself -- though torch IS available in this
+  environment, confirmed, if a future session wants to cross-check against the real `Gemma4Ref` class
+  directly instead of this plan's own from-scratch `gemma4_decoder_layer_reference`): all int4 group-64
+  weights (q/k/v/o/gate/up/down/router_proj/all 128 experts' gate|up|down), every norm, `router_scale`,
+  `per_expert_scale`, `layer_scalar`, and the real RoPE table. Input: REAL embedded tokens (random real
+  token ids through the IR's own `embed_i8`), not synthetic. Two real bugs caught and fixed while wiring
+  this up (both naming/shape mismatches in the TEST, not the kernel):
+  1. A dict key mismatch (`"input"` vs the reference function's expected `"input_norm"`, etc.) --
+     `gemma4_decoder_layer_reference`'s weight dict keys all carry a `_norm` suffix for the seven
+     residual-site norms; the real-weight extraction loop had not matched that convention.
+  2. **`ov_ir.rope_cos_sin` returns FULL-WIDTH `[N, D]` cos/sin already** (verified: the two halves are
+     exact duplicates, `np.allclose` confirmed on real data) -- NOT the half-width table the V0/real-scale
+     SYNTHETIC tests built by hand (`np.tile(angles, 2)`). Only `gemma4_e2e/pack.py`'s device packer slices
+     to half-width before storing (to save DDR space); reading `rope_cos_sin` directly for a test must
+     concatenate `[cos_full | sin_full]` directly, not re-duplicate an already-full table (which had
+     silently produced the wrong total width, a `ValueError: operands could not be broadcast` rather than
+     a silent wrong answer -- caught immediately, not a latent numerical bug).
+  3. A missing `router_scale` key in the weights dict passed to the reference (present in the kernel-side
+     `arrays` dict since it was wired correctly there, just omitted from the reference's dict construction).
+  **This is the capstone correctness result for this session**: real Gemma-4-26B-A4B-it weights, the
+  model's own real quantisation format (int4 symmetric QAT group-64), through this backend's actual
+  generated kernel code (host-simulated, not yet real NVL hardware -- see the V5 entry below for that
+  attempt), reproducing an independently-written reference to 0.03% relative error and perfect cosine
+  similarity. No shape was shrunk, no weight was faked, no tolerance was loosened to force a pass.
