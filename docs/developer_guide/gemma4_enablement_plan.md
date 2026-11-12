@@ -116,12 +116,17 @@ moe      = rmsnorm(moe_block(moe_in), post_ffn_2_norm)        # top-8 of 128, se
 combined = rmsnorm(dense + moe, post_ffn_norm)
 h_out    = (h1 + combined) * layer_scalar                      # layer_scalar: one fp32 scalar per layer
 ```
-The dense FFN is an ordinary GeGLU (gelu-tanh) projection, structurally identical to the expert FFN's
-per-expert GeGLU already in `make_moe_expert_prefill` (gate|up tile-interleaved packing is even the SAME
-layout convention, `gu_tile`-interleaved — `pack.py`'s `_interleave` helper matches `kernels.py`'s existing
-MoE weight packing exactly). **Action: the dense FFN can reuse the existing projection/GeGLU machinery
-(`make_proj_prefill` + the GeGLU macro inside `make_moe_expert_prefill`) as a "1-expert" case, rather than
-writing a new GEMM+activation kernel** — this is the single largest piece of direct reuse in this port.
+The dense FFN is an ordinary GeGLU (gelu-tanh) projection. **Correction (2026-11-11, caught before writing
+code): Qwen3.6's existing expert FFN (`make_moe_expert_prefill`) uses SiLU-based SwiGLU
+(`h = gate * sigmoid(gate) * up`, confirmed by reading the kernel's comments/source directly), NOT
+gelu-tanh — the activation FUNCTION must be written fresh for Gemma4, only the surrounding GEMM/dequant/
+tile-interleaved-packing structure transfers.** `gelu_tanh(x) = x * sigmoid(2c(x + 0.044715x^3))`,
+`c = sqrt(2/pi)` (algebraically simplified from the usual `0.5x(1+tanh(..))` form so it reuses the exact
+`exp`-based sigmoid pattern already proven on this backend, e.g. the attention output gate and the MoE
+router's shared-expert gate — not `T.tanh` directly, which exists in the common TIR op set but is
+unproven on this backend's SHAVE codegen path; safer to stay on an already-validated primitive).
+`pack.py`'s gate\|up tile-interleaved layout convention does still transfer unchanged (same packing,
+different activation reading it).
 
 ### 2.4 Router: plain softmax top-k, no shared-expert row, with `per_expert_scale`
 
