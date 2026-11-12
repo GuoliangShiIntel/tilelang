@@ -614,6 +614,7 @@ def gemma4_moe_route_prefill_reference(logits, per_expert_scale, E: int, TOPK: i
 
 
 def make_gemma4_moe_expert_prefill(N: int, H: int, I: int, E: int, TOPK: int, G: int = 64, MB: int = 16,
+                                   BNW_gu: "int | None" = None, BNW_d: "int | None" = None,
                                    tiles: int = 3, shaves: int = 2, as_block: bool = False, FL: int = 16):
     """The grouped expert FFN for `N` prompt tokens, after `make_gemma4_moe_route_prefill`'s grouping
     (`Off`/`Slot`). V0-grade simplification vs `kernels.make_moe_expert_prefill` (see the plan doc section
@@ -621,11 +622,20 @@ def make_gemma4_moe_expert_prefill(N: int, H: int, I: int, E: int, TOPK: int, G:
     pipelining, no slot-major output -- so every buffer is `T.alloc_local` and no SHAVE-to-SHAVE
     coordination is needed at all within the expert loop. Correctness over performance.
 
+    `BNW_gu` / `BNW_d` tile the gate|up output width (`I`) and the down output width (`H`) into chunks a
+    SHAVE dequantises/computes one at a time, instead of the whole `(I, H)` / `(H, I)` weight matrix at
+    once -- required at real model scale (`I` ~ 704, `H` ~ 2816: a single untiled `(I, H)` fp16 tile is
+    ~3.96 MiB, far over one SHAVE's CMX share) and a no-op at V0's small test shapes (default `None` keeps
+    the old untiled behaviour, one chunk the whole width). `I % BNW_gu == 0` and `H % BNW_d == 0` required.
+
     A token's `TOPK` choices land on different experts and therefore (generally) on different workers, so
     each worker accumulates its own expert(s)' contribution into a PRIVATE fp32 partial `Part[worker, N, H]`
     (zeroed at the start of this phase); `make_gemma4_moe_combine` sums the `workers` partials afterwards.
     Oracle: `gemma4_moe_expert_prefill_reference`."""
     assert H % G == 0 and I % G == 0 and H % FL == 0 and I % FL == 0
+    BNW_gu = I if BNW_gu is None else BNW_gu
+    BNW_d = H if BNW_d is None else BNW_d
+    assert I % BNW_gu == 0 and H % BNW_d == 0
     workers = tiles * shaves
     EPT = -(-E // workers)
     KGH, KGI = H // G, I // G
@@ -646,36 +656,24 @@ def make_gemma4_moe_expert_prefill(N: int, H: int, I: int, E: int, TOPK: int, G:
                 zero_row[0, d0 * FL + v] = T.float32(0)
         for t in T.serial(N):
             T.copy(zero_row, Part[worker, t, 0])
-        wgq_cmx = T.alloc_local((I, H // 2), T.uint8)
-        wgs_cmx = T.alloc_local((KGH, I), T.float16)
-        wg_cmx = T.alloc_local((I, H), T.float16)
-        wuq_cmx = T.alloc_local((I, H // 2), T.uint8)
-        wus_cmx = T.alloc_local((KGH, I), T.float16)
-        wu_cmx = T.alloc_local((I, H), T.float16)
-        wdq_cmx = T.alloc_local((H, I // 2), T.uint8)
-        wds_cmx = T.alloc_local((KGI, H), T.float16)
-        wd_cmx = T.alloc_local((H, I), T.float16)
+        wgq_cmx = T.alloc_local((BNW_gu, H // 2), T.uint8)
+        wgs_cmx = T.alloc_local((KGH, BNW_gu), T.float16)
+        wg_cmx = T.alloc_local((BNW_gu, H), T.float16)
+        wuq_cmx = T.alloc_local((BNW_gu, H // 2), T.uint8)
+        wus_cmx = T.alloc_local((KGH, BNW_gu), T.float16)
+        wu_cmx = T.alloc_local((BNW_gu, H), T.float16)
+        wdq_cmx = T.alloc_local((BNW_d, I // 2), T.uint8)
+        wds_cmx = T.alloc_local((KGI, BNW_d), T.float16)
+        wd_cmx = T.alloc_local((BNW_d, I), T.float16)
         x_cmx = T.alloc_local((MB, H), T.float16)
-        gate_cmx = T.alloc_local((MB, I), T.float16)
-        up_cmx = T.alloc_local((MB, I), T.float16)
+        gate_chunk = T.alloc_local((MB, BNW_gu), T.float16)
+        up_chunk = T.alloc_local((MB, BNW_gu), T.float16)
         act_cmx = T.alloc_local((MB, I), T.float16)
-        y_cmx = T.alloc_local((MB, H), T.float16)
+        y_cmx = T.alloc_local((MB, BNW_d), T.float16)
         acc = T.alloc_local((1, H), T.float32)
         for ei in T.serial(EPT):
             e = ei * workers + worker
             if e < E:
-                T.copy(WgateQ[e, 0, 0], wgq_cmx)
-                T.copy(WgateS[e, 0, 0], wgs_cmx)
-                T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wg_cmx[0, 0]),
-                             T.address_of(wgq_cmx[0, 0]), T.address_of(wgs_cmx[0, 0]), I, H, G)
-                T.copy(WupQ[e, 0, 0], wuq_cmx)
-                T.copy(WupS[e, 0, 0], wus_cmx)
-                T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wu_cmx[0, 0]),
-                             T.address_of(wuq_cmx[0, 0]), T.address_of(wus_cmx[0, 0]), I, H, G)
-                T.copy(WdownQ[e, 0, 0], wdq_cmx)
-                T.copy(WdownS[e, 0, 0], wds_cmx)
-                T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wd_cmx[0, 0]),
-                             T.address_of(wdq_cmx[0, 0]), T.address_of(wds_cmx[0, 0]), H, I, G)
                 for c in T.serial(T.ceildiv(off_cmx[e + 1] - off_cmx[e], MB)):
                     for r in T.serial(MB):
                         idx = off_cmx[e] + c * MB + r
@@ -685,28 +683,42 @@ def make_gemma4_moe_expert_prefill(N: int, H: int, I: int, E: int, TOPK: int, G:
                             for d0 in T.serial(H // FL):
                                 for v in T.vectorized(FL):
                                     x_cmx[r, d0 * FL + v] = T.float16(0)
-                    T.gemm(x_cmx, wg_cmx, gate_cmx, transpose_B=True, clear_accum=True)
-                    T.gemm(x_cmx, wu_cmx, up_cmx, transpose_B=True, clear_accum=True)
-                    for r in T.serial(MB):
-                        for d0 in T.serial(I // FL):
-                            for v in T.vectorized(FL):
-                                g = T.cast(gate_cmx[r, d0 * FL + v], T.float32)
-                                z2 = T.float32(1.5957691216057308) * (g + T.float32(0.044715) * g * g * g)
-                                e_ = T.exp(T.float32(0) - z2)
-                                act_cmx[r, d0 * FL + v] = T.cast(
-                                    g / (T.float32(1) + e_) * T.cast(up_cmx[r, d0 * FL + v], T.float32), T.float16
-                                )
-                    T.gemm(act_cmx, wd_cmx, y_cmx, transpose_B=True, clear_accum=True)
-                    for r in T.serial(MB):
-                        idx = off_cmx[e] + c * MB + r
-                        if idx < off_cmx[e + 1]:
-                            tok = slot_cmx[idx] // TOPK
-                            kk = slot_cmx[idx] % TOPK
-                            T.copy(Part[worker, tok, 0], acc)
-                            for d0 in T.serial(H // FL):
+                    for gu in T.serial(I // BNW_gu):
+                        T.copy(WgateQ[e, gu * BNW_gu, 0], wgq_cmx)
+                        T.copy(WgateS[e, 0, gu * BNW_gu], wgs_cmx)
+                        T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wg_cmx[0, 0]),
+                                     T.address_of(wgq_cmx[0, 0]), T.address_of(wgs_cmx[0, 0]), BNW_gu, H, G)
+                        T.gemm(x_cmx, wg_cmx, gate_chunk, transpose_B=True, clear_accum=True)
+                        T.copy(WupQ[e, gu * BNW_gu, 0], wuq_cmx)
+                        T.copy(WupS[e, 0, gu * BNW_gu], wus_cmx)
+                        T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wu_cmx[0, 0]),
+                                     T.address_of(wuq_cmx[0, 0]), T.address_of(wus_cmx[0, 0]), BNW_gu, H, G)
+                        T.gemm(x_cmx, wu_cmx, up_chunk, transpose_B=True, clear_accum=True)
+                        for r in T.serial(MB):
+                            for d0 in T.serial(BNW_gu // FL):
                                 for v in T.vectorized(FL):
-                                    acc[0, d0 * FL + v] = acc[0, d0 * FL + v] + T.cast(y_cmx[r, d0 * FL + v], T.float32) * wts_cmx[tok, kk]
-                            T.copy(acc, Part[worker, tok, 0])
+                                    g = T.cast(gate_chunk[r, d0 * FL + v], T.float32)
+                                    z2 = T.float32(1.5957691216057308) * (g + T.float32(0.044715) * g * g * g)
+                                    e_ = T.exp(T.float32(0) - z2)
+                                    act_cmx[r, gu * BNW_gu + d0 * FL + v] = T.cast(
+                                        g / (T.float32(1) + e_) * T.cast(up_chunk[r, d0 * FL + v], T.float32), T.float16
+                                    )
+                    for dd in T.serial(H // BNW_d):
+                        T.copy(WdownQ[e, dd * BNW_d, 0], wdq_cmx)
+                        T.copy(WdownS[e, 0, dd * BNW_d], wds_cmx)
+                        T.call_extern("handle", "tl_npu_dequant_i4_gm", T.address_of(wd_cmx[0, 0]),
+                                     T.address_of(wdq_cmx[0, 0]), T.address_of(wds_cmx[0, 0]), BNW_d, I, G)
+                        T.gemm(act_cmx, wd_cmx, y_cmx, transpose_B=True, clear_accum=True)
+                        for r in T.serial(MB):
+                            idx = off_cmx[e] + c * MB + r
+                            if idx < off_cmx[e + 1]:
+                                tok = slot_cmx[idx] // TOPK
+                                kk = slot_cmx[idx] % TOPK
+                                T.copy(Part[worker, tok, dd * BNW_d : dd * BNW_d + BNW_d], acc[0:1, 0:BNW_d])
+                                for d0 in T.serial(BNW_d // FL):
+                                    for v in T.vectorized(FL):
+                                        acc[0, d0 * FL + v] = acc[0, d0 * FL + v] + T.cast(y_cmx[r, d0 * FL + v], T.float32) * wts_cmx[tok, kk]
+                                T.copy(acc[0:1, 0:BNW_d], Part[worker, tok, dd * BNW_d : dd * BNW_d + BNW_d])
 
     if as_block:
         return expert_phase, dict(EPT=EPT, KGH=KGH, KGI=KGI)
