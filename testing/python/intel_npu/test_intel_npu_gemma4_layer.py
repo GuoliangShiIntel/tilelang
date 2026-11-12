@@ -136,6 +136,125 @@ def _build(full: bool, window, seed=0):
 
 
 @needs_cxx
+def test_two_layers_chain_matches_reference():
+    """V2 (lightweight): TWO sliding layers back to back in ONE launch, proving the residual stream
+    correctly carries from one layer's output into the next's input, and that the compiler's automatic
+    barrier derivation/CMX reuse works across a REPEATED large phase sequence, not just one. A
+    python-unrolled fixed-count loop (two separate weight sets, two separate macro calls) -- the real
+    device-side runtime layer TABLE (variable layer count, two-kind alternation) is deferred to a later
+    milestone; this proves the chaining mechanism itself."""
+    import tilelang.intel_npu.language as T
+
+    full, window = False, None
+    h0, w0, a0 = _build(full, window, seed=10)
+    _, w1, a1 = _build(full, window, seed=11)
+    # RoPE is purely positional -- both layers see the SAME N tokens at the SAME positions, so they share
+    # ONE CosSin table (the kernel below only has a single CosSin parameter, reused for both layer_macro
+    # calls); force the reference's second layer to use layer 0's table instead of its own independently
+    # randomised one, matching what the kernel actually computes.
+    w1["cos_sin"] = w0["cos_sin"]
+    a1["CosSin"] = a0["CosSin"]
+    layer_macro, sizes = make_gemma4_layer_prefill(
+        N=N, H=H, NH=NH, NKV=NKV, D=D, FI=FI, E=E, TOPK=TOPK, I=I_EXP, G=G, SMAX=SMAX, full=full, window=window,
+        TB=TB, BKV=BKV, BN=BN, MB_expert=MB_EXPERT, tiles=TILES, shaves=SHAVES,
+    )
+    NQKV, GQ, KO, SLOTS = sizes["NQKV"], sizes["GQ"], sizes["KO"], sizes["SLOTS"]
+
+    scratch_args = dict(
+        Kc=T.Tensor((NKV, SMAX, D), T.float16), Vt=T.Tensor((NKV, D, SMAX), T.float16),
+        Pos=T.Tensor((1, 1), T.int32), Nt=T.Tensor((1, 1), T.int32),
+        Xn=T.Tensor((N, H), T.float16), Ys=T.Tensor((N, NQKV), T.float16), Q=T.Tensor((NKV, N, GQ, D), T.float16),
+        AttnO=T.Tensor((N, KO), T.float16), AttnP=T.Tensor((N, H), T.float16), PostAttnN=T.Tensor((N, H), T.float16),
+        Xdense=T.Tensor((N, H), T.float16), Dense=T.Tensor((N, H), T.float16), DenseN=T.Tensor((N, H), T.float16),
+        Gate=T.Tensor((N, FI), T.float16), Up=T.Tensor((N, FI), T.float16), Act=T.Tensor((N, FI), T.float16),
+        Xroute=T.Tensor((N, H), T.float16), Logits=T.Tensor((N, E), T.float16),
+        Ids=T.Tensor((N, TOPK), T.int32), Wts=T.Tensor((N, TOPK), T.float32),
+        Off=T.Tensor((E + 1,), T.int32), Slot=T.Tensor((SLOTS,), T.int32), Xmoe=T.Tensor((N, H), T.float16),
+        MoePart=T.Tensor((TILES * SHAVES, N, H), T.float32), MoeOut=T.Tensor((N, H), T.float32),
+        MoeN=T.Tensor((N, H), T.float16), Combined=T.Tensor((N, H), T.float16),
+    )
+
+    @T.prim_func
+    def two_layer_kernel(
+        Hio: T.Tensor((N, H), T.float32), CosSin: T.Tensor((N, 2 * D), T.float32),
+        L0InNorm: T.Tensor((1, H), T.float16), L0QNorm: T.Tensor((1, D), T.float16), L0KNorm: T.Tensor((1, D), T.float16),
+        L0PostAttnNorm: T.Tensor((1, H), T.float16), L0PreFfnNorm: T.Tensor((1, H), T.float16),
+        L0PostFfn1Norm: T.Tensor((1, H), T.float16), L0PreFfn2Norm: T.Tensor((1, H), T.float16),
+        L0PostFfn2Norm: T.Tensor((1, H), T.float16), L0PostFfnNorm: T.Tensor((1, H), T.float16),
+        L0RouterScale: T.Tensor((1, H), T.float16),
+        L0WqkvQ: T.Tensor((NQKV, H // 2), T.uint8), L0WqkvS: T.Tensor((H // G, NQKV), T.float16),
+        L0WoQ: T.Tensor((H, KO // 2), T.uint8), L0WoS: T.Tensor((KO // G, H), T.float16),
+        L0WgateQ: T.Tensor((FI, H // 2), T.uint8), L0WgateS: T.Tensor((H // G, FI), T.float16),
+        L0WupQ: T.Tensor((FI, H // 2), T.uint8), L0WupS: T.Tensor((H // G, FI), T.float16),
+        L0WdownQ: T.Tensor((H, FI // 2), T.uint8), L0WdownS: T.Tensor((FI // G, H), T.float16),
+        L0WR: T.Tensor((E, H), T.float16),
+        L0EWgateQ: T.Tensor((E, I_EXP, H // 2), T.uint8), L0EWgateS: T.Tensor((E, H // G, I_EXP), T.float16),
+        L0EWupQ: T.Tensor((E, I_EXP, H // 2), T.uint8), L0EWupS: T.Tensor((E, H // G, I_EXP), T.float16),
+        L0EWdownQ: T.Tensor((E, H, I_EXP // 2), T.uint8), L0EWdownS: T.Tensor((E, I_EXP // G, H), T.float16),
+        L0PerExpertScale: T.Tensor((E, 1), T.float32), L0LayerScalar: T.Tensor((1, 1), T.float32),
+        L1InNorm: T.Tensor((1, H), T.float16), L1QNorm: T.Tensor((1, D), T.float16), L1KNorm: T.Tensor((1, D), T.float16),
+        L1PostAttnNorm: T.Tensor((1, H), T.float16), L1PreFfnNorm: T.Tensor((1, H), T.float16),
+        L1PostFfn1Norm: T.Tensor((1, H), T.float16), L1PreFfn2Norm: T.Tensor((1, H), T.float16),
+        L1PostFfn2Norm: T.Tensor((1, H), T.float16), L1PostFfnNorm: T.Tensor((1, H), T.float16),
+        L1RouterScale: T.Tensor((1, H), T.float16),
+        L1WqkvQ: T.Tensor((NQKV, H // 2), T.uint8), L1WqkvS: T.Tensor((H // G, NQKV), T.float16),
+        L1WoQ: T.Tensor((H, KO // 2), T.uint8), L1WoS: T.Tensor((KO // G, H), T.float16),
+        L1WgateQ: T.Tensor((FI, H // 2), T.uint8), L1WgateS: T.Tensor((H // G, FI), T.float16),
+        L1WupQ: T.Tensor((FI, H // 2), T.uint8), L1WupS: T.Tensor((H // G, FI), T.float16),
+        L1WdownQ: T.Tensor((H, FI // 2), T.uint8), L1WdownS: T.Tensor((FI // G, H), T.float16),
+        L1WR: T.Tensor((E, H), T.float16),
+        L1EWgateQ: T.Tensor((E, I_EXP, H // 2), T.uint8), L1EWgateS: T.Tensor((E, H // G, I_EXP), T.float16),
+        L1EWupQ: T.Tensor((E, I_EXP, H // 2), T.uint8), L1EWupS: T.Tensor((E, H // G, I_EXP), T.float16),
+        L1EWdownQ: T.Tensor((E, H, I_EXP // 2), T.uint8), L1EWdownS: T.Tensor((E, I_EXP // G, H), T.float16),
+        L1PerExpertScale: T.Tensor((E, 1), T.float32), L1LayerScalar: T.Tensor((1, 1), T.float32),
+        Kc: T.Tensor((NKV, SMAX, D), T.float16), Vt: T.Tensor((NKV, D, SMAX), T.float16),
+        Pos: T.Tensor((1, 1), T.int32), Nt: T.Tensor((1, 1), T.int32),
+        Xn: T.Tensor((N, H), T.float16), Ys: T.Tensor((N, NQKV), T.float16), Q: T.Tensor((NKV, N, GQ, D), T.float16),
+        AttnO: T.Tensor((N, KO), T.float16), AttnP: T.Tensor((N, H), T.float16), PostAttnN: T.Tensor((N, H), T.float16),
+        Xdense: T.Tensor((N, H), T.float16), Dense: T.Tensor((N, H), T.float16), DenseN: T.Tensor((N, H), T.float16),
+        Gate: T.Tensor((N, FI), T.float16), Up: T.Tensor((N, FI), T.float16), Act: T.Tensor((N, FI), T.float16),
+        Xroute: T.Tensor((N, H), T.float16), Logits: T.Tensor((N, E), T.float16),
+        Ids: T.Tensor((N, TOPK), T.int32), Wts: T.Tensor((N, TOPK), T.float32),
+        Off: T.Tensor((E + 1,), T.int32), Slot: T.Tensor((SLOTS,), T.int32), Xmoe: T.Tensor((N, H), T.float16),
+        MoePart: T.Tensor((TILES * SHAVES, N, H), T.float32), MoeOut: T.Tensor((N, H), T.float32),
+        MoeN: T.Tensor((N, H), T.float16), Combined: T.Tensor((N, H), T.float16),
+    ):
+        with T.Kernel(TILES, threads=SHAVES) as tile:
+            shave = T.get_thread_binding()
+            layer_macro(Hio, L0InNorm, L0QNorm, L0KNorm, CosSin, L0PostAttnNorm, L0PreFfnNorm, L0PostFfn1Norm,
+                       L0PreFfn2Norm, L0PostFfn2Norm, L0PostFfnNorm, L0RouterScale, L0WqkvQ, L0WqkvS, L0WoQ, L0WoS,
+                       L0WgateQ, L0WgateS, L0WupQ, L0WupS, L0WdownQ, L0WdownS, L0WR, L0EWgateQ, L0EWgateS, L0EWupQ,
+                       L0EWupS, L0EWdownQ, L0EWdownS, L0PerExpertScale, L0LayerScalar, Kc, Vt, Pos, Nt, Xn, Ys, Q,
+                       AttnO, AttnP, PostAttnN, Xdense, Dense, DenseN, Gate, Up, Act, Xroute, Logits, Ids, Wts, Off,
+                       Slot, Xmoe, MoePart, MoeOut, MoeN, Combined, tile, shave)
+            layer_macro(Hio, L1InNorm, L1QNorm, L1KNorm, CosSin, L1PostAttnNorm, L1PreFfnNorm, L1PostFfn1Norm,
+                       L1PreFfn2Norm, L1PostFfn2Norm, L1PostFfnNorm, L1RouterScale, L1WqkvQ, L1WqkvS, L1WoQ, L1WoS,
+                       L1WgateQ, L1WgateS, L1WupQ, L1WupS, L1WdownQ, L1WdownS, L1WR, L1EWgateQ, L1EWgateS, L1EWupQ,
+                       L1EWupS, L1EWdownQ, L1EWdownS, L1PerExpertScale, L1LayerScalar, Kc, Vt, Pos, Nt, Xn, Ys, Q,
+                       AttnO, AttnP, PostAttnN, Xdense, Dense, DenseN, Gate, Up, Act, Xroute, Logits, Ids, Wts, Off,
+                       Slot, Xmoe, MoePart, MoeOut, MoeN, Combined, tile, shave)
+
+    low = _lower(two_layer_kernel)
+    lib = host_sim.build(low.source, "tl_gemma4_two_layer_sim")
+    arrays = {"Hio": h0.copy(), "CosSin": a0["CosSin"]}
+    for k, v in a0.items():
+        if k not in ("CosSin", "Hio") and k not in scratch_args:
+            arrays[f"L0{k}"] = v
+    for k, v in a1.items():
+        if k not in ("CosSin", "Hio") and k not in scratch_args:
+            arrays[f"L1{k}"] = v
+    for k in scratch_args:
+        arrays[k] = a0[k]
+    host_sim.check_status(host_sim.run(lib, lowering.order_arrays(low, arrays), TILES, SHAVES))
+
+    ref = gemma4_decoder_layer_reference(h0, w0, NH, NKV, D, full, window)
+    ref = gemma4_decoder_layer_reference(ref, w1, NH, NKV, D, full, window)
+    out = arrays["Hio"]
+    rel = np.abs(out - ref).max() / (np.abs(ref).max() + 1e-6)
+    assert rel < REL, (rel, out, ref)
+
+
+@needs_cxx
 @pytest.mark.parametrize("full,window", [(False, None), (False, 6), (True, None)])
 def test_layer_matches_reference(full, window):
     h, weights_ref, arrays = _build(full, window)

@@ -281,3 +281,18 @@ have an analogous int8-embedding gather (M6 `e2e`); check for reuse before writi
   serial, not load-balanced; the expert FFN has every worker own whole experts (no tile-sharing, no
   pipelining); the attention window does not yet skip whole key-chunks before the window, only masks loaded
   ones. None of these affect correctness; all are noted in the gap table (section 3) and code docstrings.
+- 2026-11-11 continued: **V2 (lightweight) closed**: `test_two_layers_chain_matches_reference` runs the SAME
+  `make_gemma4_layer_prefill` macro TWICE in one launch (two separate weight sets, python-unrolled, not yet
+  a runtime-indexed table), proving the residual stream correctly carries from one layer's output into the
+  next's input and that the compiler's automatic barrier derivation / CMX reuse holds across a repeated
+  large phase sequence. PASSES against two chained calls of `gemma4_decoder_layer_reference`. Caught one
+  real test bug while debugging (rel 0.237, not a kernel bug): RoPE is purely positional, so both layers
+  must share ONE `CosSin` table, but the test's `_build()` helper generates a fresh random one per call --
+  fixed by forcing the second layer's reference `cos_sin` to match the first's, matching what the kernel
+  actually does (one shared `CosSin` DDR tensor for both `layer_macro` calls). **Scope decision, given
+  overall time budget**: the REAL device-side runtime layer TABLE (variable layer count, two-kind
+  alternation, matching npu_dsl's `STab`/`FTab` byte-packed format) is deferred past this session --
+  python-unrolled fixed-count chaining is sufficient to prove the mechanism, but does not scale to a real
+  30-layer model's engineering (table format, address computation, two weight-row-count kinds sharing one
+  loop). If resumed, this is the next real engineering task before attempting the full 30-layer model in
+  one launch.
